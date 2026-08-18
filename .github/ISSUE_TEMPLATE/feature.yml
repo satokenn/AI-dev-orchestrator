@@ -1,0 +1,68 @@
+name: Feature
+about: 新機能や既存機能の改善を提案・実装するためのIssue
+# GitHub Issue Formsでは description が表示に使われるため、about ではなく description を使用します。
+description: 新機能や既存機能の改善を提案・実装するためのIssue
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        このIssueでは、実装する機能だけでなく「なぜ必要か」と「何を満たせば完了か」を明確にします。
+
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景・解決したい問題
+      description: 現在どのような問題があり、なぜこの変更が必要なのかを書いてください。
+      placeholder: |
+        現状では...
+        そのため...
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired_state
+    attributes:
+      label: 実現したい状態
+      description: 実装方法ではなく、このIssue完了後に利用者・システムがどうなっていてほしいかを書いてください。
+      placeholder: このIssueが完了すると...
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: このIssueを完了と判断できる、検証可能な条件を書いてください。
+      placeholder: |
+        - [ ] 条件1
+        - [ ] 条件2
+        - [ ] 条件3
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: 今回のIssueで対応する範囲を書いてください。
+      placeholder: |
+        - 対応すること
+        - 変更対象
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of Scope
+      description: 関連しているが、このIssueでは対応しない範囲を書いてください。
+      placeholder: |
+        - 今回は対応しないこと
+
+  - type: textarea
+    id: references
+    attributes:
+      label: 参考情報
+      description: 関連Issue、ドキュメント、設計資料、外部資料などがあれば記載してください。
+      placeholder: |
+        - #123
+        - docs/architecture.md
