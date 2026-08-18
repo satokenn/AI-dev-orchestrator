@@ -1,6 +1,6 @@
-name: Bug Report
+name: 不具合報告
 description: 不具合の再現条件と期待する動作を明確にして修正するためのIssue
-title: "[Bug] "
+title: "[不具合] "
 body:
   - type: markdown
     attributes:
@@ -48,7 +48,7 @@ body:
     id: environment
     attributes:
       label: 実行環境
-      description: OS、Rust/toolchain、関連CLIやProviderのバージョンなど、再現に関係する環境情報を書いてください。
+      description: OS、Rustのツールチェーン、関連CLIやProviderのバージョンなど、再現に関係する環境情報を書いてください。
       placeholder: |
         OS:
         Rust:
@@ -58,7 +58,7 @@ body:
   - type: textarea
     id: acceptance_criteria
     attributes:
-      label: Acceptance Criteria
+      label: 完了条件
       description: 修正完了を判断できる、検証可能な条件を書いてください。
       placeholder: |
         - [ ] 再現手順で問題が発生しない
