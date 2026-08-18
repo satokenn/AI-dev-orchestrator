@@ -1,0 +1,81 @@
+name: Design / RFC
+description: 実装前に設計上の問題・選択肢・Trade-offを整理して方針を決めるためのIssue
+title: "[Design] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        このIssueでは、実装そのものではなく設計上の意思決定を行います。結論だけでなく、検討した選択肢とTrade-offを残してください。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 設計上の問題
+      description: 何を決める必要があり、現在どこが曖昧・問題なのかを書いてください。
+      placeholder: 現在は...
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: 背景・制約
+      description: この設計判断に影響する既存仕様、技術的制約、コスト、利用枠、安全性などを書いてください。
+      placeholder: |
+        - 既存仕様:
+        - 技術的制約:
+        - コスト/Quota:
+        - その他:
+    validations:
+      required: true
+
+  - type: textarea
+    id: options
+    attributes:
+      label: 検討する選択肢
+      description: 比較すべき案を列挙し、それぞれが何を意味するかを書いてください。
+      placeholder: |
+        ### Option A
+        ...
+
+        ### Option B
+        ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Trade-off
+      description: 各案の利点・欠点・運用上の影響を比較してください。
+      placeholder: |
+        | Option | 利点 | 欠点 | 運用上の影響 |
+        | --- | --- | --- | --- |
+        | A | ... | ... | ... |
+        | B | ... | ... | ... |
+    validations:
+      required: true
+
+  - type: textarea
+    id: decision
+    attributes:
+      label: 採用する方針
+      description: 決定後に、採用した案とその理由を記載してください。Issue作成時点では未決定でも構いません。
+      placeholder: 未決定
+
+  - type: textarea
+    id: unresolved
+    attributes:
+      label: 未解決事項
+      description: このIssueだけでは決めないこと、追加調査が必要なことを記載してください。
+      placeholder: |
+        - [ ] ...
+
+  - type: textarea
+    id: references
+    attributes:
+      label: 参考情報
+      description: 関連Issue、ADR、ドキュメント、外部資料などがあれば記載してください。
+      placeholder: |
+        - #123
+        - docs/architecture.md
