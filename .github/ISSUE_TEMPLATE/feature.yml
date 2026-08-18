@@ -1,6 +1,4 @@
 name: Feature
-about: 新機能や既存機能の改善を提案・実装するためのIssue
-# GitHub Issue Formsでは description が表示に使われるため、about ではなく description を使用します。
 description: 新機能や既存機能の改善を提案・実装するためのIssue
 title: "[Feature] "
 body:
