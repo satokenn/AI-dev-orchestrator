@@ -1,0 +1,67 @@
+name: Bug Report
+description: 不具合の再現条件と期待する動作を明確にして修正するためのIssue
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        不具合を再現し、修正後に解消したことを検証できる情報を記載してください。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 発生している問題
+      description: 現在どのような不具合が起きているかを書いてください。
+      placeholder: 現在は...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待する動作
+      description: 本来どのように動作すべきかを書いてください。
+      placeholder: 本来は...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 再現手順
+      description: 可能な限り最小の再現手順を書いてください。
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: ログ・エラー・関連情報
+      description: エラーメッセージ、ログ、スクリーンショット、関連Issueなどがあれば記載してください。
+      render: shell
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 実行環境
+      description: OS、Rust/toolchain、関連CLIやProviderのバージョンなど、再現に関係する環境情報を書いてください。
+      placeholder: |
+        OS:
+        Rust:
+        ai-dev-orchestrator:
+        Provider/CLI:
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: 修正完了を判断できる、検証可能な条件を書いてください。
+      placeholder: |
+        - [ ] 再現手順で問題が発生しない
+        - [ ] 回帰テストが追加されている
+    validations:
+      required: true
