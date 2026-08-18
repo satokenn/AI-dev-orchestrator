@@ -1,6 +1,6 @@
-name: Feature
+name: 機能追加
 description: 新機能や既存機能の改善を提案・実装するためのIssue
-title: "[Feature] "
+title: "[機能追加] "
 body:
   - type: markdown
     attributes:
@@ -30,7 +30,7 @@ body:
   - type: textarea
     id: acceptance_criteria
     attributes:
-      label: Acceptance Criteria
+      label: 完了条件
       description: このIssueを完了と判断できる、検証可能な条件を書いてください。
       placeholder: |
         - [ ] 条件1
@@ -42,7 +42,7 @@ body:
   - type: textarea
     id: scope
     attributes:
-      label: Scope
+      label: 対応範囲
       description: 今回のIssueで対応する範囲を書いてください。
       placeholder: |
         - 対応すること
@@ -51,7 +51,7 @@ body:
   - type: textarea
     id: out_of_scope
     attributes:
-      label: Out of Scope
+      label: 対象外
       description: 関連しているが、このIssueでは対応しない範囲を書いてください。
       placeholder: |
         - 今回は対応しないこと
