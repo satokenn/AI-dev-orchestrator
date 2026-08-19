@@ -59,3 +59,4 @@
 
 - [`README.md`](README.md): プロジェクト概要と開発者向けの入口
 - [Issue テンプレート](.github/ISSUE_TEMPLATE): 機能追加、不具合、設計検討の起票項目と完了条件
+- [Pull Request テンプレート](.github/pull_request_template.md): 概要、関連 Issue、変更内容、判断理由、完了条件への対応、GitHub Actions 以外の追加検証、影響、未解決事項の記録
