@@ -12,4 +12,4 @@ Issue を作成する際は、内容に対応するテンプレートを使用�
 - [不具合報告](.github/ISSUE_TEMPLATE/bug.yml)
 - [設計 / RFC](.github/ISSUE_TEMPLATE/design.yml)
 
-Pull Request を作成する際は、[Pull Request テンプレート](.github/pull_request_template.md)に沿って、概要、関連 Issue、変更内容と判断理由、完了条件への対応、検証結果、設計・セキュリティへの影響、未解決事項を記載してください。
+Pull Request を作成する際は、[Pull Request テンプレート](.github/pull_request_template.md)に沿って、概要、関連 Issue、変更内容と判断理由、完了条件への対応、GitHub Actions 以外の追加検証、設計・セキュリティへの影響、未解決事項を記載してください。
