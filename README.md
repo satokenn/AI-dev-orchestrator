@@ -2,6 +2,10 @@
 
 AI エージェントを活用した開発オーケストレーションのためのプロジェクトです。
 
+## アーキテクチャ
+
+主要コンポーネントの構造と、Codex、Rust Orchestrator、Provider、Validator の責務境界は、[初期アーキテクチャ](docs/architecture.md)を参照してください。
+
 ## コード品質・テスト
 
 Rustコードに適用する必須検証、テスト種別、unsafeの扱いは、[Rustコード品質・テスト方針](docs/rust-quality.md)を参照してください。
