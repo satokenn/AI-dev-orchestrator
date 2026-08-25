@@ -1,0 +1,23 @@
+{
+  "repository": {
+    "full_name": "satokenn/AI-dev-orchestrator",
+    "default_branch": "main"
+  },
+  "pull_request": {
+    "number": 100,
+    "body": "## 概要\n\nPR policyを実装します。\n\n## 関連 Issue\n\nCloses #15\n\n## PR判定\n\n- Base: main\n- Depends on: none\n- Purpose: PR policyを機械的に検証する\n- Scope decision: policy、workflow、test、文書のみ\n- Excluded: Rust Orchestratorへの組み込み\n\n## 変更内容\n\n- policy checkerを追加\n\n## Issue の完了条件\n\n- [x] checkerが動作する\n",
+    "base": {
+      "ref": "main",
+      "repo": {
+        "full_name": "satokenn/AI-dev-orchestrator"
+      }
+    },
+    "head": {
+      "ref": "agent/example"
+    },
+    "changed_files": 8,
+    "additions": 200,
+    "deletions": 20,
+    "mergeable": true
+  }
+}

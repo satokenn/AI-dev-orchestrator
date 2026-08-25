@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "default_base": "main",
+  "stacked_pull_requests": {
+    "allowed": true
+  },
+  "required_sections": [
+    "概要",
+    "関連 Issue",
+    "PR判定",
+    "変更内容",
+    "Issue の完了条件"
+  ],
+  "decision_fields": [
+    "Base",
+    "Depends on",
+    "Purpose",
+    "Scope decision",
+    "Excluded"
+  ],
+  "warning_thresholds": {
+    "changed_files": 20,
+    "changed_lines": 1000,
+    "referenced_issues": 2
+  }
+}
