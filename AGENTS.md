@@ -9,6 +9,37 @@
 3. 既存のコード、ドキュメント、テスト、設定と作業ツリーの状態を確認する。既存の未コミット変更は、今回の変更と明確に区別して保持する。
 4. 要件の不明点が成果物や設計を大きく左右する場合は、推測で進めず質問する。安全で元に戻せる小さな判断は、仮定を明示して進めてよい。
 
+## Pull Request を作成する前に
+
+### マージ先の判定
+
+- `git fetch origin --prune` でリモートを更新し、原則として最新の `origin/main` から作業ブランチを作成する。
+- 未マージの別 Pull Request に実装上の依存がなければ、`main` 以外をマージ先にしない。
+- stacked Pull Request は、親 Pull Request の変更がなければ子の差分をレビュー・検証できない場合に限る。使用する場合は、依存する Pull Request と必要なマージ順を本文に記載する。
+- マージ済みまたはクローズ済みの Pull Request のブランチをマージ先にしない。親 Pull Request が先にマージされた場合は、子 Pull Request のマージ先を `main` に変更し、差分を再確認する。
+
+### 変更粒度の判定
+
+- 1つの Pull Request は、原則として1つの Issueまたは1つの目的に限定する。
+- 同じ目的を検証するテストと、同じ変更に必要なドキュメント更新は同じ Pull Request に含めてよい。
+- 別 Issue の変更、独立してレビュー可能な機能、無関係なリファクタリングは別の Pull Request に分ける。
+- Pull Request を作成する前に、選択したマージ先を基準として次を確認し、意図したコミットとファイルだけが含まれていることを確かめる。
+
+```shell
+git log --oneline <base>..HEAD
+git diff --stat <base>...HEAD
+git diff --name-only <base>...HEAD
+```
+
+- Pull Request 作成後も、GitHub 上のマージ先と `Files changed` を確認する。想定と異なる場合はレビュー前に修正する。
+
+### マージ後の完了判定
+
+- Pull Request が `Merged` と表示されることだけで、`main` への反映完了と判断しない。
+- `git fetch origin --prune` の後、merge commit が `origin/main` から到達可能であり、成果物が `origin/main` に存在することを確認する。
+- stacked Pull Request を使用した場合は、子の変更が最終的に `main` へ到達していることを個別に確認する。
+- 上記の確認が完了するまで、Issue を `main` への反映完了としてクローズしない。
+
 ## 実装ルール
 
 ### Issue と変更範囲
