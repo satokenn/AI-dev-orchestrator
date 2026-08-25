@@ -1,0 +1,32 @@
+name: Pull Request Policy
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  policy:
+    name: PR Policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout policy
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Test policy checker
+        run: python3 -m unittest discover -s tests -v
+      - name: Validate pull request policy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/pr_policy.py preflight \
+            --event "$GITHUB_EVENT_PATH" \
+            --config .github/pr-policy.json \
+            --output pr-policy-report.json
