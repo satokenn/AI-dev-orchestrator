@@ -1,0 +1,13 @@
+{
+  "repository": {
+    "full_name": "satokenn/AI-dev-orchestrator",
+    "default_branch": "main"
+  },
+  "pull_request": {
+    "merged": true,
+    "merge_commit_sha": "0000000000000000000000000000000000000000",
+    "base": {
+      "ref": "main"
+    }
+  }
+}

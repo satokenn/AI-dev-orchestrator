@@ -10,6 +10,16 @@
 
 Closes #
 
+## PR判定
+
+<!-- BaseとDepends onは実際のPR設定と一致させてください。通常はmain / noneです。 -->
+
+- Base: main
+- Depends on: none
+- Purpose:
+- Scope decision:
+- Excluded:
+
 ## 変更内容
 
 <!-- 何を変更したかを、レビューで確認しやすい単位で記載してください。 -->
