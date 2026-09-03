@@ -1,6 +1,13 @@
 #![deny(unsafe_code)]
 
-//! Foundation crate for the AI Dev Orchestrator workspace.
+//! AI Dev Orchestrator core domain.
+
+mod domain;
+
+pub use domain::{
+    AgentResult, Attempt, AttemptId, AttemptState, DomainError, ProviderRef, Task, TaskId,
+    TaskRole, TaskState, UsageCost, UsageMetric, ValidationResult,
+};
 
 /// Reports whether the workspace crate is available.
 #[must_use]
