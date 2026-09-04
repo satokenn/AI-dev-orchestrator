@@ -2,6 +2,16 @@
 
 AI エージェントを活用した開発オーケストレーションのためのプロジェクトです。
 
+## 外部 Agent CLI の実行
+
+外部 CLI は `ProcessRequest` に command、引数配列、作業ディレクトリ、環境変数、タイムアウトを指定し、`ProcessRunner` で実行できます。引数は shell 文字列へ連結されず、stdout / stderr と終了状態が `ProcessOutput` に集約されます。長時間実行を停止する場合は `CancellationToken` を渡して `cancel()` を呼び出してください。
+
+## AgentProvider 契約
+
+Agent 実行先の違いは `AgentProvider` に閉じ込めます。実装は `ProviderRequest` の workspace、prompt、timeout を受け取り、`ProviderResult` の stdout、stderr、終了状態、任意の `AgentResult` と `UsageCost` を返します。実行に失敗した場合は `ProviderError`（不正な要求、実行失敗、タイムアウト、利用不能）を返します。
+
+Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
+
 ## アーキテクチャ
 
 主要コンポーネントの構造と、Codex、Rust Orchestrator、Provider、Validator の責務境界は、[初期アーキテクチャ](docs/architecture.md)を参照してください。
