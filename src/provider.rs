@@ -15,7 +15,11 @@ pub struct ProviderRequest {
 
 impl ProviderRequest {
     #[must_use]
-    pub fn new(workspace: impl Into<PathBuf>, prompt: impl Into<String>, timeout: Duration) -> Self {
+    pub fn new(
+        workspace: impl Into<PathBuf>,
+        prompt: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
         Self {
             workspace: workspace.into(),
             prompt: prompt.into(),
@@ -144,12 +148,10 @@ mod tests {
 
     #[test]
     fn fake_provider_satisfies_the_common_contract() {
-        let provider = FakeProvider { reference: ProviderRef::new("codex") };
-        let request = ProviderRequest::new(
-            "/tmp/worktree",
-            "do the task",
-            Duration::from_secs(30),
-        );
+        let provider = FakeProvider {
+            reference: ProviderRef::new("codex"),
+        };
+        let request = ProviderRequest::new("/tmp/worktree", "do the task", Duration::from_secs(30));
         let result = provider.execute(&request).unwrap();
 
         assert_eq!(provider.provider_ref().as_str(), "codex");
