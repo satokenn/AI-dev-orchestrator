@@ -3,11 +3,13 @@
 //! AI Dev Orchestrator core domain.
 
 mod domain;
+mod provider;
 
 pub use domain::{
     AgentResult, Attempt, AttemptId, AttemptState, DomainError, ProviderRef, Task, TaskId,
     TaskRole, TaskState, UsageCost, UsageMetric, ValidationResult,
 };
+pub use provider::{AgentProvider, ProviderError, ProviderRequest, ProviderResult};
 
 /// Reports whether the workspace crate is available.
 #[must_use]
