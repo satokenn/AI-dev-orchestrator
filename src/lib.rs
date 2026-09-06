@@ -2,10 +2,12 @@
 
 //! AI Dev Orchestrator core domain.
 
+mod codex_provider;
 mod domain;
 mod process_runner;
 mod provider;
 
+pub use codex_provider::CodexProvider;
 pub use domain::{
     AgentResult, Attempt, AttemptId, AttemptState, DomainError, ProviderRef, Task, TaskId,
     TaskRole, TaskState, UsageCost, UsageMetric, ValidationResult,
