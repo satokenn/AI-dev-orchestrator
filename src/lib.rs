@@ -2,11 +2,13 @@
 
 //! AI Dev Orchestrator core domain.
 
+mod antigravity;
 mod codex_provider;
 mod domain;
 mod process_runner;
 mod provider;
 
+pub use antigravity::AntigravityProvider;
 pub use codex_provider::CodexProvider;
 pub use domain::{
     AgentResult, Attempt, AttemptId, AttemptState, DomainError, ProviderRef, Task, TaskId,
