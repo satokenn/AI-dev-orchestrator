@@ -217,6 +217,10 @@ impl AgentProvider for CopilotProvider {
         self.execute_process(request, CancellationToken::new())
     }
 
+    fn check_availability(&self) -> Result<(), ProviderError> {
+        CopilotProvider::check_availability(self)
+    }
+
     fn execute_with_cancellation(
         &self,
         request: &ProviderRequest,

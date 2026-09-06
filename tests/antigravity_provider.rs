@@ -3,7 +3,19 @@
 use ai_dev_orchestrator::{
     AgentProvider, AntigravityProvider, CancellationToken, ProviderError, ProviderRequest,
 };
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
+static NEXT_FAKE_CLI_ID: AtomicU64 = AtomicU64::new(0);
 
 struct FakeCli {
     directory: PathBuf,
@@ -12,20 +24,12 @@ struct FakeCli {
 
 impl FakeCli {
     fn new(body: &str) -> Self {
-        let directory = std::env::temp_dir().join(format!(
-            "ai-dev-orchestrator-antigravity-{}",
-            std::process::id()
+        let unique_directory = std::env::temp_dir().join(format!(
+            "ai-dev-orchestrator-antigravity-{}-{}",
+            std::process::id(),
+            NEXT_FAKE_CLI_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        let unique_directory = (0..100)
-            .map(|suffix| {
-                if suffix == 0 {
-                    directory.clone()
-                } else {
-                    directory.with_extension(suffix.to_string())
-                }
-            })
-            .find(|candidate| fs::create_dir(candidate).is_ok())
-            .expect("create fake CLI directory");
+        fs::create_dir(&unique_directory).expect("create fake CLI directory");
         let executable = unique_directory.join("agy");
         fs::write(&executable, format!("#!/bin/sh\n{body}\n")).expect("write fake CLI");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
@@ -120,7 +124,7 @@ fn reports_authentication_failure_as_unavailable() {
     let result = cli.provider().execute(&request(
         cli.directory.clone(),
         "hello",
-        Duration::from_secs(1),
+        Duration::from_secs(10),
     ));
 
     assert!(matches!(

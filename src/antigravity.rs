@@ -187,6 +187,10 @@ impl AgentProvider for AntigravityProvider {
         self.execute_with_cancellation(request, CancellationToken::new())
     }
 
+    fn check_availability(&self) -> Result<(), ProviderError> {
+        AntigravityProvider::check_availability(self)
+    }
+
     fn execute_with_cancellation(
         &self,
         request: &ProviderRequest,

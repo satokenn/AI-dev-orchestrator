@@ -187,6 +187,10 @@ impl AgentProvider for CodexProvider {
         self.execute_process(request, CancellationToken::new())
     }
 
+    fn check_availability(&self) -> Result<(), ProviderError> {
+        CodexProvider::check_availability(self)
+    }
+
     fn execute_with_cancellation(
         &self,
         request: &ProviderRequest,

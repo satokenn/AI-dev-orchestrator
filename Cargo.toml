@@ -5,7 +5,12 @@ edition = "2024"
 rust-version = "1.88"
 publish = false
 
+[[bin]]
+name = "ai-dev-orchestrator"
+path = "src/main.rs"
+
 [dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1"
 
 [workspace]
