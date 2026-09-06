@@ -27,6 +27,12 @@ CODEX_PROVIDER_LIVE_WORKSPACE=/tmp/codex-provider-live \
 
 `CODEX_PROVIDER_LIVE_WORKSPACE` は事前に作成した、Codex が変更してよい Git workspace に置き換えてください。このテストは API 利用枠と実行時間を消費するため、Pull Request の通常 CI では実行しません。
 
+### GitHub Copilot CLI Provider
+
+`CopilotProvider` は `copilot -p` を非対話で起動し、`ProviderRequest` の workspace を cwd として使用します。実行時には `-s --no-ask-user` と、既定でファイル変更・リポジトリ操作を許可する `--allow-tool=write,shell` を付けます。必要な権限だけに絞る場合は `with_allowed_tools` を使用してください。timeout / cancellation は `execute_with_cancellation` から指定できます。
+
+手動で実 Agent を呼ぶ Live Provider Test の手順は、[GitHub Copilot CLI Provider](docs/copilot-provider.md) を参照してください。
+
 Antigravity CLI (`agy`) の headless Provider と手動 Live Provider Test の手順は、[Antigravity CLI Provider](docs/antigravity-provider.md) を参照してください。
 
 ## アーキテクチャ
