@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{AgentResult, ProviderRef, UsageCost};
+use crate::{AgentResult, CancellationToken, ProviderRef, UsageCost};
 
 /// Provider-independent input for one agent execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +94,7 @@ pub enum ProviderError {
     InvalidRequest(String),
     ExecutionFailed(String),
     TimedOut { timeout: Duration },
+    Cancelled,
     Unavailable(String),
 }
 
@@ -109,6 +110,7 @@ impl std::fmt::Display for ProviderError {
             Self::TimedOut { timeout } => {
                 write!(formatter, "provider timed out after {timeout:?}")
             }
+            Self::Cancelled => formatter.write_str("provider execution was cancelled"),
             Self::Unavailable(message) => write!(formatter, "provider unavailable: {message}"),
         }
     }
@@ -120,6 +122,19 @@ impl std::error::Error for ProviderError {}
 pub trait AgentProvider {
     fn provider_ref(&self) -> &ProviderRef;
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError>;
+
+    /// Executes a request while observing a caller-owned cancellation signal.
+    ///
+    /// Providers that support process cancellation should override this method.
+    /// The default preserves compatibility for providers whose execution model
+    /// cannot yet be interrupted.
+    fn execute_with_cancellation(
+        &self,
+        request: &ProviderRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ProviderResult, ProviderError> {
+        self.execute(request)
+    }
 }
 
 #[cfg(test)]

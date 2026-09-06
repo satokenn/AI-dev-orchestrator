@@ -12,6 +12,21 @@ Agent 実行先の違いは `AgentProvider` に閉じ込めます。実装は `P
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
+## Codex CLI Provider
+
+`CodexProvider` は `codex exec` を非対話モードで起動し、`ProviderRequest` の workspace を cwd として使用します。Codex CLI は `PATH` から解決され、実行時には workspace への書き込みを許可する `--sandbox workspace-write`、JSONL 出力の `--json`、実行状態を永続化しない `--ephemeral` を付けます。長時間実行は `execute_with_cancellation` に `CancellationToken` を渡して停止できます。
+
+手動で実 Agent を呼ぶ Live Provider Test は通常のテストには含めません。Codex CLI の導入と認証を確認したうえで、変更してよい隔離 workspace を指定して次を実行します。
+
+```shell
+codex --version
+codex login status
+CODEX_PROVIDER_LIVE_WORKSPACE=/tmp/codex-provider-live \
+  cargo test --test live_codex_provider -- --ignored --nocapture
+```
+
+`CODEX_PROVIDER_LIVE_WORKSPACE` は事前に作成した、Codex が変更してよい Git workspace に置き換えてください。このテストは API 利用枠と実行時間を消費するため、Pull Request の通常 CI では実行しません。
+
 ## アーキテクチャ
 
 主要コンポーネントの構造と、Codex、Rust Orchestrator、Provider、Validator の責務境界は、[初期アーキテクチャ](docs/architecture.md)を参照してください。
