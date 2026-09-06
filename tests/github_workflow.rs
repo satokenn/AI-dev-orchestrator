@@ -23,6 +23,10 @@ fn temp_name(prefix: &str, suffix: &str) -> PathBuf {
 #[cfg(unix)]
 fn fake_gh(mode: &str) -> (PathBuf, PathBuf, PathBuf) {
     let script = temp_name("fake-gh", ".sh");
+    // Publish the executable atomically. On macOS, spawning a path while it
+    // is still being created or chmod'd can fail with ETXTBSY ("Text file
+    // busy") when this integration test runs in parallel with other tests.
+    let script_tmp = temp_name("fake-gh", ".sh.tmp");
     let log = temp_name("fake-gh", ".log");
     let created = temp_name("fake-gh", ".created");
     let body = format!(
@@ -33,8 +37,9 @@ fn fake_gh(mode: &str) -> (PathBuf, PathBuf, PathBuf) {
         mode,
         created.display()
     );
-    fs::write(&script, body).unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&script_tmp, body).unwrap();
+    fs::set_permissions(&script_tmp, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&script_tmp, &script).unwrap();
     (script, log, created)
 }
 
