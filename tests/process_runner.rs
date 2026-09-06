@@ -14,8 +14,14 @@ fn uses_cwd_and_environment_without_shell_interpolation() {
         .expect("process succeeds");
 
     let text = String::from_utf8(output.stdout).expect("utf8 output");
-    assert!(text.starts_with("/tmp:"), "unexpected cwd: {text}");
-    assert!(text.ends_with("value with spaces"), "unexpected environment: {text}");
+    assert!(
+        text.starts_with("/tmp:") || text.starts_with("/private/tmp:"),
+        "unexpected cwd: {text}"
+    );
+    assert!(
+        text.ends_with("value with spaces"),
+        "unexpected environment: {text}"
+    );
 }
 
 #[cfg(unix)]
@@ -23,7 +29,7 @@ fn uses_cwd_and_environment_without_shell_interpolation() {
 fn timeout_preserves_captured_output() {
     let result = ProcessRunner.run(
         ProcessRequest::new("sh")
-            .args(["-c", "printf before; sleep 10"])
+            .args(["-c", "printf before; exec sleep 10"])
             .timeout(Duration::from_millis(20)),
     );
 

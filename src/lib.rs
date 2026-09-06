@@ -3,11 +3,15 @@
 //! AI Dev Orchestrator core domain.
 
 mod domain;
+mod process_runner;
 mod provider;
 
 pub use domain::{
     AgentResult, Attempt, AttemptId, AttemptState, DomainError, ProviderRef, Task, TaskId,
     TaskRole, TaskState, UsageCost, UsageMetric, ValidationResult,
+};
+pub use process_runner::{
+    CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner,
 };
 pub use provider::{AgentProvider, ProviderError, ProviderRequest, ProviderResult};
 
