@@ -178,6 +178,14 @@ mod tests {
     }
 
     #[test]
+    fn provider_error_describes_cancellation() {
+        assert_eq!(
+            ProviderError::Cancelled.to_string(),
+            "provider execution was cancelled"
+        );
+    }
+
+    #[test]
     fn provider_result_can_represent_missing_exit_status_and_usage() {
         let result = ProviderResult::new("partial", "timeout", None, None, None);
         assert_eq!(result.exit_status(), None);
