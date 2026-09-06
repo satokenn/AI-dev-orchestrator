@@ -18,6 +18,7 @@ Codex (Planner / Tech Lead)
   ↓ MCP
 Rust Orchestrator
   ├─ State / Policy / Budget
+  ├─ Execution Ledger (local SQLite)
   ├─ Workspace / Process
   ├─ Validator
   └─ Providers
@@ -38,6 +39,19 @@ Rust Orchestrator
 | Provider | Codex、Antigravity、GitHub Copilot、外部 LLM など、実行先ごとの差分を吸収する | システム全体の状態やポリシーを管理することや、検証結果から意味的な合否を決定すること |
 | Validator | テスト、lint、build などを機械的に実行・判定し、結果を Orchestrator に返す | 要求の解釈、設計判断、意味的なコードレビューを行うこと |
 
+### Planner の Provider 選択境界
+
+`PlannerRequest` は Task の immutable snapshot と、Rust が観測した `ProviderAvailability` の
+事実一覧を保持する。`Planner` は `PlannerDecision`（`provider`、`reason`、
+`execution_intent`）だけを返し、Task を直接変更しない。`PlannerService` は決定を消費する前に
+一覧との照合を行い、unknown / unavailable provider を `PlannerError` として拒否するため、
+Codex の出力だけで状態や Provider の可否を上書きできない。
+
+実装された `CodexPlanner` adapter は `codex exec --output-schema ... --output-last-message ...`
+を read-only sandbox と ephemeral mode で実行する。Codex の spawn、non-zero exit、timeout、
+cancellation、構造化出力の parse failure は、それぞれ `PlannerError` の typed failure として
+返す。schema と最終出力の temporary path は adapter が所有し、終了時に cleanup する。
+
 ## 処理の流れ
 
 1. User が目的や制約を Codex に伝える。
@@ -53,6 +67,8 @@ Rust Orchestrator
 
 - Codex の要求であっても、Rust Orchestrator が管理するポリシー、予算・利用枠、安全制約を迂回しない。
 - Rust Orchestrator は Provider 固有の処理を直接抱えず、実行先の差分は Provider 内に閉じ込める。
+- retry / escalation の Attempt 追加、最大試行回数、timeout / cancellation retry 可否、Provider 解決は Orchestrator の明示的な policy / resolver 境界で確定する。PlannerDecision は意図だけを返し、過去 Attempt は更新しない。
+- hard な Planner 実行では `ExecutionPolicy` が NonZero の最大試行回数と ProviderRef 別 timeout を唯一所有し、解決・timeout・availability を domain mutation より前に検査する。Provider availability は `AgentProvider` の必須チェックであり、未実装は fail-closed となる。
 - Validator の機械的な結果と、Codex による意味的な評価を同一の判定として扱わない。
 - 新しい責務を追加する場合は、既存コンポーネントとの境界と、その責務を置く理由を Design / RFC Issue で確認する。
 
@@ -63,8 +79,11 @@ Rust Orchestrator
 - Provider interface の具体的な形
 - Task / TaskState の具体的なデータモデルと状態遷移
 - Codex と Rust Orchestrator 間の MCP tool contract
-- Router / Planner の具体的な入出力形式
+- Router の具体的な入出力形式
 - quota・cost 情報を Provider 共通モデルに含める範囲
-- 永続化の要否と DB schema
 
 これらは、実装上の必要性と選択肢が明確になった時点で、個別の Design / RFC Issue として決定します。
+
+Execution Ledger のローカル永続化は Issue #35 で SQLite を採用した。`Task` のメタデータと
+`Attempt` の 1:N 履歴、AgentResult、ValidationResult、UsageMetric、開始・終了時刻を
+`SqliteExecutionLedger` が管理する。分散 DB、Dashboard、cost 集計はこの境界の対象外である。

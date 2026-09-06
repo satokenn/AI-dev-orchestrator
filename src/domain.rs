@@ -58,6 +58,18 @@ impl ProviderRef {
     }
 }
 
+impl From<&str> for ProviderRef {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for ProviderRef {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskState {
     Pending,
@@ -75,6 +87,15 @@ pub enum AttemptState {
     Succeeded,
     Failed,
     Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttemptFailureReason {
+    Provider,
+    Timeout,
+    Cancelled,
+    Workspace,
+    Validation,
 }
 
 /// A report returned by an agent. It is not a success decision.
@@ -102,19 +123,100 @@ impl AgentResult {
     }
 }
 
-/// A mechanical validation result produced by a validator.
+/// The result of one process-backed mechanical validation check.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationCheckResult {
+    name: String,
+    passed: bool,
+    exit_status: Option<i32>,
+    diagnostics: String,
+}
+
+impl ValidationCheckResult {
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        passed: bool,
+        exit_status: Option<i32>,
+        diagnostics: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            passed,
+            exit_status,
+            diagnostics: diagnostics.into(),
+        }
+    }
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    #[must_use]
+    pub const fn passed(&self) -> bool {
+        self.passed
+    }
+    #[must_use]
+    pub const fn exit_status(&self) -> Option<i32> {
+        self.exit_status
+    }
+    #[must_use]
+    pub fn diagnostics(&self) -> &str {
+        &self.diagnostics
+    }
+}
+
+/// An aggregate mechanical validation result produced by a validator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidationResult {
     summary: String,
     passed: bool,
+    checks: Vec<ValidationCheckResult>,
 }
 
 impl ValidationResult {
+    /// Creates a result for callers that do not have per-check details.
     #[must_use]
     pub fn new(summary: impl Into<String>, passed: bool) -> Self {
         Self {
             summary: summary.into(),
             passed,
+            checks: Vec::new(),
+        }
+    }
+
+    /// Creates one aggregate result; success is true only when every check passed.
+    #[must_use]
+    pub fn from_checks(
+        summary: impl Into<String>,
+        checks: impl IntoIterator<Item = ValidationCheckResult>,
+    ) -> Self {
+        let checks: Vec<_> = checks.into_iter().collect();
+        let passed = !checks.is_empty() && checks.iter().all(ValidationCheckResult::passed);
+        Self {
+            summary: summary.into(),
+            passed,
+            checks,
+        }
+    }
+
+    /// Compatibility constructor for a result containing one check.
+    #[must_use]
+    pub fn from_check(
+        check_name: impl Into<String>,
+        summary: impl Into<String>,
+        passed: bool,
+        exit_status: Option<i32>,
+        diagnostics: impl Into<String>,
+    ) -> Self {
+        Self {
+            summary: summary.into(),
+            passed,
+            checks: vec![ValidationCheckResult::new(
+                check_name,
+                passed,
+                exit_status,
+                diagnostics,
+            )],
         }
     }
     #[must_use]
@@ -124,6 +226,47 @@ impl ValidationResult {
     #[must_use]
     pub const fn passed(&self) -> bool {
         self.passed
+    }
+    #[must_use]
+    pub fn exit_status(&self) -> Option<i32> {
+        if self.checks.len() == 1 {
+            self.checks[0].exit_status()
+        } else {
+            None
+        }
+    }
+    #[must_use]
+    pub fn diagnostics(&self) -> &str {
+        // Aggregate diagnostics are available through `checks`; this convenience view is
+        // intended for the common single-check compatibility case.
+        self.checks
+            .first()
+            .filter(|_| self.checks.len() == 1)
+            .map_or("", ValidationCheckResult::diagnostics)
+    }
+    #[must_use]
+    pub fn check_name(&self) -> Option<&str> {
+        if self.checks.len() == 1 {
+            Some(self.checks[0].name())
+        } else {
+            None
+        }
+    }
+    #[must_use]
+    pub fn checks(&self) -> &[ValidationCheckResult] {
+        &self.checks
+    }
+
+    pub(crate) fn restore(
+        summary: String,
+        passed: bool,
+        checks: Vec<ValidationCheckResult>,
+    ) -> Self {
+        Self {
+            summary,
+            passed,
+            checks,
+        }
     }
 }
 
@@ -189,6 +332,9 @@ pub enum DomainError {
     TaskClosed {
         state: TaskState,
     },
+    DuplicateAttemptId {
+        id: AttemptId,
+    },
 }
 
 impl fmt::Display for DomainError {
@@ -201,6 +347,9 @@ impl fmt::Display for DomainError {
                 write!(formatter, "invalid attempt transition: {from:?} -> {to:?}")
             }
             Self::TaskClosed { state } => write!(formatter, "task is closed in state {state:?}"),
+            Self::DuplicateAttemptId { id } => {
+                write!(formatter, "attempt ID already exists: {}", id.as_str())
+            }
         }
     }
 }
@@ -215,6 +364,7 @@ pub struct Attempt {
     agent_result: Option<AgentResult>,
     validation_results: Vec<ValidationResult>,
     usage_cost: Option<UsageCost>,
+    failure_reason: Option<AttemptFailureReason>,
 }
 
 impl Attempt {
@@ -227,6 +377,7 @@ impl Attempt {
             agent_result: None,
             validation_results: Vec::new(),
             usage_cost: None,
+            failure_reason: None,
         }
     }
     #[must_use]
@@ -252,6 +403,10 @@ impl Attempt {
     #[must_use]
     pub const fn usage_cost(&self) -> Option<&UsageCost> {
         self.usage_cost.as_ref()
+    }
+    #[must_use]
+    pub const fn failure_reason(&self) -> Option<&AttemptFailureReason> {
+        self.failure_reason.as_ref()
     }
 
     pub fn start(&mut self) -> Result<(), DomainError> {
@@ -290,17 +445,53 @@ impl Attempt {
             });
         }
         self.validation_results.push(result);
+        if next == AttemptState::Failed {
+            self.failure_reason = Some(AttemptFailureReason::Validation);
+        }
         self.transition(next)
     }
 
     pub fn fail(&mut self) -> Result<(), DomainError> {
         self.transition(AttemptState::Failed)
     }
+    pub fn fail_with_reason(&mut self, reason: AttemptFailureReason) -> Result<(), DomainError> {
+        self.failure_reason = Some(reason);
+        self.fail()
+    }
     pub fn cancel(&mut self) -> Result<(), DomainError> {
         self.transition(AttemptState::Cancelled)
     }
+    pub fn cancel_with_reason(&mut self, reason: AttemptFailureReason) -> Result<(), DomainError> {
+        self.failure_reason = Some(reason);
+        self.cancel()
+    }
     pub fn set_usage_cost(&mut self, usage_cost: UsageCost) {
         self.usage_cost = Some(usage_cost);
+    }
+
+    /// Rebuilds an attempt read from persistence without applying transitions.
+    ///
+    /// Persistence is responsible for validating the stored representation before
+    /// calling this crate-private constructor. Keeping reconstruction here avoids
+    /// exposing persistence details in the domain API.
+    pub(crate) fn restore(
+        id: AttemptId,
+        provider: ProviderRef,
+        state: AttemptState,
+        agent_result: Option<AgentResult>,
+        validation_results: Vec<ValidationResult>,
+        usage_cost: Option<UsageCost>,
+        failure_reason: Option<AttemptFailureReason>,
+    ) -> Self {
+        Self {
+            id,
+            provider,
+            state,
+            agent_result,
+            validation_results,
+            usage_cost,
+            failure_reason,
+        }
     }
 
     fn transition(&mut self, to: AttemptState) -> Result<(), DomainError> {
@@ -369,6 +560,17 @@ impl Task {
         &self.attempts
     }
 
+    /// Returns the Attempt with `id`, if this Task owns one.
+    #[must_use]
+    pub fn attempt(&self, id: &AttemptId) -> Option<&Attempt> {
+        self.attempts.iter().find(|attempt| attempt.id() == id)
+    }
+
+    /// Returns a mutable Attempt owned by this Task.
+    pub fn attempt_mut(&mut self, id: &AttemptId) -> Option<&mut Attempt> {
+        self.attempts.iter_mut().find(|attempt| attempt.id() == id)
+    }
+
     pub fn start(&mut self) -> Result<(), DomainError> {
         self.transition(TaskState::Active)
     }
@@ -399,8 +601,34 @@ impl Task {
         ) {
             return Err(DomainError::TaskClosed { state: self.state });
         }
+        if self
+            .attempts
+            .iter()
+            .any(|existing| existing.id() == attempt.id())
+        {
+            return Err(DomainError::DuplicateAttemptId {
+                id: attempt.id().clone(),
+            });
+        }
         self.attempts.push(attempt);
         Ok(())
+    }
+
+    /// Rebuilds a task read from persistence without applying transitions.
+    pub(crate) fn restore(
+        id: TaskId,
+        description: String,
+        role: TaskRole,
+        state: TaskState,
+        attempts: Vec<Attempt>,
+    ) -> Self {
+        Self {
+            id,
+            description,
+            role,
+            state,
+            attempts,
+        }
     }
 
     fn transition(&mut self, to: TaskState) -> Result<(), DomainError> {
@@ -450,6 +678,21 @@ mod tests {
         assert_eq!(task.attempts().len(), 2);
         assert_eq!(task.role().as_str(), "developer");
         assert_eq!(task.attempts()[1].provider().as_str(), "github-copilot-cli");
+    }
+
+    #[test]
+    fn task_rejects_duplicate_attempt_ids_and_exposes_owned_attempt_mutably() {
+        let mut task = task();
+        let id = AttemptId::new("attempt-1");
+        task.add_attempt(Attempt::new(id.clone(), ProviderRef::new("codex")))
+            .unwrap();
+        task.attempt_mut(&id).unwrap().start().unwrap();
+        assert_eq!(task.attempt(&id).unwrap().state(), AttemptState::Running);
+        assert_eq!(
+            task.add_attempt(Attempt::new(id.clone(), ProviderRef::new("codex"))),
+            Err(DomainError::DuplicateAttemptId { id })
+        );
+        assert_eq!(task.attempts().len(), 1);
     }
 
     #[test]

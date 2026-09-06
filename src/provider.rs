@@ -123,6 +123,9 @@ pub trait AgentProvider {
     fn provider_ref(&self) -> &ProviderRef;
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError>;
 
+    /// Checks provider availability before an attempt is created.
+    fn check_availability(&self) -> Result<(), ProviderError>;
+
     /// Executes a request while observing a caller-owned cancellation signal.
     ///
     /// Providers that support process cancellation should override this method.
@@ -158,6 +161,10 @@ mod tests {
                 Some(AgentResult::new(request.prompt(), true)),
                 Some(UsageCost::default()),
             ))
+        }
+
+        fn check_availability(&self) -> Result<(), ProviderError> {
+            Ok(())
         }
     }
 

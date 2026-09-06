@@ -1,6 +1,6 @@
 # Task / Attempt ドメインモデル
 
-この文書は、AI Dev Orchestrator が管理する仕事と実行記録の最小ドメインモデルを定義する。Provider、永続化、MCP、Runtime Adapter の具体的なインターフェースは定義しない。
+この文書は、AI Dev Orchestrator が管理する仕事と実行記録の最小ドメインモデルを定義する。Provider、MCP、Runtime Adapter の具体的なインターフェースは定義しない。Execution Ledger の永続化境界は別途定義する。
 
 ## 設計方針
 
@@ -44,7 +44,7 @@ Provider は Attempt にだけ紐づく。`TaskRole` は `developer`、`reviewer
 
 `AgentResult` は Agent が返した報告（実装内容、提案された完了状態、問題、参照情報など）である。報告の存在や「成功した」という自己申告だけでは Task / Attempt を成功にしない。
 
-`ValidationResult` は Validator が実行した test、lint、build 等の機械的な結果、対象コミット、実行時刻、診断情報を表す。Orchestrator は ValidationResult を入力として Attempt の確定状態を更新する。意味的な retry / escalation や要求に対する妥当性判断は Planner の責務であり、Validator の責務ではない。
+`ValidationResult` は Validator が実行した test、lint、build 等の機械的な結果を表す aggregate であり、各 `ValidationCheckResult` に check 名、合否、終了 status、diagnostics を保持する。Orchestrator は ValidationResult を入力として Attempt の確定状態を更新する。意味的な retry / escalation や要求に対する妥当性判断は Planner の責務であり、Validator の責務ではない。
 
 ### Usage / Cost
 
@@ -153,7 +153,7 @@ Herdr の pane ID、session ID、プロセス ID、Provider CLI の引数など�
 
 ## v0 の範囲
 
-v0 では Task、Attempt、TaskRole、Provider 参照、TaskState、AttemptState、AgentResult、ValidationResult、Usage / Cost、cancellation と状態遷移のルールだけを扱う。SQLite の table schema、MCP JSON schema、Provider trait、Herdr Adapter、worktree 管理、Router / Planner prompt は別の設計または実装で決める。
+v0 では Task、Attempt、TaskRole、Provider 参照、TaskState、AttemptState、AgentResult、ValidationResult、Usage / Cost、cancellation と状態遷移のルールを扱う。ローカルの Execution Ledger は SQLite にこれらの実行履歴と開始・終了時刻を保存する。Provider 選択は `PlannerRequest` / `PlannerDecision` として別境界に置き、Rust の Provider availability 検証と Codex Planner adapter は Core Domain の状態遷移から分離する。MCP JSON schema、Provider trait、Herdr Adapter、worktree 管理、retry / routing policy は引き続き対象外である。
 
 親子 Task、Task dependency、DAG、複雑な並列実行、Attempt ごとの新規 workspace 作成・再利用方針は本モデルに含めず、必要になった時点で別 Issue として決定する。
 
