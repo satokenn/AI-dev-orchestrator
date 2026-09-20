@@ -53,7 +53,7 @@ cancellation、構造化出力の parse failure は、それぞれ `PlannerError
 返す。schema と最終出力の temporary path は adapter が所有し、終了時に cleanup する。
 
 Provider / Model を区別した候補、利用制限、API 利用状況、過去実績、Attempt 履歴と、複数 role の
-選定結果へ拡張する際の正本は、[モデル選定コンテキスト／結果契約](model-selection-contract.md)とする。
+選定結果へ拡張する際の正本は、[モデル選定の入力・出力仕様](model-selection-spec.md)とする。
 Codex は選定対象と理由だけを返し、Rust が観測した事実や Domain state を変更しない。
 
 ## 処理の流れ

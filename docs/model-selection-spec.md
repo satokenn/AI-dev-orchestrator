@@ -1,8 +1,12 @@
-# モデル選定コンテキスト／結果契約
+# モデル選定の入力・出力仕様
 
 この文書は、Codex Planner が実装・レビュー等の担当 Provider / Model を選ぶために受け取る
-入力と、Rust Orchestrator へ返す選定結果の正本を定義する。Provider 固有の CLI / API 形式、
+入力と、Rust Orchestrator へ返す選定結果の仕様を定義する。Provider 固有の CLI / API 形式、
 利用状況の収集方法、Planner の実装、モデル性能の評価方法は定義しない。
+
+現時点では、利用可能な Model の一覧、Model ごとの料金、どの Model が安価かを収集・判定する機能は
+存在しない。この文書も、特定の Model が利用可能または安価だとは定めない。後述の Provider名、
+Model名、利用量、金額は、データ形式を説明するための架空の値である。
 
 ## 目的と適用範囲
 
@@ -13,10 +17,10 @@
 2. Codex は snapshot を比較し、要求された role ごとに実行対象と理由だけを返す。
 3. Rust は結果を snapshot および最新の実行時事実と照合し、許可された選定だけを実行へ渡す。
 
-この契約は既存の `PlannerRequest` / `PlannerDecision` を後続 Issue で拡張するための設計であり、
+この仕様は既存の `PlannerRequest` / `PlannerDecision` を後続 Issue で拡張するための設計であり、
 この Issue では Rust 型、JSON schema、Provider adapter、Ledger schema を変更しない。
 
-## 契約の基本規則
+## 仕様の基本規則
 
 - schema version は入力と出力の両方に必須とし、v1 は整数 `1` とする。
 - `request_id` は Rust が選定要求ごとに生成する。出力は同じ値をそのまま返し、別 snapshot の
@@ -28,7 +32,7 @@
 - 金額、token、request 数等を単一 score に換算しない。値と単位を組にして保持する。
 - 推定値は判断材料にはできるが、availability、hard limit、予算等の Rust 側検証を上書きしない。
 - Planner 出力には Task / Attempt state、availability、usage、limit、履歴を含めない。これらを
-  Codex から返させないことで、観測事実の書き換えを契約上も禁止する。
+  Codex から返させないことで、観測事実の書き換えを入力・出力仕様上も禁止する。
 
 ## Rust 型案
 
@@ -285,7 +289,7 @@ struct RoleAssignment {
 `SelectionRole` と `CapabilityRef` は v1 では拡張可能な non-empty string newtype とする。
 既存 `TaskRole` は現在の単一 role を `requested_roles` の1要素へ変換できる。複数 role を Domain 上で
 どの単位に保持するか、Attempt に role を持たせるか、`ReviewSummary` をどこへ永続化するかは
-Issue #58 の決定事項であり、この契約はその結論を先取りしない。未導入の情報は
+Issue #58 の決定事項であり、この仕様はその結論を先取りしない。未導入の情報は
 `AttemptSummary.role` / `review` を省略し、履歴自体を捏造しない。
 
 `provider_default` は「Model を指定しない」の暗黙表現ではない。Rust が候補として明示した場合だけ
@@ -359,8 +363,9 @@ API の実使用量は `actual_usage` に `measured` として、設定予算は
 ## JSON 例
 
 次の例は、同じ Provider 内の named model と provider default、実測値、推定値、unknown、複数 role の
-assignment を示す。説明のため一部の空配列と履歴 field は省略している。実装する schema では
-Rust 型案にある必須 field を省略しない。
+assignment を示す。`example_api`、`sample-model-a`、利用量、金額はすべて架空であり、実在する
+Provider / Model の利用可否や価格を示さない。説明のため一部の空配列と履歴 field は省略している。
+実装する schema では Rust 型案にある必須 field を省略しない。
 
 ```json
 {
@@ -370,14 +375,14 @@ Rust 型案にある必須 field を省略しない。
     "captured_at_ms": 1790000000000,
     "task": {
       "task_id": "task-57",
-      "objective": "Issue #57 の契約を実装する",
+      "objective": "Issue #57 の入力・出力仕様を定義する",
       "constraints": ["既存の状態遷移を迂回しない"],
       "state": "active",
       "issue": {
         "repository": "owner/repository",
         "number": 57,
         "url": "https://github.com/owner/repository/issues/57",
-        "title": "モデル選定契約を定義する",
+        "title": "モデル選定の入力・出力仕様を定義する",
         "body": "...",
         "labels": ["design"],
         "comments": []
@@ -448,7 +453,7 @@ Rust 型案にある必須 field を省略しない。
         "performance": [],
         "models": [
           {
-            "model": {"kind": "named", "model": "economy-model"},
+            "model": {"kind": "named", "model": "sample-model-a"},
             "availability": {
               "status": "available",
               "observed_at_ms": 1790000000000,
@@ -497,9 +502,9 @@ Rust 型案にある必須 field を省略しない。
         "role": "implementer",
         "target": {
           "provider": "example_api",
-          "model": {"kind": "named", "model": "economy-model"}
+          "model": {"kind": "named", "model": "sample-model-a"}
         },
-        "reason": "利用可能で必要 capability を満たし、推定コストが低い候補だから"
+        "reason": "利用可能で必要 capability を満たす候補だから"
       },
       {
         "role": "reviewer",
@@ -570,5 +575,5 @@ Issue #59、snapshot の収集・集計は Issue #60 で実装する。
 3. Issue #60 で source と時刻を持つ observation、usage、performance、Attempt summary を収集する。
 4. Issue #61 で既存 `PlannerRequest` / `PlannerDecision` をこの入力／出力へ拡張し、Rust 側検証を実装する。
 
-各 Issue はこの契約の field を Provider 固有形式へ置き換えず、取得不能な field は `unknown` として
-保持する。契約の互換性を壊す変更は `schema_version` を上げ、入力と出力を同時に更新する。
+各 Issue はこの仕様の field を Provider 固有形式へ置き換えず、取得不能な field は `unknown` として
+保持する。仕様の互換性を壊す変更は `schema_version` を上げ、入力と出力を同時に更新する。
