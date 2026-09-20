@@ -52,6 +52,10 @@ Codex の出力だけで状態や Provider の可否を上書きできない。
 cancellation、構造化出力の parse failure は、それぞれ `PlannerError` の typed failure として
 返す。schema と最終出力の temporary path は adapter が所有し、終了時に cleanup する。
 
+Provider / Model を区別した候補、利用制限、API 利用状況、過去実績、Attempt 履歴と、複数 role の
+選定結果へ拡張する際の正本は、[モデル選定コンテキスト／結果契約](model-selection-contract.md)とする。
+Codex は選定対象と理由だけを返し、Rust が観測した事実や Domain state を変更しない。
+
 ## 処理の流れ
 
 1. User が目的や制約を Codex に伝える。
@@ -79,8 +83,6 @@ cancellation、構造化出力の parse failure は、それぞれ `PlannerError
 - Provider interface の具体的な形
 - Task / TaskState の具体的なデータモデルと状態遷移
 - Codex と Rust Orchestrator 間の MCP tool contract
-- Router の具体的な入出力形式
-- quota・cost 情報を Provider 共通モデルに含める範囲
 
 これらは、実装上の必要性と選択肢が明確になった時点で、個別の Design / RFC Issue として決定します。
 
