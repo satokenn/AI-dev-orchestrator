@@ -8,7 +8,10 @@
 存在しない。この文書も、特定の Model が利用可能または安価だとは定めない。後述の Provider名、
 Model名、利用量、金額は、データ形式を説明するための架空の値である。
 
-## 目的と適用範囲
+> [!IMPORTANT]
+> この文書は後続実装のための仕様である。この文書を追加するだけでは実行時の動作は変わらない。
+
+## まず把握すること
 
 モデル選定では、Rust が収集・記録した事実と、Codex が行う意味的な判断を分離する。
 
@@ -17,8 +20,85 @@ Model名、利用量、金額は、データ形式を説明するための架空
 2. Codex は snapshot を比較し、要求された role ごとに実行対象と理由だけを返す。
 3. Rust は結果を snapshot および最新の実行時事実と照合し、許可された選定だけを実行へ渡す。
 
+```text
+Rustが事実を収集 → JSON入力 → Codexが候補を選定 → JSON出力 → Rustが検証 → 実行
+```
+
 この仕様は既存の `PlannerRequest` / `PlannerDecision` を後続 Issue で拡張するための設計であり、
 この Issue では Rust 型、JSON schema、Provider adapter、Ledger schema を変更しない。
+
+### JSON入力の全体像
+
+| 項目 | 内容 |
+| --- | --- |
+| `schema_version` | 入力形式のバージョン |
+| `request_id` | 入力と出力を対応付ける選定要求ID |
+| `captured_at_ms` | Rustが入力を作成した時刻 |
+| `task` | 目的、制約、Issue、選定する担当 |
+| `providers` | 選択可能なProvider / Modelと、利用状況・実績 |
+| `current_attempts` | 同じTaskですでに行った実行と、その結果 |
+
+```text
+task
+├── issue                 Issueの本文・label・コメント
+└── requested_roles[]     選定する担当と必要な能力
+
+providers[]
+├── availability          Provider全体の利用可否
+├── limits[]              Provider全体の利用制限
+├── api_usage             実使用量・設定予算・残予算
+├── performance[]         Provider全体の過去実績
+└── models[]
+    ├── availability      Modelの利用可否
+    ├── limits[]          Model固有の利用制限
+    ├── capabilities[]    対応できる作業
+    ├── performance[]     Modelの過去実績
+    └── estimated_execution[]  次の1実行の見積り
+
+current_attempts[]        現在のTaskで行った実行履歴
+```
+
+### JSON出力の全体像
+
+Codexは、入力で要求された各roleについて次の4項目だけを返す。
+
+| 項目 | 内容 |
+| --- | --- |
+| `role` | 選定する担当。例: `implementer` |
+| `target.provider` | 選んだProvider |
+| `target.model` | 選んだModel、またはProviderの既定Model |
+| `reason` | その候補を選んだ理由 |
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "selection-01J...",
+  "assignments": [
+    {
+      "role": "implementer",
+      "target": {
+        "provider": "example_api",
+        "model": {"kind": "named", "model": "sample-model-a"}
+      },
+      "reason": "利用可能で、実装に必要な能力を満たす候補だから"
+    }
+  ]
+}
+```
+
+### 値の確かさ
+
+利用量や残予算等の値には、数値だけでなく、その値をどのように得たかを付ける。
+
+| 表現 | 意味 | 例 |
+| --- | --- | --- |
+| `measured` | Provider API等から実測した | 現在までのtoken使用量 |
+| `configured` | 利用者やrepositoryが設定した | 1日の予算上限 |
+| `computed` | 他の既知の値から計算した | 上限から使用量を引いた残量 |
+| `estimated` | 過去実績等から見積もった | 次の1実行にかかる費用 |
+| `unknown` | 取得または計算できない | Providerが残量を返さない |
+
+`unknown` を `0` や推定値へ置き換えず、取得できない理由と確認時刻を保持する。
 
 ## 仕様の基本規則
 
@@ -35,6 +115,11 @@ Model名、利用量、金額は、データ形式を説明するための架空
   Codex から返させないことで、観測事実の書き換えを入力・出力仕様上も禁止する。
 
 ## Rust 型案
+
+以下は実装者向けの正確な型定義である。JSONの全体像だけを確認する場合は読み飛ばしてよい。
+
+<details>
+<summary>Rust型定義の詳細を表示する</summary>
 
 以下は v1 の意味と必須性を示す型案である。実装時は `serde` の tagged enum を使い、
 JSON field は `snake_case` とする。時刻は既存 Ledger と同じ Unix milliseconds、量は丸めや
@@ -297,7 +382,9 @@ Issue #58 の決定事項であり、この仕様はその結論を先取りし�
 既存 Ledger のように過去 Attempt の Model を記録していない場合は、`AttemptTarget.model` を
 `unknown` とする。選定候補と Planner 出力の `ExecutionTarget.model` に `unknown` は許可しない。
 
-## 入力の意味
+</details>
+
+## 入力項目の意味
 
 ### Task / Issue
 
@@ -360,12 +447,18 @@ API の実使用量は `actual_usage` に `measured` として、設定予算は
 や機密情報は渡さず、選定に必要な分類と短い summary だけを渡す。過去 Attempt は immutable record で
 あり、新しい選定結果で上書きしない。
 
-## JSON 例
+## 入力と出力の詳細なJSON例
 
 次の例は、同じ Provider 内の named model と provider default、実測値、推定値、unknown、複数 role の
 assignment を示す。`example_api`、`sample-model-a`、利用量、金額はすべて架空であり、実在する
 Provider / Model の利用可否や価格を示さない。説明のため一部の空配列と履歴 field は省略している。
 実装する schema では Rust 型案にある必須 field を省略しない。
+
+例示上は入力と出力を見比べられるよう、外側に `input` と `output` を並べている。実際の受け渡しでは
+この外側のobjectは使わず、`input` の値がCodexへの入力、`output` の値がCodexからの出力になる。
+
+<details>
+<summary>詳細なJSON例を表示する</summary>
 
 ```json
 {
@@ -518,6 +611,8 @@ Provider / Model の利用可否や価格を示さない。説明のため一部
   }
 }
 ```
+
+</details>
 
 ## Rust が行う検証
 
