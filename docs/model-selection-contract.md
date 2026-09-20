@@ -36,10 +36,12 @@
 JSON field は `snake_case` とする。時刻は既存 Ledger と同じ Unix milliseconds、量は丸めや
 浮動小数点誤差を避けるため decimal string とする。
 
-JSON では `ModelChoice` を `kind`、`Evidence` と `AvailabilityStatus` を `status` で判別する。
+JSON では `ModelChoice` を `kind`、`Evidence` を `status` で判別する tagged object とする。
 `Evidence::Known` は `status: "known"` と `basis`、`Evidence::Unknown` は
-`status: "unknown"` と `reason` を持つ。availability の `unavailable` / `unknown` も
-non-empty `reason` を必須とする。
+`status: "unknown"` と `reason` を持つ。`AvailabilityStatus` だけは
+`AvailabilityObservation` へ flatten し、`status: "available"`、または
+`status: "unavailable" | "unknown"` と non-empty `reason` を同じ object に置く。
+`status` object を入れ子にする wire 形式は許可しない。
 
 ```rust
 struct ModelSelectionInput {
@@ -119,11 +121,13 @@ struct ModelSnapshot {
 }
 
 struct AvailabilityObservation {
+    #[serde(flatten)]
     status: AvailabilityStatus,
     observed_at_ms: i64,
     source: EvidenceSource,
 }
 
+#[serde(tag = "status", rename_all = "snake_case")]
 enum AvailabilityStatus {
     Available,
     Unavailable { reason: String },
@@ -133,6 +137,7 @@ enum AvailabilityStatus {
 struct ResourceLimitSnapshot {
     name: String,
     scope: String,
+    enforcement: ConstraintEnforcement,
     window: Option<TimeWindow>,
     limit: Evidence<MetricValue>,
     used: Evidence<MetricValue>,
@@ -144,13 +149,24 @@ struct ApiUsageSnapshot {
     scope: String,
     window: TimeWindow,
     actual_usage: Vec<NamedMetric>,
-    configured_budget: Vec<NamedMetric>,
-    remaining_budget: Vec<NamedMetric>,
+    configured_budget: Vec<PolicyMetric>,
+    remaining_budget: Vec<PolicyMetric>,
 }
 
 struct NamedMetric {
     name: String,
     value: Evidence<MetricValue>,
+}
+
+struct PolicyMetric {
+    name: String,
+    enforcement: ConstraintEnforcement,
+    value: Evidence<MetricValue>,
+}
+
+enum ConstraintEnforcement {
+    Hard,
+    Advisory,
 }
 
 struct MetricValue {
@@ -207,6 +223,7 @@ struct PerformanceSnapshot {
     validation_failed: Evidence<u64>,
     review_approved: Evidence<u64>,
     review_changes_requested: Evidence<u64>,
+    review_inconclusive: Evidence<u64>,
     retries: Evidence<u64>,
 }
 
@@ -306,6 +323,12 @@ Provider と Model の両方が `available` で、role の required capability �
 reset 時刻に分けて保持する。Provider 全体の制限は `ProviderSnapshot.limits`、Model 固有の制限は
 `ModelSnapshot.limits` に置く。同じ事実を両方へ複製しない。
 
+`ConstraintEnforcement` は Rust が所有する `ExecutionPolicy` から設定し、Codex は変更できない。
+`hard` は実行許可を左右する制約、`advisory` は選定時の比較材料を表す。budget policy が設定されて
+いない metric は `configured_budget` / `remaining_budget` に架空の `unknown` entry を作らず、
+entry 自体を持たない。同じ scope / name の configured budget と remaining budget は同じ
+enforcement を持たなければならず、不一致は Rust が不正な入力 snapshot として拒否する。
+
 API の実使用量は `actual_usage` に `measured` として、設定予算は `configured_budget` に
 `configured` として入れる。実使用量と設定予算から算出した残予算は `computed` とし、計算元を
 `source.reference` で追跡できるようにする。将来の1実行の token / cost 見込みは
@@ -324,7 +347,9 @@ API の実使用量は `actual_usage` に `measured` として、設定予算は
 `performance` は Provider / Model と、必要なら role ごとに Ledger から集計した期間付きの実績である。
 母数を隠した成功率だけを渡さず、Attempt、終了状態、Validation、review、retry の件数を渡す。
 集計値は `computed`、source は `execution_ledger` とする。review が Domain / Ledger に未導入なら
-該当値を `unknown` とする。
+該当値を `unknown` とする。保存された `ReviewOutcome` は `Approved`、`ChangesRequested`、
+`Inconclusive` をそれぞれ `review_approved`、`review_changes_requested`、`review_inconclusive` へ
+排他的に1件加算し、どの outcome も集計から除外しない。
 
 `current_attempts` は現在の Task に属する全 Attempt を `sequence` 順で渡す。これにより、直前の失敗だけで
 なく、Provider / Model の切替、Validation、review、累積 retry を再判断へ利用できる。raw stdout / stderr
@@ -397,6 +422,7 @@ Rust 型案にある必須 field を省略しない。
           "configured_budget": [
             {
               "name": "cost",
+              "enforcement": "advisory",
               "value": {
                 "status": "known",
                 "value": {"amount": "10.00", "unit": "USD"},
@@ -409,6 +435,7 @@ Rust 型案にある必須 field を省略しない。
           "remaining_budget": [
             {
               "name": "cost",
+              "enforcement": "advisory",
               "value": {
                 "status": "unknown",
                 "reason": "provider did not expose a matching billing window",
@@ -472,7 +499,7 @@ Rust 型案にある必須 field を省略しない。
           "provider": "example_api",
           "model": {"kind": "named", "model": "economy-model"}
         },
-        "reason": "利用可能で必要 capability を満たし、予算内の低コスト候補だから"
+        "reason": "利用可能で必要 capability を満たし、推定コストが低い候補だから"
       },
       {
         "role": "reviewer",
@@ -498,7 +525,7 @@ Planner 結果を Task / Attempt へ適用する前に、Rust は少なくとも
 5. Provider と Model の availability がともに `available` である。
 6. Model が role の required capability をすべて持つ。
 7. Rust が所有する予算、利用枠、retry 上限、安全 policy に反しない。
-8. 実行直前に availability と hard limit を再確認し、snapshot 後に変化した事実に反しない。
+8. 実行直前に availability と `hard` constraint を再取得し、snapshot 後に変化した事実に反しない。
 
 1〜6は選定結果の構造と snapshot に対する検証、7〜8は現在事実に対する実行許可である。
 `ValidatedPlannerDecision` 相当の値は両方を通過して初めて Provider 実行へ渡せる。検証失敗は
@@ -509,6 +536,14 @@ Planner を呼ぶ前にも、Rust は入力の ID、role、Provider / Model の�
 `unavailable` / `unknown` に理由があり、Evidence の配置と basis が上記規則に合うことを検証する。
 各 requested role に実行可能な候補が1件もない場合は、Planner に架空の target を作らせず、
 Rust が typed `no eligible target` error を返す。
+
+`hard` な `ResourceLimitSnapshot.remaining` または `remaining_budget.value` が `unknown` の target は、
+Rust が Provider adapter / usage collector から値を再取得するまで実行可能とみなさない。再取得後も
+unknown なら `SelectionValidationError::ConstraintIndeterminate { scope, name }`、既知の残量が
+不足していれば `SelectionValidationError::ConstraintExceeded { scope, name }` として fail-closed に
+拒否する。`advisory` な値は unknown のままでも実行を妨げず、unknown である事実と理由を Codex へ
+渡す。実行直前の再確認にも同じ規則を適用し、Codex の assignment や reason で enforcement を
+変更しない。
 
 ## Codex と Rust の責務境界
 
