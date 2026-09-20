@@ -11,7 +11,7 @@ Model名、利用量、金額は、データ形式を説明するための架空
 > [!IMPORTANT]
 > この文書は後続実装のための仕様である。この文書を追加するだけでは実行時の動作は変わらない。
 
-## まず把握すること
+## 目的と適用範囲
 
 モデル選定では、Rust が収集・記録した事実と、Codex が行う意味的な判断を分離する。
 
@@ -26,6 +26,8 @@ Rustが事実を収集 → JSON入力 → Codexが候補を選定 → JSON出力
 
 この仕様は既存の `PlannerRequest` / `PlannerDecision` を後続 Issue で拡張するための設計であり、
 この Issue では Rust 型、JSON schema、Provider adapter、Ledger schema を変更しない。
+
+## 入出力の構造
 
 ### JSON入力の全体像
 
@@ -116,7 +118,7 @@ Codexは、入力で要求された各roleについて次の4項目だけを返�
 
 ## Rust 型案
 
-以下は実装者向けの正確な型定義である。JSONの全体像だけを確認する場合は読み飛ばしてよい。
+以下に、実装時の基準となる型定義を示す。
 
 <details>
 <summary>Rust型定義の詳細を表示する</summary>
