@@ -4,10 +4,6 @@
 入力と、Rust Orchestrator へ返す選定結果の仕様を定義する。Provider 固有の CLI / API 形式、
 利用状況の収集方法、Planner の実装、モデル性能の評価方法は定義しない。
 
-入力の正本は Rust の型付き snapshot とし、Codex へ渡すときは人間も確認しやすい Markdown に
-整形する。Codex からの出力だけは、Rust が機械的に検証できる小さな JSON object とする。
-入力を巨大な JSON object として prompt に埋め込むことは、この仕様では要求しない。
-
 現時点では、利用可能な Model の一覧、Model ごとの料金、どの Model が安価かを収集・判定する機能は
 存在しない。この文書も、特定の Model が利用可能または安価だとは定めない。後述の Provider名、
 Model名、利用量、金額は、データ形式を説明するための架空の値である。
@@ -22,20 +18,7 @@ Model名、利用量、金額は、データ形式を説明するための架空
 3. Rust は結果を snapshot および最新の実行時事実と照合し、許可された選定だけを実行へ渡す。
 
 この仕様は既存の `PlannerRequest` / `PlannerDecision` を後続 Issue で拡張するための設計であり、
-この Issue では Rust 型、JSON Schema、Provider adapter、Ledger schema を変更しない。現在の
-`PlannerRequest::prompt()` は入力を JSON で表示しているため、後続の Issue #61 で、この仕様の
-Markdown 生成へ置き換える。
-
-## 入力と出力で形式を分ける理由
-
-| 方向 | 形式 | 理由 |
-| --- | --- | --- |
-| Rust から Codex | Markdown | 読むのは Codex と人間であり、Rust は解析し直さないため |
-| Codex から Rust | JSON | Rust が必須項目や型を JSON Schema で機械的に検証するため |
-
-入力の構造は Markdown 自体に持たせるのではなく、Rust の `ModelSelectionInput` が保持する。
-Markdown は、その型付きデータから生成する読み取り専用の表示である。これにより、判断材料を
-読みやすくしても、Rust 側の型や検証を失わない。
+この Issue では Rust 型、JSON schema、Provider adapter、Ledger schema を変更しない。
 
 ## 仕様の基本規則
 
@@ -43,30 +26,26 @@ Markdown は、その型付きデータから生成する読み取り専用の�
 - `request_id` は Rust が選定要求ごとに生成する。出力は同じ値をそのまま返し、別 snapshot の
   結果を誤適用しない。
 - Provider と Model は別の識別子で表し、実行対象は常に両方を含む。
-- Model は明示名または `provider_default` の判別可能な値とする。出力 JSON で Model field を
-  省略したり、空文字にしたりすることは許可しない。
+- Model は明示名または `provider_default` の判別可能な値とする。Model field の省略や
+  空文字は許可しない。
 - 取得できない値を `0`、空文字、推定値で補わず、`unknown` として理由を保持する。
 - 金額、token、request 数等を単一 score に換算しない。値と単位を組にして保持する。
 - 推定値は判断材料にはできるが、availability、hard limit、予算等の Rust 側検証を上書きしない。
 - Planner 出力には Task / Attempt state、availability、usage、limit、履歴を含めない。これらを
   Codex から返させないことで、観測事実の書き換えを入力・出力仕様上も禁止する。
-- Markdown 入力は Rust の型付き snapshot から毎回生成する表示形式であり、Rust が状態を復元する
-  ために解析し直さない。Task / Issue の本文やコメントは観測事実と区別できる引用区画に置き、
-  Rust は各行へ Markdown の引用記号を付けて表示する。
 
 ## Rust 型案
 
-以下は v1 の意味と必須性を示す型案である。時刻は既存 Ledger と同じ Unix milliseconds、量は
-丸めや浮動小数点誤差を避けるため decimal string とする。
+以下は v1 の意味と必須性を示す型案である。実装時は `serde` の tagged enum を使い、
+JSON field は `snake_case` とする。時刻は既存 Ledger と同じ Unix milliseconds、量は丸めや
+浮動小数点誤差を避けるため decimal string とする。
 
-入力 Markdown は、この型の階層を Task、requested role、Provider、Model、Attempt の見出しに
-対応させて生成する。`Evidence::Known` は値、単位、basis、確認時刻、source を同じ項目に表示し、
-`Evidence::Unknown` は `unknown`、理由、確認時刻、source を表示する。availability が
-`unavailable` または `unknown` の場合も理由を省略しない。
-
-出力 JSON では `ModelChoice` を `kind` で判別する tagged object とし、JSON field は
-`snake_case` とする。named Model は `{"kind":"named","model":"..."}`、Provider の既定 Model は
-`{"kind":"provider_default"}` として返す。
+JSON では `ModelChoice` を `kind`、`Evidence` を `status` で判別する tagged object とする。
+`Evidence::Known` は `status: "known"` と `basis`、`Evidence::Unknown` は
+`status: "unknown"` と `reason` を持つ。`AvailabilityStatus` だけは
+`AvailabilityObservation` へ flatten し、`status: "available"`、または
+`status: "unavailable" | "unknown"` と non-empty `reason` を同じ object に置く。
+`status` object を入れ子にする wire 形式は許可しない。
 
 ```rust
 struct ModelSelectionInput {
@@ -381,155 +360,162 @@ API の実使用量は `actual_usage` に `measured` として、設定予算は
 や機密情報は渡さず、選定に必要な分類と短い summary だけを渡す。過去 Attempt は immutable record で
 あり、新しい選定結果で上書きしない。
 
-## 実際に Codex へ渡す入力例
+## JSON 例
 
-Rust は型付き snapshot を次のような Markdown に整形して Codex へ渡す。各見出しは Rust 型の
-階層に対応し、値には取得方法、確認時刻、取得元を併記する。Task / Issue の本文とコメントは
-判断材料として引用区画に置き、Orchestrator の指示や観測事実と混在させない。
-
-```markdown
-# モデル選定要求
-
-- 形式バージョン: `1`
-- 要求ID: `selection-01J...`
-- 作成時刻: `1790000000000`
-
-## Task
-
-- Task ID: `task-57`
-- 状態: `active`
-
-### 目的
-
-> Issue #57 の入力・出力仕様を定義する
-
-### 制約
-
-- 既存の状態遷移を迂回しない
-
-### GitHub Issue
-
-- Repository: `owner/repository`
-- Issue: `#57`
-- URL: `https://github.com/owner/repository/issues/57`
-- Title: `モデル選定の入力・出力仕様を定義する`
-- Labels: `design`
-
-#### Issue本文（判断材料としての引用）
-
-> ProviderとModelを区別し、実装担当とレビュー担当を選定できるようにする。
-
-#### コメント
-
-- なし
-
-### 選定する担当
-
-#### `implementer`
-
-- 指示: 変更を実装して検証する
-- 必要な能力: `workspace_write`
-
-#### `reviewer`
-
-- 指示: 完了条件と差分をレビューする
-- 必要な能力: `code_review`
-
-## 候補
-
-### Provider: `example_api`
-
-- 利用可否: `available`
-- 確認時刻: `1790000000000`
-- 取得元: Provider API `models.list`
-- Provider全体の利用制限: なし
-- Provider全体の過去実績: まだ記録なし
-
-#### API利用状況
-
-- 対象範囲: `repository_budget`
-- 対象期間: `1789990000000` から `1790076400000`
-- 実使用額: `1.42 USD`
-  - 種別: `measured`
-  - 確認時刻: `1790000000000`
-  - 取得元: Provider API `usage`
-- 設定予算: `10.00 USD`
-  - 種別: `configured`
-  - 扱い: `advisory`
-  - 確認時刻: `1790000000000`
-  - 取得元: Repository config `daily_budget`
-- 残予算: `unknown`
-  - 理由: Providerが同じ期間の残予算を返さない
-  - 扱い: `advisory`
-  - 確認時刻: `1790000000000`
-  - 取得元: Provider API `usage`
-
-#### Model: `sample-model-a`
-
-- 指定方法: Model名を明示
-- 利用可否: `available`
-- 確認時刻: `1790000000000`
-- 取得元: Provider API `models.list`
-- Model固有の利用制限: なし
-- Model固有のAPI利用状況: 対象外
-- 必要な能力への対応: `workspace_write`, `code_review`
-- 1実行の推定額: `0.08 USD`
-  - 種別: `estimated`
-  - 確認時刻: `1790000000000`
-  - 取得元: Execution Ledger `recent_attempt_average`
-- 過去実績: まだ記録なし
-
-#### Model: Providerの既定Model
-
-- 指定方法: `provider_default`
-- 利用可否: `available`
-- 確認時刻: `1790000000000`
-- 取得元: Provider CLI `capability_probe`
-- Model固有の利用制限: なし
-- Model固有のAPI利用状況: 対象外
-- 必要な能力への対応: `code_review`
-- 1実行の推定額: `unknown`
-  - 理由: 推定に必要な実行履歴がない
-  - 確認時刻: `1790000000000`
-  - 取得元: Execution Ledger `recent_attempt_average`
-- 過去実績: まだ記録なし
-
-## このTaskのAttempt履歴
-
-- なし
-```
-
-`example_api`、`sample-model-a`、利用量、金額はデータの見せ方を説明するための架空の値である。
-実装時には、候補が複数ある場合は Provider / Model の節を繰り返し、Attempt がある場合は
-sequence 順に節を追加する。空でない必須項目は省略しない。
-
-## Codex から返す出力例
-
-Codex の返答は Rust が JSON Schema で検証するため、選定結果だけを小さな JSON object で返す。
-入力に含まれる Task、利用状況、履歴等は返さない。
+次の例は、同じ Provider 内の named model と provider default、実測値、推定値、unknown、複数 role の
+assignment を示す。`example_api`、`sample-model-a`、利用量、金額はすべて架空であり、実在する
+Provider / Model の利用可否や価格を示さない。説明のため一部の空配列と履歴 field は省略している。
+実装する schema では Rust 型案にある必須 field を省略しない。
 
 ```json
 {
-  "schema_version": 1,
-  "request_id": "selection-01J...",
-  "assignments": [
-    {
-      "role": "implementer",
-      "target": {
-        "provider": "example_api",
-        "model": {"kind": "named", "model": "sample-model-a"}
+  "input": {
+    "schema_version": 1,
+    "request_id": "selection-01J...",
+    "captured_at_ms": 1790000000000,
+    "task": {
+      "task_id": "task-57",
+      "objective": "Issue #57 の入力・出力仕様を定義する",
+      "constraints": ["既存の状態遷移を迂回しない"],
+      "state": "active",
+      "issue": {
+        "repository": "owner/repository",
+        "number": 57,
+        "url": "https://github.com/owner/repository/issues/57",
+        "title": "モデル選定の入力・出力仕様を定義する",
+        "body": "...",
+        "labels": ["design"],
+        "comments": []
       },
-      "reason": "利用可能で、実装に必要な能力を満たす候補だから"
+      "requested_roles": [
+        {
+          "role": "implementer",
+          "instruction": "変更を実装して検証する",
+          "required_capabilities": ["workspace_write"]
+        },
+        {
+          "role": "reviewer",
+          "instruction": "完了条件と差分をレビューする",
+          "required_capabilities": ["code_review"]
+        }
+      ]
     },
-    {
-      "role": "reviewer",
-      "target": {
+    "providers": [
+      {
         "provider": "example_api",
-        "model": {"kind": "provider_default"}
+        "availability": {
+          "status": "available",
+          "observed_at_ms": 1790000000000,
+          "source": {"kind": "provider_api", "reference": "models.list"}
+        },
+        "limits": [],
+        "api_usage": {
+          "scope": "repository_budget",
+          "window": {"starts_at_ms": 1789990000000, "ends_at_ms": 1790076400000},
+          "actual_usage": [
+            {
+              "name": "cost",
+              "value": {
+                "status": "known",
+                "value": {"amount": "1.42", "unit": "USD"},
+                "basis": "measured",
+                "assessed_at_ms": 1790000000000,
+                "source": {"kind": "provider_api", "reference": "usage"}
+              }
+            }
+          ],
+          "configured_budget": [
+            {
+              "name": "cost",
+              "enforcement": "advisory",
+              "value": {
+                "status": "known",
+                "value": {"amount": "10.00", "unit": "USD"},
+                "basis": "configured",
+                "assessed_at_ms": 1790000000000,
+                "source": {"kind": "repository_config", "reference": "daily_budget"}
+              }
+            }
+          ],
+          "remaining_budget": [
+            {
+              "name": "cost",
+              "enforcement": "advisory",
+              "value": {
+                "status": "unknown",
+                "reason": "provider did not expose a matching billing window",
+                "assessed_at_ms": 1790000000000,
+                "source": {"kind": "provider_api", "reference": "usage"}
+              }
+            }
+          ]
+        },
+        "performance": [],
+        "models": [
+          {
+            "model": {"kind": "named", "model": "sample-model-a"},
+            "availability": {
+              "status": "available",
+              "observed_at_ms": 1790000000000,
+              "source": {"kind": "provider_api", "reference": "models.list"}
+            },
+            "limits": [],
+            "api_usage": null,
+            "capabilities": ["workspace_write", "code_review"],
+            "performance": [],
+            "estimated_execution": [
+              {
+                "name": "cost",
+                "value": {
+                  "status": "known",
+                  "value": {"amount": "0.08", "unit": "USD"},
+                  "basis": "estimated",
+                  "assessed_at_ms": 1790000000000,
+                  "source": {"kind": "execution_ledger", "reference": "recent_attempt_average"}
+                }
+              }
+            ]
+          },
+          {
+            "model": {"kind": "provider_default"},
+            "availability": {
+              "status": "available",
+              "observed_at_ms": 1790000000000,
+              "source": {"kind": "provider_cli", "reference": "capability_probe"}
+            },
+            "limits": [],
+            "api_usage": null,
+            "capabilities": ["code_review"],
+            "performance": [],
+            "estimated_execution": []
+          }
+        ]
+      }
+    ],
+    "current_attempts": []
+  },
+  "output": {
+    "schema_version": 1,
+    "request_id": "selection-01J...",
+    "assignments": [
+      {
+        "role": "implementer",
+        "target": {
+          "provider": "example_api",
+          "model": {"kind": "named", "model": "sample-model-a"}
+        },
+        "reason": "利用可能で必要 capability を満たす候補だから"
       },
-      "reason": "レビューに必要な能力を持つ利用可能な候補だから"
-    }
-  ]
+      {
+        "role": "reviewer",
+        "target": {
+          "provider": "example_api",
+          "model": {"kind": "provider_default"}
+        },
+        "reason": "レビュー capability を持つ利用可能な候補だから"
+      }
+    ]
+  }
 }
 ```
 
