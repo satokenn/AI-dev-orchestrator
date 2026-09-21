@@ -25,4 +25,4 @@ Attempt は Provider / Model 呼び出し1回の記録であり、`Succeeded` �
 
 モデル選定の入力・出力は[モデル選定の入力・出力仕様](model-selection-spec.md)、実装・review・修正の履歴関係は[実装・レビュー・修正を記録する設計](implementation-review-model.md)を参照する。#66 はこの Operation Service、#70 は成果物同一性、#71 は修正Attemptの成果物引継ぎを実装する。
 
-MCP transport、SQLite schema、非同期方式、Provider interface、AI review Provider、並列workflow engineは未決定であり、この文書では固定しない。
+監督Codexから Operation Service を呼ぶ MCP tool の名前、request / response、識別子、冪等性、非同期・取消・失敗、秘匿境界は、[監督Codex向け MCP Operation Contract](mcp-operation-contract.md)を正本とする。MCP transport 実装、SQLite schema、Provider interface、AI review Provider、並列workflow engineは後続 Issue で実装する。

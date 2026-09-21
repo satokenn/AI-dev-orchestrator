@@ -97,6 +97,9 @@ Provider / Model 選定へ渡す Task、利用状況、過去実績、Attempt �
 公開/CI、Task完了を成果物へ束縛する別の事実として扱うDomain契約は、
 [作業・モデル実行・成果物のドメインモデル](docs/domain-model.md)を参照してください。
 
+監督Codexが Rust の Operation Service を操作する MCP tool の request / response、冪等性、
+非同期operation、失敗・秘匿境界は、[監督Codex向け MCP Operation Contract](docs/mcp-operation-contract.md)を参照してください。
+
 ## コード品質・テスト
 
 Rustコードに適用する必須検証、テスト種別、unsafeの扱いは、[Rustコード品質・テスト方針](docs/rust-quality.md)を参照してください。
