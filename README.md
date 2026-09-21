@@ -39,6 +39,8 @@ Antigravity CLI (`agy`) の headless Provider と手動 Live Provider Test の�
 
 主要コンポーネントの構造と、Codex、Rust Orchestrator、Provider、Validator の責務境界は、[初期アーキテクチャ](docs/architecture.md)を参照してください。
 
+現行Issue・実装の監査と、Codexを監督主体に据える構成案は、[最小実行基盤の再設計案](docs/minimal-runtime-review.md)を参照してください。これは採用確認前の提案であり、実行時の動作は変更していません。
+
 ## コード品質・テスト
 
 Rustコードに適用する必須検証、テスト種別、unsafeの扱いは、[Rustコード品質・テスト方針](docs/rust-quality.md)を参照してください。
