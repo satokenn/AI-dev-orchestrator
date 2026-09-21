@@ -1,6 +1,6 @@
 # モデル選定の入力・出力仕様
 
-この文書は、Codex Planner が実装・レビュー等の担当 Provider / Model を選ぶために受け取る
+この文書は、監督Codex が実装・レビュー等の担当 Provider / Model を選ぶために受け取る
 入力と、Rust Orchestrator へ返す選定結果の仕様を定義する。Provider 固有の CLI / API 形式、
 利用状況の収集方法、Planner の実装、モデル性能の評価方法は定義しない。
 
@@ -24,7 +24,7 @@ Model名、利用量、金額は、データ形式を説明するための架空
 Rustが事実を収集 → JSON入力 → Codexが候補を選定 → JSON出力 → Rustが検証 → 実行
 ```
 
-この仕様は既存の `PlannerRequest` / `PlannerDecision` を後続 Issue で拡張するための設計であり、
+この仕様は既存の選定入出力を後続 Issue で監督Codexの操作要求へ接続するための設計であり、
 この Issue では Rust 型、JSON schema、Provider adapter、Ledger schema を変更しない。
 
 ## 入出力の構造
@@ -673,9 +673,9 @@ unknown なら `SelectionValidationError::ConstraintIndeterminate { scope, name 
 | Task / Attempt state の変更 | Domain API 経由でのみ適用する | 変更しない |
 | 実行時の再検証、予算・policy 強制 | 所有する | 迂回できない |
 
-Codex が返すのは assignment という意図であり、Attempt の作成、retry / escalation、実行順、
-review 後の再作業、Task の終了を直接確定しない。これらを現在の workflow へ接続する処理は
-Issue #61、実装と review の Domain 表現は Issue #58、Provider への Model 指定と記録は
+監督Codexが返す assignment は選定という意図であり、Operation Service が Attempt の作成、状態遷移、
+実行を検証して適用する。選定だけでTaskの終了を確定しない。実装とreviewのDomain表現は #73、
+ProviderへのModel指定と記録は
 Issue #59、snapshot の収集・集計は Issue #60 で実装する。
 
 ## 後続実装への適用順
