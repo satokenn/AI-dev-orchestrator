@@ -322,6 +322,7 @@ struct AttemptSummary {
     attempt_id: AttemptId,
     sequence: u32,
     role: Option<SelectionRole>,
+    relation: Option<AttemptRelationSummary>,
     target: AttemptTarget,
     state: AttemptState,
     failure: Option<AttemptFailureSummary>,
@@ -330,6 +331,16 @@ struct AttemptSummary {
     usage: Evidence<Vec<NamedMetric>>,
     started_at_ms: Option<i64>,
     finished_at_ms: Option<i64>,
+}
+
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum AttemptRelationSummary {
+    Initial,
+    RetryOf { attempt_id: AttemptId },
+    EscalationOf { attempt_id: AttemptId },
+    ReviewOf { attempt_id: AttemptId },
+    ReworkFrom { review_attempt_id: AttemptId },
+    LegacyUnspecified,
 }
 
 struct AttemptTarget {
@@ -374,10 +385,12 @@ struct RoleAssignment {
 ```
 
 `SelectionRole` と `CapabilityRef` は v1 では拡張可能な non-empty string newtype とする。
-既存 `TaskRole` は現在の単一 role を `requested_roles` の1要素へ変換できる。複数 role を Domain 上で
-どの単位に保持するか、Attempt に role を持たせるか、`ReviewSummary` をどこへ永続化するかは
-Issue #58 の決定事項であり、この仕様はその結論を先取りしない。未導入の情報は
-`AttemptSummary.role` / `review` を省略し、履歴自体を捏造しない。
+Issue #58では、実行時のroleをAttemptへ保持し、`ReviewSummary`をreviewer Attemptの専用結果として
+永続化する方針を採用した。`AttemptRelationSummary`はretry／escalation／review／reworkを区別する。
+既存Ledgerから確定できない`role`と`review`は省略し、履歴を推測で補わない。移行済みLedgerで
+relationを復元できないAttemptは、`relation: { "kind": "legacy_unspecified" }`として保持する。
+Domain上の不変条件とLedger migrationは
+[実装・レビュー・修正のドメイン設計](implementation-review-model.md)を正本とする。
 
 `provider_default` は「Model を指定しない」の暗黙表現ではない。Rust が候補として明示した場合だけ
 選べる判別値である。Provider が実際に解決した Model の記録方法は Issue #59 で定義する。

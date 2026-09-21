@@ -56,6 +56,9 @@ Provider / Model を区別した候補、利用制限、API 利用状況、過�
 選定結果へ拡張する際の正本は、[モデル選定の入力・出力仕様](model-selection-spec.md)とする。
 Codex は選定対象と理由だけを返し、Rust が観測した事実や Domain state を変更しない。
 
+同じ開発作業で実装、レビュー、修正を順番に扱うときの履歴、レビュー結果、既存状態との対応は、
+[実装・レビュー・修正を記録する設計](implementation-review-model.md)を正本とする。
+
 ## 処理の流れ
 
 1. User が目的や制約を Codex に伝える。
@@ -65,7 +68,7 @@ Codex は選定対象と理由だけを返し、Rust が観測した事実や Do
 5. 機械的な検証が必要な場合は Validator を実行し、その結果を記録する。
 6. Rust Orchestrator が実行結果を返し、Codex が次の意味的な判断を行う。
 
-この流れは責務境界を説明するためのものであり、具体的な状態遷移、MCP tool contract、同期・非同期の方式は未決定です。
+この流れは責務境界を説明するためのものであり、MCP tool contract、同期・非同期の方式は未決定です。
 
 ## 境界を保つためのルール
 
@@ -81,7 +84,6 @@ Codex は選定対象と理由だけを返し、Rust が観測した事実や Do
 次の項目はこの文書では定義しません。
 
 - Provider interface の具体的な形
-- Task / TaskState の具体的なデータモデルと状態遷移
 - Codex と Rust Orchestrator 間の MCP tool contract
 
 これらは、実装上の必要性と選択肢が明確になった時点で、個別の Design / RFC Issue として決定します。

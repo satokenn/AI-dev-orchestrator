@@ -101,6 +101,7 @@ cargo test --workspace --all-features
 - [`README.md`](README.md): プロジェクト概要と開発者向けの入口
 - [初期アーキテクチャ](docs/architecture.md): 主要コンポーネントの高レベル構造、責務境界、未決定事項
 - [モデル選定の入力・出力仕様](docs/model-selection-spec.md): Provider / Model選定の入力、出力、観測事実とCodex判断の責務境界
+- [実装・レビュー・修正を記録する設計](docs/implementation-review-model.md): 実装・レビュー・修正の履歴、レビュー結果、状態、Ledger保存単位
 - [Rustコード品質・テスト方針](docs/rust-quality.md): 必須検証、テスト種別、warningとunsafeの扱い
 - [Issue テンプレート](.github/ISSUE_TEMPLATE): 機能追加、不具合、設計検討の起票項目と完了条件
 - [Pull Request テンプレート](.github/pull_request_template.md): 概要、関連 Issue、変更内容、判断理由、完了条件への対応、GitHub Actions 以外の追加検証、影響、未解決事項の記録
