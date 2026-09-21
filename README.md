@@ -93,6 +93,10 @@ Provider / Model 選定へ渡す Task、利用状況、過去実績、Attempt �
 同じ開発作業で実装、レビュー、修正を行うときの記録方法と、完了にする判断は、
 [実装・レビュー・修正を記録する設計](docs/implementation-review-model.md)を参照してください。
 
+`Attempt` をモデル呼び出し1回の記録として扱い、機械検証、AI review verdict、監督Codexの受入、
+公開/CI、Task完了を成果物へ束縛する別の事実として扱うDomain契約は、
+[作業・モデル実行・成果物のドメインモデル](docs/domain-model.md)を参照してください。
+
 ## コード品質・テスト
 
 Rustコードに適用する必須検証、テスト種別、unsafeの扱いは、[Rustコード品質・テスト方針](docs/rust-quality.md)を参照してください。
