@@ -31,21 +31,21 @@ IDはすべて不透明なstringとし、呼出側はIDの形式・連番・内�
 
 ### `TaskRequest` / `TaskSnapshot`
 
-| Type | Field | Type | Required |
-| --- | --- | --- | --- |
-| `TaskRequest` | `source` | `enum(issue, manual)` | 必須 |
-|  | `title` | `string` | 必須 |
-|  | `description` | `string` | 必須 |
-|  | `constraints` | `array<string>` | 必須 |
-|  | `issue` | `IssueSnapshot \| null` | 必須。`source=issue`ならobject、`source=manual`ならnull |
-| `TaskSnapshot` | `task_id` | `string` | 必須 |
-|  | `revision` | `integer` | 必須 |
-|  | `state` | `enum(pending, active, completed, failed, cancelled)` | 必須 |
-|  | `request` | `TaskRequest` | 必須 |
+| Object | Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- | --- |
+| `TaskRequest` | `source` | `enum(issue, manual)` | 必須 | 要求の出所 |
+|  | `title` | `string` | 必須 | Task title |
+|  | `description` | `string` | 必須 | 要求本文 |
+|  | `constraints` | `array<string>` | 必須 | 要求制約。制約なしは空配列 |
+|  | `issue` | `IssueSnapshot \| null` | 必須 | `source=issue`ならobject、`source=manual`ならnull |
+| `TaskSnapshot` | `task_id` | `string` | 必須 | Task ID |
+|  | `revision` | `integer` | 必須 | Task更新番号 |
+|  | `state` | `enum(pending, active, completed, failed, cancelled)` | 必須 | Task状態 |
+|  | `request` | `TaskRequest` | 必須 | 作成時の要求snapshot |
 
 `IssueSnapshot`は次のobjectとする。
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `url` | `string (format: uri)` | 必須 | Issue URL |
 | `number` | `integer (minimum: 1)` | 必須 | Issue番号 |
@@ -54,7 +54,7 @@ IDはすべて不透明なstringとし、呼出側はIDの形式・連番・内�
 
 ### `EvidenceRef`
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `kind` | `enum(validation, review, decision, publication, ci)` | 必須 | 参照する記録の種別 |
 | `id` | `string` | 必須 | Serviceが発行した記録ID |
@@ -65,7 +65,7 @@ evidenceは結果を申告するfieldではなく、保存済みrecordへの参�
 
 各`task.get_context` sectionは次の共通itemを返す。`details`の型はsectionごとの表で定義する。
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `id` | `string` | 必須 | 履歴record ID |
 | `kind` | `string` | 必須 | record種別 |
@@ -75,17 +75,57 @@ evidenceは結果を申告するfieldではなく、保存済みrecordへの参�
 | `references` | `array<Reference>` | 必須 | 関連record |
 | `details` | `object` | 必須 | section固有の追加情報 |
 
-| Section | `kind` | `details` field（すべて必須） |
-| --- | --- | --- |
-| `providers` | `provider` | `provider_id: string`; `model_ids: array<string>`; `availability: enum(available, unavailable, unknown)`; `observed_at: string (format: date-time)`; `diagnostic_ref: string \| null` |
-| `usage` | `usage` | `name: string`; `value: number \| null`; `unit: string`; `basis: enum(measured, configured, computed, estimated, unknown)`; `observed_at: string \| null` (nonnull値は`format: date-time`) |
-| `attempts` | `attempt` | `provider_id: string`; `model_id: string`; `role: enum(implementer, reviewer, explorer)`; `input_artifact_id: string \| null`; `base_commit: string \| null`; `output_artifact_id: string \| null`; `diagnostic_ref: string \| null` |
-| `artifacts` | `artifact` | `artifact_id: string`; `digest: string`; `source_attempt_id: string \| null`; `base_commit: string \| null`; `diff_ref: string \| null` |
-| `validations` | `validation` | `validation_id: string`; `artifact_id: string`; `check_profile_id: string \| null`; `checks: array<ValidationCheckResult>` |
-| `reviews` | `review_verdict` | `review_verdict_id: string`; `reviewer_attempt_id: string`; `artifact_id: string`; `verdict: enum(approved, changes_requested, inconclusive)` |
-| `decisions` | `codex_decision` | `decision_id: string`; `artifact_id: string`; `decision: enum(accepted, rejected, changes_requested)`; `reason: string`; `evidence: array<EvidenceRef>` |
-| `publication` | `publication` | `publication_id: string`; `artifact_id: string`; `repository: string`; `head_sha: string`; `pull_request_number: integer`; `pull_request_url: string (format: uri)` |
-| `ci` | `ci_observation` | `observation_id: string`; `repository: string`; `pull_request_number: integer \| null`; `head_sha: string`; `state: enum(pending, passed, failed, unknown)`; `checks: array<CiCheck>` |
+section固有の`details`は次のfieldで構成する。列挙したfieldはすべて必須であり、null可能なfieldはその型に明記する。
+
+| Section | kind | Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- | --- | --- |
+| `providers` | `provider` | `provider_id` | `string` | 必須 | Provider ID |
+|  |  | `model_ids` | `array<string>` | 必須 | 利用可能なModel ID |
+|  |  | `availability` | `enum(available, unavailable, unknown)` | 必須 | 観測した利用可否 |
+|  |  | `observed_at` | `string (format: date-time)` | 必須 | Provider状態の観測時刻 |
+|  |  | `diagnostic_ref` | `string \| null` | 必須 | 診断参照。なければnull |
+| `usage` | `usage` | `name` | `string` | 必須 | 使用量指標名 |
+|  |  | `value` | `number \| null` | 必須 | 観測値。不明ならnull |
+|  |  | `unit` | `string` | 必須 | 値の単位 |
+|  |  | `basis` | `enum(measured, configured, computed, estimated, unknown)` | 必須 | 値の根拠 |
+|  |  | `observed_at` | `string \| null` | 必須 | 観測時刻。不明ならnull、非null値はRFC 3339 UTC |
+| `attempts` | `attempt` | `provider_id` | `string` | 必須 | Provider ID |
+|  |  | `model_id` | `string` | 必須 | Model ID |
+|  |  | `role` | `enum(implementer, reviewer, explorer)` | 必須 | Attemptの役割 |
+|  |  | `input_artifact_id` | `string \| null` | 必須 | 入力Artifact。初期baseから開始した場合はnull |
+|  |  | `base_commit` | `string \| null` | 必須 | 開始時commit。なければnull |
+|  |  | `output_artifact_id` | `string \| null` | 必須 | 出力Artifact。未作成ならnull |
+|  |  | `diagnostic_ref` | `string \| null` | 必須 | 診断参照。なければnull |
+| `artifacts` | `artifact` | `artifact_id` | `string` | 必須 | Artifact ID |
+|  |  | `digest` | `string` | 必須 | Artifact内容のdigest |
+|  |  | `source_attempt_id` | `string \| null` | 必須 | 作成元Attempt。なければnull |
+|  |  | `base_commit` | `string \| null` | 必須 | 差分の基準commit。なければnull |
+|  |  | `diff_ref` | `string \| null` | 必須 | 差分参照。なければnull |
+| `validations` | `validation` | `validation_id` | `string` | 必須 | Validation ID |
+|  |  | `artifact_id` | `string` | 必須 | 検証対象Artifact |
+|  |  | `check_profile_id` | `string \| null` | 必須 | 適用profile。明示checksならnull |
+|  |  | `checks` | `array<ValidationCheckResult>` | 必須 | 個別check結果 |
+| `reviews` | `review_verdict` | `review_verdict_id` | `string` | 必須 | ReviewVerdict ID |
+|  |  | `reviewer_attempt_id` | `string` | 必須 | Reviewer Attempt ID |
+|  |  | `artifact_id` | `string` | 必須 | review対象Artifact |
+|  |  | `verdict` | `enum(approved, changes_requested, inconclusive)` | 必須 | reviewerの結論 |
+| `decisions` | `codex_decision` | `decision_id` | `string` | 必須 | CodexDecision ID |
+|  |  | `artifact_id` | `string` | 必須 | 判断対象Artifact |
+|  |  | `decision` | `enum(accepted, rejected, changes_requested)` | 必須 | 採否 |
+|  |  | `reason` | `string` | 必須 | 判断理由 |
+|  |  | `evidence` | `array<EvidenceRef>` | 必須 | 照合した証拠。なければ空配列 |
+| `publication` | `publication` | `publication_id` | `string` | 必須 | Publication ID |
+|  |  | `artifact_id` | `string` | 必須 | 公開したArtifact |
+|  |  | `repository` | `string` | 必須 | repository |
+|  |  | `head_sha` | `string` | 必須 | 公開commit |
+|  |  | `pull_request_number` | `integer` | 必須 | PR番号 |
+|  |  | `pull_request_url` | `string (format: uri)` | 必須 | PR URL |
+| `ci` | `ci_observation` | `observation_id` | `string` | 必須 | CI observation ID |
+|  |  | `repository` | `string` | 必須 | 対象repository |
+|  |  | `pull_request_number` | `integer \| null` | 必須 | PR番号。commit targetならnull |
+|  |  | `head_sha` | `string` | 必須 | 観測対象commit |
+|  |  | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約state |
+|  |  | `checks` | `array<CiCheck>` | 必須 | 個別check結果 |
 
 `ContextItem.state`の値は次のとおり。sectionごとに別のenumであり、一覧にないstateを使わない。
 
@@ -103,7 +143,7 @@ evidenceは結果を申告するfieldではなく、保存済みrecordへの参�
 
 次のobject型を使用する。記載したfieldはすべて必須。
 
-| Type | Field | Type | Required | Meaning |
+| Object | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- | --- |
 | `Reference` | `kind` | `string` | 必須 | 参照先recordの種別 |
 |  | `id` | `string` | 必須 | 参照先record ID |
@@ -117,7 +157,7 @@ evidenceは結果を申告するfieldではなく、保存済みrecordへの参�
 
 ### `ContextPage`
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `items` | `array<ContextItem>` | 必須 | sectionに属する履歴record。section固有の`details`型を使う |
 | `next_cursor` | `string \| null` | 必須 | 次page取得用token。nullは現在のsnapshotに続きがない |
@@ -128,18 +168,20 @@ cursorは不透明であり、Task・section・page size・snapshot revisionに�
 
 非同期toolが受け付けられたときの共通structured output。
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 対応するrequest ID |
 | `task_id` | `string` | 必須 | 対象Task ID |
 | `revision` | `integer` | 必須 | 受付後のTask revision |
 | `operation` | `OperationRef` | 必須 | 新規operation |
-| `attempt_id` | `string` | Attemptを作るtoolで必須 | 作成したAttempt ID |
+| `attempt_id` | `string` | 条件付き | Attemptを作るtoolが返すAttempt ID |
+
+`attempt_id`は`attempt.run`で必須、ほかの非同期toolでは省略する。
 
 `OperationRef`のfieldはすべて必須。
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `operation_id` | `string` | 必須 | operation ID |
 | `kind` | `enum(attempt.run, task.cancel, operation.cancel, validation.run, publication.publish, ci.wait)` | 必須 | 受付対象の操作 |
@@ -150,7 +192,7 @@ cursorは不透明であり、Task・section・page size・snapshot revisionに�
 
 ### `ErrorPayload`
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string \| null` | 必須 | parse可能なら対象request ID。取得不能ならnull |
@@ -158,7 +200,7 @@ cursorは不透明であり、Task・section・page size・snapshot revisionに�
 
 `Error`の次のfieldはすべて必須。
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `code` | `ErrorCode` | 必須 | 下記の業務error code |
 | `message` | `string` | 必須 | 人が読める説明 |
@@ -181,7 +223,7 @@ cursorは不透明であり、Task・section・page size・snapshot revisionに�
 
 Taskを作成する。`request_id`は冪等性keyに含まれる。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 重複作成を防ぐrequest ID |
@@ -191,11 +233,11 @@ Taskを作成する。`request_id`は冪等性keyに含まれる。
 | `constraints` | `array<string>` | 必須 | 要求制約。なしなら空配列 |
 | `issue` | `IssueSnapshot` | 条件付き | sourceが`issue`なら必須、`manual`なら省略 |
 
-`IssueSnapshot`は`url: string (format: uri)`、`number: integer (minimum: 1)`、`title: string`、`body: string`をすべて必須とする。issue title/bodyは作成時点のsnapshot。
+`issue`は前述の`IssueSnapshot`型を使う。title/bodyは作成時点のsnapshot。
 
 成功output:
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 入力request IDのecho |
@@ -223,7 +265,7 @@ Taskを作成する。`request_id`は冪等性keyに含まれる。
 
 Taskと選択したsectionのsnapshotを読む。読取専用。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `task_id` | `string` | 必須 | 読むTask |
@@ -233,7 +275,7 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
 
 成功output:
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `task` | `TaskSnapshot` | 必須 | ID、revision、state、要求snapshot |
@@ -258,7 +300,7 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
 
 指定Provider / Modelを一回実行する。長時間処理。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
@@ -271,7 +313,15 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
 | `input` | `ArtifactInput \| BaseInput` | 必須 | 入力Artifactまたは初期baseのどちらか一方 |
 | `timeout_ms` | `integer (minimum: 1)` | 任意 | timeout。省略時はService policy値 |
 
-`ArtifactInput`は`artifact_id: string`のみ、`BaseInput`は`repository: string`と`commit: string`を持つobject。入力Artifactは同じTaskに属する必要がある。branch/pathだけのbase指定は認めない。
+`ArtifactInput`と`BaseInput`の各fieldはすべて必須。
+
+| Object | Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- | --- |
+| `ArtifactInput` | `artifact_id` | `string` | 必須 | 入力Artifact ID |
+| `BaseInput` | `repository` | `string` | 必須 | base commitのrepository |
+|  | `commit` | `string` | 必須 | base commit SHA |
+
+入力Artifactは同じTaskに属する必要がある。branch/pathだけのbase指定は認めない。
 
 成功outputは`OperationAcceptance`。`attempt_id`を必須とする。受付時の`operation.state`は`accepted`。
 
@@ -279,21 +329,21 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
 
 operation状態・結果を読む。読取専用。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `operation_id` | `string` | 必須 | 取得対象 |
 
 成功output:
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `operation` | `Operation` | 必須 | operation記録 |
 
 `Operation`のfieldはすべて必須。nullを許すfieldも省略せず、該当しない場合はnullを返す。
 
-| Field | Type | Required | Meaning |
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `operation_id` | `string` | 必須 | operation ID |
 | `task_id` | `string` | 必須 | 対象Task ID |
@@ -307,35 +357,35 @@ operation状態・結果を読む。読取専用。
 
 `result`と`error`は同時に非nullにならない。`OperationResult`は`kind`に対応する次のobjectのいずれか。
 
-| Operation kind | Result field | Type | Required |
-| --- | --- | --- | --- |
-| `attempt.run` | `attempt_id` | `string` | 必須 |
-|  | `attempt_state` | `enum(succeeded, failed, cancelled)` | 必須 |
-|  | `output_artifact_id` | `string \| null` | 必須 |
-|  | `usage` | `array<UsageMetric>` | 必須 |
-|  | `diagnostic_ref` | `string \| null` | 必須 |
-| `task.cancel` | `task_state` | `enum(cancelled, active)` | 必須 |
-|  | `cancelled_operation_ids` | `array<string>` | 必須 |
-| `operation.cancel` | `target_operation_id` | `string` | 必須 |
-|  | `target_state` | `enum(cancelled, running, recovery_required)` | 必須 |
-| `validation.run` | `validation_id` | `string` | 必須 |
-|  | `artifact_id` | `string` | 必須 |
-|  | `state` | `enum(passed, failed, unknown)` | 必須 |
-|  | `checks` | `array<ValidationCheckResult>` | 必須 |
-| `publication.publish` | `publication_id` | `string` | 必須 |
-|  | `repository` | `string` | 必須 |
-|  | `head_sha` | `string` | 必須 |
-|  | `pull_request_number` | `integer` | 必須 |
-|  | `pull_request_url` | `string (format: uri)` | 必須 |
-| `ci.wait` | `observation_id` | `string` | 必須 |
-|  | `target` | `CiTarget` | 必須 |
-|  | `observed_at` | `string (format: date-time)` | 必須 |
-|  | `state` | `enum(pending, passed, failed, unknown)` | 必須 |
-|  | `checks` | `array<CiCheck>` | 必須 |
+| Operation kind | Result field | JSON type | Required | 意味 |
+| --- | --- | --- | --- | --- |
+| `attempt.run` | `attempt_id` | `string` | 必須 | 作成したAttempt ID |
+|  | `attempt_state` | `enum(succeeded, failed, cancelled)` | 必須 | Provider実行の終端state |
+|  | `output_artifact_id` | `string \| null` | 必須 | 出力Artifact。生成されなければnull |
+|  | `usage` | `array<UsageMetric>` | 必須 | Provider使用量 |
+|  | `diagnostic_ref` | `string \| null` | 必須 | 診断参照。なければnull |
+| `task.cancel` | `task_state` | `enum(cancelled, active)` | 必須 | 取消後のTask state |
+|  | `cancelled_operation_ids` | `array<string>` | 必須 | 取消したoperation ID |
+| `operation.cancel` | `target_operation_id` | `string` | 必須 | 取消対象operation |
+|  | `target_state` | `enum(cancelled, running, recovery_required)` | 必須 | 対象operationの結果state |
+| `validation.run` | `validation_id` | `string` | 必須 | Validation ID |
+|  | `artifact_id` | `string` | 必須 | 検証対象Artifact |
+|  | `state` | `enum(passed, failed, unknown)` | 必須 | 集約結果 |
+|  | `checks` | `array<ValidationCheckResult>` | 必須 | 個別check結果 |
+| `publication.publish` | `publication_id` | `string` | 必須 | Publication ID |
+|  | `repository` | `string` | 必須 | repository |
+|  | `head_sha` | `string` | 必須 | 公開commit |
+|  | `pull_request_number` | `integer` | 必須 | 作成したPR番号 |
+|  | `pull_request_url` | `string (format: uri)` | 必須 | PR URL |
+| `ci.wait` | `observation_id` | `string` | 必須 | CI observation ID |
+|  | `target` | `CiTarget` | 必須 | 観測対象 |
+|  | `observed_at` | `string (format: date-time)` | 必須 | 観測時刻 |
+|  | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約結果 |
+|  | `checks` | `array<CiCheck>` | 必須 | 個別check結果 |
 
 `UsageMetric`と`CiTarget`のfieldはすべて必須。
 
-| Type | Field | Type | Required | Meaning |
+| Object | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- | --- |
 | `UsageMetric` | `name` | `string` | 必須 | 指標名 |
 |  | `value` | `number \| null` | 必須 | 値。不明ならnull |
@@ -349,7 +399,7 @@ operation状態・結果を読む。読取専用。
 
 指定operationのログ範囲を読む。ログ本文はredacted済み。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `operation_id` | `string` | 必須 | 対象operation |
@@ -359,18 +409,18 @@ operation状態・結果を読む。読取専用。
 
 成功outputは次のfieldをすべて含む。`LogChunk`のfieldもすべて必須。
 
-| Field | Type | Required |
-| --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 |
-| `chunks` | `array<LogChunk>` | 必須 |
-| `next_cursor` | `string \| null` | 必須 |
+| Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- |
+| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `chunks` | `array<LogChunk>` | 必須 | 取得したlog chunk |
+| `next_cursor` | `string \| null` | 必須 | 次page cursor。続きがなければnull |
 
-| LogChunk field | Type | Required |
-| --- | --- | --- |
-| `sequence` | `integer` | 必須 |
-| `occurred_at` | `string (format: date-time)` | 必須 |
-| `text` | `string` | 必須 |
-| `redacted` | `boolean` | 必須 |
+| LogChunk field | JSON type | Required | 意味 |
+| --- | --- | --- | --- |
+| `sequence` | `integer` | 必須 | operation内のchunk順 |
+| `occurred_at` | `string (format: date-time)` | 必須 | log記録時刻 |
+| `text` | `string` | 必須 | redacted済み本文 |
+| `redacted` | `boolean` | 必須 | 本文内にredactionを行ったか |
 
 cursorはoperation・stream・limitに束縛される。末尾到達はoperation完了を意味しない。
 
@@ -378,7 +428,7 @@ cursorはoperation・stream・limitに束縛される。末尾到達はoperation
 
 ひとつのoperationへの取消を要求する。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
@@ -392,7 +442,7 @@ cursorはoperation・stream・limitに束縛される。末尾到達はoperation
 
 Taskと未終了operationの取消を要求する。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
@@ -406,7 +456,7 @@ Taskと未終了operationの取消を要求する。
 
 Artifactに機械検証を実行する。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
@@ -416,15 +466,28 @@ Artifactに機械検証を実行する。
 | `check_profile_id` | `string` | profile利用時に必須 | 登録済みcheck profile |
 | `checks` | `array<ValidationCheck>` | 明示check利用時に必須 | 実行するcheck |
 
-`check_profile_id`か`checks`のちょうど一方を指定する。`ValidationCheck`は`name: string`、`command: string`、`args: array<string>`、`timeout_ms: integer (minimum: 1)`をすべて必須とする。commandとworkspaceは実行前にpolicy allowlistで検査する。
+`check_profile_id`か`checks`のちょうど一方を指定する。`ValidationCheck`のfieldはすべて必須。
 
-成功outputは`OperationAcceptance`に`artifact_id: string`を加える。最終結果はoperation resultに`validation_id: string`と各checkの`state: enum(passed, failed, unknown)`を含む。
+| Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- |
+| `name` | `string` | 必須 | check名 |
+| `command` | `string` | 必須 | allowlist検査する実行command |
+| `args` | `array<string>` | 必須 | command引数。なしなら空配列 |
+| `timeout_ms` | `integer (minimum: 1)` | 必須 | check timeout |
+
+commandとworkspaceは実行前にpolicy allowlistで検査する。
+
+成功outputは`OperationAcceptance`の全fieldと、次の必須fieldを返す。最終結果の各fieldは`operation.get`の`validation.run` result schemaを参照。
+
+| Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- |
+| `artifact_id` | `string` | 必須 | 検証対象Artifact |
 
 ### `decision.record`
 
 監督Codexの判断をArtifactに記録する。同期処理。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
@@ -435,9 +498,19 @@ Artifactに機械検証を実行する。
 | `reason` | `string` | 必須 | 判断理由 |
 | `evidence` | `array<EvidenceRef>` | 任意 | 判断に参照した保存済み証拠 |
 
-成功outputは`schema_version: const "v1"`、`request_id: string`、`task_id: string`、`revision: integer`、`decision: CodexDecision`を必須とする。`CodexDecision`のfieldはすべて必須。
+成功outputのfieldはすべて必須。
 
-| Field | Type | Required | 意味 |
+| Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- |
+| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `request_id` | `string` | 必須 | 入力request IDのecho |
+| `task_id` | `string` | 必須 | 対象Task ID |
+| `revision` | `integer` | 必須 | 記録後のTask revision |
+| `decision` | `CodexDecision` | 必須 | 保存された判断record |
+
+`CodexDecision`のfieldはすべて必須。
+
+| Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `decision_id` | `string` | 必須 | 判断record ID |
 | `artifact_id` | `string` | 必須 | 判断対象Artifact |
@@ -449,7 +522,7 @@ Artifactに機械検証を実行する。
 
 指定ArtifactをPull Requestとして公開する。Service policyが必要とする証拠がない場合は副作用前に拒否する。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
@@ -465,13 +538,17 @@ Artifactに機械検証を実行する。
 
 公開前にServiceは`decision_id`で保存済みdecisionを検索し、decisionが`accepted`で、その`artifact_id`が公開対象と一致することを確認する。不在・不一致・非acceptedなら`invalid_state_transition`で拒否する。加えてServiceはArtifactとpublication payloadをconfigured secret-scan policyで検査する。secret検出または検査を安全に完了できない場合は`policy_denied`とし、commit・push・PR作成を開始しない。通常のValidation成功だけではsecret scan済みを意味しない。
 
-成功outputは`OperationAcceptance`に`artifact_id: string`を加える。operation完了時のresultは`publication_id: string`、`repository: string`、`head_sha: string`、`pull_request_number: integer`、`pull_request_url: string (format: uri)`を含む。
+成功outputは`OperationAcceptance`の全fieldと、次の必須fieldを返す。最終結果は`operation.get`の`publication.publish` result schemaを参照。
+
+| Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- |
+| `artifact_id` | `string` | 必須 | 公開対象Artifact |
 
 ### `ci.get`
 
 PR / commitのcheck状態を一度観測する。読取専用。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `publication_id` | `string` | `target`未指定時に必須 | Publicationの指定 |
@@ -479,29 +556,29 @@ PR / commitのcheck状態を一度観測する。読取専用。
 
 `PullRequestTarget`と`CommitTarget`のfieldはすべて必須。`publication_id`と`target`は同時に指定しない。
 
-| Type | Field | Type | Required |
-| --- | --- | --- | --- |
-| `PullRequestTarget` | `repository` | `string` | 必須 |
-|  | `number` | `integer (minimum: 1)` | 必須 |
-| `CommitTarget` | `repository` | `string` | 必須 |
-|  | `sha` | `string` | 必須 |
+| Object | Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- | --- |
+| `PullRequestTarget` | `repository` | `string` | 必須 | repository |
+|  | `number` | `integer (minimum: 1)` | 必須 | PR番号 |
+| `CommitTarget` | `repository` | `string` | 必須 | repository |
+|  | `sha` | `string` | 必須 | commit SHA |
 
 成功outputは次のfieldをすべて含む。`passed`は観測対象SHAに限る。
 
-| Field | Type | Required |
-| --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 |
-| `observation_id` | `string` | 必須 |
-| `target` | `CiTarget` | 必須 |
-| `observed_at` | `string (format: date-time)` | 必須 |
-| `checks` | `array<CiCheck>` | 必須 |
-| `state` | `enum(pending, passed, failed, unknown)` | 必須 |
+| Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- |
+| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `observation_id` | `string` | 必須 | observation ID |
+| `target` | `CiTarget` | 必須 | 観測対象 |
+| `observed_at` | `string (format: date-time)` | 必須 | 観測時刻 |
+| `checks` | `array<CiCheck>` | 必須 | 個別check結果 |
+| `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約結果 |
 
 ### `ci.wait`
 
 CI状態をdeadlineまで待つ。長時間処理。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
@@ -517,7 +594,7 @@ CI状態をdeadlineまで待つ。長時間処理。
 
 Task完了を要求する。指定されたArtifact、accepted decision、policy必須の証拠を照合し、満たさなければ状態を変えない。
 
-| Request field | Type | Required | 意味 |
+| Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
@@ -527,7 +604,17 @@ Task完了を要求する。指定されたArtifact、accepted decision、policy
 | `decision_id` | `string` | 必須 | 同じArtifactへのaccepted CodexDecision |
 | `evidence` | `array<EvidenceRef>` | 任意 | 追加で照合する証拠 |
 
-成功outputは`schema_version: const "v1"`、`request_id: string`、`task_id: string`、`revision: integer`、`state: const "completed"`、`artifact_id: string`、`evidence: array<EvidenceRef>`を必須とする。
+成功outputのfieldはすべて必須。
+
+| Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- |
+| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `request_id` | `string` | 必須 | 入力request IDのecho |
+| `task_id` | `string` | 必須 | 完了したTask ID |
+| `revision` | `integer` | 必須 | 完了後のTask revision |
+| `state` | `const "completed"` | 必須 | 完了状態 |
+| `artifact_id` | `string` | 必須 | 完了対象Artifact |
+| `evidence` | `array<EvidenceRef>` | 必須 | 照合した証拠。なければ空配列 |
 
 ## Errorと復旧
 
