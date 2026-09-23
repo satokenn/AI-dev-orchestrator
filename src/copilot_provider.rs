@@ -108,10 +108,13 @@ impl CopilotProvider {
                     "GitHub Copilot CLI availability check failed: {}",
                     output_diagnostic(&output.stdout, &output.stderr, output.exit_code())
                 )),
-                ProcessError::TimedOut(_) | ProcessError::Cancelled(_) => {
-                    ProviderError::Unavailable(
-                        "GitHub Copilot CLI availability check did not complete".to_owned(),
-                    )
+                ProcessError::TimedOut(_)
+                | ProcessError::Cancelled(_)
+                | ProcessError::CancelledBeforeStart => ProviderError::Unavailable(
+                    "GitHub Copilot CLI availability check did not complete".to_owned(),
+                ),
+                ProcessError::Interrupted { diagnostic, .. } => {
+                    ProviderError::Unavailable(diagnostic)
                 }
             })
     }
@@ -189,8 +192,29 @@ impl CopilotProvider {
             ProcessError::Io(error) => {
                 ProviderError::ExecutionFailed(format!("Copilot process I/O failed: {error}"))
             }
-            ProcessError::TimedOut(_) => ProviderError::TimedOut { timeout },
-            ProcessError::Cancelled(_) => ProviderError::Cancelled,
+            ProcessError::TimedOut(output) => ProviderError::TimedOutWithOutput {
+                timeout,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            },
+            ProcessError::Cancelled(output) => ProviderError::CancelledWithOutput {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            },
+            ProcessError::CancelledBeforeStart => ProviderError::Cancelled,
+            ProcessError::Interrupted {
+                reason,
+                stopped,
+                stdout,
+                stderr,
+                diagnostic,
+            } => ProviderError::Interrupted {
+                reason,
+                confirmed_stopped: stopped,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                diagnostic,
+            },
             ProcessError::NonZeroExit(output) => {
                 let diagnostic =
                     output_diagnostic(&output.stdout, &output.stderr, output.exit_code());
@@ -361,11 +385,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn maps_timeout_and_cancellation_from_process_runner() {
-        let provider = CopilotProvider::with_executable("sh").with_command_prefix("sleep 10");
+        let provider = CopilotProvider::with_executable("sh")
+            .with_command_prefix("printf partial; exec sleep 10");
         let timeout = provider
-            .execute(&request(Duration::from_millis(20)))
+            .execute(&request(Duration::from_secs(1)))
             .unwrap_err();
-        assert!(matches!(timeout, ProviderError::TimedOut { .. }));
+        assert!(
+            matches!(timeout, ProviderError::TimedOutWithOutput { stdout, .. } if stdout == "partial")
+        );
 
         let cancellation = CancellationToken::new();
         let other = cancellation.clone();
@@ -377,7 +404,7 @@ mod tests {
 
         assert!(matches!(
             thread.join().unwrap(),
-            Err(ProviderError::Cancelled)
+            Err(ProviderError::CancelledWithOutput { .. })
         ));
     }
 

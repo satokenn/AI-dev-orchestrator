@@ -585,11 +585,17 @@ fn fail_attempt_with_provider_error(
     let attempt = task
         .attempt_mut(attempt_id)
         .expect("newly added attempt must be owned by its task");
-    if matches!(error, ProviderError::Cancelled) {
+    if matches!(
+        error,
+        ProviderError::Cancelled | ProviderError::CancelledWithOutput { .. }
+    ) {
         attempt
             .cancel_with_reason(crate::AttemptFailureReason::Cancelled)
             .map_err(OrchestratorError::Domain)
-    } else if matches!(error, ProviderError::TimedOut { .. }) {
+    } else if matches!(
+        error,
+        ProviderError::TimedOut { .. } | ProviderError::TimedOutWithOutput { .. }
+    ) {
         attempt
             .fail_with_reason(crate::AttemptFailureReason::Timeout)
             .map_err(OrchestratorError::Domain)

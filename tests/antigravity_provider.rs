@@ -135,22 +135,26 @@ fn reports_authentication_failure_as_unavailable() {
 
 #[test]
 fn maps_timeout_to_provider_error() {
-    let cli = FakeCli::new("sleep 10");
+    let cli = FakeCli::new("printf partial; exec sleep 10");
     let result = cli.provider().execute(&request(
         cli.directory.clone(),
         "hello",
-        Duration::from_millis(20),
+        Duration::from_secs(1),
     ));
 
     assert!(matches!(
         result,
-        Err(ProviderError::TimedOut { timeout }) if timeout == Duration::from_millis(20)
+        Err(ProviderError::TimedOutWithOutput { timeout, stdout, .. }) if timeout == Duration::from_secs(1) && stdout == "partial"
     ));
 }
 
 #[test]
 fn maps_cancellation_to_provider_error() {
-    let cli = Arc::new(FakeCli::new("sleep 10"));
+    let ready = std::env::temp_dir().join(format!("agy-cancel-ready-{}", std::process::id()));
+    let cli = Arc::new(FakeCli::new(&format!(
+        "printf partial; touch {}; exec sleep 10",
+        ready.display()
+    )));
     let provider = cli.provider();
     let token = CancellationToken::new();
     let other = token.clone();
@@ -160,10 +164,19 @@ fn maps_cancellation_to_provider_error() {
             .execute_with_cancellation(&request(workspace, "hello", Duration::from_secs(10)), other)
     });
 
-    thread::sleep(Duration::from_millis(20));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(ready.exists(), "fake CLI did not reach the ready marker");
+    let _ = fs::remove_file(&ready);
     token.cancel();
-    assert!(matches!(
-        thread.join().expect("provider thread"),
-        Err(ProviderError::Cancelled)
-    ));
+    let result = thread.join().expect("provider thread");
+    assert!(
+        matches!(
+            &result,
+            Err(ProviderError::CancelledWithOutput { stdout, .. }) if stdout == "partial"
+        ),
+        "unexpected cancellation result: {result:?}"
+    );
 }

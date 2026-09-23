@@ -449,6 +449,19 @@ impl CodexPlanner {
             },
             ProcessError::TimedOut(_) => PlannerError::CodexTimedOut { timeout },
             ProcessError::Cancelled(_) => PlannerError::CodexCancelled,
+            ProcessError::CancelledBeforeStart => PlannerError::CodexCancelled,
+            ProcessError::Interrupted {
+                reason,
+                stopped,
+                stdout,
+                stderr,
+                diagnostic: stop_diagnostic,
+            } => PlannerError::CodexExecutionFailed {
+                message: format!(
+                    "Codex process interrupted ({reason:?}, stopped={stopped}): {stop_diagnostic}; {}",
+                    diagnostic(&stdout, &stderr, None)
+                ),
+            },
             ProcessError::NonZeroExit(output) => PlannerError::CodexExecutionFailed {
                 message: diagnostic(&output.stdout, &output.stderr, output.exit_code()),
             },
