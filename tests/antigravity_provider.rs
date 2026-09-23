@@ -3,7 +3,19 @@
 use ai_dev_orchestrator::{
     AgentProvider, AntigravityProvider, CancellationToken, ProviderError, ProviderRequest,
 };
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
+static NEXT_FAKE_CLI_ID: AtomicU64 = AtomicU64::new(0);
 
 struct FakeCli {
     directory: PathBuf,
@@ -12,20 +24,12 @@ struct FakeCli {
 
 impl FakeCli {
     fn new(body: &str) -> Self {
-        let directory = std::env::temp_dir().join(format!(
-            "ai-dev-orchestrator-antigravity-{}",
-            std::process::id()
+        let unique_directory = std::env::temp_dir().join(format!(
+            "ai-dev-orchestrator-antigravity-{}-{}",
+            std::process::id(),
+            NEXT_FAKE_CLI_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        let unique_directory = (0..100)
-            .map(|suffix| {
-                if suffix == 0 {
-                    directory.clone()
-                } else {
-                    directory.with_extension(suffix.to_string())
-                }
-            })
-            .find(|candidate| fs::create_dir(candidate).is_ok())
-            .expect("create fake CLI directory");
+        fs::create_dir(&unique_directory).expect("create fake CLI directory");
         let executable = unique_directory.join("agy");
         fs::write(&executable, format!("#!/bin/sh\n{body}\n")).expect("write fake CLI");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
@@ -120,36 +124,33 @@ fn reports_authentication_failure_as_unavailable() {
     let result = cli.provider().execute(&request(
         cli.directory.clone(),
         "hello",
-        Duration::from_secs(1),
+        Duration::from_secs(10),
     ));
 
     assert!(matches!(
-        &result,
+        result,
         Err(ProviderError::Unavailable(message)) if message.contains("authentication required")
     ));
 }
 
 #[test]
 fn maps_timeout_to_provider_error() {
-    let cli = FakeCli::new("printf partial; exec sleep 10");
+    let cli = FakeCli::new("sleep 10");
     let result = cli.provider().execute(&request(
         cli.directory.clone(),
         "hello",
-        Duration::from_secs(1),
+        Duration::from_millis(20),
     ));
 
-    assert!(
-        matches!(
-            &result,
-            Err(ProviderError::Interrupted { reason: ai_dev_orchestrator::StopReason::TimedOut, stdout, diagnostic, .. }) if stdout == "partial" && diagnostic.contains("1s")
-        ),
-        "unexpected timeout result: {result:?}"
-    );
+    assert!(matches!(
+        result,
+        Err(ProviderError::TimedOut { timeout }) if timeout == Duration::from_millis(20)
+    ));
 }
 
 #[test]
 fn maps_cancellation_to_provider_error() {
-    let cli = Arc::new(FakeCli::new("printf partial; exec sleep 10"));
+    let cli = Arc::new(FakeCli::new("sleep 10"));
     let provider = cli.provider();
     let token = CancellationToken::new();
     let other = token.clone();
@@ -159,14 +160,10 @@ fn maps_cancellation_to_provider_error() {
             .execute_with_cancellation(&request(workspace, "hello", Duration::from_secs(10)), other)
     });
 
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(20));
     token.cancel();
-    let result = thread.join().expect("provider thread");
-    assert!(
-        matches!(
-            &result,
-            Err(ProviderError::Interrupted { reason: ai_dev_orchestrator::StopReason::Cancelled, stdout, .. }) if stdout == "partial"
-        ),
-        "unexpected cancellation result: {result:?}"
-    );
+    assert!(matches!(
+        thread.join().expect("provider thread"),
+        Err(ProviderError::Cancelled)
+    ));
 }

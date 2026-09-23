@@ -93,18 +93,8 @@ impl ProviderResult {
 pub enum ProviderError {
     InvalidRequest(String),
     ExecutionFailed(String),
-    TimedOut {
-        timeout: Duration,
-    },
+    TimedOut { timeout: Duration },
     Cancelled,
-    /// A process was interrupted; the captured output is retained for diagnosis.
-    Interrupted {
-        reason: crate::StopReason,
-        confirmed_stopped: bool,
-        stdout: String,
-        stderr: String,
-        diagnostic: String,
-    },
     Unavailable(String),
 }
 
@@ -121,15 +111,6 @@ impl std::fmt::Display for ProviderError {
                 write!(formatter, "provider timed out after {timeout:?}")
             }
             Self::Cancelled => formatter.write_str("provider execution was cancelled"),
-            Self::Interrupted {
-                reason,
-                confirmed_stopped,
-                diagnostic,
-                ..
-            } => write!(
-                formatter,
-                "provider execution interrupted ({reason:?}, stopped={confirmed_stopped}): {diagnostic}"
-            ),
             Self::Unavailable(message) => write!(formatter, "provider unavailable: {message}"),
         }
     }
@@ -141,6 +122,9 @@ impl std::error::Error for ProviderError {}
 pub trait AgentProvider {
     fn provider_ref(&self) -> &ProviderRef;
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError>;
+
+    /// Checks provider availability before an attempt is created.
+    fn check_availability(&self) -> Result<(), ProviderError>;
 
     /// Executes a request while observing a caller-owned cancellation signal.
     ///
@@ -177,6 +161,10 @@ mod tests {
                 Some(AgentResult::new(request.prompt(), true)),
                 Some(UsageCost::default()),
             ))
+        }
+
+        fn check_availability(&self) -> Result<(), ProviderError> {
+            Ok(())
         }
     }
 

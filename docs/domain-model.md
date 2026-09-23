@@ -1,165 +1,130 @@
-# Task / Attempt ドメインモデル
+# 作業・モデル実行・成果物のドメインモデル
 
-この文書は、AI Dev Orchestrator が管理する仕事と実行記録の最小ドメインモデルを定義する。Provider、永続化、MCP、Runtime Adapter の具体的なインターフェースは定義しない。
+この文書は、開発作業で何を記録し、どの結果を完了判断に使うかを定義する。主経路では監督Codexが意味的な判断を行い、RustのOperation Serviceは操作要求の検証、実行、状態遷移、制約強制、記録を担当する。
 
-## 設計方針
+## この文書で決めること
 
-- `Task` は「何を達成する仕事か」を表す。特定の Provider による一度の実行は表さない。
-- `Attempt` は、ある Task をある Provider で一度実行した記録である。retry や escalation は新しい Attempt として記録する。
-- `Task` と `Attempt` は 1:N の関係を持つ。Task は 0 個以上の Attempt を持ち、各 Attempt は必ず 1 個の Task に属する。
-- `Role` と `Provider` は分離する。Task は `TaskRole` を持つが、Provider は Attempt ごとに選択する。
-- Agent の自己申告は `AgentResult`、機械的な検証は `ValidationResult` として別々に記録する。AgentResult は成功判定の正本ではない。
-- retry / escalation は状態ではなく、失敗した Attempt の後に Planner が次の Attempt を作るという意味的な判断である。Orchestrator は、その判断を受けて確定的な制約と状態遷移を適用する。
+- `Task`、`Attempt`、`Artifact`、Validation、review verdict、監督Codexの判断の区別
+- `Attempt` の成功・失敗の意味
+- 検証、review、成果物受入、Task完了の関係
+- workerを使わず監督Codex自身が編集した場合と、旧データの扱い
 
-## 概念モデル
+Rust型、SQLite migration、MCP transport、ProviderやAI reviewの実装は扱わない。
+
+## 最初に読む要約
+
+| 事実 | 記録するもの | 成功しても意味しないこと |
+| --- | --- | --- |
+| モデルを1回呼び出した | `Attempt` | 検証成功、要求達成、Task完了 |
+| testやlintを実行した | `ValidationResult` | 成果物受入、Task完了 |
+| AIにreviewを依頼した | reviewer `Attempt` と `ReviewVerdict` | 監督Codexの受入 |
+| 監督Codexが成果物を評価した | `CodexDecision` | publishやTask完了の自動実行 |
+
+この分離により、「モデル呼び出しは成功したがtestは失敗した」「reviewは正常に終わったが修正要求だった」を矛盾なく残せる。
+
+## 用語と全体像
+
+| 用語 | 実装上の名前 | 意味 |
+| --- | --- | --- |
+| 作業 | `Task` | 利用者の目的を完了まで追跡する単位 |
+| モデル実行 | `Attempt` | 指定したProvider / Modelへの1回の呼び出し |
+| 成果物 | `Artifact` | 管理対象workspaceの特定時点の内容。未コミット変更・新規ファイルを含む |
+| 機械検証 | `ValidationResult` | 指定した成果物に対するtest、lint、build等の結果 |
+| review結果 | `ReviewVerdict` | reviewerが対象成果物へ返した `approved`、`changes_requested`、`inconclusive` |
+| 監督判断 | `CodexDecision` | 監督Codexが対象成果物へ残す `accepted`、`rejected`、`changes_requested` |
 
 ```text
 Task
-  ├─ id
-  ├─ description / constraints
-  ├─ TaskRole
-  ├─ TaskState
-  └─ Attempt 0..N
-       ├─ id
-       ├─ Provider
-       ├─ AttemptState
-       ├─ AgentResult 0..1
-       ├─ ValidationResult 0..N
-       └─ Usage / Cost 0..1
+  ├─ Attempt 0..N             モデル呼び出しの記録
+  │    ├─ input Artifact 0..1
+  │    └─ output Artifact 0..1
+  ├─ ValidationResult 0..N    Artifactを対象にする
+  ├─ ReviewVerdict 0..N       reviewer AttemptとArtifactを結ぶ
+  ├─ CodexDecision 0..N       監督CodexとArtifactを結ぶ
+  └─ Publication / CI 0..N    Artifact、commit / SHA、PR、checkを結ぶ
 ```
 
-### Task
+`Artifact`の同一性は #70、修正Attemptへの入力成果物の引継ぎは #71 を正本とする。過去の記録は上書きしない。
 
-Task は利用者または Planner が依頼した仕事の同一性、目的、制約、役割、仕事全体の状態を保持する。
+## Attemptはモデル呼び出しだけを表す
 
-Task は Provider、pane ID、session ID、CLI 引数、個別 Attempt の結果や利用量を保持しない。実行に関する情報は Attempt に属する。
-
-### Attempt
-
-Attempt は Task に対する一回の実行単位であり、使用した Provider、実行状態、AgentResult、ValidationResult、Usage / Cost を保持する。同じ Task の retry や escalation は別の Attempt とするため、過去の実行履歴を失わない。
-
-Provider は Attempt にだけ紐づく。`TaskRole` は `developer`、`reviewer`、`explorer` など「期待する責務」を表し、具体的な Provider の選択は Planner が行う。
-
-### AgentResult と ValidationResult
-
-`AgentResult` は Agent が返した報告（実装内容、提案された完了状態、問題、参照情報など）である。報告の存在や「成功した」という自己申告だけでは Task / Attempt を成功にしない。
-
-`ValidationResult` は Validator が実行した test、lint、build 等の機械的な結果、対象コミット、実行時刻、診断情報を表す。Orchestrator は ValidationResult を入力として Attempt の確定状態を更新する。意味的な retry / escalation や要求に対する妥当性判断は Planner の責務であり、Validator の責務ではない。
-
-### Usage / Cost
-
-Usage / Cost は実行に紐づくため Attempt が所有する。v0 では token 数、金額、subscription quota などを一つの数値へ潰さず、Provider が報告できる任意の内訳と単位を保持できる値として扱う。Task 集計値は正本にせず、必要になった時点で Attempt から導出する。
-
-## 状態と許可される遷移
-
-状態の変更は Orchestrator が検証し、不正な遷移を Rust 側で拒否する。Planner や Agent は状態を直接書き換えず、意図または結果を Orchestrator に渡す。
-
-### TaskState の状態遷移図
-
-```mermaid
-stateDiagram-v2
-    [*] --> Pending
-    Pending --> Active: start
-    Pending --> Cancelled: cancel
-    Active --> Completed: complete
-    Active --> Failed: fail
-    Active --> Cancelled: cancel
-    Completed --> [*]
-    Failed --> [*]
-    Cancelled --> [*]
-```
-
-`Completed`、`Failed`、`Cancelled` は終端状態であり、そこからの遷移はない。Attempt の失敗後に retry / escalation する場合は `Active` のまま次の Attempt を追加する。
-
-### TaskState
+AttemptはProvider / Modelを指定して開始した1回のモデル呼び出しである。実装、修正、調査、reviewはroleやrelationで区別するが、モデルを呼んだなら別Attemptとして残す。Attemptには要求・実測のProvider / Model、instruction、入力・出力成果物、開始・終了、診断、AgentResult、usage / costを残す。AgentResultは自己申告であり、成功や完了の根拠ではない。
 
 | 状態 | 意味 |
 | --- | --- |
-| `Pending` | 実行開始前。Attempt はまだ存在しないか、開始条件を満たしていない |
-| `Active` | 少なくとも一つの Attempt を処理中 |
-| `Completed` | Task の目的に対する確定処理が完了した。再開不可 |
-| `Failed` | 許可された実行を終えたが、Task を完了できなかった。再開不可 |
-| `Cancelled` | Task の継続を明示的に取り消した。再開不可 |
-
-許可する遷移は次の通り。
-
-```text
-Pending ──start──> Active
-Pending ──cancel─> Cancelled
-Active  ──complete-> Completed
-Active  ──fail───-> Failed
-Active  ──cancel─> Cancelled
-```
-
-`Completed`、`Failed`、`Cancelled` からの遷移は許可しない。Attempt の失敗後に retry / escalation する場合も Task は `Active` のまま、新しい Attempt を追加する。Planner がこれ以上の試行を行わないと決めた場合に限り、Orchestrator が `Failed` への遷移を適用する。
-
-### AttemptState
-
-| 状態 | 意味 |
-| --- | --- |
-| `Queued` | 実行対象として作成済みだが、Provider の実行は未開始 |
-| `Running` | Provider による実行中 |
-| `Validating` | Agent の実行結果を受け、Validator による機械的検証中 |
-| `Succeeded` | この Attempt の検証が成功した |
-| `Failed` | Provider 実行または検証が失敗した |
-| `Cancelled` | この Attempt の継続を取り消した |
-
-### AttemptState の状態遷移図
+| `Queued` | 受け付け済みだが、Provider呼び出しは未開始 |
+| `Running` | Provider / Modelを呼び出し中 |
+| `Succeeded` | Provider呼び出しが正常終了し、呼び出し結果を記録できた |
+| `Failed` | Provider呼び出しが失敗、timeout、または結果を確定できなかった |
+| `Cancelled` | 取消と停止を確認した |
 
 ```mermaid
 stateDiagram-v2
     [*] --> Queued
-    Queued --> Running: run
+    Queued --> Running: start
     Queued --> Cancelled: cancel
-    Running --> Validating: finish
-    Running --> Failed: fail
-    Running --> Cancelled: cancel
-    Validating --> Succeeded: pass
-    Validating --> Failed: fail
-    Validating --> Cancelled: cancel
-    Succeeded --> [*]
-    Failed --> [*]
-    Cancelled --> [*]
+    Running --> Succeeded: provider completed
+    Running --> Failed: provider error / timeout / interrupted
+    Running --> Cancelled: cancellation confirmed
 ```
 
-許可する遷移は次の通り。
+`Succeeded` は**モデル呼び出しの正常終了だけ**を表す。検証成功、review承認、監督Codexの受入、Task完了は含まない。Attemptに `Validating` 状態は置かず、Validationの結果でAttemptの終端状態を変更しない。
 
-```text
-Queued     ──run────> Running
-Queued     ──cancel─> Cancelled
-Running    ──finish─> Validating
-Running    ──fail───> Failed
-Running    ──cancel─> Cancelled
-Validating ──pass───> Succeeded
-Validating ──fail───> Failed
-Validating ──cancel─> Cancelled
-```
+## 実装・検証・reviewの例
 
-`AgentFinished` のような中間状態は v0 では追加しない。Agent の返却は AgentResult として記録し、検証へ進める操作で `Running -> Validating` とする。終了状態からの遷移は許可しない。
+| 順番 | 行ったこと | 記録する事実 |
+| --- | --- | --- |
+| 1 | 実装モデルを呼び出した | implementer Attempt=`Succeeded`、Artifact A |
+| 2 | Artifact Aを検証した | Validation A=`failed`。Attempt 1は変更しない |
+| 3 | 修正モデルを呼び出した | implementer Attempt=`Succeeded`、input=A、output=Artifact B |
+| 4 | Artifact Bを検証した | Validation B=`passed` |
+| 5 | Artifact Bをreviewした | reviewer Attempt=`Succeeded`、ReviewVerdict B=`changes_requested` または `approved` |
+| 6 | Artifact Bを採否判断した | 監督Codexが証拠を評価してCodexDecisionを記録 |
 
-Attempt が `Failed` になっても Task は自動的に `Failed` にならない。Planner が retry / escalation の必要性を判断し、次の Attempt を作成する。検証成功後に Task を `Completed` とするか、追加の意味的判断を必要とするかは、Orchestrator が定めるポリシーに従って決定するが、AgentResult 単独では決定しない。
+reviewerが修正を求めても、reviewの呼び出し自体が正常ならreviewer Attemptは `Succeeded` である。review出力が欠ける・形式不正なら、そのAttemptは無効な出力として扱う。
 
-次の Attempt の処理内容は、失敗の原因に応じて Planner が決める。例えば、同じ worktree のコードを修正して再検証する「再実装」、別 Provider へ切り替える「escalation」、入力や制約を見直して再実行する処理などがあり得る。これらはすべて新しい Attempt として記録し、失敗した Attempt の状態を `Succeeded` に戻したり、失敗した Attempt 自体に再実装の結果を上書きしたりしない。
+## 成果物に結び付ける事実
 
-## cancellation
+`ValidationResult`はAttemptの状態ではない。対象Artifact、check定義、各checkの終了結果、診断、実行時刻を持つ。passは監督Codexの受入やTask完了を自動発生させず、failはAttemptを失敗へ書き換えない。成果物が変われば、古いValidationを新しい成果物のpublish gateに使えない。
 
-Task の cancellation は Task と、その時点で終了していない Attempt に適用する。Task が `Cancelled` になった後は、新しい Attempt を作成できない。実行中の Attempt は個別の停止結果を記録した上で `Cancelled` へ遷移する。
+reviewはreviewer roleの通常のAttemptとして実行し、正常なreviewer Attemptは対象ArtifactへのReviewVerdictを1件持てる。`approved` はreviewerの見解であり、`changes_requested` はreview処理の失敗ではない。
 
-Attempt だけを取り消す場合は、Task は `Active` のまま維持できる。別の Attempt が実行中でない場合に Task をどう終えるかは、Planner の判断を Orchestrator の `Failed` または `Cancelled` 遷移として適用する。
+監督Codexは差分、Validation、review、CI等を評価し、対象Artifactに次のCodexDecisionを残す。
 
-## Runtime との境界
+| 判断 | 意味 |
+| --- | --- |
+| `accepted` | この成果物を公開または完了判断に進めてよい |
+| `rejected` | この成果物は目的に対して採用しない |
+| `changes_requested` | 修正または追加調査が必要 |
 
-Herdr の pane ID、session ID、プロセス ID、Provider CLI の引数などは Runtime / Provider Adapter の責務であり、Core Domain の Task / Attempt の属性にはしない。必要な場合は Adapter 側の実行コンテキストや外部参照として扱い、Core Domain の状態遷移から分離する。
+AI reviewの `approved` は `CodexDecision.accepted` を代替しない。reviewは必須ではなく、監督Codexが必要性を判断する。判断記録には対象Artifact、理由、時刻、参照した証拠を残す。
 
-## v0 の範囲
+## Taskの状態と完了
 
-v0 では Task、Attempt、TaskRole、Provider 参照、TaskState、AttemptState、AgentResult、ValidationResult、Usage / Cost、cancellation と状態遷移のルールだけを扱う。SQLite の table schema、MCP JSON schema、Provider trait、Herdr Adapter、worktree 管理、Router / Planner prompt は別の設計または実装で決める。
+| `TaskState` | 意味 |
+| --- | --- |
+| `Pending` | 受け付けたが未開始 |
+| `Active` | モデル実行、検証、公開、または監督Codexの次の判断を待つ |
+| `Completed` | 監督Codexが完了条件を満たすと判断し、Operation Serviceが証拠参照とともに確定した |
+| `Failed` | 監督Codexが進められないと判断し、Operation Serviceが確定した |
+| `Cancelled` | 継続を明示的に取り消した |
 
-親子 Task、Task dependency、DAG、複雑な並列実行、Attempt ごとの新規 workspace 作成・再利用方針は本モデルに含めず、必要になった時点で別 Issue として決定する。
+`finish_task` は単一のAttempt、Validation、review verdictだけから自動実行してはならない。監督Codexが目的、採用成果物、必要なValidation、必要ならCI / 公開結果を指定し、Operation Serviceが同一Artifactとpolicyを照合して確定する。
 
-## 未解決事項
+Codex自身が編集した場合はAttemptを作らない。管理済みArtifactに対してValidation、CodexDecision、publish、CI、`finish_task` を順に記録すればよい。
 
-- `TaskRole` の固定 enum 化または拡張可能な識別子化は、Provider / Planner の契約を設計する Issue で決定する。
-- token、金額、quota の正確な単位と換算規則は、Provider 共通の Usage / Cost 契約を設計する Issue で決定する。
-- Attempt の失敗理由を型付き error として保持するかは、永続化と診断情報の設計時に決定する。
-- retry 時に同一 worktree を再利用するかは、Workspace / Runtime Adapter の設計時に決定する。
+## Operation Serviceとの境界
+
+監督Codexは目的の解釈、Provider / Model選択、実行・review・再試行の要否、成果物の採否、Task完了を判断する。Operation ServiceはTask ID、expected revision、request ID、workspace / Artifactの所属を検証し、操作受付・各事実・公開/CI参照を永続化する。Provider / Model、Validator、GitHub adapterを実行し、stale revision、busy、未知Provider / Model、policy違反、異なるArtifactへの証拠流用を外部副作用前に拒否する。これが #66 のOperation Service契約である。
+
+## 旧データとの互換性
+
+現行実装と旧Ledgerでは、AttemptはProvider終了後に `Validating` へ進み、旧 `Succeeded` は「検証成功」、旧 `Failed` は「Provider実行または検証失敗」を意味する。この意味を新しいAttemptStateに無断で変換しない。
+
+- migrationは既存の状態、AgentResult、ValidationResult、時刻、診断を消去・上書きしない
+- 旧レコードには `state_semantics_version: legacy_validation_coupled`（名称は実装時に確定）または同等の由来を保存し、旧 `Succeeded` は「当時の検証成功」と読む
+- 新規Operation Service経由のAttemptだけを `provider_call_v2` のような新しい意味論で保存し、`Succeeded` を「Provider呼び出し成功」と読む
+- 旧Attemptに根拠のないProvider成功、Artifact、verdict、CodexDecisionを推測して追加しない。Artifactを復元できない旧Validationは対象不明として保持する
+- 新旧を横断するAPI・集計は意味論バージョンを返すか、比較不能な値を `unknown` として区別する
+
+実際のSQLite schema、backfill可否、wire versionはmigration実装Issueで、既存データを読めるテストとともに決める。Provider trait、MCP JSON schema、GitHub publish、AI review Provider、worktreeの具体的な再利用・cleanup、並列実行はこの文書の対象外である。

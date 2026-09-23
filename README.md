@@ -2,11 +2,32 @@
 
 AI エージェントを活用した開発オーケストレーションのためのプロジェクトです。
 
+## インストールと使い方
+
+Rust toolchain を用意した環境では、リポジトリ直下で次を実行してインストールできます。
+
+```shell
+cargo install --path . --locked
+ai-dev-orchestrator --help
+ai-dev-orchestrator --version
+```
+
+リリースページには macOS の Apple Silicon (`aarch64-apple-darwin`) と Intel
+(`x86_64-apple-darwin`) 向け tar アーカイブを公開します。アーカイブには
+`ai-dev-orchestrator`、この README、`LICENSE` が含まれます。ダウンロード後は、同じ
+リリースの `SHA256SUMS` を取得して次のように検証してください。
+
+```shell
+shasum -a 256 -c SHA256SUMS
+tar -xzf ai-dev-orchestrator-<version>-<target>.tar.gz
+install <target>/ai-dev-orchestrator "$HOME/.local/bin/ai-dev-orchestrator"
+```
+
+検証に失敗したアーカイブは実行せず、再ダウンロードしてください。
+
 ## 外部 Agent CLI の実行
 
 外部 CLI は `ProcessRequest` に command、引数配列、作業ディレクトリ、環境変数、タイムアウトを指定し、`ProcessRunner` で実行できます。引数は shell 文字列へ連結されず、stdout / stderr と終了状態が `ProcessOutput` に集約されます。長時間実行を停止する場合は `CancellationToken` を渡して `cancel()` を呼び出してください。
-
-timeout / cancel時のprocess group停止、停止確認結果、部分ログと出力上限は、[ProcessRunner の停止と出力回収](docs/process-runner.md)を参照してください。
 
 ## AgentProvider 契約
 
@@ -14,17 +35,39 @@ Agent 実行先の違いは `AgentProvider` に閉じ込めます。実装は `P
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
-## Execution Ledger
+## Operation Ledger
 
-`SqliteExecutionLedger` は、外部 Provider の起動前に `OperationRequest` と request ID を保存し、同じ request ID の再送を同じ operation として返します。異なる payload の再送、古い Task revision、同一 Task の実行中操作は拒否します。Provider の成功・失敗・timeout・cancel・不正出力は終端事実として追記され、終端後に別の結果へ上書きできません。
+`SqliteOperationLedger` は、外部 Provider の起動前に operation と request ID を保存し、同じ request ID の再送を同じ operation として返します。異なる payload、古い Task revision、同一 Task の実行中操作は拒否します。終了事実、event、validation、review、usage / budget、publication 参照、上限付き raw log、再起動時の `recovery_required` 診断を保存します。
 
-stdout / stderr は `save_log` で上限付きのファイルへ保存し、Ledger にはファイル参照、byte 数、切り詰め有無だけを保持します。再起動時の非終端 operation は `recover` により `recovery_required` として返され、外部処理の成功を推測したり自動再実行したりしません。スキーマは SQLite の `user_version` で管理されます。
+## WorkspaceManager
 
-Antigravity CLI (`agy`) の headless Provider と手動 Live Provider Test の手順は、[Antigravity CLI Provider](docs/antigravity-provider.md) を参照してください。
+`WorkspaceManager` は Git リポジトリの root を解決し、リポジトリ外の管理ディレクトリに Task / Attempt ごとの専用 branch と Git worktree を作成します。Provider を実行する前に `validate_provider_workspace`（または `ensure_provider_workspace`）で実行先を検証してください。main の working tree や、Manager が作成していないパスは拒否されます。
 
-### Codex CLI Provider
+`cleanup`/`remove` は非 force で専用 worktree を削除します。未コミットの変更がある場合は型付き Git error を返し、worktree と内容を保持します。破棄が必要な場合だけ `cleanup_force` を明示的に呼び出してください。branch は agent のコミットを後続処理で確認できるよう保持されます。branch の merge や PR 作成は WorkspaceManager の責務ではありません。
+
+## Codex CLI Provider
 
 `CodexProvider` は `codex exec` を非対話モードで起動し、`ProviderRequest` の workspace を cwd として使用します。Codex CLI は `PATH` から解決され、実行時には workspace への書き込みを許可する `--sandbox workspace-write`、JSONL 出力の `--json`、実行状態を永続化しない `--ephemeral` を付けます。長時間実行は `execute_with_cancellation` に `CancellationToken` を渡して停止できます。
+
+## Codex Planner
+
+`CodexPlanner` は `codex exec` の `--output-schema` と `--output-last-message` を使って、Task の内容と Rust が観測した `ProviderAvailability` 一覧から、`PlannerDecision`（provider、reason、execution intent）を読み取ります。Planner は Task を不変借用するだけで、状態を変更しません。`PlannerService` が決定を `ValidatedPlannerDecision` に変換する前に、未知または利用不能な Provider を Rust 側で拒否します。Planner は `--sandbox read-only` と `--ephemeral` で実行され、schema と出力の一時ファイルは処理後に削除されます。
+
+## Validator
+
+`RustValidator` は明示された workspace を cwd として、`cargo fmt`、`cargo clippy`、`cargo test` の機械的なチェックを順番に実行します。全チェックを内包した aggregate の `ValidationResult` を1件返し、各コマンドの終了状態と stdout / stderr の診断は `ValidationResult::checks()` から参照できます。1つでも失敗した場合は aggregate を成功として扱いません。`CommandValidator` と `ValidationCheck` を使えば、同じ `Validator` API で決定的なチェック列も構成できます。
+
+## Orchestrator Service
+
+以下は現在のCLI Orchestrator実装の説明です。現行LedgerではAttemptのSucceeded/FailedがValidation結果と結合した旧意味論です（`legacy_validation_coupled`）。新しいMCP Operation Serviceの契約ではAttempt stateはProvider呼出し結果のみを表します。両者を同一のruntime semanticsとして扱わないでください。
+
+`Orchestrator`（`OrchestratorService` の別名）は、Pending の Task を Active にし、Task が所有する1つの Attempt を Queued から Running、Provider 実行、Validating へ進め、`Validator` の aggregate 結果を一度だけ適用します。検証成功時は Attempt が Succeeded、検証失敗時は Failed になります。Provider の失敗や Validator 自体の実行エラーも、失敗した Attempt と Workspace、診断を含む型付き `OrchestratorError` として返します。
+
+Retry / escalation は `RetryPolicy` と `ProviderResolver` を介して Orchestrator が制御します。`execute_decision` は PlannerDecision の意図だけを受け取り、Attempt ID、状態遷移、Provider 解決、Attempt ごとの Workspace 作成は Rust 側で行います。`max_attempts` は新しい Attempt を追加する前に検査され、終端 Task への追加は拒否されます。timeout / cancellation の retry は policy で明示的に許可した場合だけ可能です。`ProviderRegistry` は複数 Provider の本番配線と fake 差し替えに利用できます。
+
+Planner 経路では `ExecutionPolicy` と `execute_decision_with_policy` を使用してください。この hard gate は `max_attempts`、ProviderRegistry 解決、Provider 別 timeout、Provider availability を、Task / Attempt / workspace の変更より前に検査します。timeout は caller から受け取らず、policy に設定された値だけが ProviderRequest に渡されます。availability check は全 AgentProvider の必須境界で、未実装 Provider は fail-closed になります。
+
+Issue #30 の1 Attemptフローは、検証成功時も Task を Active のまま返します。Task全体の完了判断は後続の実行ポリシーで確定します。作成した worktree は Orchestrator が自動削除しないため、結果や未コミット変更を確認した後に `WorkspaceManager::cleanup`（または明示的な `cleanup_force`）を呼び出します。
 
 手動で実 Agent を呼ぶ Live Provider Test は通常のテストには含めません。Codex CLI の導入と認証を確認したうえで、変更してよい隔離 workspace を指定して次を実行します。
 
@@ -41,17 +84,48 @@ CODEX_PROVIDER_LIVE_WORKSPACE=/tmp/codex-provider-live \
 
 `CopilotProvider` は `copilot -p` を非対話で起動し、`ProviderRequest` の workspace を cwd として使用します。実行時には `-s --no-ask-user` と、既定でファイル変更・リポジトリ操作を許可する `--allow-tool=write,shell` を付けます。必要な権限だけに絞る場合は `with_allowed_tools` を使用してください。timeout / cancellation は `execute_with_cancellation` から指定できます。
 
+`ExecutionPolicy::new` と `with_timeout` は `Result` を返し、ゼロ値を構築時に拒否します。Planner 経路では `execute_validated_decision_with_policy` を通常入口として使い、`execute_decision_with_policy` は既存利用者向けの legacy 互換 API です。
+
 手動で実 Agent を呼ぶ Live Provider Test の手順は、[GitHub Copilot CLI Provider](docs/copilot-provider.md) を参照してください。
+
+Antigravity CLI (`agy`) の headless Provider と手動 Live Provider Test の手順は、[Antigravity CLI Provider](docs/antigravity-provider.md) を参照してください。
 
 ## アーキテクチャ
 
 主要コンポーネントの構造と、Codex、Rust Orchestrator、Provider、Validator の責務境界は、[初期アーキテクチャ](docs/architecture.md)を参照してください。
 
-現行Issue・実装の監査と、Codexを監督主体に据える構成案は、[最小実行基盤の再設計案](docs/minimal-runtime-review.md)を参照してください。これは採用確認前の提案であり、実行時の動作は変更していません。
+Provider / Model 選定へ渡す Task、利用状況、過去実績、Attempt 履歴と、role ごとの選定結果の構造は、[モデル選定の入力・出力仕様](docs/model-selection-spec.md)を参照してください。
+
+同じ開発作業で実装、レビュー、修正を行うときの記録方法と、完了にする判断は、
+[実装・レビュー・修正を記録する設計](docs/implementation-review-model.md)を参照してください。
+
+`Attempt` をモデル呼び出し1回の記録として扱い、機械検証、AI review verdict、監督Codexの受入、
+公開/CI、Task完了を成果物へ束縛する別の事実として扱うDomain契約は、
+[作業・モデル実行・成果物のドメインモデル](docs/domain-model.md)を参照してください。
+
+監督Codexが依頼できる操作と返る事実は、[MCP 操作契約の概要](docs/mcp-operation-contract.md)を参照してください。
+tool schema、冪等性、ページング、取消・エラー、secret / logの扱いは、同ページから[実装者向け詳細仕様](docs/mcp-operation-contract-reference.md)を参照できます。
 
 ## コード品質・テスト
 
 Rustコードに適用する必須検証、テスト種別、unsafeの扱いは、[Rustコード品質・テスト方針](docs/rust-quality.md)を参照してください。
+
+## Execution Ledger
+
+ローカル実行履歴は `SqliteExecutionLedger` に保存できます。`open(path)` は SQLite
+ファイルを開いて schema を初期化し、`open_in_memory()` は隔離された ledger を作成します。
+Task を `save_task` で保存した後、各 Attempt を `save_attempt` で保存してください。
+retry は別の Attempt ID として追加されます。
+
+## GitHub Workflow
+
+以下も現行GitHubWorkflowの挙動であり、MCP Operation Serviceの公開条件ではありません。MCP契約の`publication.publish`と`task.finish`は、対象Artifact、accepted CodexDecision、policy必須の証拠を別途照合します。
+
+`GitHubWorkflow` publishes only an `OrchestrationReport` whose aggregate
+`ValidationResult` passed. Commit, push, and pull-request effects are injected
+through fakeable traits and persisted as phases in the `SqliteExecutionLedger`,
+so interrupted publication resumes idempotently. See
+[`docs/github-workflow.md`](docs/github-workflow.md).
 
 ## Rust環境の準備
 

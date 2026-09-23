@@ -108,13 +108,10 @@ impl CopilotProvider {
                     "GitHub Copilot CLI availability check failed: {}",
                     output_diagnostic(&output.stdout, &output.stderr, output.exit_code())
                 )),
-                ProcessError::TimedOut(_)
-                | ProcessError::Cancelled(_)
-                | ProcessError::CancelledBeforeStart => ProviderError::Unavailable(
-                    "GitHub Copilot CLI availability check did not complete".to_owned(),
-                ),
-                ProcessError::Interrupted { diagnostic, .. } => {
-                    ProviderError::Unavailable(diagnostic)
+                ProcessError::TimedOut(_) | ProcessError::Cancelled(_) => {
+                    ProviderError::Unavailable(
+                        "GitHub Copilot CLI availability check did not complete".to_owned(),
+                    )
                 }
             })
     }
@@ -180,7 +177,6 @@ impl CopilotProvider {
 
     fn map_process_error(&self, error: ProcessError, timeout: Duration) -> ProviderError {
         match error {
-            ProcessError::CancelledBeforeStart => ProviderError::Cancelled,
             ProcessError::Spawn(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ProviderError::Unavailable(format!(
                     "GitHub Copilot CLI '{}' was not found; install it and ensure it is on PATH",
@@ -193,33 +189,8 @@ impl CopilotProvider {
             ProcessError::Io(error) => {
                 ProviderError::ExecutionFailed(format!("Copilot process I/O failed: {error}"))
             }
-            ProcessError::TimedOut(output) => ProviderError::Interrupted {
-                reason: crate::StopReason::TimedOut,
-                confirmed_stopped: true,
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                diagnostic: format!("timed out after {timeout:?}"),
-            },
-            ProcessError::Cancelled(output) => ProviderError::Interrupted {
-                reason: crate::StopReason::Cancelled,
-                confirmed_stopped: true,
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                diagnostic: "cancelled; managed process group stopped".into(),
-            },
-            ProcessError::Interrupted {
-                reason,
-                stopped,
-                stdout,
-                stderr,
-                diagnostic,
-            } => ProviderError::Interrupted {
-                reason,
-                confirmed_stopped: stopped,
-                stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                diagnostic,
-            },
+            ProcessError::TimedOut(_) => ProviderError::TimedOut { timeout },
+            ProcessError::Cancelled(_) => ProviderError::Cancelled,
             ProcessError::NonZeroExit(output) => {
                 let diagnostic =
                     output_diagnostic(&output.stdout, &output.stderr, output.exit_code());
@@ -244,6 +215,10 @@ impl AgentProvider for CopilotProvider {
 
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {
         self.execute_process(request, CancellationToken::new())
+    }
+
+    fn check_availability(&self) -> Result<(), ProviderError> {
+        CopilotProvider::check_availability(self)
     }
 
     fn execute_with_cancellation(
@@ -271,17 +246,11 @@ fn looks_like_authentication_failure(diagnostic: &str) -> bool {
     let diagnostic = diagnostic.to_ascii_lowercase();
     [
         "not logged in",
-        "not authenticated",
         "login required",
         "please log in",
-        "no authentication token",
         "authentication",
         "unauthorized",
         "unauthenticated",
-        "bad credentials",
-        "subscription required",
-        "copilot subscription",
-        "no access to copilot",
         "copilot requests",
         "gh_token",
         "github_token",
@@ -360,7 +329,7 @@ mod tests {
     #[test]
     fn diagnoses_authentication_failures() {
         let provider = CopilotProvider::with_executable("sh")
-            .with_command_prefix("printf 'Not authenticated: subscription required' >&2; exit 1");
+            .with_command_prefix("printf 'Not logged in' >&2; exit 1");
         let error = provider
             .execute(&request(Duration::from_secs(1)))
             .unwrap_err();
@@ -369,22 +338,6 @@ mod tests {
             error,
             ProviderError::Unavailable(message) if message.contains("/login")
         ));
-    }
-
-    #[test]
-    fn recognizes_common_authentication_diagnostics() {
-        for diagnostic in [
-            "not authenticated",
-            "no authentication token found",
-            "bad credentials",
-            "your Copilot subscription is required",
-            "no access to Copilot",
-        ] {
-            assert!(
-                looks_like_authentication_failure(diagnostic),
-                "expected authentication diagnostic: {diagnostic}"
-            );
-        }
     }
 
     #[cfg(unix)]
@@ -408,14 +361,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn maps_timeout_and_cancellation_from_process_runner() {
-        let provider = CopilotProvider::with_executable("sh")
-            .with_command_prefix("printf partial; exec sleep 10");
+        let provider = CopilotProvider::with_executable("sh").with_command_prefix("sleep 10");
         let timeout = provider
             .execute(&request(Duration::from_millis(20)))
             .unwrap_err();
-        assert!(
-            matches!(timeout, ProviderError::Interrupted { reason: crate::StopReason::TimedOut, stdout, .. } if stdout == "partial")
-        );
+        assert!(matches!(timeout, ProviderError::TimedOut { .. }));
 
         let cancellation = CancellationToken::new();
         let other = cancellation.clone();
@@ -427,10 +377,7 @@ mod tests {
 
         assert!(matches!(
             thread.join().unwrap(),
-            Err(ProviderError::Interrupted {
-                reason: crate::StopReason::Cancelled,
-                ..
-            })
+            Err(ProviderError::Cancelled)
         ));
     }
 

@@ -1,743 +1,1147 @@
-use std::{
-    fmt, fs, io,
-    path::{Path, PathBuf},
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
-};
+//! Local persistence for tasks and their immutable attempt history.
+//!
+//! The ledger stores timestamps as Unix milliseconds. Timestamps are optional so
+//! a queued attempt can be recorded before its provider starts.
+
+use std::{fmt, path::Path, sync::Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{ProviderRef, TaskId};
+use crate::{
+    AgentResult, Attempt, AttemptFailureReason, AttemptId, AttemptState, ProviderRef, Task, TaskId,
+    TaskRole, TaskState, UsageCost, UsageMetric, ValidationCheckResult, ValidationResult,
+};
 
-const SCHEMA_VERSION: u32 = 1;
-const DEFAULT_LOG_LIMIT: usize = 1024 * 1024;
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct OperationId(String);
-
-impl OperationId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OperationStatus {
-    Accepted,
-    Running,
-    Succeeded,
-    Failed,
-    InvalidOutput,
-    TimedOut,
-    Cancelled,
-    Interrupted,
-    RecoveryRequired,
-}
-
-impl OperationStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Accepted => "accepted",
-            Self::Running => "running",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::InvalidOutput => "invalid_output",
-            Self::TimedOut => "timed_out",
-            Self::Cancelled => "cancelled",
-            Self::Interrupted => "interrupted",
-            Self::RecoveryRequired => "recovery_required",
-        }
-    }
-    fn from_str(value: &str) -> Result<Self, LedgerError> {
-        match value {
-            "accepted" => Ok(Self::Accepted),
-            "running" => Ok(Self::Running),
-            "succeeded" => Ok(Self::Succeeded),
-            "failed" => Ok(Self::Failed),
-            "invalid_output" => Ok(Self::InvalidOutput),
-            "timed_out" => Ok(Self::TimedOut),
-            "cancelled" => Ok(Self::Cancelled),
-            "interrupted" => Ok(Self::Interrupted),
-            "recovery_required" => Ok(Self::RecoveryRequired),
-            _ => Err(LedgerError::InvalidValue(value.into())),
-        }
-    }
-    fn terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Succeeded | Self::Failed | Self::InvalidOutput | Self::TimedOut | Self::Cancelled
-        )
-    }
-}
-
+/// A persisted attempt together with the task it belongs to and execution times.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OperationRequest {
-    request_id: String,
+pub struct AttemptRecord {
     task_id: TaskId,
-    task_revision: u64,
-    payload: String,
-    instruction: String,
-    requested_provider: ProviderRef,
-    requested_model: Option<String>,
-}
-
-impl OperationRequest {
-    pub fn new(
-        request_id: impl Into<String>,
-        task_id: TaskId,
-        task_revision: u64,
-        payload: impl Into<String>,
-        instruction: impl Into<String>,
-        requested_provider: ProviderRef,
-        requested_model: Option<String>,
-    ) -> Self {
-        Self {
-            request_id: request_id.into(),
-            task_id,
-            task_revision,
-            payload: payload.into(),
-            instruction: instruction.into(),
-            requested_provider,
-            requested_model,
-        }
-    }
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-    pub fn task_id(&self) -> &TaskId {
-        &self.task_id
-    }
-    pub fn task_revision(&self) -> u64 {
-        self.task_revision
-    }
-    pub fn payload(&self) -> &str {
-        &self.payload
-    }
-    pub fn instruction(&self) -> &str {
-        &self.instruction
-    }
-    pub fn requested_provider(&self) -> &ProviderRef {
-        &self.requested_provider
-    }
-    pub fn requested_model(&self) -> Option<&str> {
-        self.requested_model.as_deref()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OperationRecord {
-    id: OperationId,
-    request: OperationRequest,
-    status: OperationStatus,
-    accepted_at: i64,
+    attempt: Attempt,
     started_at: Option<i64>,
     finished_at: Option<i64>,
-    observed_provider: Option<ProviderRef>,
-    observed_model: Option<String>,
-    diagnostic: Option<String>,
-    artifact_ref: Option<String>,
 }
 
-impl OperationRecord {
-    fn from_row(row: &rusqlite::Row<'_>) -> Result<Self, rusqlite::Error> {
-        let task_id: String = row.get(2)?;
-        let status: String = row.get(6)?;
-        Ok(Self {
-            id: OperationId::new(row.get::<_, String>(0)?),
-            request: OperationRequest::new(
-                row.get::<_, String>(1)?,
-                TaskId::new(task_id),
-                row.get::<_, i64>(3)? as u64,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                ProviderRef::new(row.get::<_, String>(7)?),
-                row.get(8)?,
-            ),
-            status: OperationStatus::from_str(&status)
-                .map_err(|_| rusqlite::Error::InvalidQuery)?,
-            accepted_at: row.get(9)?,
-            started_at: row.get(10)?,
-            finished_at: row.get(11)?,
-            observed_provider: row.get::<_, Option<String>>(12)?.map(ProviderRef::new),
-            observed_model: row.get(13)?,
-            diagnostic: row.get(14)?,
-            artifact_ref: row.get(15)?,
-        })
-    }
-    pub fn id(&self) -> &OperationId {
-        &self.id
-    }
-    pub fn request(&self) -> &OperationRequest {
-        &self.request
-    }
-    pub fn status(&self) -> OperationStatus {
-        self.status
-    }
-    pub fn accepted_at(&self) -> i64 {
-        self.accepted_at
-    }
-    pub fn started_at(&self) -> Option<i64> {
-        self.started_at
-    }
-    pub fn finished_at(&self) -> Option<i64> {
-        self.finished_at
-    }
-    pub fn observed_provider(&self) -> Option<&ProviderRef> {
-        self.observed_provider.as_ref()
-    }
-    pub fn observed_model(&self) -> Option<&str> {
-        self.observed_model.as_deref()
-    }
-    pub fn diagnostic(&self) -> Option<&str> {
-        self.diagnostic.as_deref()
-    }
-    pub fn artifact_ref(&self) -> Option<&str> {
-        self.artifact_ref.as_deref()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EventKind {
-    Accepted,
-    Started,
-    Finished,
-    Observation,
-    Failure,
-    Recovery,
-}
-impl EventKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Accepted => "accepted",
-            Self::Started => "started",
-            Self::Finished => "finished",
-            Self::Observation => "observation",
-            Self::Failure => "failure",
-            Self::Recovery => "recovery",
+impl AttemptRecord {
+    #[must_use]
+    pub fn new(
+        task_id: TaskId,
+        attempt: Attempt,
+        started_at: Option<i64>,
+        finished_at: Option<i64>,
+    ) -> Self {
+        Self {
+            task_id,
+            attempt,
+            started_at,
+            finished_at,
         }
     }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OperationEvent {
-    pub sequence: i64,
-    pub kind: EventKind,
-    pub occurred_at: i64,
-    pub detail: String,
-}
+    #[must_use]
+    pub const fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LogReference {
-    path: PathBuf,
-    byte_count: u64,
-    truncated: bool,
-}
-impl LogReference {
-    pub fn path(&self) -> &Path {
-        &self.path
+    #[must_use]
+    pub const fn attempt(&self) -> &Attempt {
+        &self.attempt
     }
-    pub fn byte_count(&self) -> u64 {
-        self.byte_count
+
+    #[must_use]
+    pub const fn started_at(&self) -> Option<i64> {
+        self.started_at
     }
-    pub fn truncated(&self) -> bool {
-        self.truncated
+
+    #[must_use]
+    pub const fn finished_at(&self) -> Option<i64> {
+        self.finished_at
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidationRecord {
-    pub artifact_ref: String,
-    pub passed: bool,
-    pub summary: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UsageRecord {
-    pub input_units: Option<String>,
-    pub output_units: Option<String>,
-    pub cost: Option<String>,
-    pub currency: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReviewRecord {
-    pub artifact_ref: String,
-    pub verdict: String,
-    pub summary: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublicationReference {
-    pub repository: String,
-    pub branch: Option<String>,
-    pub commit_sha: Option<String>,
-    pub pull_request_url: Option<String>,
-    pub ci_sha: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecoveryRecord {
-    pub operation: OperationId,
-    pub status: OperationStatus,
-    pub reason: String,
-}
-
+/// Errors returned by the local execution ledger.
 #[derive(Debug)]
 pub enum LedgerError {
     Sqlite(rusqlite::Error),
-    Io(io::Error),
-    InvalidValue(String),
-    RequestConflict { request_id: String },
-    StaleRevision { expected: u64, actual: u64 },
-    ActiveOperation(OperationId),
-    TerminalConflict(OperationId),
-    UnsupportedSchema(u32),
+    InvalidStoredValue(String),
+    UnsupportedSchemaVersion(u32),
 }
+
 impl fmt::Display for LedgerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Sqlite(e) => write!(f, "ledger database error: {e}"),
-            Self::Io(e) => write!(f, "ledger log error: {e}"),
-            Self::InvalidValue(v) => write!(f, "invalid ledger value: {v}"),
-            Self::RequestConflict { request_id } => {
-                write!(f, "request id has a different payload: {request_id}")
+            Self::Sqlite(error) => write!(formatter, "execution ledger database error: {error}"),
+            Self::InvalidStoredValue(value) => {
+                write!(formatter, "invalid execution ledger value: {value}")
             }
-            Self::StaleRevision { expected, actual } => write!(
-                f,
-                "stale task revision: expected {expected}, actual {actual}"
-            ),
-            Self::ActiveOperation(id) => {
-                write!(f, "task already has an active operation: {}", id.as_str())
+            Self::UnsupportedSchemaVersion(version) => {
+                write!(
+                    formatter,
+                    "unsupported execution ledger schema version: {version}"
+                )
             }
-            Self::TerminalConflict(id) => write!(
-                f,
-                "terminal operation cannot be overwritten: {}",
-                id.as_str()
-            ),
-            Self::UnsupportedSchema(v) => write!(f, "unsupported ledger schema: {v}"),
         }
     }
 }
-impl std::error::Error for LedgerError {}
+
+impl std::error::Error for LedgerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Sqlite(error) => Some(error),
+            Self::InvalidStoredValue(_) | Self::UnsupportedSchemaVersion(_) => None,
+        }
+    }
+}
+
 impl From<rusqlite::Error> for LedgerError {
-    fn from(value: rusqlite::Error) -> Self {
-        Self::Sqlite(value)
-    }
-}
-impl From<io::Error> for LedgerError {
-    fn from(value: io::Error) -> Self {
-        Self::Io(value)
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
     }
 }
 
-pub trait ExecutionLedger {
-    fn accept_operation(&self, request: &OperationRequest) -> Result<OperationRecord, LedgerError>;
-    fn get_operation(&self, id: &OperationId) -> Result<Option<OperationRecord>, LedgerError>;
-    fn finish_operation(
-        &self,
-        id: &OperationId,
-        status: OperationStatus,
-        diagnostic: Option<&str>,
-    ) -> Result<(), LedgerError>;
-}
-
+/// SQLite-backed local execution ledger.
 pub struct SqliteExecutionLedger {
     connection: Mutex<Connection>,
-    log_limit: usize,
+}
+
+type PublicationRow = (
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type PublicationTaskRow = (
+    String,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+const LATEST_SCHEMA_VERSION: u32 = 6;
+
+/// Repository boundary for local task and attempt history.
+pub trait ExecutionLedger {
+    fn save_task(&self, task: &Task) -> Result<(), LedgerError>;
+    fn get_task(&self, task_id: &TaskId) -> Result<Option<Task>, LedgerError>;
+    fn save_attempt(
+        &self,
+        task_id: &TaskId,
+        attempt: &Attempt,
+        started_at: Option<i64>,
+        finished_at: Option<i64>,
+    ) -> Result<(), LedgerError>;
+    fn get_attempt(
+        &self,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+    ) -> Result<Option<AttemptRecord>, LedgerError>;
+    fn list_attempts(&self, task_id: &TaskId) -> Result<Vec<AttemptRecord>, LedgerError>;
 }
 
 impl SqliteExecutionLedger {
+    /// Opens (and initializes) a ledger at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
-        Self::from_connection(Connection::open(path)?)
+        let connection = Connection::open(path)?;
+        Self::from_connection(connection)
     }
+
+    /// Opens an isolated in-memory ledger, useful for deterministic tests.
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         Self::from_connection(Connection::open_in_memory()?)
     }
+
+    /// Alias for [`Self::open_in_memory`].
+    pub fn in_memory() -> Result<Self, LedgerError> {
+        Self::open_in_memory()
+    }
+
     fn from_connection(connection: Connection) -> Result<Self, LedgerError> {
+        // SQLite only allows changing this setting outside a transaction.  Set it
+        // before starting the schema transaction so it also protects migrations.
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-        let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > SCHEMA_VERSION {
-            return Err(LedgerError::UnsupportedSchema(version));
+        let transaction = connection.unchecked_transaction()?;
+        let version: u32 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > LATEST_SCHEMA_VERSION {
+            return Err(LedgerError::UnsupportedSchemaVersion(version));
         }
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL, instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT, status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT); CREATE TABLE IF NOT EXISTS task_revisions (task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence)); CREATE TABLE IF NOT EXISTS log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream)); CREATE TABLE IF NOT EXISTS validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT); CREATE TABLE IF NOT EXISTS budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT); PRAGMA user_version = 1;")?;
+        let has_tasks: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks')",
+            [],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?;
+        if !has_tasks {
+            create_latest_schema(&transaction)?;
+            set_schema_version(&transaction, LATEST_SCHEMA_VERSION)?;
+        } else {
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS tasks (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 description TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 state TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS attempts (
+                 task_id TEXT NOT NULL,
+                 id TEXT NOT NULL,
+                 provider TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 started_at INTEGER,
+                 finished_at INTEGER,
+                 PRIMARY KEY (task_id, id),
+                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS agent_results (
+                 task_id TEXT NOT NULL,
+                 attempt_id TEXT NOT NULL,
+                 summary TEXT NOT NULL,
+                 reported_success INTEGER NOT NULL,
+                 PRIMARY KEY (task_id, attempt_id),
+                 FOREIGN KEY (task_id, attempt_id)
+                     REFERENCES attempts(task_id, id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS validation_results (
+                 task_id TEXT NOT NULL,
+                 attempt_id TEXT NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 summary TEXT NOT NULL,
+                 passed INTEGER NOT NULL,
+                 PRIMARY KEY (task_id, attempt_id, sequence),
+                 FOREIGN KEY (task_id, attempt_id)
+                     REFERENCES attempts(task_id, id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS validation_checks (
+                 task_id TEXT NOT NULL,
+                 attempt_id TEXT NOT NULL,
+                 validation_sequence INTEGER NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 passed INTEGER NOT NULL,
+                 exit_status INTEGER,
+                 diagnostics TEXT NOT NULL,
+                 PRIMARY KEY (task_id, attempt_id, validation_sequence, sequence),
+                 FOREIGN KEY (task_id, attempt_id, validation_sequence)
+                     REFERENCES validation_results(task_id, attempt_id, sequence)
+                     ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS usage_metrics (
+                 task_id TEXT NOT NULL,
+                 attempt_id TEXT NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 unit TEXT NOT NULL,
+                 PRIMARY KEY (task_id, attempt_id, sequence),
+                 FOREIGN KEY (task_id, attempt_id)
+                     REFERENCES attempts(task_id, id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS publications (
+                 idempotency_key TEXT PRIMARY KEY NOT NULL,
+                 task_id TEXT,
+                 repository TEXT NOT NULL,
+                 branch TEXT NOT NULL,
+                 commit_sha TEXT,
+                 pull_request TEXT,
+                 phase TEXT NOT NULL,
+                 workspace TEXT, base TEXT, title TEXT, body TEXT
+             );",
+            )?;
+            migrate_schema(&transaction, version)?;
+        }
+        transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
-            log_limit: DEFAULT_LOG_LIMIT,
         })
     }
-    pub fn set_log_limit(&mut self, bytes: usize) {
-        self.log_limit = bytes;
-    }
-    pub fn set_task_revision(&self, task_id: &TaskId, revision: u64) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.execute("INSERT INTO task_revisions(task_id, revision) VALUES(?1, ?2) ON CONFLICT(task_id) DO UPDATE SET revision=excluded.revision", params![task_id.as_str(), revision])?;
-        Ok(())
-    }
-    pub fn append_event(
+
+    pub fn load_publication(
         &self,
-        id: &OperationId,
-        kind: EventKind,
-        detail: impl Into<String>,
-    ) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        let sequence: i64 = connection.query_row(
-            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM operation_events WHERE operation_id=?1",
-            params![id.as_str()],
-            |row| row.get(0),
-        )?;
-        connection.execute(
-            "INSERT INTO operation_events VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![id.as_str(), sequence, kind.as_str(), now(), detail.into()],
-        )?;
-        Ok(())
+        key: &str,
+    ) -> Result<Option<crate::github_workflow::PublicationRecord>, LedgerError> {
+        let connection = self.lock_connection()?;
+        let row: Option<PublicationRow> = connection.query_row(
+            "SELECT task_id, repository, branch, commit_sha, pull_request, phase, workspace, base, title, body FROM publications WHERE idempotency_key = ?1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?)),
+        ).optional()?;
+        row.map(
+            |(task_id, repository, branch, commit, pr, phase, workspace, base, title, body)| {
+                crate::github_workflow::PublicationRecord::restore(
+                    key.to_owned(),
+                    task_id,
+                    repository,
+                    branch,
+                    commit,
+                    pr,
+                    phase,
+                    workspace,
+                    base,
+                    title,
+                    body,
+                )
+            },
+        )
+        .transpose()
     }
-    pub fn events(&self, id: &OperationId) -> Result<Vec<OperationEvent>, LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        let mut statement = connection.prepare("SELECT sequence, kind, occurred_at, detail FROM operation_events WHERE operation_id=?1 ORDER BY sequence")?;
-        let rows = statement.query_map(params![id.as_str()], |row| {
-            let kind: String = row.get(1)?;
-            let kind = match kind.as_str() {
-                "accepted" => EventKind::Accepted,
-                "started" => EventKind::Started,
-                "finished" => EventKind::Finished,
-                "observation" => EventKind::Observation,
-                "failure" => EventKind::Failure,
-                "recovery" => EventKind::Recovery,
-                _ => return Err(rusqlite::Error::InvalidQuery),
-            };
-            Ok(OperationEvent {
-                sequence: row.get(0)?,
-                kind,
-                occurred_at: row.get(2)?,
-                detail: row.get(3)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-    pub fn start_operation(
+
+    /// Looks up the publication associated with the conventional `issue-N` task id.
+    /// Legacy records with a null task id are intentionally not inferred.
+    pub fn load_publication_for_task(
         &self,
-        id: &OperationId,
-        observed_provider: &ProviderRef,
-        observed_model: Option<&str>,
-    ) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        let started = now();
-        connection.execute("UPDATE operations SET status='running', started_at=?2, observed_provider=?3, observed_model=?4 WHERE id=?1 AND status='accepted'", params![id.as_str(), started, observed_provider.as_str(), observed_model])?;
-        let sequence: i64 = connection.query_row(
-            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM operation_events WHERE operation_id=?1",
-            params![id.as_str()],
-            |row| row.get(0),
-        )?;
-        connection.execute(
-            "INSERT INTO operation_events VALUES(?1,?2,'started',?3,?4)",
-            params![
-                id.as_str(),
-                sequence,
-                started,
-                observed_model.unwrap_or(observed_provider.as_str())
-            ],
-        )?;
-        Ok(())
+        task_id: &crate::TaskId,
+    ) -> Result<Option<crate::github_workflow::PublicationRecord>, LedgerError> {
+        let connection = self.lock_connection()?;
+        let row: Option<PublicationTaskRow> = connection
+            .query_row(
+                "SELECT idempotency_key, task_id, repository, branch, commit_sha, pull_request, phase, workspace, base, title, body
+             FROM publications WHERE task_id = ?1 ORDER BY rowid DESC LIMIT 1",
+                params![task_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?)),
+            )
+            .optional()?;
+        row.map(
+            |(
+                key,
+                task_id,
+                repository,
+                branch,
+                commit,
+                pr,
+                phase,
+                workspace,
+                base,
+                title,
+                body,
+            )| {
+                crate::github_workflow::PublicationRecord::restore(
+                    key, task_id, repository, branch, commit, pr, phase, workspace, base, title,
+                    body,
+                )
+            },
+        )
+        .transpose()
     }
-    pub fn save_log(
-        &self,
-        id: &OperationId,
-        stream: &str,
-        directory: impl AsRef<Path>,
-        content: &[u8],
-    ) -> Result<LogReference, LedgerError> {
-        let limit = self.log_limit.min(content.len());
-        let truncated = limit < content.len();
-        let directory = directory.as_ref();
-        fs::create_dir_all(directory)?;
-        let path = directory.join(format!("{}-{stream}.log", id.as_str()));
-        fs::write(&path, &content[..limit])?;
-        let reference = LogReference {
-            path,
-            byte_count: limit as u64,
-            truncated,
-        };
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.execute(
-            "INSERT OR REPLACE INTO log_references VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![
-                id.as_str(),
-                stream,
-                reference.path.to_string_lossy().as_ref(),
-                reference.byte_count as i64,
-                reference.truncated
-            ],
-        )?;
-        Ok(reference)
-    }
-    pub fn save_validation(
-        &self,
-        id: &OperationId,
-        validation: &ValidationRecord,
-    ) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.execute(
-            "INSERT OR REPLACE INTO validations VALUES(?1, ?2, ?3, ?4)",
-            params![
-                id.as_str(),
-                validation.artifact_ref,
-                validation.passed,
-                validation.summary
-            ],
-        )?;
-        Ok(())
-    }
-    pub fn save_review(&self, id: &OperationId, review: &ReviewRecord) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.execute(
-            "INSERT OR REPLACE INTO reviews VALUES(?1, ?2, ?3, ?4)",
-            params![
-                id.as_str(),
-                review.artifact_ref,
-                review.verdict,
-                review.summary
-            ],
-        )?;
-        Ok(())
-    }
-    pub fn save_usage(&self, id: &OperationId, usage: &UsageRecord) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.execute(
-            "INSERT OR REPLACE INTO usage VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![
-                id.as_str(),
-                usage.input_units,
-                usage.output_units,
-                usage.cost,
-                usage.currency
-            ],
-        )?;
-        Ok(())
-    }
-    pub fn reserve_budget(&self, id: &OperationId, amount: &str) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.execute(
-            "INSERT OR IGNORE INTO budget_reservations VALUES(?1, ?2, NULL, 'reserved')",
-            params![id.as_str(), amount],
-        )?;
-        Ok(())
-    }
-    pub fn settle_budget(&self, id: &OperationId, amount: &str) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.execute("UPDATE budget_reservations SET settled_amount=?2, state='settled' WHERE operation_id=?1 AND state='reserved'", params![id.as_str(), amount])?;
-        Ok(())
-    }
+
     pub fn save_publication(
         &self,
-        id: &OperationId,
-        publication: &PublicationReference,
+        record: &crate::github_workflow::PublicationRecord,
     ) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
+        let connection = self.lock_connection()?;
         connection.execute(
-            "INSERT OR REPLACE INTO publications VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO publications (idempotency_key, task_id, repository, branch, commit_sha, pull_request, phase, workspace, base, title, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(idempotency_key) DO UPDATE SET repository=excluded.repository,
+             task_id=COALESCE(excluded.task_id, publications.task_id), branch=excluded.branch, commit_sha=excluded.commit_sha, pull_request=excluded.pull_request, phase=excluded.phase, workspace=COALESCE(excluded.workspace, publications.workspace), base=COALESCE(excluded.base, publications.base), title=COALESCE(excluded.title, publications.title), body=COALESCE(excluded.body, publications.body)",
+            params![record.idempotency_key(), record.task_id(), record.repository(), record.branch(), record.commit_sha(), record.pull_request(), record.phase().as_str(), record.workspace().map(|p| p.to_string_lossy().into_owned()), record.base(), record.title(), record.body()],
+        )?;
+        Ok(())
+    }
+
+    /// Saves task metadata. Existing attempt rows are retained and loaded by
+    /// [`Self::get_task`], so updating a task cannot erase its history.
+    pub fn save_task(&self, task: &Task) -> Result<(), LedgerError> {
+        let connection = self.lock_connection()?;
+        connection.execute(
+            "INSERT INTO tasks (id, description, role, state) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET description = excluded.description,
+                 role = excluded.role, state = excluded.state",
             params![
-                id.as_str(),
-                publication.repository,
-                publication.branch,
-                publication.commit_sha,
-                publication.pull_request_url,
-                publication.ci_sha
+                task.id().as_str(),
+                task.description(),
+                task.role().as_str(),
+                task_state_to_str(task.state()),
             ],
         )?;
         Ok(())
     }
-    pub fn recover(&self) -> Result<Vec<RecoveryRecord>, LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        let mut statement = connection.prepare("SELECT id, status FROM operations WHERE status IN ('accepted','running','interrupted')")?;
-        let ids = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut records = Vec::new();
-        for item in ids {
-            let (id, status) = item?;
-            let status = OperationStatus::from_str(&status)?;
-            connection.execute("UPDATE operations SET status='recovery_required' WHERE id=?1 AND status NOT IN ('succeeded','failed','invalid_output','timed_out','cancelled')", params![id])?;
-            records.push(RecoveryRecord {
-                operation: OperationId::new(id),
-                status: OperationStatus::RecoveryRequired,
-                reason: format!(
-                    "operation was not terminal at restart (previously {})",
-                    status.as_str()
-                ),
-            });
+
+    /// Retrieves a task and all of its attempts, ordered by insertion id.
+    pub fn get_task(&self, task_id: &TaskId) -> Result<Option<Task>, LedgerError> {
+        let connection = self.lock_connection()?;
+        let task = connection
+            .query_row(
+                "SELECT description, role, state FROM tasks WHERE id = ?1",
+                params![task_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((description, role, state)) = task else {
+            return Ok(None);
+        };
+        let attempts = self.load_attempts(&connection, task_id)?;
+        Ok(Some(Task::restore(
+            task_id.clone(),
+            description,
+            TaskRole::new(role),
+            task_state_from_str(&state)?,
+            attempts.into_iter().map(|record| record.attempt).collect(),
+        )))
+    }
+
+    /// Inserts or updates one attempt without affecting any other attempt.
+    pub fn save_attempt(
+        &self,
+        task_id: &TaskId,
+        attempt: &Attempt,
+        started_at: Option<i64>,
+        finished_at: Option<i64>,
+    ) -> Result<(), LedgerError> {
+        let record = AttemptRecord::new(task_id.clone(), attempt.clone(), started_at, finished_at);
+        self.save_attempt_record(&record)
+    }
+
+    /// Inserts or updates one attempt record.
+    pub fn save_attempt_record(&self, record: &AttemptRecord) -> Result<(), LedgerError> {
+        let connection = self.lock_connection()?;
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO attempts (task_id, id, provider, state, started_at, finished_at, failure_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(task_id, id) DO UPDATE SET provider = excluded.provider,
+                 state = excluded.state, started_at = excluded.started_at,
+                 finished_at = excluded.finished_at, failure_reason = excluded.failure_reason",
+            params![
+                record.task_id().as_str(),
+                record.attempt().id().as_str(),
+                record.attempt().provider().as_str(),
+                attempt_state_to_str(record.attempt().state()),
+                record.started_at(),
+                record.finished_at(),
+                record.attempt().failure_reason().map(failure_reason_to_str),
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_results WHERE task_id = ?1 AND attempt_id = ?2",
+            params![record.task_id().as_str(), record.attempt().id().as_str()],
+        )?;
+        if let Some(result) = record.attempt().agent_result() {
+            transaction.execute(
+                "INSERT INTO agent_results
+                 (task_id, attempt_id, summary, reported_success) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    record.task_id().as_str(),
+                    record.attempt().id().as_str(),
+                    result.summary(),
+                    bool_to_int(result.reported_success()),
+                ],
+            )?;
         }
-        Ok(records)
+        transaction.execute(
+            "DELETE FROM validation_results WHERE task_id = ?1 AND attempt_id = ?2",
+            params![record.task_id().as_str(), record.attempt().id().as_str()],
+        )?;
+        for (sequence, result) in record.attempt().validation_results().iter().enumerate() {
+            let sequence = i64::try_from(sequence).map_err(|_| {
+                LedgerError::InvalidStoredValue("validation sequence overflow".into())
+            })?;
+            transaction.execute(
+                "INSERT INTO validation_results
+                 (task_id, attempt_id, sequence, summary, passed) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    record.task_id().as_str(),
+                    record.attempt().id().as_str(),
+                    sequence,
+                    result.summary(),
+                    bool_to_int(result.passed()),
+                ],
+            )?;
+            for (check_sequence, check) in result.checks().iter().enumerate() {
+                let check_sequence = i64::try_from(check_sequence).map_err(|_| {
+                    LedgerError::InvalidStoredValue("validation check sequence overflow".into())
+                })?;
+                transaction.execute(
+                    "INSERT INTO validation_checks
+                     (task_id, attempt_id, validation_sequence, sequence, name, passed,
+                      exit_status, diagnostics)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        record.task_id().as_str(),
+                        record.attempt().id().as_str(),
+                        sequence,
+                        check_sequence,
+                        check.name(),
+                        bool_to_int(check.passed()),
+                        check.exit_status(),
+                        check.diagnostics(),
+                    ],
+                )?;
+            }
+        }
+        transaction.execute(
+            "DELETE FROM usage_metrics WHERE task_id = ?1 AND attempt_id = ?2",
+            params![record.task_id().as_str(), record.attempt().id().as_str()],
+        )?;
+        if let Some(usage) = record.attempt().usage_cost() {
+            for (sequence, metric) in usage.metrics().iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO usage_metrics
+                     (task_id, attempt_id, sequence, name, value, unit)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        record.task_id().as_str(),
+                        record.attempt().id().as_str(),
+                        i64::try_from(sequence).map_err(|_| {
+                            LedgerError::InvalidStoredValue("usage sequence overflow".into())
+                        })?,
+                        metric.name(),
+                        metric.value(),
+                        metric.unit(),
+                    ],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
-    fn load(&self, id: &OperationId) -> Result<Option<OperationRecord>, LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.query_row("SELECT id, request_id, task_id, task_revision, payload, instruction, status, requested_provider, requested_model, accepted_at, started_at, finished_at, observed_provider, observed_model, diagnostic, artifact_ref FROM operations WHERE id=?1", params![id.as_str()], OperationRecord::from_row).optional().map_err(Into::into)
+
+    /// Retrieves one attempt for a task.
+    pub fn get_attempt(
+        &self,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+    ) -> Result<Option<AttemptRecord>, LedgerError> {
+        let connection = self.lock_connection()?;
+        let record = connection
+            .query_row(
+                "SELECT provider, state, started_at, finished_at, failure_reason
+                 FROM attempts WHERE task_id = ?1 AND id = ?2",
+                params![task_id.as_str(), attempt_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((provider, state, started_at, finished_at, reason)) = record else {
+            return Ok(None);
+        };
+        let attempt = self.load_attempt_details(
+            &connection,
+            task_id,
+            attempt_id,
+            ProviderRef::new(provider),
+            attempt_state_from_str(&state)?,
+            reason.map(|r| failure_reason_from_str(&r)).transpose()?,
+        )?;
+        Ok(Some(AttemptRecord::new(
+            task_id.clone(),
+            attempt,
+            started_at,
+            finished_at,
+        )))
     }
+
+    /// Retrieves every attempt for a task in insertion order.
+    pub fn list_attempts(&self, task_id: &TaskId) -> Result<Vec<AttemptRecord>, LedgerError> {
+        let connection = self.lock_connection()?;
+        self.load_attempts(&connection, task_id)
+    }
+
+    fn load_attempts(
+        &self,
+        connection: &Connection,
+        task_id: &TaskId,
+    ) -> Result<Vec<AttemptRecord>, LedgerError> {
+        let mut statement = connection.prepare(
+            "SELECT id, provider, state, started_at, finished_at, failure_reason
+             FROM attempts WHERE task_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = statement.query_map(params![task_id.as_str()], |row| {
+            Ok((
+                AttemptId::new(row.get::<_, String>(0)?),
+                ProviderRef::new(row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut attempts = Vec::new();
+        for row in rows {
+            let (attempt_id, provider, state, started_at, finished_at, reason) = row?;
+            let attempt = self.load_attempt_details(
+                connection,
+                task_id,
+                &attempt_id,
+                provider,
+                attempt_state_from_str(&state)?,
+                reason.map(|r| failure_reason_from_str(&r)).transpose()?,
+            )?;
+            attempts.push(AttemptRecord::new(
+                task_id.clone(),
+                attempt,
+                started_at,
+                finished_at,
+            ));
+        }
+        Ok(attempts)
+    }
+
+    fn load_attempt_details(
+        &self,
+        connection: &Connection,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+        provider: ProviderRef,
+        state: AttemptState,
+        failure_reason: Option<AttemptFailureReason>,
+    ) -> Result<Attempt, LedgerError> {
+        let agent_result = connection
+            .query_row(
+                "SELECT summary, reported_success FROM agent_results
+                 WHERE task_id = ?1 AND attempt_id = ?2",
+                params![task_id.as_str(), attempt_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let agent_result = agent_result
+            .map(|(summary, reported_success)| {
+                int_to_bool(reported_success)
+                    .map(|reported_success| AgentResult::new(summary, reported_success))
+            })
+            .transpose()?;
+        let aggregate_rows = {
+            let mut statement = connection.prepare(
+                "SELECT sequence, summary, passed FROM validation_results
+                 WHERE task_id = ?1 AND attempt_id = ?2 ORDER BY sequence",
+            )?;
+            let rows =
+                statement.query_map(params![task_id.as_str(), attempt_id.as_str()], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut validations = Vec::with_capacity(aggregate_rows.len());
+        for (sequence, summary, passed) in aggregate_rows {
+            let mut statement = connection.prepare(
+                "SELECT name, passed, exit_status, diagnostics
+                 FROM validation_checks
+                 WHERE task_id = ?1 AND attempt_id = ?2 AND validation_sequence = ?3
+                 ORDER BY sequence",
+            )?;
+            let rows = statement.query_map(
+                params![task_id.as_str(), attempt_id.as_str(), sequence],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i32>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?;
+            let mut checks = Vec::new();
+            for row in rows {
+                let (name, check_passed, exit_status, diagnostics) = row?;
+                checks.push(ValidationCheckResult::new(
+                    name,
+                    int_to_bool(check_passed)?,
+                    exit_status,
+                    diagnostics,
+                ));
+            }
+            validations.push(ValidationResult::restore(
+                summary,
+                int_to_bool(passed)?,
+                checks,
+            ));
+        }
+        let mut metrics = Vec::new();
+        let mut statement = connection.prepare(
+            "SELECT name, value, unit FROM usage_metrics
+             WHERE task_id = ?1 AND attempt_id = ?2 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map(params![task_id.as_str(), attempt_id.as_str()], |row| {
+            Ok(UsageMetric::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            metrics.push(row?);
+        }
+        let usage_cost = (!metrics.is_empty()).then(|| UsageCost::new(metrics));
+        Ok(Attempt::restore(
+            attempt_id.clone(),
+            provider,
+            state,
+            agent_result,
+            validations,
+            usage_cost,
+            failure_reason,
+        ))
+    }
+
+    fn lock_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, LedgerError> {
+        self.connection.lock().map_err(|_| {
+            LedgerError::InvalidStoredValue("execution ledger mutex was poisoned".into())
+        })
+    }
+}
+
+fn set_schema_version(connection: &Connection, version: u32) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(&format!("PRAGMA user_version = {version};"))
+}
+
+fn create_latest_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY NOT NULL, description TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL);
+         CREATE TABLE attempts (task_id TEXT NOT NULL, id TEXT NOT NULL, provider TEXT NOT NULL, state TEXT NOT NULL,
+             started_at INTEGER, finished_at INTEGER, failure_reason TEXT, PRIMARY KEY (task_id, id),
+             FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE);
+         CREATE TABLE agent_results (task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, summary TEXT NOT NULL,
+             reported_success INTEGER NOT NULL, PRIMARY KEY (task_id, attempt_id),
+             FOREIGN KEY (task_id, attempt_id) REFERENCES attempts(task_id, id) ON DELETE CASCADE);
+         CREATE TABLE validation_results (task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+             summary TEXT NOT NULL, passed INTEGER NOT NULL, PRIMARY KEY (task_id, attempt_id, sequence),
+             FOREIGN KEY (task_id, attempt_id) REFERENCES attempts(task_id, id) ON DELETE CASCADE);
+         CREATE TABLE validation_checks (task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, validation_sequence INTEGER NOT NULL,
+             sequence INTEGER NOT NULL, name TEXT NOT NULL, passed INTEGER NOT NULL, exit_status INTEGER, diagnostics TEXT NOT NULL,
+             PRIMARY KEY (task_id, attempt_id, validation_sequence, sequence),
+             FOREIGN KEY (task_id, attempt_id, validation_sequence)
+                 REFERENCES validation_results(task_id, attempt_id, sequence) ON DELETE CASCADE);
+         CREATE TABLE usage_metrics (task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+             name TEXT NOT NULL, value TEXT NOT NULL, unit TEXT NOT NULL, PRIMARY KEY (task_id, attempt_id, sequence),
+             FOREIGN KEY (task_id, attempt_id) REFERENCES attempts(task_id, id) ON DELETE CASCADE);
+         CREATE TABLE publications (idempotency_key TEXT PRIMARY KEY NOT NULL, task_id TEXT, repository TEXT NOT NULL,
+             branch TEXT NOT NULL, commit_sha TEXT, pull_request TEXT, phase TEXT NOT NULL,
+             workspace TEXT, base TEXT, title TEXT, body TEXT);",
+    )
+}
+
+fn column_exists(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, rusqlite::Error> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), rusqlite::Error> {
+    if !column_exists(connection, table, column)? {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerError> {
+    // Each step is idempotent so version-zero databases from every historical
+    // generation can be upgraded while retaining all existing row values.
+    for target in (version + 1)..=LATEST_SCHEMA_VERSION {
+        match target {
+            1 => add_column_if_missing(connection, "attempts", "failure_reason", "TEXT")?,
+            2 => add_column_if_missing(connection, "publications", "task_id", "TEXT")?,
+            3 => add_column_if_missing(connection, "publications", "workspace", "TEXT")?,
+            4 => add_column_if_missing(connection, "publications", "base", "TEXT")?,
+            5 => add_column_if_missing(connection, "publications", "title", "TEXT")?,
+            6 => add_column_if_missing(connection, "publications", "body", "TEXT")?,
+            _ => unreachable!(),
+        }
+        set_schema_version(connection, target)?;
+    }
+    Ok(())
 }
 
 impl ExecutionLedger for SqliteExecutionLedger {
-    fn accept_operation(&self, request: &OperationRequest) -> Result<OperationRecord, LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        if let Some(existing) = connection.query_row("SELECT id, request_id, task_id, task_revision, payload, instruction, status, requested_provider, requested_model, accepted_at, started_at, finished_at, observed_provider, observed_model, diagnostic, artifact_ref FROM operations WHERE request_id=?1", params![request.request_id()], OperationRecord::from_row).optional()? {
-            if existing.request.payload() == request.payload() && existing.request.instruction() == request.instruction() && existing.request.task_id() == request.task_id() && existing.request.task_revision() == request.task_revision() { return Ok(existing); }
-            return Err(LedgerError::RequestConflict { request_id: request.request_id().into() });
-        }
-        let actual: u64 = connection
-            .query_row(
-                "SELECT revision FROM task_revisions WHERE task_id=?1",
-                params![request.task_id().as_str()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .unwrap_or(request.task_revision() as i64) as u64;
-        if actual != request.task_revision() {
-            return Err(LedgerError::StaleRevision {
-                expected: request.task_revision(),
-                actual,
-            });
-        }
-        let active: Option<String> = connection.query_row("SELECT id FROM operations WHERE task_id=?1 AND status IN ('accepted','running','interrupted','recovery_required')", params![request.task_id().as_str()], |row| row.get(0)).optional()?;
-        if let Some(id) = active {
-            return Err(LedgerError::ActiveOperation(OperationId::new(id)));
-        }
-        let id = OperationId::new(format!("op-{}-{}", request.task_id().as_str(), now()));
-        let accepted = now();
-        connection.execute("INSERT INTO operations(id,request_id,task_id,task_revision,payload,instruction,requested_provider,requested_model,status,accepted_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9)", params![id.as_str(), request.request_id(), request.task_id().as_str(), request.task_revision() as i64, request.payload(), request.instruction(), request.requested_provider().as_str(), request.requested_model(), accepted])?;
-        connection.execute(
-            "INSERT INTO operation_events VALUES(?1,0,'accepted',?2,?3)",
-            params![id.as_str(), accepted, request.instruction()],
-        )?;
-        drop(connection);
-        self.load(&id)?
-            .ok_or_else(|| LedgerError::InvalidValue("operation insert disappeared".into()))
+    fn save_task(&self, task: &Task) -> Result<(), LedgerError> {
+        Self::save_task(self, task)
     }
-    fn get_operation(&self, id: &OperationId) -> Result<Option<OperationRecord>, LedgerError> {
-        self.load(id)
+
+    fn get_task(&self, task_id: &TaskId) -> Result<Option<Task>, LedgerError> {
+        Self::get_task(self, task_id)
     }
-    fn finish_operation(
+
+    fn save_attempt(
         &self,
-        id: &OperationId,
-        status: OperationStatus,
-        diagnostic: Option<&str>,
+        task_id: &TaskId,
+        attempt: &Attempt,
+        started_at: Option<i64>,
+        finished_at: Option<i64>,
     ) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        let current: Option<String> = connection
-            .query_row(
-                "SELECT status FROM operations WHERE id=?1",
-                params![id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(current) = current else {
-            return Err(LedgerError::InvalidValue(format!(
-                "unknown operation {}",
-                id.as_str()
-            )));
-        };
-        let current = OperationStatus::from_str(&current)?;
-        if current.terminal() && current != status {
-            return Err(LedgerError::TerminalConflict(id.clone()));
-        }
-        let finished = now();
-        connection.execute("UPDATE operations SET status=?2, finished_at=?3, diagnostic=COALESCE(?4, diagnostic) WHERE id=?1", params![id.as_str(), status.as_str(), finished, diagnostic])?;
-        let sequence: i64 = connection.query_row(
-            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM operation_events WHERE operation_id=?1",
-            params![id.as_str()],
-            |row| row.get(0),
-        )?;
-        connection.execute(
-            "INSERT INTO operation_events VALUES(?1,?2,'finished',?3,?4)",
-            params![
-                id.as_str(),
-                sequence,
-                finished,
-                diagnostic.unwrap_or(status.as_str())
-            ],
-        )?;
-        Ok(())
+        Self::save_attempt(self, task_id, attempt, started_at, finished_at)
+    }
+
+    fn get_attempt(
+        &self,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+    ) -> Result<Option<AttemptRecord>, LedgerError> {
+        Self::get_attempt(self, task_id, attempt_id)
+    }
+
+    fn list_attempts(&self, task_id: &TaskId) -> Result<Vec<AttemptRecord>, LedgerError> {
+        Self::list_attempts(self, task_id)
     }
 }
 
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
+fn bool_to_int(value: bool) -> i64 {
+    i64::from(value)
+}
+
+fn int_to_bool(value: i64) -> Result<bool, LedgerError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(LedgerError::InvalidStoredValue(format!(
+            "boolean value {other}"
+        ))),
+    }
+}
+
+fn task_state_to_str(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Pending => "pending",
+        TaskState::Active => "active",
+        TaskState::Completed => "completed",
+        TaskState::Failed => "failed",
+        TaskState::Cancelled => "cancelled",
+    }
+}
+
+fn task_state_from_str(value: &str) -> Result<TaskState, LedgerError> {
+    match value {
+        "pending" => Ok(TaskState::Pending),
+        "active" => Ok(TaskState::Active),
+        "completed" => Ok(TaskState::Completed),
+        "failed" => Ok(TaskState::Failed),
+        "cancelled" => Ok(TaskState::Cancelled),
+        other => Err(LedgerError::InvalidStoredValue(format!(
+            "task state {other}"
+        ))),
+    }
+}
+
+fn attempt_state_to_str(state: AttemptState) -> &'static str {
+    match state {
+        AttemptState::Queued => "queued",
+        AttemptState::Running => "running",
+        AttemptState::Validating => "validating",
+        AttemptState::Succeeded => "succeeded",
+        AttemptState::Failed => "failed",
+        AttemptState::Cancelled => "cancelled",
+    }
+}
+
+fn attempt_state_from_str(value: &str) -> Result<AttemptState, LedgerError> {
+    match value {
+        "queued" => Ok(AttemptState::Queued),
+        "running" => Ok(AttemptState::Running),
+        "validating" => Ok(AttemptState::Validating),
+        "succeeded" => Ok(AttemptState::Succeeded),
+        "failed" => Ok(AttemptState::Failed),
+        "cancelled" => Ok(AttemptState::Cancelled),
+        other => Err(LedgerError::InvalidStoredValue(format!(
+            "attempt state {other}"
+        ))),
+    }
+}
+
+fn failure_reason_to_str(reason: &AttemptFailureReason) -> &'static str {
+    match reason {
+        AttemptFailureReason::Provider => "provider",
+        AttemptFailureReason::Timeout => "timeout",
+        AttemptFailureReason::Cancelled => "cancelled",
+        AttemptFailureReason::Workspace => "workspace",
+        AttemptFailureReason::Validation => "validation",
+    }
+}
+fn failure_reason_from_str(value: &str) -> Result<AttemptFailureReason, LedgerError> {
+    match value {
+        "provider" => Ok(AttemptFailureReason::Provider),
+        "timeout" => Ok(AttemptFailureReason::Timeout),
+        "cancelled" => Ok(AttemptFailureReason::Cancelled),
+        "workspace" => Ok(AttemptFailureReason::Workspace),
+        "validation" => Ok(AttemptFailureReason::Validation),
+        _ => Err(LedgerError::InvalidStoredValue(value.to_owned())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn request(id: &str, payload: &str) -> OperationRequest {
-        OperationRequest::new(
-            id,
+
+    fn task() -> Task {
+        Task::new(
             TaskId::new("task-1"),
-            3,
-            payload,
-            "implement",
-            ProviderRef::new("codex"),
-            Some("gpt".into()),
+            "implement ledger",
+            TaskRole::new("developer"),
         )
     }
-    #[test]
-    fn idempotency_returns_same_operation_and_rejects_payload_change() {
-        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
-        ledger.set_task_revision(&TaskId::new("task-1"), 3).unwrap();
-        let first = ledger.accept_operation(&request("r1", "a")).unwrap();
-        assert_eq!(
-            ledger.accept_operation(&request("r1", "a")).unwrap().id(),
-            first.id()
-        );
-        assert!(matches!(
-            ledger.accept_operation(&request("r1", "b")),
-            Err(LedgerError::RequestConflict { .. })
-        ));
+
+    fn attempt(id: &str, provider: &str) -> Attempt {
+        Attempt::new(AttemptId::new(id), ProviderRef::new(provider))
     }
+
     #[test]
-    fn terminal_fact_cannot_be_overwritten() {
+    fn schema_is_initialized_and_task_round_trips() {
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
-        let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
-        ledger
-            .finish_operation(operation.id(), OperationStatus::TimedOut, Some("timeout"))
+        let task = task();
+        ledger.save_task(&task).unwrap();
+        assert_eq!(ledger.get_task(task.id()).unwrap(), Some(task));
+    }
+
+    #[test]
+    fn foreign_key_enforcement_is_enabled_before_schema_transaction() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let connection = ledger.connection.lock().unwrap();
+        let enabled: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .unwrap();
-        assert!(matches!(
-            ledger.finish_operation(operation.id(), OperationStatus::Succeeded, None),
-            Err(LedgerError::TerminalConflict(_))
-        ));
+        assert_eq!(enabled, 1);
+        let error = connection
+            .execute(
+                "INSERT INTO attempts (task_id, id, provider, state) VALUES ('missing', 'a', 'codex', 'queued')",
+                [],
+            )
+            .unwrap_err();
+        assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
     }
+
     #[test]
-    fn recovery_marks_unknown_state_without_claiming_success() {
+    fn invalid_publication_phase_is_rejected_when_restored() {
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
-        let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
-        let recovered = ledger.recover().unwrap();
-        assert_eq!(recovered[0].operation, *operation.id());
-        assert_eq!(
-            ledger
-                .get_operation(operation.id())
-                .unwrap()
-                .unwrap()
-                .status(),
-            OperationStatus::RecoveryRequired
-        );
-    }
-    #[test]
-    fn raw_logs_are_bounded_and_referenced() {
-        let mut ledger = SqliteExecutionLedger::open_in_memory().unwrap();
-        ledger.set_log_limit(3);
-        let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
-        let reference = ledger
-            .save_log(
-                operation.id(),
-                "stdout",
-                std::env::temp_dir().join(format!("ledger-test-{}", now())),
-                b"abcdef",
+        ledger
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO publications (idempotency_key, repository, branch, phase) VALUES ('bad', 'o/r', 'main', 'future')",
+                [],
             )
             .unwrap();
-        assert_eq!(reference.byte_count(), 3);
-        assert!(reference.truncated());
-        assert_eq!(fs::read(reference.path()).unwrap(), b"abc");
-        let _ = fs::remove_file(reference.path());
+        assert!(matches!(
+            ledger.load_publication("bad"),
+            Err(LedgerError::InvalidStoredValue(_))
+        ));
+    }
+
+    #[test]
+    fn published_publication_without_pull_request_is_rejected_when_restored() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        ledger
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO publications (idempotency_key, repository, branch, phase) VALUES ('missing-pr', 'o/r', 'main', 'published')",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            ledger.load_publication("missing-pr"),
+            Err(LedgerError::InvalidStoredValue(_))
+        ));
+    }
+
+    #[test]
+    fn attempt_round_trips_results_state_and_timestamps() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task = task();
+        ledger.save_task(&task).unwrap();
+        let mut attempt = attempt("attempt-1", "codex");
+        attempt.start().unwrap();
+        attempt
+            .record_agent_result(AgentResult::new("done", true))
+            .unwrap();
+        attempt.finish().unwrap();
+        attempt
+            .apply_validation(ValidationResult::new("tests passed", true))
+            .unwrap();
+        attempt.set_usage_cost(UsageCost::new([UsageMetric::new("tokens", "42", "count")]));
+        ledger
+            .save_attempt(task.id(), &attempt, Some(1_000), Some(2_000))
+            .unwrap();
+        let record = ledger
+            .get_attempt(task.id(), attempt.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.attempt(), &attempt);
+        assert_eq!(record.started_at(), Some(1_000));
+        assert_eq!(record.finished_at(), Some(2_000));
+    }
+
+    #[test]
+    fn validation_round_trips_aggregate_and_all_check_details() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task = task();
+        ledger.save_task(&task).unwrap();
+        let mut attempt = attempt("attempt-1", "codex");
+        attempt.start().unwrap();
+        attempt.finish().unwrap();
+        let validation = ValidationResult::from_checks(
+            "one check failed",
+            [
+                ValidationCheckResult::new("cargo test", true, Some(0), ""),
+                ValidationCheckResult::new(
+                    "cargo clippy",
+                    false,
+                    None,
+                    "warning: diagnostic details",
+                ),
+            ],
+        );
+        attempt.apply_validation(validation.clone()).unwrap();
+        ledger
+            .save_attempt(task.id(), &attempt, Some(10), Some(20))
+            .unwrap();
+
+        let loaded = ledger
+            .get_attempt(task.id(), attempt.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.attempt().validation_results(), &[validation]);
+        assert_eq!(loaded.attempt().state(), AttemptState::Failed);
+    }
+
+    #[test]
+    fn retry_adds_history_without_overwriting_previous_attempt() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task = task();
+        ledger.save_task(&task).unwrap();
+        let first = attempt("attempt-1", "codex");
+        let second = attempt("attempt-2", "antigravity");
+        ledger
+            .save_attempt(task.id(), &first, Some(10), Some(20))
+            .unwrap();
+        ledger
+            .save_attempt(task.id(), &second, Some(30), None)
+            .unwrap();
+        let attempts = ledger.list_attempts(task.id()).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].attempt().provider().as_str(), "codex");
+        assert_eq!(attempts[1].attempt().provider().as_str(), "antigravity");
+        assert_eq!(attempts[0].finished_at(), Some(20));
+    }
+
+    #[test]
+    fn task_load_includes_linked_attempts() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task = task();
+        ledger.save_task(&task).unwrap();
+        let attempt = attempt("attempt-1", "codex");
+        ledger
+            .save_attempt(task.id(), &attempt, None, None)
+            .unwrap();
+        let loaded = ledger.get_task(task.id()).unwrap().unwrap();
+        assert_eq!(loaded.attempts(), &[attempt]);
+    }
+
+    #[test]
+    fn file_ledger_survives_connection_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "ai-dev-orchestrator-ledger-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let task = task();
+        let attempt = attempt("attempt-1", "codex");
+        {
+            let ledger = SqliteExecutionLedger::open(&path).unwrap();
+            ledger.save_task(&task).unwrap();
+            ledger
+                .save_attempt(task.id(), &attempt, Some(100), Some(200))
+                .unwrap();
+        }
+        let reopened = SqliteExecutionLedger::open(&path).unwrap();
+        let record = reopened
+            .get_attempt(task.id(), attempt.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.attempt(), &attempt);
+        assert_eq!(record.started_at(), Some(100));
+        assert_eq!(record.finished_at(), Some(200));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_schema_migration_preserves_attempt_and_publication_data() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY NOT NULL, description TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL);
+                 CREATE TABLE attempts (task_id TEXT NOT NULL, id TEXT NOT NULL, provider TEXT NOT NULL, state TEXT NOT NULL,
+                     started_at INTEGER, finished_at INTEGER, failure_reason TEXT, PRIMARY KEY (task_id, id));
+                 CREATE TABLE publications (idempotency_key TEXT PRIMARY KEY NOT NULL, repository TEXT NOT NULL,
+                     branch TEXT NOT NULL, commit_sha TEXT, pull_request TEXT, phase TEXT NOT NULL);
+                 INSERT INTO tasks VALUES ('task-1', 'legacy', 'developer', 'failed');
+                 INSERT INTO attempts VALUES ('task-1', 'attempt-1', 'codex', 'failed', 10, 20, 'timeout');
+                 INSERT INTO publications VALUES ('key-1', 'owner/repo', 'main', 'abc', '42', 'published');
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
+
+        let attempt = ledger
+            .get_attempt(&TaskId::new("task-1"), &AttemptId::new("attempt-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attempt.attempt().failure_reason(),
+            Some(&AttemptFailureReason::Timeout)
+        );
+        let publication = ledger.load_publication("key-1").unwrap().unwrap();
+        assert_eq!(publication.repository(), "owner/repo");
+        assert_eq!(publication.branch(), "main");
+        assert_eq!(publication.commit_sha(), Some("abc"));
+        assert_eq!(publication.pull_request(), Some("42"));
+        assert_eq!(publication.task_id(), None);
+        assert_eq!(publication.workspace(), None);
+        assert_eq!(publication.base(), None);
+        assert_eq!(publication.title(), None);
+        assert_eq!(publication.body(), None);
+    }
+
+    #[test]
+    fn future_schema_version_is_rejected() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 7;")
+            .unwrap();
+        assert!(matches!(
+            SqliteExecutionLedger::from_connection(connection),
+            Err(LedgerError::UnsupportedSchemaVersion(7))
+        ));
     }
 }
