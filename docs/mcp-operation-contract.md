@@ -9,14 +9,15 @@ MCP（Model Context Protocol）は、AIアプリケーションが外部サー�
 ## 想定する接続
 
 ```mermaid
-flowchart LR
+flowchart TB
     User[利用者] --> Host[監督Codexを動かすMCP Host<br/>MCP Clientを含む]
-    Host <-->|tools/list・tools/call・結果| Gateway[MCP Gateway<br/>MCP Server / tools]
+    Host <-->|toolの発見・呼び出し・結果| Gateway[MCP Gateway<br/>MCP Server / tools]
     Gateway -->|tool request| Service[Rust Operation Service]
-    Service <-->|状態・制約・記録| Store[Domain・Policy・Budget・Ledger]
-    Service <-->|実行・観測| Workers[Provider / Model・Validator・GitHub / CI]
-    Service -->|operation状態・観測結果| Gateway
+    Service -->|operation状態・結果| Gateway
     Gateway -->|tool response| Host
+
+    Service --> Store[Domain / Policy / Budget / Ledger<br/>状態・制約・記録]
+    Service --> Workers[Provider / Model / Validator / GitHub / CI<br/>実行・観測]
 ```
 
 図は目標構成であり、MCP Gateway / transportはまだ実装対象外である（#45）。このPRが定義するのは、Gatewayが公開するtoolの意味と、Rust Operation Serviceとの境界である。現行CLIの挙動を示す図ではない。
