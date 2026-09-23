@@ -1,10 +1,33 @@
 # 監督Codex向け MCP 操作契約
 
-監督Codexが Rust Operation Service に依頼できる操作と、その結果として返る事実を示す。操作の詳細な wire schema、再送・ページング・取消・エラー等の規則は[実装者向け詳細仕様](mcp-operation-contract-reference.md)を参照する。
+## MCPとは何か
+
+MCP（Model Context Protocol）は、AIアプリケーションが外部サービスの情報や操作を利用するための通信規約である。MCP Host（AIアプリケーション）がClientを通じてMCP Serverへ接続し、Serverが公開するtoolを発見・呼び出して結果を受け取る。この文書が扱うのは、そのうちtoolによる操作の接続である。[MCP仕様](https://modelcontextprotocol.io/specification/2026-07-28)は接続とtool呼び出しの共通形式を定めるが、AI Dev Orchestrator固有のTask、Attempt、Artifactや完了条件は定めない。Host・Client・Serverの関係は[MCPアーキテクチャ](https://modelcontextprotocol.io/specification/2026-07-28/architecture)を参照。
+
+このプロジェクトでMCPを使う目的は、監督CodexがRustの操作を、特定のCLIや会話文の解釈に頼らず、名前・入力・結果が定義されたtoolとして依頼できるようにすることにある。MCP対応Hostと接続する共通のtool interfaceになるが、各Hostがこの契約のtool schemaや必要機能を扱えることは別途確認が必要である。MCP自体がProviderを選んだり、retryしたり、成果物を採用したりするわけではない。また、MCPだけで権限や実行安全性が保証されるわけでもない。Hostはtool利用に対する利用者の同意を扱い、Rust Operation Serviceは操作の検証・実行・記録と、権限・予算・workspace等の制約強制を担当する。MCP Gatewayはtool呼び出しをServiceへ渡す。
+
+## 想定する接続
+
+```mermaid
+flowchart LR
+    User[利用者] --> Host[監督Codexを動かすMCP Host<br/>MCP Clientを含む]
+    Host <-->|tools/list・tools/call・結果| Gateway[MCP Gateway<br/>MCP Server / tools]
+    Gateway -->|tool request| Service[Rust Operation Service]
+    Service <-->|状態・制約・記録| Store[Domain・Policy・Budget・Ledger]
+    Service <-->|実行・観測| Workers[Provider / Model・Validator・GitHub / CI]
+    Service -->|operation状態・観測結果| Gateway
+    Gateway -->|tool response| Host
+```
+
+図は目標構成であり、MCP Gateway / transportはまだ実装対象外である（#45）。このPRが定義するのは、Gatewayが公開するtoolの意味と、Rust Operation Serviceとの境界である。現行CLIの挙動を示す図ではない。
+
+## この契約の役割
+
+監督CodexがRust Operation Serviceに依頼できる操作と、その結果として返る事実を示す。MCPの一般仕様ではなく、AI Dev Orchestrator固有のtool契約である。詳細なwire schema、再送・ページング・取消・エラー等の規則は[実装者向け詳細仕様](mcp-operation-contract-reference.md)を参照する。
 
 ## 監督CodexとServiceの分担
 
-監督Codexは依頼の解釈、Provider / Model の選択、再実行やreviewの要否、Artifactの採否、Task完了を判断する。Rust Operation Serviceは依頼を検査し、明示された操作を実行・記録し、revision・権限・予算・workspace等の機械的制約を強制する。MCP Gatewayはtool requestをServiceへ渡して結果を返す。
+監督Codexは依頼の解釈、Provider / Model の選択、再実行やreviewの要否、Artifactの採否、Task完了を判断する。Rust Operation Serviceは依頼を検査し、明示された操作を実行・記録し、revision・権限・予算・workspace等の機械的制約を強制する。MCP Gatewayはtool requestをServiceへ渡し、Serviceの結果をMCP tool responseとして返す。
 
 Serviceは次のProvider / Model、retry、review、成果物の採否、Task完了を自分で選ばない。Providerの終了状態、Validation結果、review verdict、CI状態は別々の観測事実であり、ひとつが成功しても他の成功やTask完了を意味しない。Attempt / Artifact / Validation / ReviewVerdict / CodexDecision等の意味は[ドメインモデル](domain-model.md)を参照する。
 

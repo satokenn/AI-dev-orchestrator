@@ -1,10 +1,10 @@
 # MCP 操作契約 — wire reference
 
-[概要](mcp-operation-contract.md)にある各toolの入力と出力を定める。toolの入力はMCP `tools/call` の `arguments`、成功時の構造化出力は `CallToolResult.structuredContent` に対応する。この文書はJSON-RPC/MCPの外側のenvelopeを再定義しない。
+[概要](mcp-operation-contract.md)にある各toolの入力と出力を定める。toolの入力はMCP `tools/call` の`params.arguments`、成功時の構造化出力はcomplete tool resultの`structuredContent`に対応する。この文書はMCP request metadataやJSON-RPC/tool resultの外側のenvelopeを再定義しない。
 
 toolのschema記述はJSON Schema 2020-12のobject、`properties`、`required`、`type`、`enum`に対応する。表の`Required`欄はfieldの省略可否を表し、`null`可否とは別である。`string | null` はfieldが必須で値にnullを許す。`Optional`はfield自体を省略できる。説明文や例の日本語はschema値ではない。
 
-MCP toolsでは`inputSchema`が入力schemaを定め、`outputSchema`は構造化出力のschemaとして指定できる。[MCP Tools仕様](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)と[JSON Schema objectのrequired properties](https://json-schema.org/understanding-json-schema/reference/object#required-properties)に従い、#45はこの文書の型・必須field・enumと整合するschema validationを実装する。
+MCP toolsでは`inputSchema`が入力schemaを定め、任意の`outputSchema`が構造化出力を定める。[MCP Tools仕様（2026-07-28）](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)と[JSON Schema objectのrequired properties](https://json-schema.org/understanding-json-schema/reference/object#required-properties)に従い、#45はこの文書の型・必須field・enumと整合するschema validationを実装する。
 
 ## 型と共通規則
 
@@ -19,7 +19,7 @@ MCP toolsでは`inputSchema`が入力schemaを定め、`outputSchema`は構造�
 | `T \| null` | T型またはJSON `null`。field自体は省略できない |
 | `enum(a, b)` | 記載したstring値のみ許可 |
 
-すべてのtool requestは`schema_version: "v1"`を必須とする。未対応versionは`unsupported_schema_version`。不明なrequest fieldは`invalid_request`とし、副作用前に拒否する。成功するtool outputはすべて`schema_version: "v1"`を含む。MCP側のtool実行errorは`CallToolResult.isError: true`とし、本文に下記のtyped errorを含める。
+すべてのtool requestの`params.arguments`は`schema_version: "v1"`を必須とする。未対応versionは`unsupported_schema_version`。不明なrequest fieldは`invalid_request`とし、副作用前に拒否する。成功するtool outputの`structuredContent`はすべて`schema_version: "v1"`を含む。業務errorはMCP tool execution error（`isError: true`）として返し、`content`に下記のtyped errorを含める。MCP request metadataやprotocol errorはこのアプリケーション契約の対象外。
 
 副作用を伴うrequestは`request_id: string`を必須とする。既存Taskを変更する場合はさらに`task_id: string`と`expected_revision: integer`を必須とする。読取requestは`request_id`と`expected_revision`を持たない。
 
