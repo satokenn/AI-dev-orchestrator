@@ -41,18 +41,21 @@ Serviceは次のProvider / Model、retry、review、成果物の採否、Task完
 
 ## 依頼できる操作
 
-| Tool | 渡すもの | 返るものと読み方 |
-| --- | --- | --- |
-| `task.create` | Issue snapshot、または手入力の要求と制約 | Task ID と初期 revision。以後の操作対象を識別する |
-| `task.get_context` | Task ID と読みたい情報の分類 | Taskの要求・revisionと、Provider、usage、Attempt、Artifact、Validation、review、decision、PR / CI等の記録。これは現在までに記録された事実であり、次の手順の自動提案ではない |
-| `attempt.run` | Task、Provider / Model、instruction、role、入力Artifactまたは初期base | 受付時にoperation IDとAttempt ID。完了後にProvider実行の状態、出力Artifact、usage等。受付は実行成功を意味しない |
-| `operation.get` / `operation.list_logs` | operation ID。ログ取得ではstreamと必要な範囲 | operationの進行状態・最終結果、または指定範囲のredacted log。ログ末尾を読んだだけではoperationの終了を意味しない |
-| `operation.cancel` / `task.cancel` | 対象operation、またはTask全体の停止要求 | 取消要求の受付と現在状態。停止確認前に取消完了とは扱わない |
-| `validation.run` | 対象Artifactと検査profileまたは検査内容 | 受付後、対象Artifactに対する各検査の結果。Validation成功はArtifactの採用判断ではない |
-| `decision.record` | 対象Artifact、監督Codexの判断、理由、参照証拠 | 保存されたCodexDecisionと更新後revision。reviewerの判断とは別の記録 |
-| `publication.publish` | 対象Artifactと公開先・PR情報 | 受付後、公開結果とPR / head SHAの参照。PR作成だけでCI成功やTask完了にはならない |
-| `ci.get` / `ci.wait` | Publication、PRまたはcommitと、待機時は期限 | 対象SHAについて観測したcheck状態。`unknown` / `pending` は成功ではない |
-| `task.finish` | 完了させるArtifact、accepted decision、必要な証拠 | 条件を満たせばcompleted Task。Serviceは証拠を照合し、不足や不一致があれば完了を拒否する |
+| Tool | 何をするか | 渡すもの | 返るものと読み方 |
+| --- | --- | --- | --- |
+| `task.create` | Issueまたは手入力の要求を、以後の作業と記録の単位となるTaskとして登録する | Issue snapshot、または手入力の要求と制約 | Task ID と初期revision。以後の操作対象を識別する |
+| `task.get_context` | 次の判断に必要なTask情報や作業履歴を、指定した分類ごとに読み出す | Task ID と読みたい情報の分類 | Taskの要求・revisionと、Provider、usage、Attempt、Artifact、Validation、review、decision、PR / CI等の記録。現在までに記録された事実であり、次の手順の自動提案ではない |
+| `attempt.run` | 指定されたProvider / Modelに、一回分の作業を依頼してAttemptとして記録する | Task、Provider / Model、instruction、role、入力Artifactまたは初期base | 受付時にoperation IDとAttempt ID。完了後にProvider実行の状態、出力Artifact、usage等。受付は実行成功を意味しない |
+| `operation.get` | 長時間処理のoperationが進行中か、どの結果で終了したかを確認する | operation ID | operationの進行状態・最終結果。`completed`等の終端状態と結果を確認してから処理結果を判断する |
+| `operation.list_logs` | operationが出したログの一部を、streamと範囲を指定して読む | operation ID、stream、必要ならcursorと件数上限 | 指定範囲のredacted logと続きのcursor。ログ末尾を読んだだけではoperationの終了を意味しない |
+| `operation.cancel` | 一つのoperationに停止を要求する | 対象operationとTask、最新revision | 取消要求を表すoperationの受付。対象operationの停止を確認するまでは取消完了ではない |
+| `task.cancel` | Task全体を停止し、未終了operationにも取消を要求する | Task、最新revision、任意の取消理由 | 停止要求の受付。関連operationとTaskの状態を確認するまでは取消完了ではない |
+| `validation.run` | Artifactに対して指定された機械検査を実行する | 対象Artifactと検査profileまたは検査内容 | 受付後、対象Artifactに対する各検査の結果。Validation成功はArtifactの採用判断ではない |
+| `decision.record` | Artifactを採用するかどうかの監督Codexの判断と理由をTaskの記録に残す | 対象Artifact、判断、理由、参照証拠 | 保存されたCodexDecisionと更新後revision。reviewerの判断とは別の記録 |
+| `publication.publish` | 採用済みArtifactを指定先へ公開し、Pull Requestを作成する | 対象Artifact、accepted decision、公開先・PR情報 | 受付後、公開結果とPR / head SHAの参照。PR作成だけでCI成功やTask完了にはならない |
+| `ci.get` | PRまたはcommitのCI check状態を一度だけ観測する | Publication、PRまたはcommit | 対象SHAについて観測したcheck状態。`unknown` / `pending` は成功ではない |
+| `ci.wait` | PRまたはcommitのCI状態を期限まで待ち、確定したcheck状態を観測する | Publication、PRまたはcommit、期限 | 受付後、対象SHAの観測結果。期限内に確定しない場合も成功とは扱わず、operationの結果を確認する |
+| `task.finish` | Artifactと採用判断・必要な証拠を照合し、Taskの完了を確定する | 完了させるArtifact、accepted decision、必要な証拠 | 条件を満たせばcompleted Task。Serviceは証拠を照合し、不足や不一致があれば完了を拒否する |
 
 ## 結果を読むときの要点
 
