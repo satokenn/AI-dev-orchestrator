@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{ProviderRef, TaskId};
 
@@ -351,7 +351,8 @@ pub struct SqliteExecutionLedger {
 
 impl SqliteExecutionLedger {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
-        Self::from_connection(Connection::open(path)?)
+        let sidecar = PathBuf::from(format!("{}.operations.sqlite3", path.as_ref().display()));
+        Self::from_connection(Connection::open(sidecar)?)
     }
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         Self::from_connection(Connection::open_in_memory()?)
@@ -423,15 +424,22 @@ impl SqliteExecutionLedger {
         observed_provider: &ProviderRef,
         observed_model: Option<&str>,
     ) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let started = now();
-        connection.execute("UPDATE operations SET status='running', started_at=?2, observed_provider=?3, observed_model=?4 WHERE id=?1 AND status='accepted'", params![id.as_str(), started, observed_provider.as_str(), observed_model])?;
-        let sequence: i64 = connection.query_row(
+        let changed = transaction.execute("UPDATE operations SET status='running', started_at=?2, observed_provider=?3, observed_model=?4 WHERE id=?1 AND status='accepted'", params![id.as_str(), started, observed_provider.as_str(), observed_model])?;
+        if changed != 1 {
+            return Err(LedgerError::InvalidValue(format!(
+                "operation is not accepted: {}",
+                id.as_str()
+            )));
+        }
+        let sequence: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(sequence), -1) + 1 FROM operation_events WHERE operation_id=?1",
             params![id.as_str()],
             |row| row.get(0),
         )?;
-        connection.execute(
+        transaction.execute(
             "INSERT INTO operation_events VALUES(?1,?2,'started',?3,?4)",
             params![
                 id.as_str(),
@@ -440,6 +448,7 @@ impl SqliteExecutionLedger {
                 observed_model.unwrap_or(observed_provider.as_str())
             ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn save_log(
@@ -550,8 +559,9 @@ impl SqliteExecutionLedger {
         Ok(())
     }
     pub fn recover(&self) -> Result<Vec<RecoveryRecord>, LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        let mut statement = connection.prepare("SELECT id, status FROM operations WHERE status IN ('accepted','running','interrupted')")?;
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut statement = transaction.prepare("SELECT id, status FROM operations WHERE status IN ('accepted','running','interrupted')")?;
         let ids = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -559,7 +569,7 @@ impl SqliteExecutionLedger {
         for item in ids {
             let (id, status) = item?;
             let status = OperationStatus::from_str(&status)?;
-            connection.execute("UPDATE operations SET status='recovery_required' WHERE id=?1 AND status NOT IN ('succeeded','failed','invalid_output','timed_out','cancelled')", params![id])?;
+            transaction.execute("UPDATE operations SET status='recovery_required' WHERE id=?1 AND status NOT IN ('succeeded','failed','invalid_output','timed_out','cancelled')", params![id])?;
             records.push(RecoveryRecord {
                 operation: OperationId::new(id),
                 status: OperationStatus::RecoveryRequired,
@@ -569,6 +579,8 @@ impl SqliteExecutionLedger {
                 ),
             });
         }
+        drop(statement);
+        transaction.commit()?;
         Ok(records)
     }
     fn load(&self, id: &OperationId) -> Result<Option<OperationRecord>, LedgerError> {
@@ -579,12 +591,21 @@ impl SqliteExecutionLedger {
 
 impl ExecutionLedger for SqliteExecutionLedger {
     fn accept_operation(&self, request: &OperationRequest) -> Result<OperationRecord, LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        if let Some(existing) = connection.query_row("SELECT id, request_id, task_id, task_revision, payload, instruction, status, requested_provider, requested_model, accepted_at, started_at, finished_at, observed_provider, observed_model, diagnostic, artifact_ref FROM operations WHERE request_id=?1", params![request.request_id()], OperationRecord::from_row).optional()? {
-            if existing.request.payload() == request.payload() && existing.request.instruction() == request.instruction() && existing.request.task_id() == request.task_id() && existing.request.task_revision() == request.task_revision() { return Ok(existing); }
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = transaction.query_row("SELECT id, request_id, task_id, task_revision, payload, instruction, status, requested_provider, requested_model, accepted_at, started_at, finished_at, observed_provider, observed_model, diagnostic, artifact_ref FROM operations WHERE request_id=?1", params![request.request_id()], OperationRecord::from_row).optional()? {
+            if existing.request.payload() == request.payload()
+                && existing.request.instruction() == request.instruction()
+                && existing.request.task_id() == request.task_id()
+                && existing.request.task_revision() == request.task_revision()
+                && existing.request.requested_provider() == request.requested_provider()
+                && existing.request.requested_model() == request.requested_model()
+            {
+                return Ok(existing);
+            }
             return Err(LedgerError::RequestConflict { request_id: request.request_id().into() });
         }
-        let actual: u64 = connection
+        let actual: u64 = transaction
             .query_row(
                 "SELECT revision FROM task_revisions WHERE task_id=?1",
                 params![request.task_id().as_str()],
@@ -598,17 +619,27 @@ impl ExecutionLedger for SqliteExecutionLedger {
                 actual,
             });
         }
-        let active: Option<String> = connection.query_row("SELECT id FROM operations WHERE task_id=?1 AND status IN ('accepted','running','interrupted','recovery_required')", params![request.task_id().as_str()], |row| row.get(0)).optional()?;
+        let active: Option<String> = transaction.query_row("SELECT id FROM operations WHERE task_id=?1 AND status IN ('accepted','running','interrupted','recovery_required')", params![request.task_id().as_str()], |row| row.get(0)).optional()?;
         if let Some(id) = active {
             return Err(LedgerError::ActiveOperation(OperationId::new(id)));
         }
-        let id = OperationId::new(format!("op-{}-{}", request.task_id().as_str(), now()));
+        let row_id: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) + 1 FROM operations",
+            [],
+            |row| row.get(0),
+        )?;
+        let id = OperationId::new(format!(
+            "op-{}-{row_id}-{}",
+            request.task_id().as_str(),
+            now()
+        ));
         let accepted = now();
-        connection.execute("INSERT INTO operations(id,request_id,task_id,task_revision,payload,instruction,requested_provider,requested_model,status,accepted_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9)", params![id.as_str(), request.request_id(), request.task_id().as_str(), request.task_revision() as i64, request.payload(), request.instruction(), request.requested_provider().as_str(), request.requested_model(), accepted])?;
-        connection.execute(
+        transaction.execute("INSERT INTO operations(id,request_id,task_id,task_revision,payload,instruction,requested_provider,requested_model,status,accepted_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9)", params![id.as_str(), request.request_id(), request.task_id().as_str(), request.task_revision() as i64, request.payload(), request.instruction(), request.requested_provider().as_str(), request.requested_model(), accepted])?;
+        transaction.execute(
             "INSERT INTO operation_events VALUES(?1,0,'accepted',?2,?3)",
             params![id.as_str(), accepted, request.instruction()],
         )?;
+        transaction.commit()?;
         drop(connection);
         self.load(&id)?
             .ok_or_else(|| LedgerError::InvalidValue("operation insert disappeared".into()))
@@ -622,8 +653,15 @@ impl ExecutionLedger for SqliteExecutionLedger {
         status: OperationStatus,
         diagnostic: Option<&str>,
     ) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        let current: Option<String> = connection
+        if !status.terminal() {
+            return Err(LedgerError::InvalidValue(format!(
+                "operation status is not terminal: {}",
+                status.as_str()
+            )));
+        }
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = transaction
             .query_row(
                 "SELECT status FROM operations WHERE id=?1",
                 params![id.as_str()],
@@ -637,17 +675,23 @@ impl ExecutionLedger for SqliteExecutionLedger {
             )));
         };
         let current = OperationStatus::from_str(&current)?;
-        if current.terminal() && current != status {
-            return Err(LedgerError::TerminalConflict(id.clone()));
+        if current.terminal() {
+            if current != status {
+                return Err(LedgerError::TerminalConflict(id.clone()));
+            }
+            return Ok(());
         }
         let finished = now();
-        connection.execute("UPDATE operations SET status=?2, finished_at=?3, diagnostic=COALESCE(?4, diagnostic) WHERE id=?1", params![id.as_str(), status.as_str(), finished, diagnostic])?;
-        let sequence: i64 = connection.query_row(
+        let changed = transaction.execute("UPDATE operations SET status=?2, finished_at=?3, diagnostic=COALESCE(?4, diagnostic) WHERE id=?1 AND status NOT IN ('succeeded','failed','invalid_output','timed_out','cancelled')", params![id.as_str(), status.as_str(), finished, diagnostic])?;
+        if changed != 1 {
+            return Err(LedgerError::TerminalConflict(id.clone()));
+        }
+        let sequence: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(sequence), -1) + 1 FROM operation_events WHERE operation_id=?1",
             params![id.as_str()],
             |row| row.get(0),
         )?;
-        connection.execute(
+        transaction.execute(
             "INSERT INTO operation_events VALUES(?1,?2,'finished',?3,?4)",
             params![
                 id.as_str(),
@@ -656,6 +700,7 @@ impl ExecutionLedger for SqliteExecutionLedger {
                 diagnostic.unwrap_or(status.as_str())
             ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 }
@@ -706,6 +751,48 @@ mod tests {
             ledger.finish_operation(operation.id(), OperationStatus::Succeeded, None),
             Err(LedgerError::TerminalConflict(_))
         ));
+    }
+    #[test]
+    fn request_settings_are_part_of_idempotency() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let first = ledger.accept_operation(&request("r1", "a")).unwrap();
+        let different_provider = OperationRequest::new(
+            "r1",
+            TaskId::new("task-1"),
+            3,
+            "a",
+            "implement",
+            ProviderRef::new("copilot"),
+            Some("gpt".into()),
+        );
+        assert!(matches!(
+            ledger.accept_operation(&different_provider),
+            Err(LedgerError::RequestConflict { .. })
+        ));
+        assert_eq!(
+            ledger.get_operation(first.id()).unwrap().unwrap().id(),
+            first.id()
+        );
+    }
+    #[test]
+    fn start_requires_an_accepted_operation_and_terminal_finish_is_idempotent() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let unknown = OperationId::new("missing");
+        assert!(matches!(
+            ledger.start_operation(&unknown, &ProviderRef::new("codex"), Some("gpt")),
+            Err(LedgerError::InvalidValue(_))
+        ));
+        let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
+        ledger
+            .start_operation(operation.id(), &ProviderRef::new("codex"), Some("gpt"))
+            .unwrap();
+        ledger
+            .finish_operation(operation.id(), OperationStatus::Succeeded, None)
+            .unwrap();
+        ledger
+            .finish_operation(operation.id(), OperationStatus::Succeeded, None)
+            .unwrap();
+        assert_eq!(ledger.events(operation.id()).unwrap().len(), 3);
     }
     #[test]
     fn recovery_marks_unknown_state_without_claiming_success() {
