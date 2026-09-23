@@ -63,7 +63,9 @@ request ID は Task、Attempt、operation とは別物である。副作用を�
 
 Task に属する操作受付、Attempt / Artifact / Validation / verdict / decision / publication / CI の記録、Task 状態変更は revision を進める。情報を読むだけの tool は revision を進めない。
 
-## 操作一覧
+## 操作一覧（概要）
+
+この表は tool の選択に使う一覧である。field の型・必須条件・返却内容は、後述の tool 別定義を参照する。
 
 | Tool | 目的 | 同期性 | 主な入力 | 主な出力 |
 | --- | --- | --- | --- | --- |
@@ -82,6 +84,87 @@ Task に属する操作受付、Attempt / Artifact / Validation / verdict / deci
 ## 共通 request と response
 
 すべての request と response は schema_version: v1 を持つ。未知の version は unsupported_schema_version として拒否する。任意 field の後方互換な追加は v1 のまま許すが、必須 field、enum、既存 field の意味を変えるときは新 version を作る。旧 Ledger の意味を新 version へ黙って読み替えない。
+
+前の操作一覧は役割を比較するための概要であり、schema 定義ではない。実装者が入力を組み立て、応答を解釈できるよう、各 tool の必須 field、型、許可値を以下に定める。必須 field の欠落、型違い、許可されない組合せは invalid_request として拒否する。
+
+### 共通 field
+
+| Field | 型 | 適用範囲・意味 |
+| --- | --- | --- |
+| schema_version | string | 全 request / response。現在は v1 |
+| request_id | string | 副作用 request に必須。呼出側が生成し、同じ request の再送では同じ値を使う |
+| task_id | string | 既存 Task を対象とする request に必須 |
+| expected_revision | integer | Task 変更 request に必須。最後に取得した Task revision |
+| operation_id | string | Rust が返す非同期処理 ID。get / cancel / log 取得で使う |
+| cursor | string または null | Rust が返すページ位置。クライアントは内容を解釈しない |
+
+既存 Task を変更する request は schema_version、request_id、task_id、expected_revision と tool 固有 field を同じ JSON object に含む。task.create は Task がまだないため task_id と expected_revision を含まない。読取 request は request_id と expected_revision を必要としない。
+
+### Task の作成と context 取得
+
+| Tool | Request の必須 field | Response の必須 field |
+| --- | --- | --- |
+| task.create | request_id:string、source: issue/manual、title:string、description:string、constraints:string[]。任意の issue は url、number、title、body を持つ | task_id、revision、state=pending、source、title、description、constraints、issue |
+| task.get_context | task_id:string、sections:string[]。任意の page_size:integer (1–100、既定20)、cursors:map | task {task_id, revision, state, title, description}、要求 section ごとの items と next_cursor、observed_at |
+
+sections の許可値は task、providers、usage、attempts、artifacts、validations、reviews、decisions、publication、ci。要求しなかった section は返さない。履歴 item は id、kind、state、created_at、対象 ID と短い summary を持つ。詳細本文と log は返さず、必要なら別 tool で取得する。
+
+### Attempt と operation
+
+| Tool | Request の必須 field | Response の必須 field |
+| --- | --- | --- |
+| attempt.run | 共通 field、provider_id:string、model_id:string、instruction:string、role:implementer/reviewer/explorer、input | 共通 operation response、attempt_id |
+| operation.get | operation_id:string | operation_id、kind、state、submitted_at、started_at、finished_at、result、error |
+| operation.list_logs | operation_id:string、stream:stdout/stderr/diagnostic。任意の cursor、limit:integer (1–1000、既定100) | chunks[{sequence,timestamp,text,redacted}]、next_cursor |
+| operation.cancel | 共通 field、operation_id:string | 共通 operation response と対象 operation の現在状態 |
+| task.cancel | 共通 field。任意の reason:string | 共通 operation response と Task の取消要求状態 |
+
+attempt.run の input は、artifact_id:string を持つ object、または repository:string と commit:string を持つ object のどちらか一方。path や branch 名だけでは入力成果物を指定できない。timeout_ms は任意で、省略時は Rust policy の値を使う。budget や権限を request から拡張できない。
+
+operation response は request_id、task_id、revision、operation {operation_id, kind, state, submitted_at} を返す。attempt.run の response は attempt_id も返す。state は accepted、running、completed、failed、cancelling、cancelled、recovery_required のいずれか。結果がまだない場合 result は null とする。operation.list_logs の返却対象を安全に表示できない場合、本文を空文字にせず省略し、diagnostic 参照と redacted=true を返す。
+
+### Validation、受入、公開
+
+| Tool | Request の必須 field | Response の必須 field |
+| --- | --- | --- |
+| validation.run | 共通 field、artifact_id:string、および check_profile_id:string または checks 配列のいずれか一方 | 共通 operation response、artifact_id。完了時は validation_id と checks[{name,state,diagnostic_ref}] |
+| decision.record | 共通 field、artifact_id:string、decision:accepted/rejected/changes_requested、reason:string。任意の evidence 配列 | decision_id、artifact_id、decision、reason、evidence、revision |
+| publication.publish | 共通 field、artifact_id:string、base_branch、head_branch、title、body。任意の evidence 配列 | 共通 operation response、artifact_id。完了時は publication_id、repository、head_sha、pull_request {number,url} |
+
+checks の各要素は name:string、command:string、args:string[]、timeout_ms:integer。Rust は command と workspace が policy allowlist に適合することを実行前に検証する。profile と checks は同時に指定できない。各 check state は passed、failed、unknown のいずれか。
+
+evidence の要素は kind と id を持つ。kind は validation、review、decision、publication、ci のいずれか。Rust は参照先が同じ Task と artifact_id に属することを検証する。reviewer の verdict は reviewer Attempt の実行結果として Rust が記録し、監督Codexが decision.record で書き換えることはできない。
+
+### CI と Task 完了
+
+| Tool | Request の必須 field | Response の必須 field |
+| --- | --- | --- |
+| ci.get | publication_id、pull_request {repository,number}、commit {repository,sha} のうち一つだけ | selector、observed_at、checks[{name,state,url,completed_at}]、state |
+| ci.wait | 共通 field、同じ CI selector のいずれか一つ、deadline:string (RFC 3339) | 共通 operation response。完了時 ci.get と同じ result、期限到達時 timeout と最終観測 |
+| task.finish | 共通 field、artifact_id、decision_id。任意の evidence 配列 | task_id、revision、state=completed、採用 Artifact と証拠参照 |
+
+CI の aggregate state は pending、passed、failed、unknown。Task を完了できるのは同じ artifact_id を対象とする accepted decision があり、Rust policy が要求する Validation / CI / publication evidence が揃う場合だけである。不足時は policy_denied を返し Task state を変えない。
+
+### エラー response
+
+業務上の拒否は次の形を返す。current_task_revision、operation_id、details_ref は適用されない場合 null とする。
+
+~~~json
+{
+  "schema_version": "v1",
+  "request_id": "req_01J...",
+  "error": {
+    "code": "stale_revision",
+    "message": "Task changed after the supplied revision",
+    "retryable": true,
+    "current_task_revision": 13,
+    "operation_id": null,
+    "details_ref": null
+  }
+}
+~~~
+
+retryable=true は同じ request を再送してよい意味ではない。再試行するときは context を再取得し、最新 revision と新しい request_id を使う。
 
 副作用を持つ request の共通部分は次である。
 
