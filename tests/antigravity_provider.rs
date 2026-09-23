@@ -124,29 +124,32 @@ fn reports_authentication_failure_as_unavailable() {
     ));
 
     assert!(matches!(
-        result,
+        &result,
         Err(ProviderError::Unavailable(message)) if message.contains("authentication required")
     ));
 }
 
 #[test]
 fn maps_timeout_to_provider_error() {
-    let cli = FakeCli::new("sleep 10");
+    let cli = FakeCli::new("printf partial; exec sleep 10");
     let result = cli.provider().execute(&request(
         cli.directory.clone(),
         "hello",
-        Duration::from_millis(20),
+        Duration::from_secs(1),
     ));
 
-    assert!(matches!(
-        result,
-        Err(ProviderError::TimedOut { timeout }) if timeout == Duration::from_millis(20)
-    ));
+    assert!(
+        matches!(
+            &result,
+            Err(ProviderError::Interrupted { reason: ai_dev_orchestrator::StopReason::TimedOut, stdout, diagnostic, .. }) if stdout == "partial" && diagnostic.contains("1s")
+        ),
+        "unexpected timeout result: {result:?}"
+    );
 }
 
 #[test]
 fn maps_cancellation_to_provider_error() {
-    let cli = Arc::new(FakeCli::new("sleep 10"));
+    let cli = Arc::new(FakeCli::new("printf partial; exec sleep 10"));
     let provider = cli.provider();
     let token = CancellationToken::new();
     let other = token.clone();
@@ -156,10 +159,14 @@ fn maps_cancellation_to_provider_error() {
             .execute_with_cancellation(&request(workspace, "hello", Duration::from_secs(10)), other)
     });
 
-    thread::sleep(Duration::from_millis(20));
+    thread::sleep(Duration::from_millis(500));
     token.cancel();
-    assert!(matches!(
-        thread.join().expect("provider thread"),
-        Err(ProviderError::Cancelled)
-    ));
+    let result = thread.join().expect("provider thread");
+    assert!(
+        matches!(
+            &result,
+            Err(ProviderError::Interrupted { reason: ai_dev_orchestrator::StopReason::Cancelled, stdout, .. }) if stdout == "partial"
+        ),
+        "unexpected cancellation result: {result:?}"
+    );
 }

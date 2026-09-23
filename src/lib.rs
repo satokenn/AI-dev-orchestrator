@@ -6,6 +6,7 @@ mod antigravity;
 mod codex_provider;
 mod copilot_provider;
 mod domain;
+mod execution_ledger;
 mod process_runner;
 mod provider;
 
@@ -16,8 +17,13 @@ pub use domain::{
     AgentResult, Attempt, AttemptId, AttemptState, DomainError, ProviderRef, Task, TaskId,
     TaskRole, TaskState, UsageCost, UsageMetric, ValidationResult,
 };
+pub use execution_ledger::{
+    EventKind, ExecutionLedger, LedgerError, LogReference, OperationEvent, OperationId,
+    OperationRecord, OperationRequest, OperationStatus, PublicationReference, RecoveryRecord,
+    ReviewRecord, SqliteExecutionLedger, UsageRecord, ValidationRecord,
+};
 pub use process_runner::{
-    CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner,
+    CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner, StopReason,
 };
 pub use provider::{AgentProvider, ProviderError, ProviderRequest, ProviderResult};
 

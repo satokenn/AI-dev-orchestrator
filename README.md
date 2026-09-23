@@ -6,13 +6,23 @@ AI エージェントを活用した開発オーケストレーションのた�
 
 外部 CLI は `ProcessRequest` に command、引数配列、作業ディレクトリ、環境変数、タイムアウトを指定し、`ProcessRunner` で実行できます。引数は shell 文字列へ連結されず、stdout / stderr と終了状態が `ProcessOutput` に集約されます。長時間実行を停止する場合は `CancellationToken` を渡して `cancel()` を呼び出してください。
 
+timeout / cancel時のprocess group停止、停止確認結果、部分ログと出力上限は、[ProcessRunner の停止と出力回収](docs/process-runner.md)を参照してください。
+
 ## AgentProvider 契約
 
 Agent 実行先の違いは `AgentProvider` に閉じ込めます。実装は `ProviderRequest` の workspace、prompt、timeout を受け取り、`ProviderResult` の stdout、stderr、終了状態、任意の `AgentResult` と `UsageCost` を返します。実行に失敗した場合は `ProviderError`（不正な要求、実行失敗、タイムアウト、利用不能）を返します。
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
-## Codex CLI Provider
+## Execution Ledger
+
+`SqliteExecutionLedger` は、外部 Provider の起動前に `OperationRequest` と request ID を保存し、同じ request ID の再送を同じ operation として返します。異なる payload の再送、古い Task revision、同一 Task の実行中操作は拒否します。Provider の成功・失敗・timeout・cancel・不正出力は終端事実として追記され、終端後に別の結果へ上書きできません。
+
+stdout / stderr は `save_log` で上限付きのファイルへ保存し、Ledger にはファイル参照、byte 数、切り詰め有無だけを保持します。再起動時の非終端 operation は `recover` により `recovery_required` として返され、外部処理の成功を推測したり自動再実行したりしません。スキーマは SQLite の `user_version` で管理されます。
+
+Antigravity CLI (`agy`) の headless Provider と手動 Live Provider Test の手順は、[Antigravity CLI Provider](docs/antigravity-provider.md) を参照してください。
+
+### Codex CLI Provider
 
 `CodexProvider` は `codex exec` を非対話モードで起動し、`ProviderRequest` の workspace を cwd として使用します。Codex CLI は `PATH` から解決され、実行時には workspace への書き込みを許可する `--sandbox workspace-write`、JSONL 出力の `--json`、実行状態を永続化しない `--ephemeral` を付けます。長時間実行は `execute_with_cancellation` に `CancellationToken` を渡して停止できます。
 
@@ -32,8 +42,6 @@ CODEX_PROVIDER_LIVE_WORKSPACE=/tmp/codex-provider-live \
 `CopilotProvider` は `copilot -p` を非対話で起動し、`ProviderRequest` の workspace を cwd として使用します。実行時には `-s --no-ask-user` と、既定でファイル変更・リポジトリ操作を許可する `--allow-tool=write,shell` を付けます。必要な権限だけに絞る場合は `with_allowed_tools` を使用してください。timeout / cancellation は `execute_with_cancellation` から指定できます。
 
 手動で実 Agent を呼ぶ Live Provider Test の手順は、[GitHub Copilot CLI Provider](docs/copilot-provider.md) を参照してください。
-
-Antigravity CLI (`agy`) の headless Provider と手動 Live Provider Test の手順は、[Antigravity CLI Provider](docs/antigravity-provider.md) を参照してください。
 
 ## アーキテクチャ
 

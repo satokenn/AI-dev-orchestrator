@@ -140,6 +140,7 @@ impl AntigravityProvider {
 
     fn map_process_error(&self, error: ProcessError, timeout: Duration) -> ProviderError {
         match error {
+            ProcessError::CancelledBeforeStart => ProviderError::Cancelled,
             ProcessError::Spawn(error) => {
                 ProviderError::Unavailable(format_spawn_error(self.executable.as_os_str(), error))
             }
@@ -156,8 +157,33 @@ impl AntigravityProvider {
                     ProviderError::ExecutionFailed(detail)
                 }
             }
-            ProcessError::TimedOut(_) => ProviderError::TimedOut { timeout },
-            ProcessError::Cancelled(_) => ProviderError::Cancelled,
+            ProcessError::TimedOut(output) => ProviderError::Interrupted {
+                reason: crate::StopReason::TimedOut,
+                confirmed_stopped: true,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                diagnostic: format!("timed out after {timeout:?}"),
+            },
+            ProcessError::Cancelled(output) => ProviderError::Interrupted {
+                reason: crate::StopReason::Cancelled,
+                confirmed_stopped: true,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                diagnostic: "cancelled; managed process group stopped".into(),
+            },
+            ProcessError::Interrupted {
+                reason,
+                stopped,
+                stdout,
+                stderr,
+                diagnostic,
+            } => ProviderError::Interrupted {
+                reason,
+                confirmed_stopped: stopped,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                diagnostic,
+            },
         }
     }
 
@@ -269,6 +295,7 @@ fn format_spawn_error(executable: &OsStr, error: std::io::Error) -> String {
 
 fn process_error_message(error: ProcessError) -> String {
     match error {
+        ProcessError::CancelledBeforeStart => "process was cancelled before start".to_owned(),
         ProcessError::Spawn(error) | ProcessError::Io(error) => error.to_string(),
         ProcessError::NonZeroExit(output)
         | ProcessError::TimedOut(output)
@@ -276,6 +303,7 @@ fn process_error_message(error: ProcessError) -> String {
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
         ),
+        ProcessError::Interrupted { diagnostic, .. } => diagnostic,
     }
 }
 

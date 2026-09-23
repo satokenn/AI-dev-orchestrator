@@ -93,8 +93,18 @@ impl ProviderResult {
 pub enum ProviderError {
     InvalidRequest(String),
     ExecutionFailed(String),
-    TimedOut { timeout: Duration },
+    TimedOut {
+        timeout: Duration,
+    },
     Cancelled,
+    /// A process was interrupted; the captured output is retained for diagnosis.
+    Interrupted {
+        reason: crate::StopReason,
+        confirmed_stopped: bool,
+        stdout: String,
+        stderr: String,
+        diagnostic: String,
+    },
     Unavailable(String),
 }
 
@@ -111,6 +121,15 @@ impl std::fmt::Display for ProviderError {
                 write!(formatter, "provider timed out after {timeout:?}")
             }
             Self::Cancelled => formatter.write_str("provider execution was cancelled"),
+            Self::Interrupted {
+                reason,
+                confirmed_stopped,
+                diagnostic,
+                ..
+            } => write!(
+                formatter,
+                "provider execution interrupted ({reason:?}, stopped={confirmed_stopped}): {diagnostic}"
+            ),
             Self::Unavailable(message) => write!(formatter, "provider unavailable: {message}"),
         }
     }

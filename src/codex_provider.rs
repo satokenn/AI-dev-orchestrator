@@ -147,6 +147,7 @@ impl CodexProvider {
 
     fn map_process_error(&self, error: ProcessError, timeout: Duration) -> ProviderError {
         match error {
+            ProcessError::CancelledBeforeStart => ProviderError::Cancelled,
             ProcessError::Spawn(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ProviderError::Unavailable(format!(
                     "Codex CLI '{}' was not found; install it and ensure it is on PATH",
@@ -159,8 +160,33 @@ impl CodexProvider {
             ProcessError::Io(error) => {
                 ProviderError::ExecutionFailed(format!("Codex process I/O failed: {error}"))
             }
-            ProcessError::TimedOut(_) => ProviderError::TimedOut { timeout },
-            ProcessError::Cancelled(_) => ProviderError::Cancelled,
+            ProcessError::TimedOut(output) => ProviderError::Interrupted {
+                reason: crate::StopReason::TimedOut,
+                confirmed_stopped: true,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                diagnostic: format!("timed out after {timeout:?}"),
+            },
+            ProcessError::Cancelled(output) => ProviderError::Interrupted {
+                reason: crate::StopReason::Cancelled,
+                confirmed_stopped: true,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                diagnostic: "cancelled; managed process group stopped".into(),
+            },
+            ProcessError::Interrupted {
+                reason,
+                stopped,
+                stdout,
+                stderr,
+                diagnostic,
+            } => ProviderError::Interrupted {
+                reason,
+                confirmed_stopped: stopped,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                diagnostic,
+            },
             ProcessError::NonZeroExit(output) => {
                 let diagnostic =
                     output_diagnostic(&output.stdout, &output.stderr, output.exit_code());
@@ -312,11 +338,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn maps_timeout_and_cancellation_from_process_runner() {
-        let provider = shell_provider("sleep 10");
+        let provider = shell_provider("printf partial; exec sleep 10");
         let timeout = provider
             .execute(&request(Duration::from_millis(20)))
             .unwrap_err();
-        assert!(matches!(timeout, ProviderError::TimedOut { .. }));
+        assert!(
+            matches!(timeout, ProviderError::Interrupted { reason: crate::StopReason::TimedOut, stdout, .. } if stdout == "partial")
+        );
 
         let cancellation = CancellationToken::new();
         let other = cancellation.clone();
@@ -328,7 +356,10 @@ mod tests {
 
         assert!(matches!(
             thread.join().unwrap(),
-            Err(ProviderError::Cancelled)
+            Err(ProviderError::Interrupted {
+                reason: crate::StopReason::Cancelled,
+                ..
+            })
         ));
     }
 
