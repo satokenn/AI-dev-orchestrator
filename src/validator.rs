@@ -307,6 +307,24 @@ fn result_from_error(check: &ValidationCheck, error: ProcessError) -> Validation
         ProcessError::Cancelled(output) => {
             result_from_output_with_prefix(check, output, "process cancelled")
         }
+        ProcessError::CancelledBeforeStart => {
+            ValidationCheckResult::new(check.name(), false, None, "process cancelled before start")
+        }
+        ProcessError::Interrupted {
+            reason,
+            stopped,
+            stdout,
+            stderr,
+            diagnostic,
+        } => ValidationCheckResult::new(
+            check.name(),
+            false,
+            None,
+            format!(
+                "process interrupted ({reason:?}, stopped={stopped}): {diagnostic}; {}",
+                diagnostics(&stdout, &stderr)
+            ),
+        ),
         ProcessError::Spawn(error) | ProcessError::Io(error) => {
             ValidationCheckResult::new(check.name(), false, None, error.to_string())
         }
