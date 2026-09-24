@@ -144,7 +144,7 @@ impl CodexProvider {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let exit_status = output.exit_code();
         let captured_output = CapturedOutput::from_process_output(&output);
-        let parsed = parse_codex_jsonl(&stdout, output.output_truncated).map_err(|message| {
+        let parsed = parse_codex_jsonl(&stdout, output.stdout_truncated).map_err(|message| {
             ProviderError::ExecutionFailed(message).with_captured_output(captured_output.clone())
         })?;
         let result = ProviderResult::new(
@@ -479,6 +479,22 @@ mod tests {
             result.captured_output().unwrap().stdout(),
             result.stdout().as_bytes()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_truncation_does_not_reject_complete_jsonl_stdout() {
+        let provider = shell_provider(
+            "head -c 1048577 /dev/zero >&2; printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"complete\"}}'",
+        );
+
+        let result = provider.execute(&request(Duration::from_secs(5))).unwrap();
+
+        assert_eq!(result.agent_result().unwrap().summary(), "complete");
+        let captured = result.captured_output().unwrap();
+        assert!(!captured.stdout_truncated());
+        assert!(captured.stderr_truncated());
+        assert!(captured.truncated());
     }
 
     #[cfg(unix)]
