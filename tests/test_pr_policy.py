@@ -152,5 +152,25 @@ class PostMergeTests(unittest.TestCase):
         self.assertIn("not-default-base", codes(report, "failure"))
 
 
+class WorkflowTrustBoundaryTests(unittest.TestCase):
+    def test_pr_policy_bridges_both_triggers_with_default_branch_sources(self):
+        workflow = (ROOT / ".github/workflows/pr-policy.yml").read_text(encoding="utf-8")
+
+        self.assertRegex(workflow, r"(?m)^  pull_request:")
+        self.assertRegex(workflow, r"(?m)^  pull_request_target:")
+        self.assertRegex(
+            workflow,
+            r"(?ms)uses: actions/checkout@[^\n]+\n\s+with:\n\s+ref: \$\{\{ github\.event\.repository\.default_branch \}\}",
+        )
+        self.assertRegex(workflow, r"(?ms)permissions:\n  contents: read\n  pull-requests: read")
+        self.assertIn("python3 -m unittest discover -s tests -v", workflow)
+        self.assertIn("python3 scripts/pr_policy.py preflight", workflow)
+        self.assertIn("--config .github/pr-policy.json", workflow)
+        self.assertNotRegex(
+            workflow,
+            r"(?m)^\s+ref: \$\{\{ github\.event\.pull_request\.(?:head|base)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
