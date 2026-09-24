@@ -225,7 +225,7 @@ section固有の`details`は次のfieldで構成する。省略可否は`Require
   "target": {
     "repository": "owner/repo",
     "pull_request_number": 42,
-    "head_sha": "0123456789abcdef"
+    "head_sha": "0123456789abcdef0123456789abcdef01234567"
   },
   "observed_at": "2026-09-25T03:00:00Z",
   "checks": [
@@ -259,7 +259,7 @@ Rulesetを確認できた結果、Required Checkが一つもない場合は`stat
   "target": {
     "repository": "owner/repo",
     "pull_request_number": 42,
-    "head_sha": "0123456789abcdef"
+    "head_sha": "0123456789abcdef0123456789abcdef01234567"
   },
   "observed_at": "2026-09-25T03:00:00Z",
   "checks": [],
@@ -282,7 +282,7 @@ Required Check集合そのものを取得できない場合も、観測された
   "target": {
     "repository": "owner/repo",
     "pull_request_number": 42,
-    "head_sha": "0123456789abcdef"
+    "head_sha": "0123456789abcdef0123456789abcdef01234567"
   },
   "observed_at": "2026-09-25T03:00:00Z",
   "checks": [
