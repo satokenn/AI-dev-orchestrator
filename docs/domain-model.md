@@ -46,6 +46,10 @@ Task
 
 `Artifact`の同一性は #70、修正Attemptへの入力成果物の引継ぎは #71 を正本とする。過去の記録は上書きしない。
 
+Artifactのdigestは、そのworkspaceのGit object formatで計算したtree object IDである。snapshotはHEADを基準に、追跡済みファイルの作業tree上の内容と、Git ignore対象ではない新規ファイルを一時indexへ取り込み、Git treeとして記録する。既存のGit indexとworktreeは変更しない。Git ignore対象の新規ファイルはArtifactに含めない。保存したtreeはArtifactごとの専用refでLedger recordの存続中保持し、readback時にrefとtree objectを照合する。ref登録とLedger保存は単一transactionではないため、中断したArtifactはpending状態から再読込時に復旧する。不一致やtree object欠損を確認したArtifactは復旧が必要な状態とし、証拠や公開対象として使わない。
+
+初回Artifactの`base_commit`はAttempt開始時のbase commitとする。後続Artifactは入力ArtifactのTaskと同じTaskに属し、`base_commit`を入力Artifactから引き継ぐ。出力treeとの差分を比較するときはこのbase commitを使う。`source_attempt_id`は生成元Attemptを示し、監督Codex自身による編集ではnullにできる。Artifact IDはLedgerが発行する不透明な識別子であり、Git tree OIDは内容digestとして別に返す。
+
 ## Attemptはモデル呼び出しだけを表す
 
 AttemptはProvider / Modelを指定して開始した1回のモデル呼び出しである。実装、修正、調査、reviewはroleやrelationで区別するが、モデルを呼んだなら別Attemptとして残す。Attemptには要求・実測のProvider / Model、instruction、入力・出力成果物、開始・終了、診断、AgentResult、usage / costを残す。AgentResultは自己申告であり、成功や完了の根拠ではない。

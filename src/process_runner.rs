@@ -1,7 +1,7 @@
 //! Run external commands with bounded, observable process lifecycles.
 
 use std::ffi::OsString;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -131,7 +131,26 @@ pub struct ProcessRunner;
 impl ProcessRunner {
     /// Runs a command without an external cancellation signal.
     pub fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
-        self.run_with_cancellation(request, CancellationToken::new())
+        self.run_inner(request, CancellationToken::new(), None)
+    }
+
+    /// Runs a command with a small, bounded stdin payload.
+    pub(crate) fn run_with_stdin(
+        &self,
+        request: ProcessRequest,
+        input: &[u8],
+    ) -> Result<ProcessOutput, ProcessError> {
+        // This internal input path currently feeds object IDs only. Keeping
+        // the bound below the POSIX minimum pipe capacity ensures a child
+        // that does not read stdin cannot block the lifecycle monitor.
+        const MAX_STDIN_BYTES: usize = 128;
+        if input.len() > MAX_STDIN_BYTES {
+            return Err(ProcessError::Spawn(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process stdin input exceeds the 128 byte limit",
+            )));
+        }
+        self.run_inner(request, CancellationToken::new(), Some(input.to_vec()))
     }
 
     /// Runs a command, stopping it when cancelled or when its timeout elapses.
@@ -140,11 +159,24 @@ impl ProcessRunner {
         request: ProcessRequest,
         token: CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
+        self.run_inner(request, token, None)
+    }
+
+    fn run_inner(
+        &self,
+        request: ProcessRequest,
+        token: CancellationToken,
+        input: Option<Vec<u8>>,
+    ) -> Result<ProcessOutput, ProcessError> {
         let timeout = request.timeout;
         let mut command = Command::new(&request.command);
         command
             .args(&request.args)
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(cwd) = request.cwd {
@@ -163,6 +195,10 @@ impl ProcessRunner {
         let stderr = Arc::new(Mutex::new(CapturedBytes::default()));
         let stdout_reader = take_pipe(&mut child, true, Arc::clone(&stdout))?;
         let stderr_reader = take_pipe(&mut child, false, Arc::clone(&stderr))?;
+        let stdin_writer = input.map(|input| {
+            let mut stdin = child.stdin.take().expect("piped stdin was configured");
+            thread::spawn(move || stdin.write_all(&input))
+        });
         let started = Instant::now();
         let mut reason = loop {
             if token.is_cancelled() {
@@ -210,6 +246,12 @@ impl ProcessRunner {
         }
         let stdout_capture = captured(&stdout);
         let stderr_capture = captured(&stderr);
+        if let Some(writer) = stdin_writer {
+            writer
+                .join()
+                .map_err(|_| ProcessError::Io(io::Error::other("stdin writer thread panicked")))?
+                .map_err(ProcessError::Io)?;
+        }
         let output = ProcessOutput {
             stdout: stdout_capture.bytes,
             stderr: stderr_capture.bytes,
@@ -431,6 +473,16 @@ mod tests {
         assert_eq!(output.stdout, b"out");
         assert_eq!(output.stderr, b"err");
         assert_eq!(output.exit_code(), Some(0));
+    }
+
+    #[test]
+    fn writes_bounded_stdin_and_closes_it_before_waiting() {
+        let output = ProcessRunner
+            .run_with_stdin(ProcessRequest::new("cat"), b"artifact-id\n")
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"artifact-id\n");
     }
 
     #[test]

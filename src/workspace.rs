@@ -152,6 +152,8 @@ impl std::error::Error for WorkspaceError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
     repository_root: PathBuf,
+    task_id: TaskId,
+    attempt_id: AttemptId,
     branch: String,
     path: PathBuf,
 }
@@ -319,6 +321,8 @@ impl WorkspaceManager {
         }
         Ok(Workspace {
             repository_root: self.repository_root.clone(),
+            task_id: task.clone(),
+            attempt_id: attempt.clone(),
             branch,
             path,
         })
@@ -377,6 +381,33 @@ impl WorkspaceManager {
             .any(|candidate| candidate == &path)
         {
             return Err(WorkspaceError::WorkspaceNotManaged { path });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_artifact_workspace(
+        &self,
+        workspace: &Workspace,
+        task: &TaskId,
+        attempt: Option<&AttemptId>,
+    ) -> Result<(), WorkspaceError> {
+        if workspace.repository_root != self.repository_root {
+            return Err(WorkspaceError::WorkspaceNotManaged {
+                path: workspace.path.clone(),
+            });
+        }
+        self.validate_provider_workspace(&workspace.path)?;
+        // Keep the original IDs on Workspace: branch/path components are
+        // sanitized for filesystem/Git use and are not injective (for example,
+        // "a/b" and "a-b" produce the same component).
+        if workspace.task_id != *task
+            || attempt.is_some_and(|expected| expected != &workspace.attempt_id)
+            || workspace.path != self.worktree_path(&workspace.task_id, &workspace.attempt_id)
+            || workspace.branch != self.branch_name(&workspace.task_id, &workspace.attempt_id)
+        {
+            return Err(WorkspaceError::WorkspaceNotManaged {
+                path: workspace.path.clone(),
+            });
         }
         Ok(())
     }
