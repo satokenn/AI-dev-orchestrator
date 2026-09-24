@@ -177,13 +177,18 @@ impl<'a> ArtifactManager<'a> {
             return Err(ArtifactError::RecoveryRequired(record.id().to_owned()));
         }
 
-        self.ensure_tree_object(&record).inspect_err(|_error| {
-            let _ = self.ledger.set_artifact_state(
-                task_id,
-                artifact_id,
-                ArtifactState::RecoveryRequired,
-            );
-        })?;
+        match self.ensure_tree_object(&record) {
+            Ok(()) => {}
+            Err(ArtifactError::InvalidTreeObject(_)) => {
+                self.ledger.set_artifact_state(
+                    task_id,
+                    artifact_id,
+                    ArtifactState::RecoveryRequired,
+                )?;
+                return Err(ArtifactError::RecoveryRequired(record.id().to_owned()));
+            }
+            Err(error) => return Err(error),
+        }
         let ref_target = self.ref_target(&record)?;
         match ref_target {
             Some(target) if target == record.tree_oid() => {}
@@ -282,11 +287,22 @@ impl<'a> ArtifactManager<'a> {
     }
 
     fn ensure_tree_object(&self, record: &ArtifactRecord) -> Result<(), ArtifactError> {
-        let output = self.run_git(
-            record.repository_root(),
-            &["cat-file", "-t", record.tree_oid()],
-            &[],
-        )?;
+        let output = self
+            .runner
+            .run(
+                ProcessRequest::new("git")
+                    .args(["cat-file", "-t", record.tree_oid()])
+                    .cwd(record.repository_root()),
+            )
+            .map_err(|error| match error {
+                // A clean Git invocation that cannot resolve this object is
+                // an artifact integrity problem. Spawn/I/O/timeout failures
+                // remain process errors and must not change artifact state.
+                ProcessError::NonZeroExit(_) => {
+                    ArtifactError::InvalidTreeObject(record.tree_oid().to_owned())
+                }
+                other => ArtifactError::Git(process_error(other)),
+            })?;
         if String::from_utf8_lossy(&output.stdout).trim() != "tree" {
             return Err(ArtifactError::InvalidTreeObject(
                 record.tree_oid().to_owned(),
@@ -726,6 +742,81 @@ mod tests {
         );
 
         workspace_manager.cleanup_force(&workspace).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn invalid_tree_object_marks_artifact_as_recovery_required() {
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let task_id = TaskId::new("task-invalid-tree");
+        let attempt_id = AttemptId::new("attempt-invalid-tree");
+        let workspace = workspace_manager.create(&task_id, &attempt_id).unwrap();
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+        let base = git(workspace.path(), &["rev-parse", "HEAD"]);
+        let blob = git(workspace.path(), &["hash-object", "-w", "--stdin"]);
+        let record = ArtifactRecord::new(
+            "artifact-invalid-tree",
+            task_id.clone(),
+            Some(attempt_id.as_str().to_owned()),
+            None,
+            base,
+            blob,
+            workspace_manager.repository_root(),
+            format!("{ARTIFACT_REF_PREFIX}artifact-invalid-tree"),
+            ArtifactState::Available,
+        );
+        ledger.prepare_artifact(&record).unwrap();
+
+        assert!(matches!(
+            artifacts.read(&task_id, record.id()),
+            Err(ArtifactError::RecoveryRequired(_))
+        ));
+        assert_eq!(
+            ledger
+                .get_artifact(&task_id, record.id())
+                .unwrap()
+                .unwrap()
+                .state(),
+            ArtifactState::RecoveryRequired
+        );
+
+        workspace_manager.cleanup_force(&workspace).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn git_process_error_does_not_change_artifact_state() {
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let task_id = TaskId::new("task-git-process-error");
+        let attempt_id = AttemptId::new("attempt-git-process-error");
+        let workspace = workspace_manager.create(&task_id, &attempt_id).unwrap();
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+        let base = git(workspace.path(), &["rev-parse", "HEAD"]);
+        let record = artifacts
+            .capture(&workspace, &task_id, Some(&attempt_id), None, Some(&base))
+            .unwrap();
+        workspace_manager.cleanup_force(&workspace).unwrap();
+
+        let unavailable_repository = repository.with_extension("unavailable");
+        fs::rename(&repository, &unavailable_repository).unwrap();
+        assert!(matches!(
+            artifacts.read(&task_id, record.id()),
+            Err(ArtifactError::Git(_))
+        ));
+        assert_eq!(
+            ledger
+                .get_artifact(&task_id, record.id())
+                .unwrap()
+                .unwrap()
+                .state(),
+            ArtifactState::Available
+        );
+
+        fs::rename(&unavailable_repository, &repository).unwrap();
         fs::remove_dir_all(repository).unwrap();
     }
 }
