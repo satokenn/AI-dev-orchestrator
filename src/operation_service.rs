@@ -1433,6 +1433,11 @@ mod tests {
         let base = repo.commit();
         let hooks = repo.0.join(".git").join("hooks");
         fs::create_dir_all(&hooks).unwrap();
+        let hooks_path = hooks.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &["config", "--local", "core.hooksPath", &hooks_path],
+        );
         let hook = hooks.join("post-checkout");
         fs::write(
             &hook,

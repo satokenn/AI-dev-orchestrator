@@ -443,7 +443,8 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    /// Checks the managed worktree is still at the requested commit and contains no files.
+    /// Checks the managed worktree matches the requested base and has no local changes,
+    /// untracked files, or ignored content.
     /// This is intended for the first Provider call, before the agent can modify the workspace.
     pub fn validate_provider_workspace_at_base(
         &self,
