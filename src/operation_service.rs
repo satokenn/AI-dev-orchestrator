@@ -3,7 +3,7 @@
 //! This core service accepts explicit Provider / Model and BaseInput requests.
 //! It does not select a target or expose Provider output and raw diagnostics.
 
-use std::{path::PathBuf, time::Duration};
+use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
@@ -133,6 +133,27 @@ pub struct OperationAcceptance {
     status: ServiceOperationStatus,
 }
 
+/// A hard per-Task limit on Operation Service execution claims.
+///
+/// A claim consumes one unit before Provider availability checks and workspace
+/// preparation. The durable claim is counted once, including after recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskExecutionCountBudget {
+    max_executions: NonZeroU64,
+}
+
+impl TaskExecutionCountBudget {
+    #[must_use]
+    pub const fn new(max_executions: NonZeroU64) -> Self {
+        Self { max_executions }
+    }
+
+    #[must_use]
+    pub const fn max_executions(self) -> u64 {
+        self.max_executions.get()
+    }
+}
+
 impl OperationAcceptance {
     #[must_use]
     pub fn operation_id(&self) -> &OperationId {
@@ -249,6 +270,7 @@ pub enum ServiceError {
     StaleRevision { expected: u64, actual: u64 },
     Busy(OperationId),
     PolicyDenied(&'static str),
+    BudgetExhausted { limit: u64 },
     IdempotencyConflict,
     OperationNotFound,
     InvalidStoredState,
@@ -279,6 +301,10 @@ impl std::fmt::Display for ServiceError {
                 id.as_str()
             ),
             Self::PolicyDenied(reason) => write!(formatter, "operation denied by policy: {reason}"),
+            Self::BudgetExhausted { limit } => write!(
+                formatter,
+                "Task execution-count budget exhausted (limit: {limit})"
+            ),
             Self::IdempotencyConflict => {
                 formatter.write_str("request ID was already used with a different payload")
             }
@@ -323,6 +349,7 @@ pub struct OperationService<'a, P> {
     providers: &'a P,
     max_attempts: usize,
     default_timeout: Duration,
+    execution_count_budget: Option<TaskExecutionCountBudget>,
 }
 
 impl<'a, P: ProviderResolver> OperationService<'a, P> {
@@ -347,7 +374,15 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             providers,
             max_attempts,
             default_timeout,
+            execution_count_budget: None,
         })
+    }
+
+    /// Enables a hard per-Task execution-count budget. `None` disables it.
+    #[must_use]
+    pub fn with_execution_count_budget(mut self, budget: Option<TaskExecutionCountBudget>) -> Self {
+        self.execution_count_budget = budget;
+        self
     }
 
     fn idempotent_acceptance(
@@ -517,6 +552,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if let Some(id) = busy {
             return Err(ServiceError::Busy(OperationId::new(id)));
         }
+        self.check_execution_count_budget(&transaction, &request.task_id)?;
 
         if task.state() == TaskState::Pending {
             task.start()?;
@@ -870,6 +906,22 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if status != "accepted" {
             return Ok(false);
         }
+        match self.check_execution_count_budget(&tx, &TaskId::new(task_id.clone())) {
+            Ok(()) => {}
+            Err(error @ ServiceError::BudgetExhausted { .. }) => {
+                let changed = tx.execute(
+                    "UPDATE service_operations SET status='failed',finished_at=?2,diagnostic_code='budget_exhausted' WHERE id=?1 AND status='accepted'",
+                    params![operation_id.as_str(), now_ms()],
+                )?;
+                if changed != 1 {
+                    return Err(ServiceError::InvalidStoredState);
+                }
+                bump_revision(&tx, &TaskId::new(task_id))?;
+                tx.commit()?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
         let started = now_ms();
         let changed=tx.execute("UPDATE service_operations SET status='running',started_at=?2 WHERE id=?1 AND status='accepted'",params![operation_id.as_str(),started])?;
         if changed != 1 {
@@ -878,6 +930,28 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         bump_revision(&tx, &TaskId::new(task_id))?;
         tx.commit()?;
         Ok(true)
+    }
+
+    fn check_execution_count_budget(
+        &self,
+        connection: &rusqlite::Connection,
+        task_id: &TaskId,
+    ) -> Result<(), ServiceError> {
+        if let Some(budget) = self.execution_count_budget {
+            let claimed: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM service_operations WHERE task_id=?1 AND started_at IS NOT NULL",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if u64::try_from(claimed).map_err(|_| ServiceError::InvalidStoredState)?
+                >= budget.max_executions()
+            {
+                return Err(ServiceError::BudgetExhausted {
+                    limit: budget.max_executions(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn mark_attempt_started(&self, operation_id: &OperationId) -> Result<(), ServiceError> {
@@ -1354,6 +1428,168 @@ mod tests {
     }
 
     #[test]
+    fn task_execution_count_budget_rejects_before_accepting_or_starting_provider() {
+        let (repo, ledger, workspace, providers, calls, checks, task_id) =
+            service_parts(false, Duration::ZERO, false);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_execution_count_budget(Some(TaskExecutionCountBudget::new(
+                    std::num::NonZeroU64::new(1).unwrap(),
+                )));
+        let first_request = request(&repo, &task_id, 0, "budget-first");
+        let accepted = service.submit_attempt(&first_request).unwrap();
+        assert_eq!(service.submit_attempt(&first_request).unwrap(), accepted);
+        let completed = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(completed.status(), ServiceOperationStatus::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let revision: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            service.submit_attempt(&request(&repo, &task_id, revision as u64, "budget-second")),
+            Err(ServiceError::BudgetExhausted { limit: 1 })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn disabled_execution_count_budget_preserves_unlimited_policy_behavior() {
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(false, Duration::ZERO, false);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_execution_count_budget(None);
+        let accepted = service
+            .submit_attempt(&request(&repo, &task_id, 0, "budget-disabled"))
+            .unwrap();
+        assert_eq!(
+            service
+                .run(accepted.operation_id(), CancellationToken::new())
+                .unwrap()
+                .status(),
+            ServiceOperationStatus::Completed
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_provider_claim_consumes_budget_once() {
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(true, Duration::ZERO, false);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_execution_count_budget(Some(TaskExecutionCountBudget::new(
+                    std::num::NonZeroU64::new(1).unwrap(),
+                )));
+        let accepted = service
+            .submit_attempt(&request(&repo, &task_id, 0, "budget-provider-failure"))
+            .unwrap();
+        assert_eq!(
+            service
+                .run(accepted.operation_id(), CancellationToken::new())
+                .unwrap()
+                .status(),
+            ServiceOperationStatus::Failed
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let revision: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            service.submit_attempt(&request(
+                &repo,
+                &task_id,
+                revision as u64,
+                "budget-after-provider-failure"
+            )),
+            Err(ServiceError::BudgetExhausted { limit: 1 })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn budget_exhaustion_at_claim_ends_accepted_operation_and_releases_task() {
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(false, Duration::ZERO, false);
+        let unrestricted =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let first = unrestricted
+            .submit_attempt(&request(&repo, &task_id, 0, "budget-reconfigure-a"))
+            .unwrap();
+        let first_result = unrestricted
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(first_result.status(), ServiceOperationStatus::Completed);
+
+        let revision: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let second = unrestricted
+            .submit_attempt(&request(
+                &repo,
+                &task_id,
+                revision as u64,
+                "budget-reconfigure-b",
+            ))
+            .unwrap();
+        let limited =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_execution_count_budget(Some(TaskExecutionCountBudget::new(
+                    std::num::NonZeroU64::new(1).unwrap(),
+                )));
+
+        assert!(matches!(
+            limited.submit_attempt(&request(
+                &repo,
+                &task_id,
+                second.revision(),
+                "budget-reconfigure-c"
+            )),
+            Err(ServiceError::Busy(active)) if active == *second.operation_id()
+        ));
+        assert!(matches!(
+            limited.run(second.operation_id(), CancellationToken::new()),
+            Err(ServiceError::BudgetExhausted { limit: 1 })
+        ));
+        let rejected = limited.get_operation(second.operation_id()).unwrap();
+        assert_eq!(rejected.status(), ServiceOperationStatus::Failed);
+        assert_eq!(rejected.attempt_state(), AttemptState::Queued);
+        assert_eq!(rejected.diagnostic_code(), Some("budget_exhausted"));
+        let replay = limited
+            .run(second.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(replay.status(), ServiceOperationStatus::Failed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn provider_timeout_is_recorded_without_raw_streams() {
         let (repo, ledger, workspace, providers, calls, _, task_id) =
             service_parts(true, Duration::ZERO, false);
@@ -1542,7 +1778,10 @@ mod tests {
         });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
+                .unwrap()
+                .with_execution_count_budget(Some(TaskExecutionCountBudget::new(
+                    std::num::NonZeroU64::new(1).unwrap(),
+                )));
         let accepted = service
             .submit_attempt(&request(&repo, &task_id, 0, "concurrent-run"))
             .unwrap();
@@ -1588,7 +1827,10 @@ mod tests {
             service_parts(false, Duration::ZERO, false);
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
+                .unwrap()
+                .with_execution_count_budget(Some(TaskExecutionCountBudget::new(
+                    std::num::NonZeroU64::new(1).unwrap(),
+                )));
         let accepted = service
             .submit_attempt(&request(&repo, &task_id, 0, "crash-recovery"))
             .unwrap();
@@ -1618,5 +1860,23 @@ mod tests {
             .unwrap();
         assert_eq!(repeated.status(), ServiceOperationStatus::RecoveryRequired);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let revision: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            service.submit_attempt(&request(
+                &repo,
+                &task_id,
+                revision as u64,
+                "crash-recovery-retry"
+            )),
+            Err(ServiceError::Busy(active)) if active == *accepted.operation_id()
+        ));
     }
 }

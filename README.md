@@ -71,6 +71,8 @@ JSONLの最後の`item.completed` / `agent_message.text`を`AgentResult`へ、�
 
 Provider起動前にworkspaceのHEADが指定commitと一致し、tracked・untracked・ignored fileが空であることも確認します。hook等が内容を作った場合はProviderを起動せず、workspaceと内容を保持します。実行中のOperationはworkspace pathとbranchを参照として記録し、結果確認・Artifact連携までは自動削除しません。プロセス再起動時は `recover_incomplete_operations()` を新しい依頼を受け付ける前に呼び、running Operationを `recovery_required` として閉じます。中断結果を推測せず、同じOperationを再実行しません。これはRust Service APIの中核実装であり、MCP transport、ArtifactInput、redacted log保存、named Model catalog、CLIへの配線は別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
 
+任意の hard budget は `OperationService::with_execution_count_budget(Some(...))` で有効化します。現在の予算metricはTask scopeの実行claim数（`execution` 単位）のみです。上限に達すると受付時に `BudgetExhausted` で拒否し、Policy未設定（`None`）なら予算だけを理由に拒否しません。実行claimはSQLiteの即時transaction内で再確認し、同じOperationの再送・復旧は再計上しません。Service再構成後に受理済みOperationのbudgetが超過していた場合は、claimを原子的に `failed` / `budget_exhausted` として終端化し、後続受付のbusyを解除します。claimされた実行はProvider availabilityやworkspace準備で失敗しても1回を消費します。これはServiceが保証する操作実行枠であり、Provider側の外部利用量・料金上限を保証しません。
+
 Service利用側は明示したbase commitで受付し、返されたIDで同期実行または後から状態取得を行います。
 
 ```rust,ignore
