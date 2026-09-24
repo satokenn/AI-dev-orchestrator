@@ -704,6 +704,17 @@ mod tests {
             .unwrap()
     }
 
+    fn write_marker(marker: &std::path::Path, contents: &str) -> std::io::Result<()> {
+        let mut temporary_name = marker
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("marker path has no file name"))?
+            .to_os_string();
+        temporary_name.push(".tmp");
+        let temporary_path = marker.with_file_name(temporary_name);
+        fs::write(&temporary_path, contents)?;
+        fs::rename(temporary_path, marker)
+    }
+
     fn wait_for_marker(child: &mut Child, marker: &std::path::Path) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -732,10 +743,10 @@ mod tests {
         match mode.as_str() {
             "lock" => match LedgerRunLock::acquire(&ledger_path) {
                 Err(error) if error.contains("ledger is busy") => {
-                    fs::write(marker, "busy").unwrap();
+                    write_marker(&marker, "busy").unwrap();
                 }
-                Err(error) => fs::write(marker, format!("error: {error}")).unwrap(),
-                Ok(_lock) => fs::write(marker, "acquired").unwrap(),
+                Err(error) => write_marker(&marker, &format!("error: {error}")).unwrap(),
+                Ok(_lock) => write_marker(&marker, "acquired").unwrap(),
             },
             "run" => {
                 let result = ProductionRuntime.run_issue(&RunRequest {
@@ -744,11 +755,11 @@ mod tests {
                     repository_root: std::path::PathBuf::from("."),
                     ledger: ledger_path,
                 });
-                fs::write(marker, result.to_string()).unwrap();
+                write_marker(&marker, &result.to_string()).unwrap();
             }
             "hold" => {
                 let _lock = LedgerRunLock::acquire(&ledger_path).unwrap();
-                fs::write(marker, "locked").unwrap();
+                write_marker(&marker, "locked").unwrap();
                 thread::sleep(Duration::from_secs(60));
             }
             _ => panic!("unknown lock test mode"),
