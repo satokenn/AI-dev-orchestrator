@@ -38,6 +38,22 @@ fn open_ledger_for_run(path: &Path) -> Result<SqliteExecutionLedger, String> {
         .map_err(|error| format!("cannot open ledger {}: {error}", path.display()))
 }
 
+fn open_operation_ledger_for_run(path: &Path) -> Result<Arc<SqliteOperationLedger>, String> {
+    let ledger = SqliteOperationLedger::open(path)
+        .map_err(|error| format!("cannot open operation ledger: {error}"))?;
+    let recovered = ledger
+        .recover()
+        .map_err(|error| format!("cannot recover operation ledger: {error}"))?;
+    for record in recovered {
+        eprintln!(
+            "operation {} requires recovery: {}",
+            record.operation.as_str(),
+            record.reason
+        );
+    }
+    Ok(Arc::new(ledger))
+}
+
 fn help() -> String {
     format!(
         "ai-dev-orchestrator {}\n\nUSAGE:\n  ai-dev-orchestrator doctor [--json]\n  ai-dev-orchestrator run --repo OWNER/NAME --issue N --repository-root PATH --ledger PATH\n  ai-dev-orchestrator status --task-id ID --ledger PATH [--json]\n\nEXIT CODES: 0 success, 1 operation failure, 2 usage error, 3 provider unavailable\n",
@@ -183,6 +199,13 @@ impl CliRuntime for ProductionRuntime {
                 return OPERATION_ERROR;
             }
         };
+        let operation_ledger = match open_operation_ledger_for_run(&request.ledger) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                eprintln!("{error}");
+                return OPERATION_ERROR;
+            }
+        };
         let key = format!("{}#{}", request.repository, request.issue);
         let source = GhIssueSource;
         let existing = match ledger.load_publication(&key) {
@@ -233,13 +256,6 @@ impl CliRuntime for ProductionRuntime {
                 };
             }
         }
-        let operation_ledger = match SqliteOperationLedger::open(&request.ledger) {
-            Ok(ledger) => Arc::new(ledger),
-            Err(error) => {
-                eprintln!("cannot open operation ledger: {error}");
-                return OPERATION_ERROR;
-            }
-        };
         let executor = ProductionIssueExecutor {
             root: request.repository_root.clone(),
             ledger,
@@ -505,4 +521,140 @@ pub fn run_with_runtime<I: IntoIterator<Item = String>>(args: I, runtime: &dyn C
 
 pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     run_with_runtime(args, &ProductionRuntime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_operation_ledger_for_run;
+    use crate::{
+        EventKind, OperationLedger, OperationRequest, OperationStatus, ProviderRef,
+        SqliteOperationLedger, TaskId,
+    };
+    use std::fs;
+
+    fn temporary_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ai-dev-orchestrator-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn opening_operation_ledger_recovers_unfinished_operations() {
+        let root = temporary_path("startup-recovery");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        let (accepted_id, running_id) = {
+            let ledger = SqliteOperationLedger::open(&path).unwrap();
+            ledger.set_task_revision(&TaskId::new("task-1"), 1).unwrap();
+            ledger.set_task_revision(&TaskId::new("task-2"), 1).unwrap();
+            let accepted = ledger
+                .accept_operation(&OperationRequest::new(
+                    "request-1",
+                    TaskId::new("task-1"),
+                    1,
+                    "payload",
+                    "instruction",
+                    ProviderRef::new("codex"),
+                    None,
+                ))
+                .unwrap();
+            let running = ledger
+                .accept_operation(&OperationRequest::new(
+                    "request-2",
+                    TaskId::new("task-2"),
+                    1,
+                    "payload",
+                    "instruction",
+                    ProviderRef::new("codex"),
+                    None,
+                ))
+                .unwrap();
+            ledger
+                .start_operation(running.id(), &ProviderRef::new("codex"), None)
+                .unwrap();
+            (accepted.id().clone(), running.id().clone())
+        };
+
+        let recovered = open_operation_ledger_for_run(&path).unwrap();
+        for id in [&accepted_id, &running_id] {
+            let operation = recovered.get_operation(id).unwrap().unwrap();
+            assert_eq!(operation.status(), OperationStatus::RecoveryRequired);
+            assert!(operation.diagnostic().is_some());
+            let events = recovered.events(id).unwrap();
+            assert_eq!(events.last().unwrap().kind, EventKind::Recovery);
+            assert_eq!(
+                events.last().unwrap().detail,
+                operation.diagnostic().unwrap()
+            );
+        }
+        drop(recovered);
+
+        // Reopening after recovery is idempotent and does not append another event.
+        let reopened = open_operation_ledger_for_run(&path).unwrap();
+        assert_eq!(reopened.events(&accepted_id).unwrap().len(), 2);
+        assert_eq!(reopened.events(&running_id).unwrap().len(), 3);
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operation_ledger_open_failure_is_reported_without_continuing() {
+        let root = temporary_path("startup-recovery-failure");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        let sidecar = std::path::PathBuf::from(format!("{}.operations.sqlite3", path.display()));
+        fs::write(&sidecar, b"not a sqlite database").unwrap();
+
+        let error = open_operation_ledger_for_run(&path).err().unwrap();
+        assert!(error.contains("cannot open operation ledger"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operation_ledger_recovery_failure_is_reported_without_partial_update() {
+        let root = temporary_path("startup-recovery-transaction");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        let id = {
+            let ledger = SqliteOperationLedger::open(&path).unwrap();
+            ledger.set_task_revision(&TaskId::new("task-1"), 1).unwrap();
+            ledger
+                .accept_operation(&OperationRequest::new(
+                    "request-1",
+                    TaskId::new("task-1"),
+                    1,
+                    "payload",
+                    "instruction",
+                    ProviderRef::new("codex"),
+                    None,
+                ))
+                .unwrap()
+                .id()
+                .clone()
+        };
+        let sidecar = std::path::PathBuf::from(format!("{}.operations.sqlite3", path.display()));
+        let connection = rusqlite::Connection::open(&sidecar).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_recovery BEFORE INSERT ON operation_events
+                 WHEN NEW.kind = 'recovery' BEGIN SELECT RAISE(ABORT, 'injected recovery failure'); END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = open_operation_ledger_for_run(&path).err().unwrap();
+        assert!(error.contains("cannot recover operation ledger"));
+        let ledger = SqliteOperationLedger::open(&path).unwrap();
+        let operation = ledger.get_operation(&id).unwrap().unwrap();
+        assert_eq!(operation.status(), OperationStatus::Accepted);
+        assert_eq!(operation.diagnostic(), None);
+        assert_eq!(ledger.events(&id).unwrap().len(), 1);
+        drop(ledger);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
