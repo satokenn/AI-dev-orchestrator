@@ -681,7 +681,7 @@ fn provider_error_status(error: &ProviderError) -> OperationStatus {
         ProviderError::TimedOut { .. } | ProviderError::TimedOutWithOutput { .. } => {
             OperationStatus::TimedOut
         }
-        ProviderError::Interrupted { .. } => OperationStatus::Interrupted,
+        ProviderError::Interrupted { .. } => OperationStatus::RecoveryRequired,
         _ => OperationStatus::Failed,
     }
 }
@@ -693,9 +693,18 @@ fn finish_operation(
     diagnostic: Option<&str>,
 ) -> Result<(), OrchestratorError> {
     if let (Some(ledger), Some(operation_id)) = (ledger, operation_id) {
-        ledger
-            .finish_operation(operation_id, status, diagnostic)
-            .map_err(OrchestratorError::Ledger)?;
+        if status == OperationStatus::RecoveryRequired {
+            ledger
+                .mark_recovery_required(
+                    operation_id,
+                    diagnostic.unwrap_or("operation outcome requires recovery"),
+                )
+                .map_err(OrchestratorError::Ledger)?;
+        } else {
+            ledger
+                .finish_operation(operation_id, status, diagnostic)
+                .map_err(OrchestratorError::Ledger)?;
+        }
     }
     Ok(())
 }
