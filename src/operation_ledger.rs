@@ -348,6 +348,8 @@ pub trait ExecutionLedger {
         status: OperationStatus,
         diagnostic: Option<&str>,
     ) -> Result<(), LedgerError>;
+    fn mark_recovery_required(&self, id: &OperationId, diagnostic: &str)
+    -> Result<(), LedgerError>;
 }
 
 pub struct SqliteExecutionLedger {
@@ -588,19 +590,100 @@ impl SqliteExecutionLedger {
         for item in ids {
             let (id, status) = item?;
             let status = OperationStatus::from_str(&status)?;
-            transaction.execute("UPDATE operations SET status='recovery_required' WHERE id=?1 AND status NOT IN ('succeeded','failed','invalid_output','timed_out','cancelled')", params![id])?;
+            let reason = format!(
+                "operation was not terminal at restart (previously {})",
+                status.as_str()
+            );
+            let recovered_at = now();
+            let changed = transaction.execute(
+                "UPDATE operations SET status='recovery_required', diagnostic=?2 \
+                 WHERE id=?1 AND status IN ('accepted','running','interrupted')",
+                params![id, reason],
+            )?;
+            if changed != 1 {
+                return Err(LedgerError::InvalidValue(format!(
+                    "operation changed during recovery: {id}"
+                )));
+            }
+            let sequence: i64 = transaction.query_row(
+                "SELECT COALESCE(MAX(sequence), -1) + 1 FROM operation_events WHERE operation_id=?1",
+                params![id],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO operation_events VALUES(?1, ?2, 'recovery', ?3, ?4)",
+                params![id, sequence, recovered_at, reason],
+            )?;
             records.push(RecoveryRecord {
                 operation: OperationId::new(id),
                 status: OperationStatus::RecoveryRequired,
-                reason: format!(
-                    "operation was not terminal at restart (previously {})",
-                    status.as_str()
-                ),
+                reason,
             });
         }
         drop(statement);
         transaction.commit()?;
         Ok(records)
+    }
+    pub fn mark_recovery_required(
+        &self,
+        id: &OperationId,
+        diagnostic: &str,
+    ) -> Result<(), LedgerError> {
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM operations WHERE id=?1",
+                params![id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Err(LedgerError::InvalidValue(format!(
+                "unknown operation {}",
+                id.as_str()
+            )));
+        };
+        let current = OperationStatus::from_str(&current)?;
+        if current == OperationStatus::RecoveryRequired {
+            let saved_diagnostic: Option<String> = transaction.query_row(
+                "SELECT diagnostic FROM operations WHERE id=?1",
+                params![id.as_str()],
+                |row| row.get(0),
+            )?;
+            return if saved_diagnostic.as_deref() == Some(diagnostic) {
+                Ok(())
+            } else {
+                Err(LedgerError::TerminalConflict(id.clone()))
+            };
+        }
+        if !matches!(
+            current,
+            OperationStatus::Accepted | OperationStatus::Running | OperationStatus::Interrupted
+        ) {
+            return Err(LedgerError::TerminalConflict(id.clone()));
+        }
+
+        let occurred_at = now();
+        let changed = transaction.execute(
+            "UPDATE operations SET status='recovery_required', diagnostic=?2 \
+             WHERE id=?1 AND status IN ('accepted','running','interrupted')",
+            params![id.as_str(), diagnostic],
+        )?;
+        if changed != 1 {
+            return Err(LedgerError::TerminalConflict(id.clone()));
+        }
+        let sequence: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM operation_events WHERE operation_id=?1",
+            params![id.as_str()],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO operation_events VALUES(?1, ?2, 'recovery', ?3, ?4)",
+            params![id.as_str(), sequence, occurred_at, diagnostic],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
     fn load(&self, id: &OperationId) -> Result<Option<OperationRecord>, LedgerError> {
         let connection = self.connection.lock().expect("ledger mutex poisoned");
@@ -717,6 +800,12 @@ impl ExecutionLedger for SqliteExecutionLedger {
             )));
         };
         let current = OperationStatus::from_str(&current)?;
+        if matches!(
+            current,
+            OperationStatus::Interrupted | OperationStatus::RecoveryRequired
+        ) {
+            return Err(LedgerError::TerminalConflict(id.clone()));
+        }
         if current.terminal() {
             if current != status {
                 return Err(LedgerError::TerminalConflict(id.clone()));
@@ -724,7 +813,7 @@ impl ExecutionLedger for SqliteExecutionLedger {
             return Ok(());
         }
         let finished = now();
-        let changed = transaction.execute("UPDATE operations SET status=?2, finished_at=?3, diagnostic=COALESCE(?4, diagnostic) WHERE id=?1 AND status NOT IN ('succeeded','failed','invalid_output','timed_out','cancelled')", params![id.as_str(), status.as_str(), finished, diagnostic])?;
+        let changed = transaction.execute("UPDATE operations SET status=?2, finished_at=?3, diagnostic=COALESCE(?4, diagnostic) WHERE id=?1 AND status IN ('accepted','running')", params![id.as_str(), status.as_str(), finished, diagnostic])?;
         if changed != 1 {
             return Err(LedgerError::TerminalConflict(id.clone()));
         }
@@ -744,6 +833,13 @@ impl ExecutionLedger for SqliteExecutionLedger {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+    fn mark_recovery_required(
+        &self,
+        id: &OperationId,
+        diagnostic: &str,
+    ) -> Result<(), LedgerError> {
+        SqliteExecutionLedger::mark_recovery_required(self, id, diagnostic)
     }
 }
 
@@ -843,6 +939,10 @@ mod tests {
         let recovered = ledger.recover().unwrap();
         assert_eq!(recovered[0].operation, *operation.id());
         assert_eq!(
+            recovered[0].reason,
+            "operation was not terminal at restart (previously accepted)"
+        );
+        assert_eq!(
             ledger
                 .get_operation(operation.id())
                 .unwrap()
@@ -850,6 +950,52 @@ mod tests {
                 .status(),
             OperationStatus::RecoveryRequired
         );
+        assert_eq!(
+            ledger
+                .get_operation(operation.id())
+                .unwrap()
+                .unwrap()
+                .diagnostic(),
+            Some(recovered[0].reason.as_str())
+        );
+        let events = ledger.events(operation.id()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, EventKind::Recovery);
+        assert_eq!(events[1].detail, recovered[0].reason);
+        assert!(ledger.recover().unwrap().is_empty());
+        assert_eq!(ledger.events(operation.id()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn recovery_required_operation_cannot_be_finished_or_overwritten() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
+        ledger
+            .start_operation(operation.id(), &ProviderRef::new("codex"), Some("gpt"))
+            .unwrap();
+        ledger
+            .mark_recovery_required(operation.id(), "process outcome is unknown")
+            .unwrap();
+        ledger
+            .mark_recovery_required(operation.id(), "process outcome is unknown")
+            .unwrap();
+
+        assert!(matches!(
+            ledger.finish_operation(operation.id(), OperationStatus::Succeeded, None),
+            Err(LedgerError::TerminalConflict(_))
+        ));
+        assert!(matches!(
+            ledger.mark_recovery_required(operation.id(), "different diagnosis"),
+            Err(LedgerError::TerminalConflict(_))
+        ));
+        let stored = ledger.get_operation(operation.id()).unwrap().unwrap();
+        assert_eq!(stored.status(), OperationStatus::RecoveryRequired);
+        assert_eq!(stored.finished_at(), None);
+        assert_eq!(stored.diagnostic(), Some("process outcome is unknown"));
+        let events = ledger.events(operation.id()).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].kind, EventKind::Recovery);
+        assert_eq!(events[2].detail, "process outcome is unknown");
     }
     #[test]
     fn raw_logs_are_bounded_and_referenced() {

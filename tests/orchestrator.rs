@@ -224,6 +224,101 @@ fn provider_failure_keeps_failed_attempt_and_workspace_diagnostics() {
 }
 
 #[test]
+fn interrupted_provider_is_persisted_as_recovery_required_without_terminal_time() {
+    let repository = temporary_repository();
+    let manager = WorkspaceManager::new(&repository).expect("resolve repository");
+    let provider = FakeProvider {
+        reference: ProviderRef::new("fake-provider"),
+        calls: Arc::new(Mutex::new(Vec::new())),
+        result: Err(ProviderError::Interrupted {
+            reason: ai_dev_orchestrator::StopReason::TimedOut,
+            confirmed_stopped: false,
+            stdout: "partial output".to_owned(),
+            stderr: String::new(),
+            diagnostic: "process group still exists".to_owned(),
+        }),
+    };
+    let validator = FakeValidator {
+        calls: Arc::new(Mutex::new(Vec::new())),
+        result: Ok(ValidationResult::new("unused", true)),
+    };
+    let operation_ledger = Arc::new(SqliteOperationLedger::open_in_memory().unwrap());
+    let service = Orchestrator::new(manager.clone(), provider, validator)
+        .with_operation_ledger(operation_ledger.clone());
+    let mut task = task();
+
+    let error = service
+        .execute(
+            &mut task,
+            AttemptId::new("attempt-1"),
+            Duration::from_secs(30),
+        )
+        .expect_err("interrupted provider outcome must be returned");
+
+    let operation = operation_ledger
+        .accept_operation(&ai_dev_orchestrator::OperationRequest::new(
+            "attempt:attempt-1",
+            task.id().clone(),
+            1,
+            task.description(),
+            task.description(),
+            ProviderRef::new("fake-provider"),
+            None,
+        ))
+        .expect("accepted operation remains queryable");
+    let stored = operation_ledger
+        .get_operation(operation.id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.status(),
+        ai_dev_orchestrator::OperationStatus::RecoveryRequired
+    );
+    assert!(stored.started_at().is_some());
+    assert_eq!(stored.finished_at(), None);
+    assert!(
+        stored
+            .diagnostic()
+            .unwrap()
+            .contains("process group still exists")
+    );
+    assert_eq!(
+        operation_ledger
+            .events(operation.id())
+            .unwrap()
+            .last()
+            .unwrap()
+            .kind,
+        ai_dev_orchestrator::EventKind::Recovery
+    );
+    assert!(matches!(error, OrchestratorError::Provider { .. }));
+    assert_eq!(
+        task.attempts()[0].state(),
+        ai_dev_orchestrator::AttemptState::Failed
+    );
+
+    let retry = ai_dev_orchestrator::OperationRequest::new(
+        "attempt:attempt-2",
+        task.id().clone(),
+        1,
+        task.description(),
+        task.description(),
+        ProviderRef::new("fake-provider"),
+        None,
+    );
+    assert!(matches!(
+        operation_ledger.accept_operation(&retry),
+        Err(ai_dev_orchestrator::OperationLedgerError::ActiveOperation(
+            _
+        ))
+    ));
+
+    let workspace = error.workspace().expect("workspace retained");
+    manager.cleanup(workspace).expect("clean workspace");
+    fs::remove_dir_all(repository).expect("remove repository");
+}
+
+#[test]
 fn workspace_failure_keeps_one_failed_attempt_in_task() {
     let repository = temporary_repository();
     let manager = WorkspaceManager::new(&repository).expect("resolve repository");
