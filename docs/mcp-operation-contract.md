@@ -20,7 +20,10 @@ flowchart TB
     Service --> Workers[Provider / Model / Validator / GitHub / CI<br/>実行・観測]
 ```
 
-図は目標構成であり、MCP Gateway / transportはまだ実装対象外である（#45）。このPRが定義するのは、Gatewayが公開するtoolの意味と、Rust Operation Serviceとの境界である。現行CLIの挙動を示す図ではない。
+図は目標構成であり、MCP Gateway / transportはまだ実装対象外である（#45）。この文書はGatewayが公開するtoolの意味と、Rust Operation Serviceとの境界を定め、現行CLIの挙動を示すものではない。
+
+> [!IMPORTANT]
+> この改訂で追加するCI項目はwire contractの仕様であり、CI観測runtimeの実装ではない。PR head SHAとRequired Check集合に束縛した観測は#79、Operation Serviceへの接続は#66、Publication / Artifact保存との接続は#70、MCP Gatewayは#45で実装する。文書の変更だけでは新しいCI観測結果は返らず、runtimeの動作も変わらない。
 
 ## この契約の役割
 
@@ -53,8 +56,8 @@ Serviceは次のProvider / Model、retry、review、成果物の採否、Task完
 | `validation.run` | Artifactに対して指定された機械検査を実行する | 対象Artifactと検査profileまたは検査内容 | 受付後、対象Artifactに対する各検査の結果。Validation成功はArtifactの採用判断ではない |
 | `decision.record` | Artifactを採用するかどうかの監督Codexの判断と理由をTaskの記録に残す | 対象Artifact、判断、理由、参照証拠 | 保存されたCodexDecisionと更新後revision。reviewerの判断とは別の記録 |
 | `publication.publish` | 採用済みArtifactを指定先へ公開し、Pull Requestを作成する | 対象Artifact、accepted decision、公開先・PR情報 | 受付後、公開結果とPR / head SHAの参照。PR作成だけでCI成功やTask完了にはならない |
-| `ci.get` | PRまたはcommitのCI check状態を一度だけ観測する | Publication、PRまたはcommit | 対象SHAについて観測したcheck状態。`unknown` / `pending` は成功ではない |
-| `ci.wait` | PRまたはcommitのCI状態を期限まで待ち、確定したcheck状態を観測する | Publication、PRまたはcommit、期限 | 受付後、対象SHAの観測結果。期限内に確定しない場合も成功とは扱わず、operationの結果を確認する |
+| `ci.get` | PRまたはcommitのCI check状態を一度観測する | Publication、PRまたはcommit | 対象SHAのRequired Check集合と個別状態。集合不明、`unknown`、`pending`は成功ではない |
+| `ci.wait` | PRまたはcommitのCI状態を期限まで待つ | Publication、PRまたはcommit、期限 | 受付後、対象SHAのRequired Check集合と個別状態。期限切れや観測不能は成功ではなく、operationの結果を確認する |
 | `task.finish` | Artifactと採用判断・必要な証拠を照合し、Taskの完了を確定する | 完了させるArtifact、accepted decision、必要な証拠 | 条件を満たせばcompleted Task。Serviceは証拠を照合し、不足や不一致があれば完了を拒否する |
 
 ## 結果を読むときの要点
