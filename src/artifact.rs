@@ -494,7 +494,8 @@ fn process_error(error: ProcessError) -> String {
 mod tests {
     use super::*;
     use std::{
-        process::Command,
+        io::Write,
+        process::{Command, Stdio},
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -532,12 +533,37 @@ mod tests {
             .success()
     }
 
+    fn git_with_input(directory: &Path, args: &[&str], input: &[u8]) -> String {
+        let mut child = Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("git is installed");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin is piped")
+            .write_all(input)
+            .expect("write git input");
+        let output = child.wait_with_output().expect("wait for git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
     fn repository() -> PathBuf {
         let path = temporary_directory();
         git(&path, &["init", "-b", "main"]);
         git(&path, &["config", "user.email", "artifact@example.invalid"]);
         git(&path, &["config", "user.name", "Artifact Test"]);
-        fs::write(path.join(".gitignore"), "*.secret\n").expect("write ignore file");
+        fs::write(path.join(".gitignore"), "*.secret\nhook-owned.txt\n")
+            .expect("write ignore file");
         fs::write(path.join("source.txt"), "base\n").expect("write tracked source");
         git(&path, &["add", ".gitignore", "source.txt"]);
         git(&path, &["commit", "-m", "initial"]);
@@ -778,6 +804,138 @@ mod tests {
                 .worktree_path(&task_id, &tampered_attempt)
                 .exists()
         );
+
+        workspace_manager.cleanup_force(&source).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_refuses_ignored_file_created_by_post_checkout_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let task_id = TaskId::new("task-hook-file");
+        let source_attempt = AttemptId::new("attempt-hook-source");
+        let source = workspace_manager.create(&task_id, &source_attempt).unwrap();
+        let base = git(source.path(), &["rev-parse", "HEAD"]);
+
+        // In the base commit the path is ignored. The saved Artifact removes
+        // that ignore rule and includes the file, so a checkout hook can place
+        // an ignored file at the path before Artifact materialization.
+        fs::write(source.path().join(".gitignore"), "*.secret\n").unwrap();
+        fs::write(source.path().join("hook-owned.txt"), "artifact version\n").unwrap();
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+        let artifact = artifacts
+            .capture(&source, &task_id, Some(&source_attempt), None, Some(&base))
+            .unwrap();
+        assert_eq!(
+            git(
+                source.path(),
+                &["show", &format!("{}:hook-owned.txt", artifact.tree_oid())]
+            ),
+            "artifact version"
+        );
+
+        let hooks = repository.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'hook version\\n' > hook-owned.txt\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let repair_attempt = AttemptId::new("attempt-hook-repair");
+        let repair_path = workspace_manager.worktree_path(&task_id, &repair_attempt);
+        let repair_branch = workspace_manager.branch_name(&task_id, &repair_attempt);
+        assert!(matches!(
+            artifacts.materialize(&task_id, &repair_attempt, artifact.id()),
+            Err(ArtifactError::Workspace(_))
+        ));
+        assert!(
+            !repair_path.exists(),
+            "failed preparation removes new worktree"
+        );
+        assert!(
+            !git_status(
+                &repository,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{repair_branch}")
+                ]
+            ),
+            "failed preparation removes its private branch"
+        );
+
+        workspace_manager.cleanup_force(&source).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn read_tree_failure_discards_new_worktree_and_branch() {
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let task_id = TaskId::new("task-unreadable-tree");
+        let source_attempt = AttemptId::new("attempt-unreadable-source");
+        let source = workspace_manager.create(&task_id, &source_attempt).unwrap();
+        let base = git(source.path(), &["rev-parse", "HEAD"]);
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+
+        // Construct a valid root tree that references a missing blob. Artifact
+        // readback can verify the root tree and ref, but read-tree cannot
+        // populate the materialized worktree from its unavailable child.
+        let missing_blob = "f".repeat(40);
+        let tree = git_with_input(
+            source.path(),
+            &["mktree", "--missing"],
+            format!("100644 blob {missing_blob}\tbroken.txt\n").as_bytes(),
+        );
+        let artifact = ArtifactRecord::new(
+            "artifact-unreadable-tree",
+            task_id.clone(),
+            Some(source_attempt.as_str().to_owned()),
+            None,
+            base,
+            &tree,
+            workspace_manager.repository_root(),
+            format!("{ARTIFACT_REF_PREFIX}artifact-unreadable-tree"),
+            ArtifactState::Available,
+        );
+        ledger.prepare_artifact(&artifact).unwrap();
+        git(
+            source.path(),
+            &[
+                "update-ref",
+                artifact.ref_name(),
+                artifact.tree_oid(),
+                &"0".repeat(tree.len()),
+            ],
+        );
+
+        let repair_attempt = AttemptId::new("attempt-unreadable-repair");
+        let repair_path = workspace_manager.worktree_path(&task_id, &repair_attempt);
+        let repair_branch = workspace_manager.branch_name(&task_id, &repair_attempt);
+        assert!(matches!(
+            artifacts.materialize(&task_id, &repair_attempt, artifact.id()),
+            Err(ArtifactError::Git(_))
+        ));
+        assert!(!repair_path.exists());
+        assert!(!git_status(
+            &repository,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{repair_branch}")
+            ]
+        ));
 
         workspace_manager.cleanup_force(&source).unwrap();
         fs::remove_dir_all(repository).unwrap();

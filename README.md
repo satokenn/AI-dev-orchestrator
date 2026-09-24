@@ -47,7 +47,7 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 開始commitを呼出側が指定する場合は `create_at_base(task_id, attempt_id, commit_oid)` を使います。これは完全なcommit object IDのみ受け付け、branch名や短縮OIDを拒否します。既存の `create` もworktree追加前に現在のHEADを完全なOIDへ解決し、そのOIDを固定してbranchを作ります。初回Artifactを記録するときはAttempt開始時のcommitを`base_commit`として渡します。
 
-`ArtifactManager::materialize(task_id, attempt_id, artifact_id)` は、保存済み Artifact のLedger所属、専用ref、tree objectを検証してから、Artifact記録の `base_commit` を基点に新しいmanaged worktreeを作成し、treeを展開します。リポジトリのHEADが保存後に進んでいても、記録されたcommitを使います。既存worktreeの再利用・resetはせず、新worktreeがcleanでbase commit上にあることを確認してから `git read-tree --reset -u` を実行します。展開後のtreeが一致しない場合は、新worktreeとまだ未公開のattempt branchをcleanupし、cleanup自体も失敗した場合は両方のエラーを返します。Artifactがない、別Task所属、ref/tree不整合、base commit不正の場合はworktreeを作る前に拒否します。
+`ArtifactManager::materialize(task_id, attempt_id, artifact_id)` は、保存済み Artifact のLedger所属、専用ref、tree objectを検証してから、Artifact記録の `base_commit` を基点に新しいmanaged worktreeを作成し、treeを展開します。リポジトリのHEADが保存後に進んでいても、記録されたcommitを使います。既存worktreeの再利用・resetはせず、新worktreeがclean（ignored fileを含む）でbase commit上にあることを確認してから `git read-tree --reset -u` を実行します。展開後のtreeが一致しない場合は、新worktreeとまだ未公開のattempt branchをcleanupし、cleanup自体も失敗した場合は両方のエラーを返します。Artifactがない、別Task所属、ref/tree不整合、base commit不正の場合はworktreeを作る前に拒否します。
 
 このAPIは保存済みArtifactの安全なmaterializeまでを提供します。現行Provider実行経路のAttempt input/output ArtifactへのLedger記録、修正Attemptの実行前検証・materialize接続は未実装で、#66 Operation Serviceとの統合が必要です。
 

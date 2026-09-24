@@ -400,7 +400,12 @@ impl WorkspaceManager {
         let status = self.run_git_at(
             &workspace.path,
             "verify fresh worktree",
-            &["status", "--porcelain=v1", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
         )?;
         if !status.stdout.is_empty() {
             return Err(WorkspaceError::WorkspaceNotManaged {
