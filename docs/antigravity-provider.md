@@ -29,9 +29,10 @@ CLI が PATH にない場合は `ProviderError::Unavailable` になります。�
 必要な場合や認証情報が無効な場合も、headless 実行時の診断メッセージを
 `Unavailable` として返します。その他の非0終了は `ExecutionFailed` です。
 
-`observe_model_catalog()` は `agy models` の候補 ID / 表示名を `ProviderCli` source、コマンド名、
-取得時刻付きで返します。CLI出力は安定した機械形式ではないため、起動失敗、非0終了、timeout、
-不正UTF-8、切り詰め、未対応形式は `unknown_reason` を持つ空の observation になります。
+`observe_model_catalog()` は `agy models` の候補 ID / 表示名を `ModelCatalogSource::ProviderCli`、
+コマンド名、取得時刻付きで返します。CLI出力は安定した機械形式ではないため、起動失敗、非0終了、
+timeout、不正UTF-8、切り詰め、未対応形式は固定コードの `unknown_reason` を持つ空の observation
+になります。診断にはCLIのstdout / stderrを含めません。
 列挙された ID はアカウントでの利用権や実行成功を保証しないため、この結果だけから Model
 availability を `available` にしてはいけません。
 

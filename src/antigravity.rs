@@ -26,23 +26,30 @@ pub struct ModelCatalogEntry {
     pub label: String,
 }
 
+/// Internal, non-wire provenance for a candidate model catalog observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelCatalogSource {
+    ProviderCli,
+}
+
 /// A point-in-time listing from the Provider CLI. This is not an entitlement or
 /// execution guarantee; callers must keep model availability unknown.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelCatalogObservation {
     pub entries: Vec<ModelCatalogEntry>,
-    pub unknown_reason: Option<String>,
-    pub source: &'static str,
+    /// A fixed, non-sensitive diagnostic; never contains process output.
+    pub unknown_reason: Option<&'static str>,
+    pub source: ModelCatalogSource,
     pub reference: &'static str,
     pub observed_at_ms: i64,
 }
 
 impl ModelCatalogObservation {
-    fn unknown(reason: impl Into<String>) -> Self {
+    fn unknown(reason: &'static str) -> Self {
         Self {
             entries: Vec::new(),
-            unknown_reason: Some(reason.into()),
-            source: "ProviderCli",
+            unknown_reason: Some(reason),
+            source: ModelCatalogSource::ProviderCli,
             reference: "agy models",
             observed_at_ms: now_ms(),
         }
@@ -119,27 +126,39 @@ impl AntigravityProvider {
         );
         let output = match result {
             Ok(output) if !output.output_truncated => output,
-            Ok(_) => return ModelCatalogObservation::unknown("agy models output was truncated"),
+            Ok(_) => return ModelCatalogObservation::unknown("output_truncated"),
             Err(ProcessError::TimedOut(_)) => {
-                return ModelCatalogObservation::unknown("agy models timed out");
+                return ModelCatalogObservation::unknown("process_timed_out");
             }
-            Err(error) => {
-                return ModelCatalogObservation::unknown(format!("agy models failed: {error:?}"));
+            Err(ProcessError::Spawn(_)) => {
+                return ModelCatalogObservation::unknown("process_spawn_failed");
+            }
+            Err(ProcessError::Io(_)) => {
+                return ModelCatalogObservation::unknown("process_io_failed");
+            }
+            Err(ProcessError::NonZeroExit(_)) => {
+                return ModelCatalogObservation::unknown("process_nonzero_exit");
+            }
+            Err(ProcessError::Cancelled(_)) | Err(ProcessError::CancelledBeforeStart) => {
+                return ModelCatalogObservation::unknown("process_cancelled");
+            }
+            Err(ProcessError::Interrupted { .. }) => {
+                return ModelCatalogObservation::unknown("process_stop_unconfirmed");
             }
         };
         let text = match String::from_utf8(output.stdout) {
             Ok(text) => text,
-            Err(_) => return ModelCatalogObservation::unknown("agy models output was not UTF-8"),
+            Err(_) => return ModelCatalogObservation::unknown("output_not_utf8"),
         };
         match parse_model_catalog(&text) {
             Some(entries) => ModelCatalogObservation {
                 entries,
                 unknown_reason: None,
-                source: "ProviderCli",
+                source: ModelCatalogSource::ProviderCli,
                 reference: "agy models",
                 observed_at_ms: now_ms(),
             },
-            None => ModelCatalogObservation::unknown("agy models output was empty or ambiguous"),
+            None => ModelCatalogObservation::unknown("output_empty_or_ambiguous"),
         }
     }
 
@@ -301,10 +320,9 @@ fn parse_model_catalog(output: &str) -> Option<Vec<ModelCatalogEntry>> {
             continue;
         }
         let (id, label) = line.split_once('\t')?;
-        if id.is_empty()
+        if !is_model_id(id)
             || label.trim().is_empty()
-            || id.chars().any(char::is_whitespace)
-            || label.contains('\t')
+            || label.chars().any(char::is_control)
             || entries
                 .iter()
                 .any(|entry: &ModelCatalogEntry| entry.id == id)
@@ -317,6 +335,14 @@ fn parse_model_catalog(output: &str) -> Option<Vec<ModelCatalogEntry>> {
         });
     }
     (!entries.is_empty()).then_some(entries)
+}
+
+fn is_model_id(id: &str) -> bool {
+    let mut bytes = id.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"._:/@+-".contains(&byte))
 }
 
 fn now_ms() -> i64 {
@@ -477,6 +503,10 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "claude-sonnet-4");
         assert_eq!(entries[0].label, "Claude Sonnet 4");
+        assert_eq!(
+            ModelCatalogSource::ProviderCli,
+            ModelCatalogObservation::unknown("test").source
+        );
     }
 
     #[test]
@@ -487,6 +517,9 @@ mod tests {
             "Fetching available models...\nmodel-without-label\n",
             "Fetching available models...\nmodel\tLabel\textra\n",
             "Fetching available models...\nmodel\tFirst\nmodel\tDuplicate\n",
+            "Fetching available models...\nmodel\u{1b}secret\tLabel\n",
+            "Fetching available models...\nmodel\tLabel\u{7}\n",
+            "Fetching available models...\nmodel name\tLabel\n",
             "Unexpected output\nmodel\tLabel\n",
         ] {
             assert!(parse_model_catalog(output).is_none(), "accepted {output:?}");
@@ -495,7 +528,13 @@ mod tests {
 
     #[test]
     fn failed_and_timed_out_catalog_commands_are_unknown() {
-        for script in ["#!/bin/sh\nexit 7\n", "#!/bin/sh\nsleep 20\n"] {
+        for (script, reason) in [
+            (
+                "#!/bin/sh\nprintf 'secret-token'\necho 'secret-key' >&2\nexit 7\n",
+                "process_nonzero_exit",
+            ),
+            ("#!/bin/sh\nsleep 20\n", "process_timed_out"),
+        ] {
             let path = std::env::temp_dir().join(format!(
                 "agy-models-fixture-{}-{}",
                 std::process::id(),
@@ -510,7 +549,8 @@ mod tests {
             }
             let observation = AntigravityProvider::with_executable(&path).observe_model_catalog();
             assert!(observation.entries.is_empty());
-            assert!(observation.unknown_reason.is_some());
+            assert_eq!(observation.unknown_reason, Some(reason));
+            assert!(!observation.unknown_reason.unwrap().contains("secret"));
             let _ = std::fs::remove_file(path);
         }
     }
