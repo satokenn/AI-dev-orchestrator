@@ -51,7 +51,7 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 `CodexProvider` は `codex exec` を非対話モードで起動し、`ProviderRequest` の workspace を cwd として使用します。named Modelなら `--model <model>` を渡し、`ProviderDefault`ならModel引数を渡さずCodex CLI設定を使います。Codex CLI は `PATH` から解決され、workspaceへの書き込みを許可する `--sandbox workspace-write`、JSONL 出力の `--json`、実行状態を永続化しない `--ephemeral` も付けます。
 
-JSONLの最後の`item.completed` / `agent_message.text`を`AgentResult`へ、各`turn.completed.usage`の明示済みtoken値を名前と`tokens`単位を保った`UsageMetric`へ変換します。usageの欠落、不正値、負数、または集計不能な値はunknownとしてmetricに追加しません。金額はJSONLに含まれないため推定しません。`error`と`turn.failed`イベント、壊れたJSONL、出力切り詰めは実行エラーとしてraw出力とともに返し、空出力は`AgentResult`なしで返します。未知のイベントは無視しraw出力に残します。公式JSONLイベントは実Modelを示さないため、observed Modelはunknownです。
+JSONLの最後の`item.completed` / `agent_message.text`を`AgentResult`へ、各`turn.completed.usage`の明示済みtoken値を名前と`tokens`単位を保った`UsageMetric`へ変換します。usageの欠落、不正値、負数、または集計不能な値はunknownとしてmetricに追加しません。金額はJSONLに含まれないため推定しません。`error`と`turn.failed`イベント、壊れたJSONL、stdoutの切り詰めは実行エラーとしてraw出力とともに返し、空出力は`AgentResult`なしで返します。stderrだけの切り詰めはJSONL解析を妨げず、raw captureの切り詰め情報で確認できます。未知のイベントは無視しraw出力に残します。公式JSONLイベントは実Modelを示さないため、observed Modelはunknownです。
 
 成功結果と失敗結果はUTF-8変換前のstdout/stderr byte列、終了状態、capture切り詰め状態も参照できます。失敗では`ProviderError::kind()`で意味上のエラー、`captured_output()`で元のbyte列を取得できます。これらのbyte列は`SqliteOperationLedger::save_log`へ、正規化usageは`save_usage_metrics`へ渡せます。Codex JSONL解析はfixture unit testで検証し、実Codex CLIは通常のPR testで起動しません。AgentResultを含むAttemptの保存は既存Execution Ledgerの責務です。両LedgerとOperationを自動で結び付けるServiceは#66の対象であり、ここでは未実装です。長時間実行は `execute_with_cancellation` に `CancellationToken` を渡して停止できます。
 
