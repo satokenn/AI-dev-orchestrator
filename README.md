@@ -119,6 +119,9 @@ Rustコードに適用する必須検証、テスト種別、unsafeの扱いは�
 Task を `save_task` で保存した後、各 Attempt を `save_attempt` で保存してください。
 retry は別の Attempt ID として追加されます。
 
+本番CLIの`run`は、指定Ledger単位で実行全体を排他します。同じLedgerを使う別プロセスの実行中は、後続の`run`をbusyとして中止します。
+Ledgerの隣に作られる`.operations.lock`ファイルはプロセス終了後も残りますが、排他状態はOSがファイルを開いている間だけ保持します。実行中にこのファイルを削除しないでください。
+
 ## GitHub Workflow
 
 以下も現行GitHubWorkflowの挙動であり、MCP Operation Serviceの公開条件ではありません。MCP契約の`publication.publish`と`task.finish`は、対象Artifact、accepted CodexDecision、policy必須の証拠を別途照合します。
