@@ -181,3 +181,55 @@ fn init_rejects_config_directory_symlink_escaping_repository() {
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_dir_all(outside);
 }
+
+#[cfg(unix)]
+#[test]
+fn load_rejects_config_directory_symlink_escaping_repository() {
+    let root = repository("load-directory-symlink-root");
+    let outside = repository("load-directory-symlink-outside");
+    fs::write(
+        outside.join("config.toml"),
+        "schema_version = 1\n[validation]\nchecks = []\n",
+    )
+    .expect("write external config");
+    std::os::unix::fs::symlink(&outside, root.join(".ai-dev-orchestrator"))
+        .expect("create config directory symlink");
+
+    assert!(matches!(
+        load_repository_config(&root),
+        Err(RepositoryConfigError::Io(error))
+            if error.kind() == std::io::ErrorKind::InvalidInput
+    ));
+
+    let _ = fs::remove_file(root.join(".ai-dev-orchestrator"));
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn load_rejects_config_file_symlink_escaping_repository() {
+    let root = repository("load-file-symlink-root");
+    let outside = repository("load-file-symlink-outside");
+    init_repository(&root).expect("initialize repository");
+    let external_config = outside.join("external-config.toml");
+    fs::write(
+        &external_config,
+        "schema_version = 1\n[validation]\nchecks = []\n",
+    )
+    .expect("write external config");
+    let repository_config = root.join(REPOSITORY_CONFIG_PATH);
+    fs::remove_file(&repository_config).expect("remove template");
+    std::os::unix::fs::symlink(&external_config, &repository_config)
+        .expect("create config file symlink");
+
+    assert!(matches!(
+        load_repository_config(&root),
+        Err(RepositoryConfigError::Io(error))
+            if error.kind() == std::io::ErrorKind::InvalidInput
+    ));
+
+    let _ = fs::remove_file(repository_config);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
+}

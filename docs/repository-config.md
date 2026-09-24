@@ -1,6 +1,6 @@
 # Repository-local 設定
 
-Repository固有の機械検証は `.ai-dev-orchestrator/config.toml` に設定します。既存のLedger・管理worktreeと同じディレクトリ系統を使い、保存場所の改名やデータ移行は行いません。`init_repository(root)` は初期templateを作成します。既存設定を上書きせず、`.ai-dev-orchestrator` がsymlinkでRepository外を指す場合も拒否します。
+Repository固有の機械検証は `.ai-dev-orchestrator/config.toml` に設定します。既存のLedger・管理worktreeと同じディレクトリ系統を使い、保存場所の改名やデータ移行は行いません。`init_repository(root)` は初期templateを作成します。既存設定を上書きせず、初期化と読込の両方でconfig directory/fileのsymlinkを拒否し、解決先がRepository内にあることを確認します。これらは通常時のpath境界を検証するもので、検査とfile openの間に別プロセスがpathを置き換える競合までは保証しません。
 
 ## Validation check
 

@@ -161,8 +161,55 @@ pub fn init_repository(repository_root: &Path) -> Result<PathBuf, RepositoryConf
 pub fn load_repository_config(
     repository_root: &Path,
 ) -> Result<RepositoryConfig, RepositoryConfigError> {
-    let path = repository_root.join(REPOSITORY_CONFIG_PATH);
-    let source = fs::read_to_string(path).map_err(RepositoryConfigError::Io)?;
+    let root = fs::canonicalize(repository_root).map_err(RepositoryConfigError::Io)?;
+    if !root.is_dir() {
+        return Err(RepositoryConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repository root must be a directory",
+        )));
+    }
+    let path = root.join(REPOSITORY_CONFIG_PATH);
+    let parent = path.parent().expect("config path has a parent");
+    let parent_metadata = fs::symlink_metadata(parent).map_err(RepositoryConfigError::Io)?;
+    if parent_metadata.file_type().is_symlink() {
+        return Err(RepositoryConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repository config directory must not be a symlink",
+        )));
+    }
+    let canonical_parent = fs::canonicalize(parent).map_err(RepositoryConfigError::Io)?;
+    if !canonical_parent.starts_with(&root) {
+        return Err(RepositoryConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repository config directory resolves outside the repository",
+        )));
+    }
+    let config_path = canonical_parent.join("config.toml");
+    let config_metadata = fs::symlink_metadata(&config_path).map_err(RepositoryConfigError::Io)?;
+    if config_metadata.file_type().is_symlink() {
+        return Err(RepositoryConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repository config file must not be a symlink",
+        )));
+    }
+    if !config_metadata.is_file() {
+        return Err(RepositoryConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repository config path must be a file",
+        )));
+    }
+    let canonical_config = fs::canonicalize(&config_path).map_err(RepositoryConfigError::Io)?;
+    if !canonical_config.starts_with(&canonical_parent) {
+        return Err(RepositoryConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repository config file resolves outside the repository",
+        )));
+    }
+    // Read the resolved in-repository path rather than the original path, which could
+    // otherwise traverse a static directory or file symlink outside the repository.
+    // Standard-library path checks do not provide descriptor-relative open semantics,
+    // so concurrent replacement of these paths remains outside this guarantee.
+    let source = fs::read_to_string(canonical_config).map_err(RepositoryConfigError::Io)?;
     let config: RepositoryConfig = toml::from_str(&source).map_err(RepositoryConfigError::Parse)?;
     if config.schema_version != 1 {
         return Err(RepositoryConfigError::UnsupportedVersion(
