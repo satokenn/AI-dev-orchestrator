@@ -467,6 +467,19 @@ API の実使用量は `actual_usage` に `measured` として、設定予算は
 や機密情報は渡さず、選定に必要な分類と短い summary だけを渡す。過去 Attempt は immutable record で
 あり、新しい選定結果で上書きしない。
 
+現行 Execution Ledger の `query_historical_performance(PerformanceWindow)` は、開始時刻が指定された
+半開区間 `[starts_at_ms, ends_at_ms)` に入る Attempt を、requested target・observed target・state semantics
+ごとに分けて集計する。モデル性能の帰属先は observed target であり、observed model が記録されていない
+Attempt は unknown bucket に残す。provider-call semantics の成功・失敗・取消・実行中件数と、保存済み
+Validation結果の pass / fail 件数を返す。legacy validation-coupled Attempt は別 group にし、terminal state
+をProvider呼び出し結果として数えない。結果には区間内のAttempt母数と開始時刻がなく区間へ割り当てられない
+全Attempt数を添える。指定区間の外、または開始時刻不明のAttemptは区間内母数へ含めない。
+
+現時点で Ledger が修正・再実行relation、review verdict、完了時刻付き監督Codex受入を保存していないため、
+これらは集計不能の理由付き `unavailable` として表し、値を推測しない。このAPIは集計query境界を提供するが、
+選定入力へのcontext組立て接続はまだ行わない。Issue #67 は、未保存の事実を記録する後続変更とcontext接続まで
+完了扱いにしない。
+
 ## 入力と出力の詳細なJSON例
 
 次の例は、同じ Provider 内の named model と provider default、実測値、推定値、unknown、複数 role の

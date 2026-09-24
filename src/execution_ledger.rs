@@ -3,7 +3,7 @@
 //! The ledger stores timestamps as Unix milliseconds. Timestamps are optional so
 //! a queued attempt can be recorded before its provider starts.
 
-use std::{fmt, path::Path, sync::Mutex};
+use std::{collections::BTreeMap, fmt, path::Path, sync::Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -21,6 +21,183 @@ pub struct AttemptRecord {
     attempt: Attempt,
     started_at: Option<i64>,
     finished_at: Option<i64>,
+}
+
+/// A bounded historical-performance query. The interval is half-open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PerformanceWindow {
+    starts_at_ms: i64,
+    ends_at_ms: i64,
+}
+
+impl PerformanceWindow {
+    pub fn new(starts_at_ms: i64, ends_at_ms: i64) -> Result<Self, LedgerError> {
+        if starts_at_ms >= ends_at_ms {
+            return Err(LedgerError::InvalidPerformanceWindow);
+        }
+        Ok(Self {
+            starts_at_ms,
+            ends_at_ms,
+        })
+    }
+
+    #[must_use]
+    pub const fn starts_at_ms(self) -> i64 {
+        self.starts_at_ms
+    }
+    #[must_use]
+    pub const fn ends_at_ms(self) -> i64 {
+        self.ends_at_ms
+    }
+}
+
+/// A group keeps requested and observed targets separate. Missing observed values
+/// form an explicit unknown bucket and are never attributed to the requested model.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PerformanceRequestedModel {
+    Named(String),
+    ProviderDefault,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PerformanceTarget {
+    requested_provider: String,
+    requested_model: PerformanceRequestedModel,
+    observed_provider: Option<String>,
+    observed_model: Option<String>,
+    semantics: String,
+}
+
+impl PerformanceTarget {
+    #[must_use]
+    pub fn requested_provider(&self) -> &str {
+        &self.requested_provider
+    }
+    #[must_use]
+    pub fn requested_model(&self) -> &PerformanceRequestedModel {
+        &self.requested_model
+    }
+    #[must_use]
+    pub fn observed_provider(&self) -> Option<&str> {
+        self.observed_provider.as_deref()
+    }
+    #[must_use]
+    pub fn observed_model(&self) -> Option<&str> {
+        self.observed_model.as_deref()
+    }
+    #[must_use]
+    pub fn semantics(&self) -> &str {
+        &self.semantics
+    }
+}
+
+/// Facts that can be derived from persisted Attempt and Validation rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalPerformance {
+    target: PerformanceTarget,
+    window: PerformanceWindow,
+    attempts: u64,
+    provider_call_succeeded: u64,
+    provider_call_failed: u64,
+    provider_call_cancelled: u64,
+    provider_call_pending: u64,
+    validation_passed: u64,
+    validation_failed: u64,
+    validation_observations: u64,
+    unavailable: Vec<&'static str>,
+}
+
+/// Result envelope containing the requested interval and population coverage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalPerformanceQuery {
+    window: PerformanceWindow,
+    entries: Vec<HistoricalPerformance>,
+    attempts_without_start_time: u64,
+}
+
+impl HistoricalPerformanceQuery {
+    #[must_use]
+    pub const fn window(&self) -> PerformanceWindow {
+        self.window
+    }
+    #[must_use]
+    pub fn entries(&self) -> &[HistoricalPerformance] {
+        &self.entries
+    }
+    /// These records cannot be assigned to any requested interval.
+    #[must_use]
+    pub const fn attempts_without_start_time(&self) -> u64 {
+        self.attempts_without_start_time
+    }
+    #[must_use]
+    pub fn window_attempts(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(HistoricalPerformance::attempts)
+            .sum()
+    }
+}
+
+impl HistoricalPerformance {
+    #[must_use]
+    pub fn target(&self) -> &PerformanceTarget {
+        &self.target
+    }
+    #[must_use]
+    pub const fn window(&self) -> PerformanceWindow {
+        self.window
+    }
+    #[must_use]
+    pub const fn attempts(&self) -> u64 {
+        self.attempts
+    }
+    #[must_use]
+    pub const fn provider_call_succeeded(&self) -> u64 {
+        self.provider_call_succeeded
+    }
+    #[must_use]
+    pub const fn provider_call_failed(&self) -> u64 {
+        self.provider_call_failed
+    }
+    #[must_use]
+    pub const fn provider_call_cancelled(&self) -> u64 {
+        self.provider_call_cancelled
+    }
+    #[must_use]
+    pub const fn provider_call_pending(&self) -> u64 {
+        self.provider_call_pending
+    }
+    #[must_use]
+    pub const fn validation_passed(&self) -> u64 {
+        self.validation_passed
+    }
+    #[must_use]
+    pub const fn validation_failed(&self) -> u64 {
+        self.validation_failed
+    }
+    #[must_use]
+    pub const fn validation_observations(&self) -> u64 {
+        self.validation_observations
+    }
+    #[must_use]
+    pub fn unavailable(&self) -> &[&'static str] {
+        &self.unavailable
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PerformanceGroupKey(PerformanceTarget);
+
+#[derive(Default)]
+struct PerformanceCounts {
+    attempts: u64,
+    succeeded: u64,
+    failed: u64,
+    cancelled: u64,
+    pending: u64,
+    validation_passed: u64,
+    validation_failed: u64,
 }
 
 impl AttemptRecord {
@@ -65,6 +242,7 @@ impl AttemptRecord {
 pub enum LedgerError {
     Sqlite(rusqlite::Error),
     InvalidStoredValue(String),
+    InvalidPerformanceWindow,
     UnsupportedSchemaVersion(u32),
 }
 
@@ -74,6 +252,9 @@ impl fmt::Display for LedgerError {
             Self::Sqlite(error) => write!(formatter, "execution ledger database error: {error}"),
             Self::InvalidStoredValue(value) => {
                 write!(formatter, "invalid execution ledger value: {value}")
+            }
+            Self::InvalidPerformanceWindow => {
+                formatter.write_str("performance window must have a positive duration")
             }
             Self::UnsupportedSchemaVersion(version) => {
                 write!(
@@ -89,7 +270,9 @@ impl std::error::Error for LedgerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Sqlite(error) => Some(error),
-            Self::InvalidStoredValue(_) | Self::UnsupportedSchemaVersion(_) => None,
+            Self::InvalidStoredValue(_)
+            | Self::InvalidPerformanceWindow
+            | Self::UnsupportedSchemaVersion(_) => None,
         }
     }
 }
@@ -634,6 +817,143 @@ impl SqliteExecutionLedger {
         self.load_attempts(&connection, task_id)
     }
 
+    /// Aggregates only persisted Attempt and Validation facts in the requested
+    /// half-open time window. Rows without a known start time cannot be assigned
+    /// to a window and are therefore excluded. Unsupported facts remain explicit.
+    pub fn query_historical_performance(
+        &self,
+        window: PerformanceWindow,
+    ) -> Result<HistoricalPerformanceQuery, LedgerError> {
+        let connection = self.lock_connection()?;
+        let attempts_without_start_time = connection.query_row(
+            "SELECT COUNT(*) FROM attempts WHERE started_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT a.provider, a.requested_model_kind, a.requested_model,
+                    a.observed_provider, a.observed_model, a.semantics_version, a.state,
+                    (SELECT COUNT(*) FROM validation_results v
+                     WHERE v.task_id=a.task_id AND v.attempt_id=a.id),
+                    (SELECT COALESCE(SUM(v.passed),0) FROM validation_results v
+                     WHERE v.task_id=a.task_id AND v.attempt_id=a.id)
+             FROM attempts a
+             WHERE a.started_at >= ?1 AND a.started_at < ?2
+             ORDER BY a.rowid",
+        )?;
+        let rows =
+            statement.query_map(params![window.starts_at_ms(), window.ends_at_ms()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, u64>(7)?,
+                    row.get::<_, u64>(8)?,
+                ))
+            })?;
+        let mut groups = BTreeMap::<PerformanceGroupKey, PerformanceCounts>::new();
+        for row in rows {
+            let (
+                requested_provider,
+                requested_model_kind,
+                requested_model_name,
+                observed_provider,
+                observed_model,
+                semantics,
+                state,
+                validation_observations,
+                validation_passed,
+            ) = row?;
+            let requested_model = match requested_model_kind.as_deref() {
+                Some("named") => requested_model_name
+                    .map(PerformanceRequestedModel::Named)
+                    .ok_or_else(|| {
+                        LedgerError::InvalidStoredValue("named requested model has no name".into())
+                    })?,
+                Some("provider_default") if requested_model_name.is_none() => {
+                    PerformanceRequestedModel::ProviderDefault
+                }
+                None if requested_model_name.is_none() => PerformanceRequestedModel::Unknown,
+                Some(other) => {
+                    return Err(LedgerError::InvalidStoredValue(format!(
+                        "unknown requested model kind in history: {other}"
+                    )));
+                }
+                _ => {
+                    return Err(LedgerError::InvalidStoredValue(
+                        "invalid requested model fields in history".into(),
+                    ));
+                }
+            };
+            let key = PerformanceGroupKey(PerformanceTarget {
+                requested_provider,
+                requested_model,
+                observed_provider,
+                observed_model,
+                semantics: semantics.clone(),
+            });
+            if semantics != "provider_call_v2" && semantics != "legacy_validation_coupled" {
+                return Err(LedgerError::InvalidStoredValue(format!(
+                    "unknown Attempt semantics in history: {semantics}"
+                )));
+            }
+            let counts = groups.entry(key).or_default();
+            counts.attempts += 1;
+            if semantics == "provider_call_v2" {
+                match state.as_str() {
+                    "succeeded" => counts.succeeded += 1,
+                    "failed" => counts.failed += 1,
+                    "cancelled" => counts.cancelled += 1,
+                    "queued" | "running" => counts.pending += 1,
+                    other => {
+                        return Err(LedgerError::InvalidStoredValue(format!(
+                            "unknown Attempt state in history: {other}"
+                        )));
+                    }
+                }
+            }
+            counts.validation_passed += validation_passed;
+            counts.validation_failed += validation_observations - validation_passed;
+        }
+        let entries = groups
+            .into_iter()
+            .map(|(PerformanceGroupKey(target), counts)| {
+                let mut unavailable = vec![
+                    "retry/rework relations are not stored in this Ledger",
+                    "review verdicts are not stored in this Ledger",
+                    "Codex acceptance is not stored with a completion timestamp",
+                ];
+                if target.semantics == "legacy_validation_coupled" {
+                    unavailable.push(
+                        "legacy Attempt terminal states do not represent Provider call outcomes",
+                    );
+                }
+                HistoricalPerformance {
+                    target,
+                    window,
+                    attempts: counts.attempts,
+                    provider_call_succeeded: counts.succeeded,
+                    provider_call_failed: counts.failed,
+                    provider_call_cancelled: counts.cancelled,
+                    provider_call_pending: counts.pending,
+                    validation_passed: counts.validation_passed,
+                    validation_failed: counts.validation_failed,
+                    validation_observations: counts.validation_passed + counts.validation_failed,
+                    unavailable,
+                }
+            })
+            .collect();
+        Ok(HistoricalPerformanceQuery {
+            window,
+            entries,
+            attempts_without_start_time,
+        })
+    }
+
     pub(crate) fn load_attempts(
         &self,
         connection: &Connection,
@@ -1125,6 +1445,181 @@ mod tests {
             ProviderRef::new(provider),
             ModelChoice::ProviderDefault,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn history_fixture_attempt(
+        ledger: &SqliteExecutionLedger,
+        id: &str,
+        state: &str,
+        started_at: Option<i64>,
+        requested_model_kind: Option<&str>,
+        requested_model: Option<&str>,
+        observed_provider: Option<&str>,
+        observed_model: Option<&str>,
+        semantics: &str,
+        validations: &[(i64, i64)],
+    ) {
+        ledger
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO attempts(task_id,id,provider,state,started_at,requested_model_kind,
+                requested_model,observed_provider,observed_model,semantics_version)
+             VALUES('task-1',?1,'codex',?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    id,
+                    state,
+                    started_at,
+                    requested_model_kind,
+                    requested_model,
+                    observed_provider,
+                    observed_model,
+                    semantics
+                ],
+            )
+            .unwrap();
+        for (sequence, passed) in validations {
+            ledger
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO validation_results(task_id,attempt_id,sequence,summary,passed)
+                 VALUES('task-1',?1,?2,'fixture',?3)",
+                    params![id, sequence, passed],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn history_query_uses_observed_target_and_respects_window_and_semantics() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        ledger.save_task(&task()).unwrap();
+        history_fixture_attempt(
+            &ledger,
+            "known",
+            "succeeded",
+            Some(100),
+            Some("named"),
+            Some("requested-a"),
+            Some("codex"),
+            Some("observed-a"),
+            "provider_call_v2",
+            &[(0, 1)],
+        );
+        history_fixture_attempt(
+            &ledger,
+            "unknown",
+            "failed",
+            Some(200),
+            Some("named"),
+            Some("requested-a"),
+            Some("codex"),
+            None,
+            "provider_call_v2",
+            &[],
+        );
+        history_fixture_attempt(
+            &ledger,
+            "other",
+            "cancelled",
+            Some(300),
+            Some("named"),
+            Some("requested-a"),
+            Some("codex"),
+            Some("observed-b"),
+            "provider_call_v2",
+            &[(0, 0)],
+        );
+        history_fixture_attempt(
+            &ledger,
+            "legacy",
+            "succeeded",
+            Some(400),
+            Some("named"),
+            Some("requested-a"),
+            None,
+            None,
+            "legacy_validation_coupled",
+            &[(0, 1)],
+        );
+        history_fixture_attempt(
+            &ledger,
+            "untimed",
+            "failed",
+            None,
+            Some("named"),
+            Some("requested-a"),
+            None,
+            None,
+            "provider_call_v2",
+            &[],
+        );
+
+        let results = ledger
+            .query_historical_performance(PerformanceWindow::new(100, 400).unwrap())
+            .unwrap();
+        assert_eq!(results.entries().len(), 3);
+        assert_eq!(results.window_attempts(), 3);
+        assert_eq!(results.attempts_without_start_time(), 1);
+        let observed = results
+            .entries()
+            .iter()
+            .find(|entry| entry.target().observed_model() == Some("observed-a"))
+            .unwrap();
+        assert_eq!(observed.attempts(), 1);
+        assert_eq!(observed.provider_call_succeeded(), 1);
+        assert_eq!(observed.validation_observations(), 1);
+        assert_eq!(observed.validation_passed(), 1);
+        assert_eq!(
+            observed.target().requested_model(),
+            &PerformanceRequestedModel::Named("requested-a".into())
+        );
+
+        let unknown = results
+            .entries()
+            .iter()
+            .find(|entry| entry.target().observed_model().is_none())
+            .unwrap();
+        assert_eq!(
+            unknown.target().requested_model(),
+            &PerformanceRequestedModel::Named("requested-a".into())
+        );
+        assert_eq!(unknown.provider_call_failed(), 1);
+        assert!(results.entries().iter().all(|entry| {
+            entry
+                .unavailable()
+                .iter()
+                .any(|reason| reason.contains("review verdicts"))
+        }));
+
+        let legacy = ledger
+            .query_historical_performance(PerformanceWindow::new(400, 401).unwrap())
+            .unwrap();
+        assert_eq!(legacy.window_attempts(), 1);
+        let legacy_entry = &legacy.entries()[0];
+        assert_eq!(legacy_entry.provider_call_succeeded(), 0);
+        assert!(
+            legacy_entry
+                .unavailable()
+                .iter()
+                .any(|reason| reason.contains("legacy Attempt terminal states"))
+        );
+    }
+
+    #[test]
+    fn history_query_rejects_empty_or_reversed_window() {
+        assert!(matches!(
+            PerformanceWindow::new(10, 10),
+            Err(LedgerError::InvalidPerformanceWindow)
+        ));
+        assert!(matches!(
+            PerformanceWindow::new(11, 10),
+            Err(LedgerError::InvalidPerformanceWindow)
+        ));
     }
 
     #[test]
