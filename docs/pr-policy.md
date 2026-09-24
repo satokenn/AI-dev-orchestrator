@@ -63,9 +63,9 @@ scripts/check-pr-policy.sh <pull-request-number> <owner/repository>
 
 ## GitHub Actions
 
-[`pr-policy.yml`](../.github/workflows/pr-policy.yml)は、移行の準備段階として`pull_request`と`pull_request_target`の両方で、PRの作成、本文編集、commit追加、reopen、Ready for reviewへの変更時に検査を実行します。checkout先はrepositoryのdefault branchに固定し、checker、設定、テストはそのcheckoutから実行します。PR本文やbase、mergeable、変更数などの検査対象データはGitHubイベントpayloadから、stacked依存先はGitHub APIから読み取ります。Workflowの権限は`contents: read`と`pull-requests: read`に限定しています。
+[`pr-policy.yml`](../.github/workflows/pr-policy.yml)は、`pull_request_target`でPRの作成、本文編集、commit追加、reopen、Ready for reviewへの変更時に検査を実行します。このイベントではworkflowがbase repository側の信頼できるdefault branchの定義から起動し、jobもrepositoryのdefault branchを明示してcheckoutします。checker、設定、テストもそのcheckoutから実行します。PR headはcheckoutも実行もしません。PR本文やbase、mergeable、変更数などの検査対象データはGitHubイベントpayloadから、stacked依存先はGitHub APIから読み取ります。Workflowの権限は`contents: read`と`pull-requests: read`に限定しています。
 
-この準備段階では、既存必須check `PR Policy`を継続させるため`pull_request` triggerを残します。`pull_request_target`はbase repositoryのdefault branchに存在するworkflow定義で動作し、後続段階でこのtriggerへ切り替えるために先行導入します。切り替えがdefault branchへ反映されるまでは、`pull_request` workflow定義をPR自身が変更できる従来の信頼上の制約が残ります。この準備PRだけで信頼境界の移行が完了したとは扱いません。
+GitHubは、head branch名がcommit SHAに似た特定のpatternに一致する場合、セキュリティ上の理由で[`pull_request_target` workflowを起動しないことがあります](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target)。作業branchには`agent/`や`feature/`など用途を示すprefixを使い、SHAに見える名前を避けてください。`PR Policy` checkが表示されない場合はmergeしてはいけません。main rulesetはこのcheckを必須にしているため、checkが未生成・未完了ならmergeはblockedのままです。branch名を修正した後、`PR Policy` checkが作成され成功したことを確認してください。PR headから成功checkを代替発行したり、required checkを迂回したりしてはいけません。
 
 [`post-merge-policy.yml`](../.github/workflows/post-merge-policy.yml)は、mergeされたPRの`merge_commit_sha`が、checkoutしたdefault branchから到達可能であることを確認します。merge commit、squash、rebaseの各方式でGitHub APIが返すmerge後のSHAを使用します。
 
@@ -93,8 +93,8 @@ scripts/sync-pr-ruleset.sh
 
 - Workflow tokenは読み取り権限だけを使用する。
 - 外部Actionは完全なcommit SHAへ固定する。
-- `pull_request_target`でPR headのコードをcheckoutまたは実行しない。
-- 二段階移行の準備中は`pull_request`と`pull_request_target`を併用し、既存必須checkを維持する。`pull_request`由来workflow定義の従来の制約は、後続段階でtriggerを切り替えるまで残る。
+- PR Policyは`pull_request_target`から起動し、checker・設定・テストをdefault branchから取得する。PR headをcheckoutまたは実行しない。
+- Policy関連ファイルを変更するPRでも、判定ロジックはPR変更の影響を受けない。workflow trust-boundary回帰テストがイベント種別とcheckout参照先を検査する。
 - Rulesetの同期は管理者が差分をレビューし、Policy workflowのmerge後に実行する。
 - 機械検査の成功を、目的・設計・PR粒度の意味的な妥当性と同一視しない。
 

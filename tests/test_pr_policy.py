@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -153,10 +154,10 @@ class PostMergeTests(unittest.TestCase):
 
 
 class WorkflowTrustBoundaryTests(unittest.TestCase):
-    def test_pr_policy_bridges_both_triggers_with_default_branch_sources(self):
+    def test_pr_policy_uses_default_branch_sources(self):
         workflow = (ROOT / ".github/workflows/pr-policy.yml").read_text(encoding="utf-8")
-
-        self.assertRegex(workflow, r"(?m)^  pull_request:")
+        pull_request_trigger = r"(?m)^  (?:['\"])?pull_request(?:['\"])?\s*:"
+        self.assertNotRegex(workflow, pull_request_trigger)
         self.assertRegex(workflow, r"(?m)^  pull_request_target:")
         self.assertRegex(
             workflow,
@@ -170,6 +171,21 @@ class WorkflowTrustBoundaryTests(unittest.TestCase):
             workflow,
             r"(?m)^\s+ref: \$\{\{ github\.event\.pull_request\.(?:head|base)",
         )
+
+    def test_pull_request_trigger_match_handles_quoted_yaml_keys(self):
+        trigger_pattern = re.compile(r"(?m)^  (?:['\"])?pull_request(?:['\"])?\s*:")
+
+        for event_key in ("pull_request:", "'pull_request':", '"pull_request":'):
+            with self.subTest(event_key=event_key):
+                self.assertRegex(f"on:\n  {event_key}\n", trigger_pattern)
+
+    def test_pr_policy_remains_a_required_main_check(self):
+        ruleset = json.loads(
+            (ROOT / ".github/rulesets/main-pr-policy.json").read_text(encoding="utf-8")
+        )
+        required_checks = ruleset["rules"][0]["parameters"]["required_status_checks"]
+
+        self.assertIn({"context": "PR Policy"}, required_checks)
 
 
 if __name__ == "__main__":
