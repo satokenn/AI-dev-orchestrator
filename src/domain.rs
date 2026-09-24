@@ -120,6 +120,33 @@ pub enum AttemptFailureReason {
     Validation,
 }
 
+/// The meaning assigned to an Attempt's terminal state.
+///
+/// Existing CLI records remain validation-coupled. Operation Service records
+/// use provider-call semantics and do not run validation as part of the call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptSemantics {
+    LegacyValidationCoupled,
+    ProviderCallV2,
+}
+
+impl AttemptSemantics {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyValidationCoupled => "legacy_validation_coupled",
+            Self::ProviderCallV2 => "provider_call_v2",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "legacy_validation_coupled" => Ok(Self::LegacyValidationCoupled),
+            "provider_call_v2" => Ok(Self::ProviderCallV2),
+            other => Err(format!("unknown Attempt semantics: {other}")),
+        }
+    }
+}
+
 /// A report returned by an agent. It is not a success decision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentResult {
@@ -386,6 +413,7 @@ pub struct Attempt {
     observed_provider: Option<ProviderRef>,
     observed_model: Option<ModelRef>,
     state: AttemptState,
+    semantics: AttemptSemantics,
     agent_result: Option<AgentResult>,
     validation_results: Vec<ValidationResult>,
     usage_cost: Option<UsageCost>,
@@ -416,11 +444,25 @@ impl Attempt {
             observed_provider: None,
             observed_model: None,
             state: AttemptState::Queued,
+            semantics: AttemptSemantics::LegacyValidationCoupled,
             agent_result: None,
             validation_results: Vec::new(),
             usage_cost: None,
             failure_reason: None,
         }
+    }
+
+    /// Creates an Attempt whose terminal state represents Provider execution only.
+    #[must_use]
+    pub fn new_provider_call_v2(id: AttemptId, provider: ProviderRef, model: ModelChoice) -> Self {
+        let mut attempt = Self::new(id, provider, model);
+        attempt.semantics = AttemptSemantics::ProviderCallV2;
+        attempt
+    }
+
+    #[must_use]
+    pub const fn semantics(&self) -> AttemptSemantics {
+        self.semantics
     }
     #[must_use]
     pub const fn id(&self) -> &AttemptId {
@@ -475,7 +517,24 @@ impl Attempt {
         self.transition(AttemptState::Running)
     }
     pub fn finish(&mut self) -> Result<(), DomainError> {
+        if self.semantics != AttemptSemantics::LegacyValidationCoupled {
+            return Err(DomainError::InvalidAttemptTransition {
+                from: self.state,
+                to: AttemptState::Validating,
+            });
+        }
         self.transition(AttemptState::Validating)
+    }
+
+    /// Marks a provider-call-v2 Attempt successful without coupling success to validation.
+    pub fn complete_provider_call(&mut self) -> Result<(), DomainError> {
+        if self.semantics != AttemptSemantics::ProviderCallV2 {
+            return Err(DomainError::InvalidAttemptTransition {
+                from: self.state,
+                to: AttemptState::Succeeded,
+            });
+        }
+        self.transition(AttemptState::Succeeded)
     }
 
     /// Records an agent report without changing the attempt state.
@@ -495,6 +554,12 @@ impl Attempt {
 
     /// Applies a validator result and makes the attempt's terminal state explicit.
     pub fn apply_validation(&mut self, result: ValidationResult) -> Result<(), DomainError> {
+        if self.semantics != AttemptSemantics::LegacyValidationCoupled {
+            return Err(DomainError::InvalidAttemptTransition {
+                from: self.state,
+                to: AttemptState::Succeeded,
+            });
+        }
         let next = if result.passed() {
             AttemptState::Succeeded
         } else {
@@ -546,6 +611,7 @@ impl Attempt {
         validation_results: Vec<ValidationResult>,
         usage_cost: Option<UsageCost>,
         failure_reason: Option<AttemptFailureReason>,
+        semantics: AttemptSemantics,
     ) -> Self {
         Self {
             id,
@@ -554,6 +620,7 @@ impl Attempt {
             observed_provider: targets.observed_provider,
             observed_model: targets.observed_model,
             state,
+            semantics,
             agent_result,
             validation_results,
             usage_cost,
@@ -569,7 +636,10 @@ impl Attempt {
                 AttemptState::Running | AttemptState::Cancelled
             ) | (
                 AttemptState::Running,
-                AttemptState::Validating | AttemptState::Failed | AttemptState::Cancelled
+                AttemptState::Validating
+                    | AttemptState::Succeeded
+                    | AttemptState::Failed
+                    | AttemptState::Cancelled
             ) | (
                 AttemptState::Validating,
                 AttemptState::Succeeded | AttemptState::Failed | AttemptState::Cancelled
@@ -799,6 +869,41 @@ mod tests {
             .unwrap();
         assert_eq!(attempt.state(), AttemptState::Succeeded);
         assert_eq!(attempt.validation_results().len(), 1);
+    }
+
+    #[test]
+    fn attempt_semantics_keep_provider_success_separate_from_validation() {
+        let mut provider_call = Attempt::new_provider_call_v2(
+            AttemptId::new("attempt-provider-v2"),
+            ProviderRef::new("codex"),
+            ModelChoice::ProviderDefault,
+        );
+        provider_call.start().unwrap();
+        assert!(provider_call.finish().is_err());
+        assert!(
+            provider_call
+                .apply_validation(ValidationResult::new("must remain separate", true))
+                .is_err()
+        );
+        assert_eq!(provider_call.state(), AttemptState::Running);
+        provider_call.complete_provider_call().unwrap();
+        assert_eq!(provider_call.state(), AttemptState::Succeeded);
+        assert!(provider_call.validation_results().is_empty());
+        assert_eq!(provider_call.semantics(), AttemptSemantics::ProviderCallV2);
+
+        let mut legacy = attempt("attempt-legacy");
+        legacy.start().unwrap();
+        legacy.finish().unwrap();
+        legacy
+            .apply_validation(ValidationResult::new("validation remains legacy", true))
+            .unwrap();
+        assert_eq!(legacy.state(), AttemptState::Succeeded);
+        assert_eq!(
+            legacy.semantics(),
+            AttemptSemantics::LegacyValidationCoupled
+        );
+        assert_eq!(legacy.validation_results().len(), 1);
+        assert!(legacy.complete_provider_call().is_err());
     }
 
     #[test]

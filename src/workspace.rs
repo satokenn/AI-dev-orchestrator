@@ -68,6 +68,9 @@ pub enum WorkspaceError {
         path: PathBuf,
         reason: String,
     },
+    InvalidBaseCommit {
+        value: String,
+    },
     Io {
         operation: String,
         path: PathBuf,
@@ -97,6 +100,9 @@ impl fmt::Display for WorkspaceError {
                     "invalid repository path '{}': {reason}",
                     path.display()
                 )
+            }
+            Self::InvalidBaseCommit { value } => {
+                write!(formatter, "invalid full base commit object ID: {value}")
             }
             Self::Io {
                 operation,
@@ -291,6 +297,51 @@ impl WorkspaceManager {
 
     /// Creates a new branch and worktree for one attempt.
     pub fn create(&self, task: &TaskId, attempt: &AttemptId) -> Result<Workspace, WorkspaceError> {
+        self.create_at_revision(task, attempt, None)
+    }
+
+    /// Creates a new worktree pinned to a complete commit object ID.
+    pub fn create_at_base(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        commit_oid: &str,
+    ) -> Result<Workspace, WorkspaceError> {
+        self.verify_base_commit(commit_oid)?;
+        self.create_at_revision(task, attempt, Some(commit_oid))
+    }
+
+    pub fn verify_base_commit(&self, commit_oid: &str) -> Result<(), WorkspaceError> {
+        if !matches!(commit_oid.len(), 40 | 64)
+            || !commit_oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(WorkspaceError::InvalidBaseCommit {
+                value: commit_oid.to_owned(),
+            });
+        }
+        let expression = format!("{commit_oid}^{{commit}}");
+        let resolved = self
+            .run_git(
+                "verify base commit",
+                &["rev-parse", "--verify", "--end-of-options", &expression],
+            )
+            .map_err(|_| WorkspaceError::InvalidBaseCommit {
+                value: commit_oid.to_owned(),
+            })?;
+        if String::from_utf8_lossy(&resolved.stdout).trim() != commit_oid {
+            return Err(WorkspaceError::InvalidBaseCommit {
+                value: commit_oid.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn create_at_revision(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        revision: Option<&str>,
+    ) -> Result<Workspace, WorkspaceError> {
         let branch = self.branch_name(task, attempt);
         let path = self.worktree_path(task, attempt);
         if fs::symlink_metadata(&path).is_ok() {
@@ -307,13 +358,16 @@ impl WorkspaceManager {
             },
         )?;
         let path_string = path.to_string_lossy().into_owned();
-        let args = [
+        let mut args = vec![
             "worktree",
             "add",
             "-b",
             branch.as_str(),
             path_string.as_str(),
         ];
+        if let Some(revision) = revision {
+            args.push(revision);
+        }
         if let Err(error) = self.run_git("create worktree", &args) {
             return Err(classify_creation_error(error, &branch, &path));
         }
