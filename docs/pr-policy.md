@@ -69,9 +69,20 @@ scripts/check-pr-policy.sh <pull-request-number> <owner/repository>
 
 `pull_request_target`を利用するpost-merge workflowでは、PRのheadをcheckoutまたは実行しません。default branchの検査コードだけを実行します。
 
-## Required Checkの同期
+## Required Checkの同期と確認
 
-Rulesetの宣言は[`.github/rulesets/main-pr-policy.json`](../.github/rulesets/main-pr-policy.json)で管理します。Policy workflowが`main`へmergeされ、`PR Policy` checkが一度GitHub上で実行された後、repository管理権限を持つ認証済みGitHub CLIで同期します。
+`main`のRulesetは、PR PolicyとRust必須検証をすべてRequired Checkにします。GitHub上で観測したCheckRun名をそのままcontextに使います。
+
+| GitHub Actions | 実check context | 実行内容 |
+| --- | --- | --- |
+| Pull Request Policy / PR Policy | `PR Policy` | PR本文、base、変更範囲の機械検査 |
+| Rust CI / Format | `Format` | `cargo fmt --all -- --check` |
+| Rust CI / Clippy | `Clippy` | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| Rust CI / Test | `Test` | `cargo test --workspace --all-features` |
+
+宣言は[`.github/rulesets/main-pr-policy.json`](../.github/rulesets/main-pr-policy.json)で管理します。Required Checkの失敗・未報告・実行中はマージ条件を満たしません。Check名をworkflowで変更した場合は、GitHubで新しいCheckRun名を確認してから同じ名前を宣言へ反映します。
+
+コード変更が`main`へmergeされ、追加するcheck contextがGitHub上で少なくとも一度報告された後、Rulesetの反映を担当する管理者が同期します。同期コマンドはGitHub設定を書き換えます。このIssueはRuleset宣言と確認手順を対象とし、repositoryの有効設定そのものは変更しません。
 
 適用内容を先に確認します。
 
@@ -85,7 +96,19 @@ scripts/sync-pr-ruleset.sh --dry-run
 scripts/sync-pr-ruleset.sh
 ```
 
-このRulesetは`main`に対して`PR Policy`をRequired Checkにし、baseが最新であることも要求します。Ruleset同期はrepository設定を変更するため、PR上の未mergeファイルから自動実行しません。
+同期直後に、次の読み取り専用検査を実行して宣言と有効設定の一致を確認します。
+
+```shell
+python3 scripts/pr_ruleset.py
+```
+
+別repositoryを確認する場合は`owner/repository`を指定します。
+
+```shell
+python3 scripts/pr_ruleset.py owner/repository
+```
+
+検査はRuleset一覧から同名Rulesetを特定して詳細を取得し、active状態、`main`対象条件、全Required Check context、strict設定を比較します。`PASS`は一致、`FAIL` (終了status `1`)は宣言と有効設定の不一致、取得・認証・設定エラー (終了status `2`)は比較未完了を表します。不一致時は診断の`不足`と`余分`を確認し、宣言または管理者が行ったRuleset設定のどちらが意図と異なるかを修正して、同じ読み取り専用検査を再実行します。同期コマンドはrepository設定を変更するため、PR上の未mergeファイルから自動実行しません。
 
 ## 安全上の制約
 
