@@ -6,7 +6,6 @@ use ai_dev_orchestrator::{
 };
 use std::{
     fs,
-    io::Write,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
@@ -33,13 +32,11 @@ impl FakeCli {
         ));
         fs::create_dir(&unique_directory).expect("create fake CLI directory");
         let executable = unique_directory.join("agy");
-        let mut script = fs::File::create(&executable).expect("create fake CLI");
-        script
-            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
-            .expect("write fake CLI");
-        drop(script);
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+        let temporary_script = unique_directory.join("agy.tmp");
+        fs::write(&temporary_script, format!("#!/bin/sh\n{body}\n")).expect("write fake CLI");
+        fs::set_permissions(&temporary_script, fs::Permissions::from_mode(0o755))
             .expect("make fake CLI executable");
+        fs::rename(&temporary_script, &executable).expect("publish fake CLI atomically");
         Self {
             directory: unique_directory,
             executable,
