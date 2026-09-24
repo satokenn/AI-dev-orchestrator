@@ -120,6 +120,12 @@ Codex自身が編集した場合はAttemptを作らない。管理済みArtifact
 
 監督Codexは目的の解釈、Provider / Model選択、実行・review・再試行の要否、成果物の採否、Task完了を判断する。Operation ServiceはTask ID、expected revision、request ID、workspace / Artifactの所属を検証し、操作受付・各事実・公開/CI参照を永続化する。Provider / Model、Validator、GitHub adapterを実行し、stale revision、busy、未知Provider / Model、policy違反、異なるArtifactへの証拠流用を外部副作用前に拒否する。これが #66 のOperation Service契約である。
 
+### Task実行回数budget
+
+Rust API利用側が `TaskExecutionCountBudget` を明示してOperation Serviceへ渡した場合だけ、Task scopeのhard上限を適用する。`None` はbudget無効を表し、Provider観測情報からbudgetを推測しない。現在のmetricは `execution` 単位のService claim数であり、受付transactionと実行claim transactionの両方で検査する。実行claim数は `started_at` のあるOperation数として同じLedgerから読み、claimと同じ即時transactionで上限を再検査するため、同一Operationの再送、並行claim、`recovery_required` への遷移で二重計上しない。上限到達は `BudgetExhausted`、budget未設定は制限なしで区別される。
+
+上限を消費する時点はProvider availability / workspace準備より前のOperation claimである。このためclaim後、Provider呼出し前に失敗した場合も枠を消費する。ここで保証するのはOperation Serviceがclaimする回数であり、Provider内の再試行や外部accountのtoken・credit消費量ではない。後者を保証するには別のProvider側制約が必要となる。
+
 ## 旧データとの互換性
 
 現行実装と旧Ledgerでは、AttemptはProvider終了後に `Validating` へ進み、旧 `Succeeded` は「検証成功」、旧 `Failed` は「Provider実行または検証失敗」を意味する。この意味を新しいAttemptStateに無断で変換しない。

@@ -440,6 +440,11 @@ reset 時刻に分けて保持する。Provider 全体の制限は `ProviderSnap
 entry 自体を持たない。同じ scope / name の configured budget と remaining budget は同じ
 enforcement を持たなければならず、不一致は Rust が不正な入力 snapshot として拒否する。
 
+実行側がhard上限を原子的に検査できるmetricだけを、実行可能なhard budgetとして設定する。現在のRust
+Operation ServiceはTask scopeの `execution` claim数を任意のpolicyとして適用できる。未設定は制限なし、
+上限超過は `budget_exhausted` としてProvider処理前に拒否する。Serviceが保証できない外部利用量や
+Provider側の再試行を、この回数上限から保証したと表現してはならない。
+
 API の実使用量は `actual_usage` に `measured` として、設定予算は `configured_budget` に
 `configured` として入れる。実使用量と設定予算から算出した残予算は `computed` とし、計算元を
 `source.reference` で追跡できるようにする。将来の1実行の token / cost 見込みは

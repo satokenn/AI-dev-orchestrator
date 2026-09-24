@@ -232,6 +232,8 @@ cursorは不透明であり、Task・section・page size・snapshot revisionに�
 
 `ErrorCode`は`invalid_request`、`unsupported_schema_version`、`task_not_found`、`stale_revision`、`idempotency_conflict`、`busy`、`unknown_provider`、`unknown_model`、`policy_denied`、`budget_exhausted`、`workspace_boundary_violation`、`artifact_not_found`、`artifact_task_mismatch`、`evidence_artifact_mismatch`、`invalid_state_transition`、`operation_not_found`、`not_cancellable`、`timeout`、`cancelled`、`interrupted`、`recovery_required`、`invalid_cursor`、`forbidden`、`internal_error`のいずれか。
 
+`budget_exhausted`は設定済みhard budgetの残枠がなく、Serviceがその操作を実行前に拒否した場合に使う。Policy違反一般は`policy_denied`、budget自体が設定されていない状態はbudget exhaustionではない。観測値がunknownという事実を、上限超過として扱わない。
+
 `Error.details_ref`は、追加のtyped recordを取得するためのopaque referenceである。`ci.wait`が期限切れになった場合は、最後に永続化した`CiObservation`のIDを指す。診断本文を直接errorへ埋め込まない。
 
 `interrupted`はerror codeでありoperation stateではない。終了結果を確定できないinterrupted operationは`recovery_required`になり、復旧状態が確定するまで同じoperationのretryで副作用を再実行しない。再起動後もServiceはこの状態を保持し、`operation.get`で確認できる。復旧確認前の`operation.cancel`は`not_cancellable`で拒否する。

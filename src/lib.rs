@@ -43,7 +43,7 @@ pub use operation_ledger::{
 };
 pub use operation_service::{
     AttemptRunRequest, BaseInput, OperationAcceptance, OperationService, OperationSnapshot,
-    ServiceError, ServiceOperationStatus,
+    ServiceError, ServiceOperationStatus, TaskExecutionCountBudget,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,
