@@ -80,6 +80,7 @@ impl AntigravityProvider {
         request: &ProviderRequest,
         cancellation: CancellationToken,
     ) -> Result<ProviderResult, ProviderError> {
+        request.validate_model_selection()?;
         Self::validate_workspace(request.workspace())?;
 
         let mut process_request = ProcessRequest::new(self.executable.clone()).args([
@@ -105,11 +106,7 @@ impl AntigravityProvider {
         let parsed = parse_json_result(&stdout);
 
         if let Some(error) = parsed.as_ref().and_then(|result| result.error.as_deref()) {
-            return Err(if is_authentication_error(error, &stderr) {
-                ProviderError::Unavailable(error.to_owned())
-            } else {
-                ProviderError::ExecutionFailed(error.to_owned())
-            });
+            return Err(self.map_diagnostic_error(error, &stderr, request.model()));
         }
 
         if parsed
@@ -118,11 +115,7 @@ impl AntigravityProvider {
             .is_some_and(|status| !status.eq_ignore_ascii_case("SUCCESS"))
         {
             let diagnostic = format_diagnostic(&stdout, &stderr);
-            return Err(if is_authentication_error(&diagnostic, "") {
-                ProviderError::Unavailable(diagnostic)
-            } else {
-                ProviderError::ExecutionFailed(diagnostic)
-            });
+            return Err(self.map_diagnostic_error(&diagnostic, "", request.model()));
         }
 
         let agent_result = parsed.as_ref().map_or_else(
@@ -165,15 +158,7 @@ impl AntigravityProvider {
                 let detail = parse_json_result(&stdout)
                     .and_then(|result| result.error)
                     .unwrap_or_else(|| format_diagnostic(&stdout, &stderr));
-                if let Some(error) =
-                    crate::provider::unsupported_model_error(&self.provider_ref, model, &detail)
-                {
-                    error
-                } else if is_authentication_error(&detail, &stderr) {
-                    ProviderError::Unavailable(detail)
-                } else {
-                    ProviderError::ExecutionFailed(detail)
-                }
+                self.map_diagnostic_error(&detail, &stderr, model)
             }
             ProcessError::TimedOut(output) => ProviderError::TimedOutWithOutput {
                 timeout,
@@ -198,6 +183,23 @@ impl AntigravityProvider {
                 stderr: String::from_utf8_lossy(&stderr).into_owned(),
                 diagnostic,
             },
+        }
+    }
+
+    fn map_diagnostic_error(
+        &self,
+        detail: &str,
+        stderr: &str,
+        model: &ModelChoice,
+    ) -> ProviderError {
+        if let Some(error) =
+            crate::provider::unsupported_model_error(&self.provider_ref, model, detail)
+        {
+            error
+        } else if is_authentication_error(detail, stderr) {
+            ProviderError::Unavailable(detail.to_owned())
+        } else {
+            ProviderError::ExecutionFailed(detail.to_owned())
         }
     }
 

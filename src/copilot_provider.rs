@@ -153,6 +153,7 @@ impl CopilotProvider {
         request: &ProviderRequest,
         cancellation: CancellationToken,
     ) -> Result<ProviderResult, ProviderError> {
+        request.validate_model_selection()?;
         if request.workspace().as_os_str().is_empty() {
             return Err(ProviderError::InvalidRequest(
                 "workspace path must not be empty".to_owned(),
@@ -355,6 +356,16 @@ mod tests {
             "test \"$6\" = --model; test \"$7\" = claude-haiku-test; printf ok",
         );
         assert!(provider.execute(&request).is_ok());
+        let empty_model_request = ProviderRequest::new(
+            std::env::temp_dir(),
+            "do the task",
+            Duration::from_secs(1),
+            ModelChoice::Named(crate::ModelRef::new("")),
+        );
+        assert!(matches!(
+            provider.execute(&empty_model_request),
+            Err(ProviderError::InvalidRequest(message)) if message.contains("model identifier")
+        ));
 
         let provider = CopilotProvider::with_executable("sh")
             .with_command_prefix("printf 'unsupported model' >&2; exit 1");

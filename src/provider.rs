@@ -45,6 +45,14 @@ impl ProviderRequest {
     pub const fn model(&self) -> &ModelChoice {
         &self.model
     }
+    pub(crate) fn validate_model_selection(&self) -> Result<(), ProviderError> {
+        if matches!(&self.model, ModelChoice::Named(model) if model.as_str().is_empty()) {
+            return Err(ProviderError::InvalidRequest(
+                "named model identifier must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The minimum provider output needed by the orchestrator.

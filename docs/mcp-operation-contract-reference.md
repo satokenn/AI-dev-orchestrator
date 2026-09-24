@@ -38,7 +38,7 @@ Providerへ要求するModelの指定。fieldの省略やnullではなく、Prov
 | `kind` | `enum(named, provider_default)` | 必須 | Model指定方法 |
 | `model` | `string` | `kind=named`なら必須 | Providerへ渡すModel識別子 |
 
-`kind=named`では`model`が必須で追加fieldを認めない。`kind=provider_default`では`model`を認めない。
+`kind=named`では空でない`model`が必須で追加fieldを認めない。空文字のModel IDはProvider実行前に`invalid_request`として拒否する。`kind=provider_default`では`model`を認めない。
 
 ~~~json
 {"kind":"named","model":"model-a"}
