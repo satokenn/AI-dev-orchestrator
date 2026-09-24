@@ -381,6 +381,30 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    pub(crate) fn validate_artifact_workspace(
+        &self,
+        workspace: &Workspace,
+        task: &TaskId,
+        attempt: Option<&AttemptId>,
+    ) -> Result<(), WorkspaceError> {
+        if workspace.repository_root != self.repository_root {
+            return Err(WorkspaceError::WorkspaceNotManaged {
+                path: workspace.path.clone(),
+            });
+        }
+        self.validate_provider_workspace(&workspace.path)?;
+        if let Some(attempt) = attempt {
+            if workspace.path != self.worktree_path(task, attempt)
+                || workspace.branch != self.branch_name(task, attempt)
+            {
+                return Err(WorkspaceError::WorkspaceNotManaged {
+                    path: workspace.path.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Alias emphasizing that this check is a precondition for Provider use.
     pub fn ensure_provider_workspace(&self, path: impl AsRef<Path>) -> Result<(), WorkspaceError> {
         self.validate_provider_workspace(path)
