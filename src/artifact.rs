@@ -583,12 +583,20 @@ mod tests {
     fn supervisor_artifact_requires_workspace_task_identity() {
         let repository = repository();
         let workspace_manager = WorkspaceManager::new(&repository).unwrap();
-        let workspace_task = TaskId::new("task-a");
-        let other_task = TaskId::new("task-b");
+        let workspace_task = TaskId::new("a/b");
+        let other_task = TaskId::new("a-b");
         let attempt_id = AttemptId::new("attempt-a");
         let workspace = workspace_manager
             .create(&workspace_task, &attempt_id)
             .unwrap();
+        assert_eq!(
+            workspace_manager.worktree_path(&workspace_task, &attempt_id),
+            workspace_manager.worktree_path(&other_task, &attempt_id)
+        );
+        assert_eq!(
+            workspace_manager.branch_name(&workspace_task, &attempt_id),
+            workspace_manager.branch_name(&other_task, &attempt_id)
+        );
         fs::write(workspace.path().join("source.txt"), "supervisor edit\n").unwrap();
         let base = git(workspace.path(), &["rev-parse", "HEAD"]);
         let ledger = SqliteOperationLedger::open_in_memory().unwrap();
