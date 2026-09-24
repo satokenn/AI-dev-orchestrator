@@ -156,8 +156,29 @@ impl AntigravityProvider {
                     ProviderError::ExecutionFailed(detail)
                 }
             }
-            ProcessError::TimedOut(_) => ProviderError::TimedOut { timeout },
-            ProcessError::Cancelled(_) => ProviderError::Cancelled,
+            ProcessError::TimedOut(output) => ProviderError::TimedOutWithOutput {
+                timeout,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            },
+            ProcessError::Cancelled(output) => ProviderError::CancelledWithOutput {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            },
+            ProcessError::CancelledBeforeStart => ProviderError::Cancelled,
+            ProcessError::Interrupted {
+                reason,
+                stopped,
+                stdout,
+                stderr,
+                diagnostic,
+            } => ProviderError::Interrupted {
+                reason,
+                confirmed_stopped: stopped,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                diagnostic,
+            },
         }
     }
 
@@ -280,6 +301,8 @@ fn process_error_message(error: ProcessError) -> String {
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
         ),
+        ProcessError::CancelledBeforeStart => "process was cancelled before start".to_owned(),
+        ProcessError::Interrupted { diagnostic, .. } => diagnostic,
     }
 }
 

@@ -173,8 +173,16 @@ impl RetryPolicy {
     #[must_use]
     pub const fn allows(&self, error: &ProviderError) -> bool {
         match error {
-            ProviderError::TimedOut { .. } => self.retry_on_timeout,
-            ProviderError::Cancelled => self.retry_on_cancellation,
+            ProviderError::TimedOut { .. } | ProviderError::TimedOutWithOutput { .. } => {
+                self.retry_on_timeout
+            }
+            ProviderError::Cancelled | ProviderError::CancelledWithOutput { .. } => {
+                self.retry_on_cancellation
+            }
+            ProviderError::Interrupted {
+                confirmed_stopped: false,
+                ..
+            } => false,
             _ => true,
         }
     }
@@ -309,6 +317,18 @@ mod tests {
                 .allows(&timeout)
         );
         assert!(!RetryPolicy::new(2).allows(&ProviderError::Cancelled));
+    }
+
+    #[test]
+    fn does_not_retry_when_process_stop_was_not_confirmed() {
+        let interrupted = ProviderError::Interrupted {
+            reason: crate::StopReason::TimedOut,
+            confirmed_stopped: false,
+            stdout: "partial output".into(),
+            stderr: String::new(),
+            diagnostic: "process group still exists".into(),
+        };
+        assert!(!RetryPolicy::new(3).allows(&interrupted));
     }
 
     #[test]

@@ -499,6 +499,23 @@ fn git_error(
             output.stdout,
             String::from_utf8_lossy(&output.stderr).into_owned(),
         ),
+        ProcessError::CancelledBeforeStart => {
+            (None, Vec::new(), "process cancelled before start".into())
+        }
+        ProcessError::Interrupted {
+            reason,
+            stopped,
+            stdout,
+            stderr,
+            diagnostic,
+        } => (
+            None,
+            stdout,
+            format!(
+                "process interrupted ({reason:?}, stopped={stopped}): {diagnostic}; {}",
+                String::from_utf8_lossy(&stderr)
+            ),
+        ),
     };
     let command = std::iter::once("git".to_owned())
         .chain(args.into_iter().map(|arg| arg.as_ref().to_owned()))

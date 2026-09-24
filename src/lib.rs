@@ -49,7 +49,7 @@ pub use planner::{
     ValidatedPlannerDecision,
 };
 pub use process_runner::{
-    CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner,
+    CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner, StopReason,
 };
 pub use provider::{AgentProvider, ProviderError, ProviderRequest, ProviderResult};
 pub use retry::{
