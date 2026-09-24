@@ -69,6 +69,8 @@ pub struct ProcessOutput {
     pub status: ExitStatus,
     /// Whether stdout or stderr exceeded the per-stream capture limit.
     pub output_truncated: bool,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 impl ProcessOutput {
@@ -120,6 +122,9 @@ pub enum ProcessError {
         stopped: bool,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+        output_truncated: bool,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
         diagnostic: String,
     },
 }
@@ -182,11 +187,16 @@ impl ProcessRunner {
             true
         };
         if !stopped {
+            let stdout_capture = captured(&stdout);
+            let stderr_capture = captured(&stderr);
             return Err(ProcessError::Interrupted {
                 reason: reason.expect("a stop was requested"),
                 stopped: false,
-                stdout: captured(&stdout).bytes,
-                stderr: captured(&stderr).bytes,
+                stdout: stdout_capture.bytes,
+                stderr: stderr_capture.bytes,
+                output_truncated: stdout_capture.truncated || stderr_capture.truncated,
+                stdout_truncated: stdout_capture.truncated,
+                stderr_truncated: stderr_capture.truncated,
                 diagnostic: "managed process group did not stop within the grace period".into(),
             });
         }
@@ -198,11 +208,16 @@ impl ProcessRunner {
             reason = Some(StopReason::PipeHeld);
             let stopped = stop_process_group(&mut child, STOP_GRACE_PERIOD)?;
             if !stopped {
+                let stdout_capture = captured(&stdout);
+                let stderr_capture = captured(&stderr);
                 return Err(ProcessError::Interrupted {
                     reason: StopReason::PipeHeld,
                     stopped: false,
-                    stdout: captured(&stdout).bytes,
-                    stderr: captured(&stderr).bytes,
+                    stdout: stdout_capture.bytes,
+                    stderr: stderr_capture.bytes,
+                    output_truncated: stdout_capture.truncated || stderr_capture.truncated,
+                    stdout_truncated: stdout_capture.truncated,
+                    stderr_truncated: stderr_capture.truncated,
                     diagnostic: "a descendant kept an output pipe open after the command exited"
                         .into(),
                 });
@@ -215,6 +230,8 @@ impl ProcessRunner {
             stderr: stderr_capture.bytes,
             status,
             output_truncated: stdout_capture.truncated || stderr_capture.truncated,
+            stdout_truncated: stdout_capture.truncated,
+            stderr_truncated: stderr_capture.truncated,
         };
         match reason {
             Some(StopReason::Cancelled) => Err(ProcessError::Cancelled(output)),
@@ -224,6 +241,9 @@ impl ProcessRunner {
                 stopped: true,
                 stdout: output.stdout,
                 stderr: output.stderr,
+                output_truncated: output.output_truncated,
+                stdout_truncated: output.stdout_truncated,
+                stderr_truncated: output.stderr_truncated,
                 diagnostic: "descendant process held an output pipe open".into(),
             }),
             None if !output.status.success() => Err(ProcessError::NonZeroExit(output)),

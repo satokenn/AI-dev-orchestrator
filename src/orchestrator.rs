@@ -698,6 +698,7 @@ fn fail_attempt_with_provider_error(
     attempt_id: &AttemptId,
     error: &ProviderError,
 ) -> Result<(), OrchestratorError> {
+    let error = error.kind();
     let attempt = task
         .attempt_mut(attempt_id)
         .expect("newly added attempt must be owned by its task");
@@ -723,7 +724,7 @@ fn fail_attempt_with_provider_error(
 }
 
 fn provider_error_status(error: &ProviderError) -> OperationStatus {
-    match error {
+    match error.kind() {
         ProviderError::Cancelled | ProviderError::CancelledWithOutput { .. } => {
             OperationStatus::Cancelled
         }

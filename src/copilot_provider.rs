@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::{
-    AgentProvider, AgentResult, CancellationToken, ModelChoice, ProcessError, ProcessRequest,
-    ProcessRunner, ProviderError, ProviderRef, ProviderRequest, ProviderResult,
+    AgentProvider, AgentResult, CancellationToken, CapturedOutput, ModelChoice, ProcessError,
+    ProcessRequest, ProcessRunner, ProviderError, ProviderRef, ProviderRequest, ProviderResult,
 };
 
 const COPILOT_COMMAND: &str = "copilot";
@@ -171,12 +171,14 @@ impl CopilotProvider {
             .run_with_cancellation(self.process_request(request), cancellation)
             .map_err(|error| self.map_process_error(error, request.timeout(), request.model()))?;
 
+        let captured = CapturedOutput::from_process_output(&output);
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let agent_result = Some(AgentResult::new(stdout.clone(), output.status.success()));
         Ok(
             ProviderResult::new(stdout, stderr, output.exit_code(), agent_result, None)
-                .with_observed_target(Some(self.reference.clone()), None),
+                .with_observed_target(Some(self.reference.clone()), None)
+                .with_captured_output(captured),
         )
     }
 
@@ -199,21 +201,32 @@ impl CopilotProvider {
             ProcessError::Io(error) => {
                 ProviderError::ExecutionFailed(format!("Copilot process I/O failed: {error}"))
             }
-            ProcessError::TimedOut(output) => ProviderError::TimedOutWithOutput {
-                timeout,
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            },
-            ProcessError::Cancelled(output) => ProviderError::CancelledWithOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            },
+            ProcessError::TimedOut(output) => {
+                let captured = CapturedOutput::from_process_output(&output);
+                ProviderError::TimedOutWithOutput {
+                    timeout,
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                }
+                .with_captured_output(captured)
+            }
+            ProcessError::Cancelled(output) => {
+                let captured = CapturedOutput::from_process_output(&output);
+                ProviderError::CancelledWithOutput {
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                }
+                .with_captured_output(captured)
+            }
             ProcessError::CancelledBeforeStart => ProviderError::Cancelled,
             ProcessError::Interrupted {
                 reason,
                 stopped,
                 stdout,
                 stderr,
+                output_truncated: _,
+                stdout_truncated,
+                stderr_truncated,
                 diagnostic,
             } => ProviderError::Interrupted {
                 reason,
@@ -221,22 +234,31 @@ impl CopilotProvider {
                 stdout: String::from_utf8_lossy(&stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&stderr).into_owned(),
                 diagnostic,
-            },
+            }
+            .with_captured_output(CapturedOutput::with_stream_truncation(
+                stdout,
+                stderr,
+                None,
+                stdout_truncated,
+                stderr_truncated,
+            )),
             ProcessError::NonZeroExit(output) => {
                 let diagnostic =
                     output_diagnostic(&output.stdout, &output.stderr, output.exit_code());
+                let captured = CapturedOutput::from_process_output(&output);
                 if let Some(error) =
                     crate::provider::unsupported_model_error(&self.reference, model, &diagnostic)
                 {
-                    error
+                    error.with_captured_output(captured)
                 } else if looks_like_authentication_failure(&diagnostic) {
                     ProviderError::Unavailable(format!(
                         "GitHub Copilot CLI authentication failed; run `copilot` and use `/login`: {diagnostic}"
-                    ))
+                    )).with_captured_output(captured)
                 } else {
                     ProviderError::ExecutionFailed(format!(
                         "GitHub Copilot CLI exited unsuccessfully: {diagnostic}"
                     ))
+                    .with_captured_output(captured)
                 }
             }
         }
@@ -369,9 +391,10 @@ mod tests {
 
         let provider = CopilotProvider::with_executable("sh")
             .with_command_prefix("printf 'unsupported model' >&2; exit 1");
+        let error = provider.execute(&request).unwrap_err();
         assert!(matches!(
-            provider.execute(&request),
-            Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "claude-haiku-test"
+            error.kind(),
+            ProviderError::UnsupportedModel { model, .. } if model.as_str() == "claude-haiku-test"
         ));
     }
 
@@ -408,10 +431,9 @@ mod tests {
             .execute(&request(Duration::from_secs(1)))
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            ProviderError::Unavailable(message) if message.contains("/login")
-        ));
+        assert!(
+            matches!(error.kind(), ProviderError::Unavailable(message) if message.contains("/login"))
+        );
     }
 
     #[cfg(unix)]
@@ -424,7 +446,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(
-            error,
+            error.kind(),
             ProviderError::ExecutionFailed(message)
                 if message.contains("exit status Some(7)")
                     && message.contains("partial stdout")
@@ -441,8 +463,9 @@ mod tests {
             .execute(&request(Duration::from_secs(1)))
             .unwrap_err();
         assert!(
-            matches!(timeout, ProviderError::TimedOutWithOutput { stdout, .. } if stdout == "partial")
+            matches!(timeout.kind(), ProviderError::TimedOutWithOutput { stdout, .. } if stdout == "partial")
         );
+        assert_eq!(timeout.captured_output().unwrap().stdout(), b"partial");
 
         let cancellation = CancellationToken::new();
         let other = cancellation.clone();
@@ -452,10 +475,12 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         cancellation.cancel();
 
+        let cancelled = thread.join().unwrap().unwrap_err();
         assert!(matches!(
-            thread.join().unwrap(),
-            Err(ProviderError::CancelledWithOutput { .. })
+            cancelled.kind(),
+            ProviderError::CancelledWithOutput { .. }
         ));
+        assert_eq!(cancelled.captured_output().unwrap().stdout(), b"partial");
     }
 
     #[test]

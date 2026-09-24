@@ -144,9 +144,17 @@ fn passes_named_model_and_types_invalid_model_selection() {
     );
     let workspace = cli.directory.join("workspace");
     fs::create_dir(&workspace).expect("create workspace");
+    let error = cli
+        .provider()
+        .execute(&named_model_request(
+            workspace,
+            "hello",
+            Duration::from_secs(1),
+        ))
+        .unwrap_err();
     assert!(matches!(
-        cli.provider().execute(&named_model_request(workspace, "hello", Duration::from_secs(1))),
-        Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "gemini-test"
+        error.kind(),
+        ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
     ));
 
     let cli = FakeCli::new(
@@ -154,9 +162,17 @@ fn passes_named_model_and_types_invalid_model_selection() {
     );
     let workspace = cli.directory.join("workspace");
     fs::create_dir(&workspace).expect("create workspace");
+    let error = cli
+        .provider()
+        .execute(&named_model_request(
+            workspace,
+            "hello",
+            Duration::from_secs(1),
+        ))
+        .unwrap_err();
     assert!(matches!(
-        cli.provider().execute(&named_model_request(workspace, "hello", Duration::from_secs(1))),
-        Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "gemini-test"
+        error.kind(),
+        ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
     ));
 }
 
@@ -194,10 +210,10 @@ fn reports_authentication_failure_as_unavailable() {
         Duration::from_secs(10),
     ));
 
-    assert!(matches!(
-        result,
-        Err(ProviderError::Unavailable(message)) if message.contains("authentication required")
-    ));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error.kind(), ProviderError::Unavailable(message) if message.contains("authentication required"))
+    );
 }
 
 #[test]
@@ -209,10 +225,11 @@ fn maps_timeout_to_provider_error() {
         Duration::from_secs(1),
     ));
 
-    assert!(matches!(
-        result,
-        Err(ProviderError::TimedOutWithOutput { timeout, stdout, .. }) if timeout == Duration::from_secs(1) && stdout == "partial"
-    ));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error.kind(), ProviderError::TimedOutWithOutput { timeout, stdout, .. } if *timeout == Duration::from_secs(1) && stdout == "partial")
+    );
+    assert_eq!(error.captured_output().unwrap().stdout(), b"partial");
 }
 
 #[test]
@@ -242,7 +259,8 @@ fn maps_cancellation_to_provider_error() {
     assert!(
         matches!(
             &result,
-            Err(ProviderError::CancelledWithOutput { stdout, .. }) if stdout == "partial"
+            Err(error) if matches!(error.kind(), ProviderError::CancelledWithOutput { stdout, .. } if stdout == "partial")
+                && error.captured_output().is_some_and(|output| output.stdout() == b"partial")
         ),
         "unexpected cancellation result: {result:?}"
     );

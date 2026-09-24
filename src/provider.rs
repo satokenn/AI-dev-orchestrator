@@ -3,7 +3,80 @@ use std::{
     time::Duration,
 };
 
+use crate::process_runner::ProcessOutput;
 use crate::{AgentResult, CancellationToken, ModelChoice, ModelRef, ProviderRef, UsageCost};
+
+/// Raw output captured from a provider process, before UTF-8 decoding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_status: Option<i32>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+impl CapturedOutput {
+    #[must_use]
+    pub fn new(
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_status: Option<i32>,
+        truncated: bool,
+    ) -> Self {
+        Self::with_stream_truncation(stdout, stderr, exit_status, truncated, truncated)
+    }
+    #[must_use]
+    pub fn with_stream_truncation(
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_status: Option<i32>,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    ) -> Self {
+        Self {
+            stdout,
+            stderr,
+            exit_status,
+            stdout_truncated,
+            stderr_truncated,
+        }
+    }
+    #[must_use]
+    pub fn from_process_output(output: &ProcessOutput) -> Self {
+        Self::with_stream_truncation(
+            output.stdout.clone(),
+            output.stderr.clone(),
+            output.exit_code(),
+            output.stdout_truncated,
+            output.stderr_truncated,
+        )
+    }
+    #[must_use]
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+    #[must_use]
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
+    #[must_use]
+    pub const fn exit_status(&self) -> Option<i32> {
+        self.exit_status
+    }
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.stdout_truncated || self.stderr_truncated
+    }
+    #[must_use]
+    pub const fn stdout_truncated(&self) -> bool {
+        self.stdout_truncated
+    }
+    #[must_use]
+    pub const fn stderr_truncated(&self) -> bool {
+        self.stderr_truncated
+    }
+}
 
 /// Provider-independent input for one agent execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,6 +138,8 @@ pub struct ProviderResult {
     usage: Option<UsageCost>,
     observed_provider: Option<ProviderRef>,
     observed_model: Option<ModelRef>,
+    captured_output: Option<CapturedOutput>,
+    diagnostics: Vec<String>,
 }
 
 impl ProviderResult {
@@ -84,6 +159,8 @@ impl ProviderResult {
             usage,
             observed_provider: None,
             observed_model: None,
+            captured_output: None,
+            diagnostics: Vec::new(),
         }
     }
     #[must_use]
@@ -94,6 +171,16 @@ impl ProviderResult {
     ) -> Self {
         self.observed_provider = provider;
         self.observed_model = model;
+        self
+    }
+    #[must_use]
+    pub fn with_captured_output(mut self, output: CapturedOutput) -> Self {
+        self.captured_output = Some(output);
+        self
+    }
+    #[must_use]
+    pub fn with_diagnostics(mut self, diagnostics: impl IntoIterator<Item = String>) -> Self {
+        self.diagnostics = diagnostics.into_iter().collect();
         self
     }
     #[must_use]
@@ -123,6 +210,14 @@ impl ProviderResult {
     #[must_use]
     pub fn observed_model(&self) -> Option<&ModelRef> {
         self.observed_model.as_ref()
+    }
+    #[must_use]
+    pub fn captured_output(&self) -> Option<&CapturedOutput> {
+        self.captured_output.as_ref()
+    }
+    #[must_use]
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
     }
 }
 
@@ -155,6 +250,36 @@ pub enum ProviderError {
         provider: ProviderRef,
         model: ModelRef,
     },
+    /// Wraps a semantic provider error with the unmodified process streams.
+    WithCapturedOutput {
+        error: Box<ProviderError>,
+        output: CapturedOutput,
+    },
+}
+
+impl ProviderError {
+    #[must_use]
+    pub fn with_captured_output(self, output: CapturedOutput) -> Self {
+        Self::WithCapturedOutput {
+            error: Box::new(self),
+            output,
+        }
+    }
+    #[must_use]
+    pub fn captured_output(&self) -> Option<&CapturedOutput> {
+        match self {
+            Self::WithCapturedOutput { output, .. } => Some(output),
+            _ => None,
+        }
+    }
+    /// Returns the semantic error variant, unwrapping any captured-output envelope.
+    #[must_use]
+    pub fn kind(&self) -> &ProviderError {
+        match self {
+            Self::WithCapturedOutput { error, .. } => error.kind(),
+            _ => self,
+        }
+    }
 }
 
 pub(crate) fn unsupported_model_error(
@@ -219,6 +344,7 @@ impl std::fmt::Display for ProviderError {
                 provider.as_str(),
                 model.as_str()
             ),
+            Self::WithCapturedOutput { error, .. } => write!(formatter, "{error}"),
         }
     }
 }

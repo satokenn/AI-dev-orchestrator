@@ -315,7 +315,9 @@ fn result_from_error(check: &ValidationCheck, error: ProcessError) -> Validation
             stopped,
             stdout,
             stderr,
+            output_truncated: _,
             diagnostic,
+            ..
         } => ValidationCheckResult::new(
             check.name(),
             false,

@@ -171,8 +171,8 @@ impl RetryPolicy {
         self
     }
     #[must_use]
-    pub const fn allows(&self, error: &ProviderError) -> bool {
-        match error {
+    pub fn allows(&self, error: &ProviderError) -> bool {
+        match error.kind() {
             ProviderError::TimedOut { .. } | ProviderError::TimedOutWithOutput { .. } => {
                 self.retry_on_timeout
             }
