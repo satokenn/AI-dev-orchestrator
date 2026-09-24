@@ -289,21 +289,21 @@ impl<'a> ArtifactManager<'a> {
     fn ensure_tree_object(&self, record: &ArtifactRecord) -> Result<(), ArtifactError> {
         let output = self
             .runner
-            .run(
+            .run_with_stdin(
                 ProcessRequest::new("git")
-                    .args(["cat-file", "-t", record.tree_oid()])
+                    .args(["cat-file", "--batch-check"])
                     .cwd(record.repository_root()),
+                format!("{}\n", record.tree_oid()).as_bytes(),
             )
-            .map_err(|error| match error {
-                // A clean Git invocation that cannot resolve this object is
-                // an artifact integrity problem. Spawn/I/O/timeout failures
-                // remain process errors and must not change artifact state.
-                ProcessError::NonZeroExit(_) => {
-                    ArtifactError::InvalidTreeObject(record.tree_oid().to_owned())
-                }
-                other => ArtifactError::Git(process_error(other)),
-            })?;
-        if String::from_utf8_lossy(&output.stdout).trim() != "tree" {
+            .map_err(|error| ArtifactError::Git(process_error(error)))?;
+        if output.output_truncated {
+            return Err(ArtifactError::Git(
+                "git object lookup output was truncated".into(),
+            ));
+        }
+        let response = String::from_utf8_lossy(&output.stdout);
+        let mut fields = response.split_whitespace();
+        if fields.next() != Some(record.tree_oid()) || fields.next() != Some("tree") {
             return Err(ArtifactError::InvalidTreeObject(
                 record.tree_oid().to_owned(),
             ));
@@ -312,18 +312,35 @@ impl<'a> ArtifactManager<'a> {
     }
 
     fn ref_target(&self, record: &ArtifactRecord) -> Result<Option<String>, ArtifactError> {
-        let output = self.runner.run(
-            ProcessRequest::new("git")
-                .args(["rev-parse", "--verify", "--quiet", record.ref_name()])
-                .cwd(record.repository_root()),
-        );
-        match output {
-            Ok(output) => Ok(Some(
-                String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            )),
-            Err(ProcessError::NonZeroExit(_)) => Ok(None),
-            Err(error) => Err(ArtifactError::Git(process_error(error))),
+        let output = self
+            .runner
+            .run(
+                ProcessRequest::new("git")
+                    .args([
+                        "for-each-ref",
+                        "--format=%(refname)%00%(objectname)",
+                        record.ref_name(),
+                    ])
+                    .cwd(record.repository_root()),
+            )
+            .map_err(|error| ArtifactError::Git(process_error(error)))?;
+        if output.output_truncated {
+            return Err(ArtifactError::Git(
+                "git ref lookup output was truncated".into(),
+            ));
         }
+        let output = String::from_utf8_lossy(&output.stdout);
+        let mut target = None;
+        for line in output.lines() {
+            let (ref_name, object_id) = line.split_once('\0').ok_or_else(|| {
+                ArtifactError::Git("git returned malformed ref lookup output".into())
+            })?;
+            if ref_name == record.ref_name() {
+                target = Some(object_id.to_owned());
+                break;
+            }
+        }
+        Ok(target)
     }
 
     fn create_artifact_ref(&self, record: &ArtifactRecord) -> Result<(), ArtifactError> {
@@ -787,6 +804,47 @@ mod tests {
     }
 
     #[test]
+    fn missing_tree_object_marks_artifact_as_recovery_required() {
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let task_id = TaskId::new("task-missing-tree");
+        let attempt_id = AttemptId::new("attempt-missing-tree");
+        let workspace = workspace_manager.create(&task_id, &attempt_id).unwrap();
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+        let base = git(workspace.path(), &["rev-parse", "HEAD"]);
+        let missing_oid = "0".repeat(40);
+        let record = ArtifactRecord::new(
+            "artifact-missing-tree",
+            task_id.clone(),
+            Some(attempt_id.as_str().to_owned()),
+            None,
+            base,
+            missing_oid,
+            workspace_manager.repository_root(),
+            format!("{ARTIFACT_REF_PREFIX}artifact-missing-tree"),
+            ArtifactState::Available,
+        );
+        ledger.prepare_artifact(&record).unwrap();
+
+        assert!(matches!(
+            artifacts.read(&task_id, record.id()),
+            Err(ArtifactError::RecoveryRequired(_))
+        ));
+        assert_eq!(
+            ledger
+                .get_artifact(&task_id, record.id())
+                .unwrap()
+                .unwrap()
+                .state(),
+            ArtifactState::RecoveryRequired
+        );
+
+        workspace_manager.cleanup_force(&workspace).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
     fn git_process_error_does_not_change_artifact_state() {
         let repository = repository();
         let workspace_manager = WorkspaceManager::new(&repository).unwrap();
@@ -801,10 +859,14 @@ mod tests {
             .unwrap();
         workspace_manager.cleanup_force(&workspace).unwrap();
 
-        let unavailable_repository = repository.with_extension("unavailable");
-        fs::rename(&repository, &unavailable_repository).unwrap();
+        let unavailable_git_directory = repository.join(".git.unavailable");
+        fs::rename(repository.join(".git"), &unavailable_git_directory).unwrap();
         assert!(matches!(
             artifacts.read(&task_id, record.id()),
+            Err(ArtifactError::Git(_))
+        ));
+        assert!(matches!(
+            artifacts.ref_target(&record),
             Err(ArtifactError::Git(_))
         ));
         assert_eq!(
@@ -816,7 +878,7 @@ mod tests {
             ArtifactState::Available
         );
 
-        fs::rename(&unavailable_repository, &repository).unwrap();
+        fs::rename(&unavailable_git_directory, repository.join(".git")).unwrap();
         fs::remove_dir_all(repository).unwrap();
     }
 }
