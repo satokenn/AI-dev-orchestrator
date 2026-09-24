@@ -335,6 +335,12 @@ impl From<io::Error> for LedgerError {
 
 pub trait ExecutionLedger {
     fn accept_operation(&self, request: &OperationRequest) -> Result<OperationRecord, LedgerError>;
+    fn start_operation(
+        &self,
+        id: &OperationId,
+        observed_provider: &ProviderRef,
+        observed_model: Option<&str>,
+    ) -> Result<(), LedgerError>;
     fn get_operation(&self, id: &OperationId) -> Result<Option<OperationRecord>, LedgerError>;
     fn finish_operation(
         &self,
@@ -462,7 +468,20 @@ impl SqliteExecutionLedger {
         let truncated = limit < content.len();
         let directory = directory.as_ref();
         fs::create_dir_all(directory)?;
-        let path = directory.join(format!("{}-{stream}.log", id.as_str()));
+        let operation_component = safe_log_component(id.as_str())?;
+        let stream_component = safe_log_component(stream)?;
+        let canonical_directory = directory.canonicalize()?;
+        let path =
+            canonical_directory.join(format!("{operation_component}-{stream_component}.log"));
+        let canonical_parent = path
+            .parent()
+            .ok_or_else(|| LedgerError::InvalidValue("log path has no parent".into()))?
+            .canonicalize()?;
+        if canonical_parent != canonical_directory || !path.starts_with(&canonical_directory) {
+            return Err(LedgerError::InvalidValue(
+                "log path escapes directory".into(),
+            ));
+        }
         fs::write(&path, &content[..limit])?;
         let reference = LogReference {
             path,
@@ -589,6 +608,21 @@ impl SqliteExecutionLedger {
     }
 }
 
+fn safe_log_component(value: &str) -> Result<&str, LedgerError> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(LedgerError::InvalidValue(format!(
+            "unsafe log path component: {value:?}"
+        )));
+    }
+    Ok(value)
+}
+
 impl ExecutionLedger for SqliteExecutionLedger {
     fn accept_operation(&self, request: &OperationRequest) -> Result<OperationRecord, LedgerError> {
         let mut connection = self.connection.lock().expect("ledger mutex poisoned");
@@ -643,6 +677,14 @@ impl ExecutionLedger for SqliteExecutionLedger {
         drop(connection);
         self.load(&id)?
             .ok_or_else(|| LedgerError::InvalidValue("operation insert disappeared".into()))
+    }
+    fn start_operation(
+        &self,
+        id: &OperationId,
+        observed_provider: &ProviderRef,
+        observed_model: Option<&str>,
+    ) -> Result<(), LedgerError> {
+        SqliteExecutionLedger::start_operation(self, id, observed_provider, observed_model)
     }
     fn get_operation(&self, id: &OperationId) -> Result<Option<OperationRecord>, LedgerError> {
         self.load(id)
@@ -826,5 +868,20 @@ mod tests {
         assert!(reference.truncated());
         assert_eq!(fs::read(reference.path()).unwrap(), b"abc");
         let _ = fs::remove_file(reference.path());
+    }
+
+    #[test]
+    fn save_log_rejects_path_traversal_components() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let directory = std::env::temp_dir().join(format!("ledger-path-test-{}", now()));
+        assert!(matches!(
+            ledger.save_log(&OperationId::new("../escape"), "stdout", &directory, b"x"),
+            Err(LedgerError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            ledger.save_log(&OperationId::new("op-1"), "../stderr", &directory, b"x"),
+            Err(LedgerError::InvalidValue(_))
+        ));
+        let _ = fs::remove_dir_all(directory);
     }
 }

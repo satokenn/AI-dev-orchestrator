@@ -39,7 +39,7 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 ## Operation Ledger
 
-`SqliteOperationLedger` は、外部 Provider の起動前に operation と request ID を保存し、同じ request ID の再送を同じ operation として返します。異なる payload、古い Task revision、同一 Task の実行中操作は拒否します。終了事実、event、validation、review、usage / budget、publication 参照、上限付き raw log、再起動時の `recovery_required` 診断を保存します。
+`Orchestrator` は、設定された `SqliteOperationLedger` に外部 Provider の起動前の受理・開始を記録し、workspace 準備、Provider実行、validation の結果を終了状態として保存します。CLI は指定された実行Ledgerのサイドカーへ自動的にOperation Ledgerを保存します。`SqliteOperationLedger` は同じ request ID の再送を同じ operation として返し、異なる payload、古い Task revision、同一 Task の実行中操作を拒否します。終了事実、event、validation、review、usage / budget、publication 参照、上限付き raw log、再起動時の `recovery_required` 診断を保存します。
 
 ## WorkspaceManager
 
