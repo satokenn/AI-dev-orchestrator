@@ -91,6 +91,7 @@ CODEX_PROVIDER_LIVE_WORKSPACE=/tmp/codex-provider-live \
 手動で実 Agent を呼ぶ Live Provider Test の手順は、[GitHub Copilot CLI Provider](docs/copilot-provider.md) を参照してください。
 
 Antigravity CLI (`agy`) の headless Provider と手動 Live Provider Test の手順は、[Antigravity CLI Provider](docs/antigravity-provider.md) を参照してください。
+`observe_model_catalog()` は `agy models` の候補一覧を観測しますが、アカウント利用権や実行可能性は判定しません。
 
 ## アーキテクチャ
 
