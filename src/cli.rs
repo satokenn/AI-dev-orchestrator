@@ -306,7 +306,11 @@ impl CliRuntime for FakeRuntime {
             TaskRole::new("developer"),
         );
         let _ = task.start();
-        let mut attempt = Attempt::new(AttemptId::new("attempt-1"), ProviderRef::new("codex"));
+        let mut attempt = Attempt::new(
+            AttemptId::new("attempt-1"),
+            ProviderRef::new("codex"),
+            crate::ModelChoice::ProviderDefault,
+        );
         let _ = attempt.start();
         let _ = attempt.record_agent_result(AgentResult::new("fake execution", true));
         let _ = attempt.apply_validation(ValidationResult::new("fake validation", true));

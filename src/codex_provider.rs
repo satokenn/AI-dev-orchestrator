@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::{
-    AgentProvider, AgentResult, CancellationToken, ProcessError, ProcessRequest, ProcessRunner,
-    ProviderError, ProviderRef, ProviderRequest, ProviderResult,
+    AgentProvider, AgentResult, CancellationToken, ModelChoice, ProcessError, ProcessRequest,
+    ProcessRunner, ProviderError, ProviderRef, ProviderRequest, ProviderResult,
 };
 
 const CODEX_COMMAND: &str = "codex";
@@ -86,7 +86,7 @@ impl CodexProvider {
     }
 
     fn process_request(&self, request: &ProviderRequest) -> ProcessRequest {
-        ProcessRequest::new(self.executable.clone())
+        let mut process = ProcessRequest::new(self.executable.clone())
             .args(self.command_prefix.iter().cloned())
             .args([
                 OsString::from("exec"),
@@ -94,7 +94,11 @@ impl CodexProvider {
                 OsString::from("--sandbox"),
                 OsString::from("workspace-write"),
                 OsString::from("--ephemeral"),
-            ])
+            ]);
+        if let ModelChoice::Named(model) = request.model() {
+            process = process.args([OsString::from("--model"), OsString::from(model.as_str())]);
+        }
+        process
             .arg(request.prompt().to_owned())
             .cwd(request.workspace().to_owned())
             .timeout(request.timeout())
@@ -121,6 +125,7 @@ impl CodexProvider {
         request: &ProviderRequest,
         cancellation: CancellationToken,
     ) -> Result<ProviderResult, ProviderError> {
+        request.validate_model_selection()?;
         if request.workspace().as_os_str().is_empty() {
             return Err(ProviderError::InvalidRequest(
                 "workspace path must not be empty".to_owned(),
@@ -130,22 +135,24 @@ impl CodexProvider {
         let output = self
             .runner
             .run_with_cancellation(self.process_request(request), cancellation)
-            .map_err(|error| self.map_process_error(error, request.timeout()))?;
+            .map_err(|error| self.map_process_error(error, request.timeout(), request.model()))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let exit_status = output.exit_code();
         let agent_result = Some(AgentResult::new(stdout.clone(), output.status.success()));
-        Ok(ProviderResult::new(
-            stdout,
-            stderr,
-            exit_status,
-            agent_result,
-            None,
-        ))
+        Ok(
+            ProviderResult::new(stdout, stderr, exit_status, agent_result, None)
+                .with_observed_target(Some(self.reference.clone()), None),
+        )
     }
 
-    fn map_process_error(&self, error: ProcessError, timeout: Duration) -> ProviderError {
+    fn map_process_error(
+        &self,
+        error: ProcessError,
+        timeout: Duration,
+        model: &ModelChoice,
+    ) -> ProviderError {
         match error {
             ProcessError::Spawn(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ProviderError::Unavailable(format!(
@@ -185,7 +192,11 @@ impl CodexProvider {
             ProcessError::NonZeroExit(output) => {
                 let diagnostic =
                     output_diagnostic(&output.stdout, &output.stderr, output.exit_code());
-                if looks_like_authentication_failure(&diagnostic) {
+                if let Some(error) =
+                    crate::provider::unsupported_model_error(&self.reference, model, &diagnostic)
+                {
+                    error
+                } else if looks_like_authentication_failure(&diagnostic) {
                     ProviderError::Unavailable(format!(
                         "Codex CLI authentication failed; run `codex login`: {diagnostic}"
                     ))
@@ -256,7 +267,12 @@ mod tests {
     use std::{thread, time::Duration};
 
     fn request(timeout: Duration) -> ProviderRequest {
-        ProviderRequest::new(std::env::temp_dir(), "do the task", timeout)
+        ProviderRequest::new(
+            std::env::temp_dir(),
+            "do the task",
+            timeout,
+            ModelChoice::ProviderDefault,
+        )
     }
 
     #[cfg(unix)]
@@ -280,6 +296,37 @@ mod tests {
         assert_eq!(result.stderr(), "err");
         assert_eq!(result.exit_status(), Some(0));
         assert!(result.agent_result().unwrap().reported_success());
+        assert_eq!(result.observed_provider().unwrap().as_str(), "codex");
+        assert!(result.observed_model().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passes_named_model_to_cli_and_types_unsupported_model() {
+        let request = ProviderRequest::new(
+            std::env::temp_dir(),
+            "do the task",
+            Duration::from_secs(1),
+            ModelChoice::Named(crate::ModelRef::new("gpt-test")),
+        );
+        let provider = shell_provider("test \"$6\" = --model; test \"$7\" = gpt-test; printf ok");
+        assert!(provider.execute(&request).is_ok());
+        let empty_model_request = ProviderRequest::new(
+            std::env::temp_dir(),
+            "do the task",
+            Duration::from_secs(1),
+            ModelChoice::Named(crate::ModelRef::new("")),
+        );
+        assert!(matches!(
+            provider.execute(&empty_model_request),
+            Err(ProviderError::InvalidRequest(message)) if message.contains("model identifier")
+        ));
+
+        let provider = shell_provider("printf 'unknown model' >&2; exit 1");
+        assert!(matches!(
+            provider.execute(&request),
+            Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "gpt-test"
+        ));
     }
 
     #[test]
@@ -366,6 +413,7 @@ mod tests {
             std::env::temp_dir().join("codex-provider-workspace-does-not-exist"),
             "do the task",
             Duration::from_secs(1),
+            ModelChoice::ProviderDefault,
         );
 
         assert!(matches!(

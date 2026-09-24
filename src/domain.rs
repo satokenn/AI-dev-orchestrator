@@ -70,6 +70,28 @@ impl From<String> for ProviderRef {
     }
 }
 
+/// A named model selected for one provider execution.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ModelRef(String);
+
+impl ModelRef {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The requested model. Provider default is an explicit selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelChoice {
+    Named(ModelRef),
+    ProviderDefault,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskState {
     Pending,
@@ -360,6 +382,9 @@ impl std::error::Error for DomainError {}
 pub struct Attempt {
     id: AttemptId,
     provider: ProviderRef,
+    requested_model: Option<ModelChoice>,
+    observed_provider: Option<ProviderRef>,
+    observed_model: Option<ModelRef>,
     state: AttemptState,
     agent_result: Option<AgentResult>,
     validation_results: Vec<ValidationResult>,
@@ -367,12 +392,29 @@ pub struct Attempt {
     failure_reason: Option<AttemptFailureReason>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AttemptTargets {
+    pub requested_model: Option<ModelChoice>,
+    pub observed_provider: Option<ProviderRef>,
+    pub observed_model: Option<ModelRef>,
+}
+
 impl Attempt {
     #[must_use]
-    pub fn new(id: AttemptId, provider: ProviderRef) -> Self {
+    pub fn new(id: AttemptId, provider: ProviderRef, model: ModelChoice) -> Self {
+        Self::with_optional_model(id, provider, Some(model))
+    }
+    fn with_optional_model(
+        id: AttemptId,
+        provider: ProviderRef,
+        requested_model: Option<ModelChoice>,
+    ) -> Self {
         Self {
             id,
             provider,
+            requested_model,
+            observed_provider: None,
+            observed_model: None,
             state: AttemptState::Queued,
             agent_result: None,
             validation_results: Vec::new(),
@@ -387,6 +429,26 @@ impl Attempt {
     #[must_use]
     pub const fn provider(&self) -> &ProviderRef {
         &self.provider
+    }
+    #[must_use]
+    pub fn requested_model(&self) -> Option<&ModelChoice> {
+        self.requested_model.as_ref()
+    }
+    #[must_use]
+    pub fn observed_provider(&self) -> Option<&ProviderRef> {
+        self.observed_provider.as_ref()
+    }
+    #[must_use]
+    pub fn observed_model(&self) -> Option<&ModelRef> {
+        self.observed_model.as_ref()
+    }
+    pub fn record_observed_target(
+        &mut self,
+        provider: Option<ProviderRef>,
+        model: Option<ModelRef>,
+    ) {
+        self.observed_provider = provider;
+        self.observed_model = model;
     }
     #[must_use]
     pub const fn state(&self) -> AttemptState {
@@ -474,9 +536,11 @@ impl Attempt {
     /// Persistence is responsible for validating the stored representation before
     /// calling this crate-private constructor. Keeping reconstruction here avoids
     /// exposing persistence details in the domain API.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
         id: AttemptId,
         provider: ProviderRef,
+        targets: AttemptTargets,
         state: AttemptState,
         agent_result: Option<AgentResult>,
         validation_results: Vec<ValidationResult>,
@@ -486,6 +550,9 @@ impl Attempt {
         Self {
             id,
             provider,
+            requested_model: targets.requested_model,
+            observed_provider: targets.observed_provider,
+            observed_model: targets.observed_model,
             state,
             agent_result,
             validation_results,
@@ -663,7 +730,11 @@ mod tests {
         )
     }
     fn attempt(id: &str) -> Attempt {
-        Attempt::new(AttemptId::new(id), ProviderRef::new("codex"))
+        Attempt::new(
+            AttemptId::new(id),
+            ProviderRef::new("codex"),
+            ModelChoice::ProviderDefault,
+        )
     }
 
     #[test]
@@ -673,6 +744,7 @@ mod tests {
         task.add_attempt(Attempt::new(
             AttemptId::new("attempt-2"),
             ProviderRef::new("github-copilot-cli"),
+            ModelChoice::ProviderDefault,
         ))
         .unwrap();
         assert_eq!(task.attempts().len(), 2);
@@ -684,12 +756,20 @@ mod tests {
     fn task_rejects_duplicate_attempt_ids_and_exposes_owned_attempt_mutably() {
         let mut task = task();
         let id = AttemptId::new("attempt-1");
-        task.add_attempt(Attempt::new(id.clone(), ProviderRef::new("codex")))
-            .unwrap();
+        task.add_attempt(Attempt::new(
+            id.clone(),
+            ProviderRef::new("codex"),
+            ModelChoice::ProviderDefault,
+        ))
+        .unwrap();
         task.attempt_mut(&id).unwrap().start().unwrap();
         assert_eq!(task.attempt(&id).unwrap().state(), AttemptState::Running);
         assert_eq!(
-            task.add_attempt(Attempt::new(id.clone(), ProviderRef::new("codex"))),
+            task.add_attempt(Attempt::new(
+                id.clone(),
+                ProviderRef::new("codex"),
+                ModelChoice::ProviderDefault
+            )),
             Err(DomainError::DuplicateAttemptId { id })
         );
         assert_eq!(task.attempts().len(), 1);

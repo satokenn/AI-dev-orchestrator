@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{AgentResult, CancellationToken, ProviderRef, UsageCost};
+use crate::{AgentResult, CancellationToken, ModelChoice, ModelRef, ProviderRef, UsageCost};
 
 /// Provider-independent input for one agent execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11,6 +11,7 @@ pub struct ProviderRequest {
     workspace: PathBuf,
     prompt: String,
     timeout: Duration,
+    model: ModelChoice,
 }
 
 impl ProviderRequest {
@@ -19,11 +20,13 @@ impl ProviderRequest {
         workspace: impl Into<PathBuf>,
         prompt: impl Into<String>,
         timeout: Duration,
+        model: ModelChoice,
     ) -> Self {
         Self {
             workspace: workspace.into(),
             prompt: prompt.into(),
             timeout,
+            model,
         }
     }
     #[must_use]
@@ -38,6 +41,18 @@ impl ProviderRequest {
     pub const fn timeout(&self) -> Duration {
         self.timeout
     }
+    #[must_use]
+    pub const fn model(&self) -> &ModelChoice {
+        &self.model
+    }
+    pub(crate) fn validate_model_selection(&self) -> Result<(), ProviderError> {
+        if matches!(&self.model, ModelChoice::Named(model) if model.as_str().is_empty()) {
+            return Err(ProviderError::InvalidRequest(
+                "named model identifier must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The minimum provider output needed by the orchestrator.
@@ -48,6 +63,8 @@ pub struct ProviderResult {
     exit_status: Option<i32>,
     agent_result: Option<AgentResult>,
     usage: Option<UsageCost>,
+    observed_provider: Option<ProviderRef>,
+    observed_model: Option<ModelRef>,
 }
 
 impl ProviderResult {
@@ -65,7 +82,19 @@ impl ProviderResult {
             exit_status,
             agent_result,
             usage,
+            observed_provider: None,
+            observed_model: None,
         }
+    }
+    #[must_use]
+    pub fn with_observed_target(
+        mut self,
+        provider: Option<ProviderRef>,
+        model: Option<ModelRef>,
+    ) -> Self {
+        self.observed_provider = provider;
+        self.observed_model = model;
+        self
     }
     #[must_use]
     pub fn stdout(&self) -> &str {
@@ -86,6 +115,14 @@ impl ProviderResult {
     #[must_use]
     pub fn usage(&self) -> Option<&UsageCost> {
         self.usage.as_ref()
+    }
+    #[must_use]
+    pub fn observed_provider(&self) -> Option<&ProviderRef> {
+        self.observed_provider.as_ref()
+    }
+    #[must_use]
+    pub fn observed_model(&self) -> Option<&ModelRef> {
+        self.observed_model.as_ref()
     }
 }
 
@@ -114,6 +151,37 @@ pub enum ProviderError {
         diagnostic: String,
     },
     Unavailable(String),
+    UnsupportedModel {
+        provider: ProviderRef,
+        model: ModelRef,
+    },
+}
+
+pub(crate) fn unsupported_model_error(
+    provider: &ProviderRef,
+    choice: &ModelChoice,
+    diagnostic: &str,
+) -> Option<ProviderError> {
+    let ModelChoice::Named(model) = choice else {
+        return None;
+    };
+    let diagnostic = diagnostic.to_ascii_lowercase();
+    let recognized = [
+        "invalid model selection",
+        "unknown model",
+        "unsupported model",
+        "model not supported",
+        "model is not supported",
+        "model is not recognized",
+        "model does not exist",
+        "model not found",
+    ]
+    .iter()
+    .any(|marker| diagnostic.contains(marker));
+    recognized.then(|| ProviderError::UnsupportedModel {
+        provider: provider.clone(),
+        model: model.clone(),
+    })
 }
 
 impl std::fmt::Display for ProviderError {
@@ -145,6 +213,12 @@ impl std::fmt::Display for ProviderError {
                 "provider execution interrupted ({reason:?}, stopped={confirmed_stopped}): {diagnostic}"
             ),
             Self::Unavailable(message) => write!(formatter, "provider unavailable: {message}"),
+            Self::UnsupportedModel { provider, model } => write!(
+                formatter,
+                "provider {} does not support model {}",
+                provider.as_str(),
+                model.as_str()
+            ),
         }
     }
 }
@@ -179,6 +253,7 @@ mod tests {
 
     struct FakeProvider {
         reference: ProviderRef,
+        supported_model: Option<&'static str>,
     }
 
     impl AgentProvider for FakeProvider {
@@ -187,13 +262,26 @@ mod tests {
         }
 
         fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {
+            if let ModelChoice::Named(model) = request.model() {
+                if self.supported_model != Some(model.as_str()) {
+                    return Err(ProviderError::UnsupportedModel {
+                        provider: self.reference.clone(),
+                        model: model.clone(),
+                    });
+                }
+            }
+            let observed_model = match request.model() {
+                ModelChoice::Named(model) => Some(model.clone()),
+                ModelChoice::ProviderDefault => None,
+            };
             Ok(ProviderResult::new(
                 format!("ran in {}", request.workspace().display()),
                 "",
                 Some(0),
                 Some(AgentResult::new(request.prompt(), true)),
                 Some(UsageCost::default()),
-            ))
+            )
+            .with_observed_target(Some(self.reference.clone()), observed_model))
         }
 
         fn check_availability(&self) -> Result<(), ProviderError> {
@@ -205,8 +293,14 @@ mod tests {
     fn fake_provider_satisfies_the_common_contract() {
         let provider = FakeProvider {
             reference: ProviderRef::new("codex"),
+            supported_model: Some("gpt-test"),
         };
-        let request = ProviderRequest::new("/tmp/worktree", "do the task", Duration::from_secs(30));
+        let request = ProviderRequest::new(
+            "/tmp/worktree",
+            "do the task",
+            Duration::from_secs(30),
+            ModelChoice::ProviderDefault,
+        );
         let result = provider.execute(&request).unwrap();
 
         assert_eq!(provider.provider_ref().as_str(), "codex");
@@ -231,5 +325,46 @@ mod tests {
         assert_eq!(result.exit_status(), None);
         assert!(result.agent_result().is_none());
         assert!(result.usage().is_none());
+    }
+
+    #[test]
+    fn fake_provider_contract_separates_requested_and_observed_model() {
+        let provider = FakeProvider {
+            reference: ProviderRef::new("fake"),
+            supported_model: Some("gpt-test"),
+        };
+        let named_request = ProviderRequest::new(
+            "/tmp/worktree",
+            "do the task",
+            Duration::from_secs(30),
+            ModelChoice::Named(ModelRef::new("gpt-test")),
+        );
+        let named_result = provider.execute(&named_request).unwrap();
+        assert_eq!(
+            named_request.model(),
+            &ModelChoice::Named(ModelRef::new("gpt-test"))
+        );
+        assert_eq!(named_result.observed_model().unwrap().as_str(), "gpt-test");
+
+        let default_request = ProviderRequest::new(
+            "/tmp/worktree",
+            "do the task",
+            Duration::from_secs(30),
+            ModelChoice::ProviderDefault,
+        );
+        let default_result = provider.execute(&default_request).unwrap();
+        assert_eq!(default_request.model(), &ModelChoice::ProviderDefault);
+        assert!(default_result.observed_model().is_none());
+
+        let unsupported_request = ProviderRequest::new(
+            "/tmp/worktree",
+            "do the task",
+            Duration::from_secs(30),
+            ModelChoice::Named(ModelRef::new("unknown-model")),
+        );
+        assert!(matches!(
+            provider.execute(&unsupported_request),
+            Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "unknown-model"
+        ));
     }
 }

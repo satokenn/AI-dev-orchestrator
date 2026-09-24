@@ -7,9 +7,11 @@ use std::{fmt, path::Path, sync::Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::domain::AttemptTargets;
 use crate::{
-    AgentResult, Attempt, AttemptFailureReason, AttemptId, AttemptState, ProviderRef, Task, TaskId,
-    TaskRole, TaskState, UsageCost, UsageMetric, ValidationCheckResult, ValidationResult,
+    AgentResult, Attempt, AttemptFailureReason, AttemptId, AttemptState, ModelChoice, ModelRef,
+    ProviderRef, Task, TaskId, TaskRole, TaskState, UsageCost, UsageMetric, ValidationCheckResult,
+    ValidationResult,
 };
 
 /// A persisted attempt together with the task it belongs to and execution times.
@@ -129,7 +131,7 @@ type PublicationTaskRow = (
     Option<String>,
 );
 
-const LATEST_SCHEMA_VERSION: u32 = 6;
+const LATEST_SCHEMA_VERSION: u32 = 7;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -412,11 +414,16 @@ impl SqliteExecutionLedger {
         let connection = self.lock_connection()?;
         let transaction = connection.unchecked_transaction()?;
         transaction.execute(
-            "INSERT INTO attempts (task_id, id, provider, state, started_at, finished_at, failure_reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO attempts (task_id, id, provider, state, started_at, finished_at, failure_reason,
+                 requested_model_kind, requested_model, observed_provider, observed_model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(task_id, id) DO UPDATE SET provider = excluded.provider,
                  state = excluded.state, started_at = excluded.started_at,
-                 finished_at = excluded.finished_at, failure_reason = excluded.failure_reason",
+                 finished_at = excluded.finished_at, failure_reason = excluded.failure_reason,
+                 requested_model_kind = excluded.requested_model_kind,
+                 requested_model = excluded.requested_model,
+                 observed_provider = excluded.observed_provider,
+                 observed_model = excluded.observed_model",
             params![
                 record.task_id().as_str(),
                 record.attempt().id().as_str(),
@@ -425,6 +432,10 @@ impl SqliteExecutionLedger {
                 record.started_at(),
                 record.finished_at(),
                 record.attempt().failure_reason().map(failure_reason_to_str),
+                record.attempt().requested_model().map(model_choice_kind),
+                record.attempt().requested_model().and_then(model_choice_name),
+                record.attempt().observed_provider().map(ProviderRef::as_str),
+                record.attempt().observed_model().map(ModelRef::as_str),
             ],
         )?;
         transaction.execute(
@@ -520,7 +531,8 @@ impl SqliteExecutionLedger {
         let connection = self.lock_connection()?;
         let record = connection
             .query_row(
-                "SELECT provider, state, started_at, finished_at, failure_reason
+                "SELECT provider, state, started_at, finished_at, failure_reason,
+                        requested_model_kind, requested_model, observed_provider, observed_model
                  FROM attempts WHERE task_id = ?1 AND id = ?2",
                 params![task_id.as_str(), attempt_id.as_str()],
                 |row| {
@@ -530,11 +542,26 @@ impl SqliteExecutionLedger {
                         row.get::<_, Option<i64>>(2)?,
                         row.get::<_, Option<i64>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((provider, state, started_at, finished_at, reason)) = record else {
+        let Some((
+            provider,
+            state,
+            started_at,
+            finished_at,
+            reason,
+            model_kind,
+            model_name,
+            observed_provider,
+            observed_model,
+        )) = record
+        else {
             return Ok(None);
         };
         let attempt = self.load_attempt_details(
@@ -542,6 +569,14 @@ impl SqliteExecutionLedger {
             task_id,
             attempt_id,
             ProviderRef::new(provider),
+            AttemptTargets {
+                requested_model: requested_model_from_storage(
+                    model_kind.as_deref(),
+                    model_name.as_deref(),
+                )?,
+                observed_provider: observed_provider.map(ProviderRef::new),
+                observed_model: observed_model.map(ModelRef::new),
+            },
             attempt_state_from_str(&state)?,
             reason.map(|r| failure_reason_from_str(&r)).transpose()?,
         )?;
@@ -565,7 +600,8 @@ impl SqliteExecutionLedger {
         task_id: &TaskId,
     ) -> Result<Vec<AttemptRecord>, LedgerError> {
         let mut statement = connection.prepare(
-            "SELECT id, provider, state, started_at, finished_at, failure_reason
+            "SELECT id, provider, state, started_at, finished_at, failure_reason,
+                    requested_model_kind, requested_model, observed_provider, observed_model
              FROM attempts WHERE task_id = ?1 ORDER BY rowid",
         )?;
         let rows = statement.query_map(params![task_id.as_str()], |row| {
@@ -576,16 +612,39 @@ impl SqliteExecutionLedger {
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         let mut attempts = Vec::new();
         for row in rows {
-            let (attempt_id, provider, state, started_at, finished_at, reason) = row?;
+            let (
+                attempt_id,
+                provider,
+                state,
+                started_at,
+                finished_at,
+                reason,
+                model_kind,
+                model_name,
+                observed_provider,
+                observed_model,
+            ) = row?;
             let attempt = self.load_attempt_details(
                 connection,
                 task_id,
                 &attempt_id,
                 provider,
+                AttemptTargets {
+                    requested_model: requested_model_from_storage(
+                        model_kind.as_deref(),
+                        model_name.as_deref(),
+                    )?,
+                    observed_provider: observed_provider.map(ProviderRef::new),
+                    observed_model: observed_model.map(ModelRef::new),
+                },
                 attempt_state_from_str(&state)?,
                 reason.map(|r| failure_reason_from_str(&r)).transpose()?,
             )?;
@@ -599,12 +658,14 @@ impl SqliteExecutionLedger {
         Ok(attempts)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_attempt_details(
         &self,
         connection: &Connection,
         task_id: &TaskId,
         attempt_id: &AttemptId,
         provider: ProviderRef,
+        targets: AttemptTargets,
         state: AttemptState,
         failure_reason: Option<AttemptFailureReason>,
     ) -> Result<Attempt, LedgerError> {
@@ -691,6 +752,7 @@ impl SqliteExecutionLedger {
         Ok(Attempt::restore(
             attempt_id.clone(),
             provider,
+            targets,
             state,
             agent_result,
             validations,
@@ -714,7 +776,8 @@ fn create_latest_schema(connection: &Connection) -> Result<(), rusqlite::Error> 
     connection.execute_batch(
         "CREATE TABLE tasks (id TEXT PRIMARY KEY NOT NULL, description TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL);
          CREATE TABLE attempts (task_id TEXT NOT NULL, id TEXT NOT NULL, provider TEXT NOT NULL, state TEXT NOT NULL,
-             started_at INTEGER, finished_at INTEGER, failure_reason TEXT, PRIMARY KEY (task_id, id),
+             started_at INTEGER, finished_at INTEGER, failure_reason TEXT, requested_model_kind TEXT,
+             requested_model TEXT, observed_provider TEXT, observed_model TEXT, PRIMARY KEY (task_id, id),
              FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE);
          CREATE TABLE agent_results (task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, summary TEXT NOT NULL,
              reported_success INTEGER NOT NULL, PRIMARY KEY (task_id, attempt_id),
@@ -777,11 +840,45 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
             4 => add_column_if_missing(connection, "publications", "base", "TEXT")?,
             5 => add_column_if_missing(connection, "publications", "title", "TEXT")?,
             6 => add_column_if_missing(connection, "publications", "body", "TEXT")?,
+            7 => {
+                add_column_if_missing(connection, "attempts", "requested_model_kind", "TEXT")?;
+                add_column_if_missing(connection, "attempts", "requested_model", "TEXT")?;
+                add_column_if_missing(connection, "attempts", "observed_provider", "TEXT")?;
+                add_column_if_missing(connection, "attempts", "observed_model", "TEXT")?;
+            }
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
     }
     Ok(())
+}
+
+fn model_choice_kind(choice: &ModelChoice) -> &'static str {
+    match choice {
+        ModelChoice::Named(_) => "named",
+        ModelChoice::ProviderDefault => "provider_default",
+    }
+}
+
+fn model_choice_name(choice: &ModelChoice) -> Option<&str> {
+    match choice {
+        ModelChoice::Named(model) => Some(model.as_str()),
+        ModelChoice::ProviderDefault => None,
+    }
+}
+
+fn requested_model_from_storage(
+    kind: Option<&str>,
+    name: Option<&str>,
+) -> Result<Option<ModelChoice>, LedgerError> {
+    match (kind, name) {
+        (None, None) => Ok(None), // Legacy attempt: requested model was not recorded.
+        (Some("named"), Some(name)) => Ok(Some(ModelChoice::Named(ModelRef::new(name)))),
+        (Some("provider_default"), None) => Ok(Some(ModelChoice::ProviderDefault)),
+        _ => Err(LedgerError::InvalidStoredValue(format!(
+            "invalid requested model fields: kind={kind:?}, name={name:?}"
+        ))),
+    }
 }
 
 impl ExecutionLedger for SqliteExecutionLedger {
@@ -911,7 +1008,11 @@ mod tests {
     }
 
     fn attempt(id: &str, provider: &str) -> Attempt {
-        Attempt::new(AttemptId::new(id), ProviderRef::new(provider))
+        Attempt::new(
+            AttemptId::new(id),
+            ProviderRef::new(provider),
+            ModelChoice::ProviderDefault,
+        )
     }
 
     #[test]
@@ -1069,6 +1170,38 @@ mod tests {
     }
 
     #[test]
+    fn attempt_requested_and_observed_targets_round_trip() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task = task();
+        ledger.save_task(&task).unwrap();
+        let mut attempt = Attempt::new(
+            AttemptId::new("attempt-model"),
+            ProviderRef::new("codex"),
+            ModelChoice::Named(ModelRef::new("gpt-test")),
+        );
+        attempt.record_observed_target(
+            Some(ProviderRef::new("codex")),
+            Some(ModelRef::new("gpt-test")),
+        );
+        ledger
+            .save_attempt(task.id(), &attempt, Some(1), Some(2))
+            .unwrap();
+        let loaded = ledger
+            .get_attempt(task.id(), attempt.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.attempt().requested_model(),
+            attempt.requested_model()
+        );
+        assert_eq!(
+            loaded.attempt().observed_provider(),
+            attempt.observed_provider()
+        );
+        assert_eq!(loaded.attempt().observed_model(), attempt.observed_model());
+    }
+
+    #[test]
     fn file_ledger_survives_connection_reopen() {
         let path = std::env::temp_dir().join(format!(
             "ai-dev-orchestrator-ledger-{}.sqlite",
@@ -1121,6 +1254,9 @@ mod tests {
             attempt.attempt().failure_reason(),
             Some(&AttemptFailureReason::Timeout)
         );
+        assert_eq!(attempt.attempt().requested_model(), None);
+        assert_eq!(attempt.attempt().observed_provider(), None);
+        assert_eq!(attempt.attempt().observed_model(), None);
         let publication = ledger.load_publication("key-1").unwrap().unwrap();
         assert_eq!(publication.repository(), "owner/repo");
         assert_eq!(publication.branch(), "main");
@@ -1137,11 +1273,11 @@ mod tests {
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 7;")
+            .execute_batch("PRAGMA user_version = 8;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(7))
+            Err(LedgerError::UnsupportedSchemaVersion(8))
         ));
     }
 }

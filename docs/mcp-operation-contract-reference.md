@@ -19,7 +19,7 @@ MCP toolsでは`inputSchema`が入力schemaを定め、任意の`outputSchema`�
 | `T \| null` | T型またはJSON `null`。field自体は省略できない |
 | `enum(a, b)` | 記載したstring値のみ許可 |
 
-すべてのtool requestの`params.arguments`は`schema_version: "v1"`を必須とする。未対応versionは`unsupported_schema_version`。不明なrequest fieldは`invalid_request`とし、副作用前に拒否する。成功するtool outputの`structuredContent`はすべて`schema_version: "v1"`を含む。業務errorはMCP tool execution error（`isError: true`）として返し、`content`に下記のtyped errorを含める。MCP request metadataやprotocol errorはこのアプリケーション契約の対象外。
+すべてのtool requestの`params.arguments`は`schema_version: "v2"`を必須とする。未対応versionは`unsupported_schema_version`。不明なrequest fieldは`invalid_request`とし、副作用前に拒否する。成功するtool outputの`structuredContent`はすべて`schema_version: "v2"`を含む。業務errorはMCP tool execution error（`isError: true`）として返し、`content`に下記のtyped errorを含める。MCP request metadataやprotocol errorはこのアプリケーション契約の対象外。
 
 副作用を伴うrequestは`request_id: string`を必須とする。既存Taskを変更する場合はさらに`task_id: string`と`expected_revision: integer`を必須とする。読取requestは`request_id`と`expected_revision`を持たない。
 
@@ -28,6 +28,25 @@ MCP toolsでは`inputSchema`が入力schemaを定め、任意の`outputSchema`�
 IDはすべて不透明なstringとし、呼出側はIDの形式・連番・内部構造を解釈しない。RFC 3339日時は`string`として送受信し、UTC (`Z`) を使う。fieldがoptionalなら省略し、nullを使うのは型に`| null`と明記された場合だけ。
 
 ## 共通型
+
+### `ModelChoice`
+
+Providerへ要求するModelの指定。fieldの省略やnullではなく、Providerの既定値を使う場合も判別値で表す。
+
+| Field | JSON type | Required | 意味 |
+| --- | --- | --- | --- |
+| `kind` | `enum(named, provider_default)` | 必須 | Model指定方法 |
+| `model` | `string` | `kind=named`なら必須 | Providerへ渡すModel識別子 |
+
+`kind=named`では空でない`model`が必須で追加fieldを認めない。空文字のModel IDはProvider実行前に`invalid_request`として拒否する。`kind=provider_default`では`model`を認めない。
+
+~~~json
+{"kind":"named","model":"model-a"}
+~~~
+
+~~~json
+{"kind":"provider_default"}
+~~~
 
 ### `TaskRequest` / `TaskSnapshot`
 
@@ -89,8 +108,10 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 |  |  | `unit` | `string` | 必須 | 値の単位 |
 |  |  | `basis` | `enum(measured, configured, computed, estimated, unknown)` | 必須 | 値の根拠 |
 |  |  | `observed_at` | `string \| null` | 必須 | 観測時刻。不明ならnull、非null値はRFC 3339 UTC |
-| `attempts` | `attempt` | `provider_id` | `string` | 必須 | Provider ID |
-|  |  | `model_id` | `string` | 必須 | Model ID |
+| `attempts` | `attempt` | `requested_provider_id` | `string` | 必須 | 要求Provider ID |
+|  |  | `requested_model` | `ModelChoice \| null` | 必須 | 要求Model。旧記録等で確認できなければnull |
+|  |  | `observed_provider_id` | `string \| null` | 必須 | 実行されたと観測できたProvider。未知ならnull |
+|  |  | `observed_model_id` | `string \| null` | 必須 | 実際に使用したと観測できたModel。未知ならnull |
 |  |  | `role` | `enum(implementer, reviewer, explorer)` | 必須 | Attemptの役割 |
 |  |  | `input_artifact_id` | `string \| null` | 必須 | 入力Artifact。初期baseから開始した場合はnull |
 |  |  | `base_commit` | `string \| null` | 必須 | 開始時commit。なければnull |
@@ -170,7 +191,7 @@ cursorは不透明であり、Task・section・page size・snapshot revisionに�
 
 | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 対応するrequest ID |
 | `task_id` | `string` | 必須 | 対象Task ID |
 | `revision` | `integer` | 必須 | 受付後のTask revision |
@@ -194,7 +215,7 @@ cursorは不透明であり、Task・section・page size・snapshot revisionに�
 
 | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string \| null` | 必須 | parse可能なら対象request ID。取得不能ならnull |
 | `error` | `Error` | 必須 | 業務error |
 
@@ -217,7 +238,7 @@ cursorは不透明であり、Task・section・page size・snapshot revisionに�
 
 ## Tool schemas
 
-各request / response表はJSON Schemaの`properties`に相当するfieldを列挙する。`Required`は「必須」「任意」「条件付き」のいずれか。条件付きfieldの条件は表の直後に記す。未知request fieldは拒否し、未知response fieldは無視する。全成功outputには`schema_version: const "v1"`を含む。
+各request / response表はJSON Schemaの`properties`に相当するfieldを列挙する。`Required`は「必須」「任意」「条件付き」のいずれか。条件付きfieldの条件は表の直後に記す。未知request fieldは拒否し、未知response fieldは無視する。全成功outputには`schema_version: const "v2"`を含む。
 
 ### `task.create`
 
@@ -225,7 +246,7 @@ Taskを作成する。`request_id`は冪等性keyに含まれる。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 重複作成を防ぐrequest ID |
 | `source` | `enum(issue, manual)` | 必須 | 要求の出所 |
 | `title` | `string` | 必須 | Task title |
@@ -239,7 +260,7 @@ Taskを作成する。`request_id`は冪等性keyに含まれる。
 
 | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 入力request IDのecho |
 | `task_id` | `string` | 必須 | 新規Task ID |
 | `revision` | `integer` | 必須 | 初期revision |
@@ -250,7 +271,7 @@ Taskを作成する。`request_id`は冪等性keyに含まれる。
 
 ~~~json
 {
-  "schema_version": "v1",
+  "schema_version": "v2",
   "request_id": "req-01",
   "source": "manual",
   "title": "Update parser",
@@ -267,7 +288,7 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `task_id` | `string` | 必須 | 読むTask |
 | `sections` | `array<enum(providers, usage, attempts, artifacts, validations, reviews, decisions, publication, ci)>` | 必須 | 返す履歴section。重複不可 |
 | `page_size` | `integer (minimum: 1, maximum: 100)` | 任意、既定20 | 各sectionから返す最大件数 |
@@ -277,7 +298,7 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
 
 | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `task` | `TaskSnapshot` | 必須 | ID、revision、state、要求snapshot |
 | `sections` | `object<string, ContextPage>` | 必須 | 要求されたsectionごとのpage |
 | `observed_at` | `string (format: date-time)` | 必須 | snapshot観測時刻 |
@@ -292,7 +313,7 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
   "occurred_at": "2026-09-23T01:02:03Z",
   "summary": "Provider call completed",
   "references": [{"kind": "artifact", "id": "artifact-01"}],
-  "details": {"provider_id": "provider-a", "model_id": "model-a", "role": "implementer", "input_artifact_id": null, "base_commit": "abc123", "output_artifact_id": "artifact-01", "diagnostic_ref": null}
+  "details": {"requested_provider_id": "provider-a", "requested_model": {"kind": "named", "model": "model-a"}, "observed_provider_id": "provider-a", "observed_model_id": null, "role": "implementer", "input_artifact_id": null, "base_commit": "abc123", "output_artifact_id": "artifact-01", "diagnostic_ref": null}
 }
 ~~~
 
@@ -302,12 +323,12 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
 | `task_id` | `string` | 必須 | 対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に観測したrevision |
 | `provider_id` | `string` | 必須 | 呼び出すProvider |
-| `model_id` | `string` | 必須 | 呼び出すModel |
+| `model_id` | `ModelChoice` | 必須 | named Modelまたは明示したProvider既定値 |
 | `instruction` | `string` | 必須 | Providerへ渡す依頼 |
 | `role` | `enum(implementer, reviewer, explorer)` | 必須 | Attemptのrole |
 | `input` | `ArtifactInput \| BaseInput` | 必須 | 入力Artifactまたは初期baseのどちらか一方 |
@@ -331,14 +352,14 @@ operation状態・結果を読む。読取専用。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `operation_id` | `string` | 必須 | 取得対象 |
 
 成功output:
 
 | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `operation` | `Operation` | 必須 | operation記録 |
 
 `Operation`のfieldはすべて必須。nullを許すfieldも省略せず、該当しない場合はnullを返す。
@@ -361,6 +382,10 @@ operation状態・結果を読む。読取専用。
 | --- | --- | --- | --- | --- |
 | `attempt.run` | `attempt_id` | `string` | 必須 | 作成したAttempt ID |
 |  | `attempt_state` | `enum(succeeded, failed, cancelled)` | 必須 | Provider実行の終端state |
+|  | `requested_provider_id` | `string` | 必須 | 要求Provider ID |
+|  | `model_id` | `ModelChoice` | 必須 | 要求したnamed ModelまたはProvider既定値 |
+|  | `observed_provider_id` | `string \| null` | 必須 | 実行後に観測したProvider。未知ならnull |
+|  | `observed_model_id` | `string \| null` | 必須 | 実行後に観測したModel。未知ならnull |
 |  | `output_artifact_id` | `string \| null` | 必須 | 出力Artifact。生成されなければnull |
 |  | `usage` | `array<UsageMetric>` | 必須 | Provider使用量 |
 |  | `diagnostic_ref` | `string \| null` | 必須 | 診断参照。なければnull |
@@ -385,6 +410,8 @@ operation状態・結果を読む。読取専用。
 
 `UsageMetric`と`CiTarget`のfieldはすべて必須。
 
+要求Modelはoperationの受理時点で保存し、observed targetはProvider結果を受け取った後に別fieldへ保存する。Provider出力からModelを確定できない場合は`observed_model_id: null`とし、`model_id`をコピーしない。既知のProvider error `unknown_model`は、選択ModelをProviderが受け付けない場合にも使う。
+
 | Object | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- | --- |
 | `UsageMetric` | `name` | `string` | 必須 | 指標名 |
@@ -401,7 +428,7 @@ operation状態・結果を読む。読取専用。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `operation_id` | `string` | 必須 | 対象operation |
 | `stream` | `enum(stdout, stderr, diagnostic)` | 必須 | 読むstream |
 | `cursor` | `string` | 任意 | 次page cursor |
@@ -411,7 +438,7 @@ operation状態・結果を読む。読取専用。
 
 | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `chunks` | `array<LogChunk>` | 必須 | 取得したlog chunk |
 | `next_cursor` | `string \| null` | 必須 | 次page cursor。続きがなければnull |
 
@@ -430,7 +457,7 @@ cursorはoperation・stream・limitに束縛される。末尾到達はoperation
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
 | `task_id` | `string` | 必須 | 対象operationのTask |
 | `expected_revision` | `integer` | 必須 | 最後に観測したrevision |
@@ -444,7 +471,7 @@ Taskと未終了operationの取消を要求する。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
 | `task_id` | `string` | 必須 | 取消対象 |
 | `expected_revision` | `integer` | 必須 | 最後に観測したrevision |
@@ -458,7 +485,7 @@ Artifactに機械検証を実行する。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
 | `task_id` | `string` | 必須 | 対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に観測したrevision |
@@ -489,7 +516,7 @@ commandとworkspaceは実行前にpolicy allowlistで検査する。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
 | `task_id` | `string` | 必須 | 対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に観測したrevision |
@@ -502,7 +529,7 @@ commandとworkspaceは実行前にpolicy allowlistで検査する。
 
 | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 入力request IDのecho |
 | `task_id` | `string` | 必須 | 対象Task ID |
 | `revision` | `integer` | 必須 | 記録後のTask revision |
@@ -524,7 +551,7 @@ commandとworkspaceは実行前にpolicy allowlistで検査する。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
 | `task_id` | `string` | 必須 | 対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に観測したrevision |
@@ -550,7 +577,7 @@ PR / commitのcheck状態を一度観測する。読取専用。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `publication_id` | `string` | `target`未指定時に必須 | Publicationの指定 |
 | `target` | `PullRequestTarget \| CommitTarget` | `publication_id`未指定時に必須 | PRまたはcommitの指定 |
 
@@ -567,7 +594,7 @@ PR / commitのcheck状態を一度観測する。読取専用。
 
 | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `observation_id` | `string` | 必須 | observation ID |
 | `target` | `CiTarget` | 必須 | 観測対象 |
 | `observed_at` | `string (format: date-time)` | 必須 | 観測時刻 |
@@ -580,7 +607,7 @@ CI状態をdeadlineまで待つ。長時間処理。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
 | `task_id` | `string` | 必須 | 対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に観測したrevision |
@@ -596,7 +623,7 @@ Task完了を要求する。指定されたArtifact、accepted decision、policy
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 冪等性key |
 | `task_id` | `string` | 必須 | 完了対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に観測したrevision |
@@ -608,7 +635,7 @@ Task完了を要求する。指定されたArtifact、accepted decision、policy
 
 | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 契約version |
+| `schema_version` | `const "v2"` | 必須 | 契約version |
 | `request_id` | `string` | 必須 | 入力request IDのecho |
 | `task_id` | `string` | 必須 | 完了したTask ID |
 | `revision` | `integer` | 必須 | 完了後のTask revision |

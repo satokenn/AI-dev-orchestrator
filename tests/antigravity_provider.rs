@@ -1,10 +1,12 @@
 #![cfg(unix)]
 
 use ai_dev_orchestrator::{
-    AgentProvider, AntigravityProvider, CancellationToken, ProviderError, ProviderRequest,
+    AgentProvider, AntigravityProvider, CancellationToken, ModelChoice, ProviderError,
+    ProviderRequest,
 };
 use std::{
     fs,
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
@@ -31,7 +33,11 @@ impl FakeCli {
         ));
         fs::create_dir(&unique_directory).expect("create fake CLI directory");
         let executable = unique_directory.join("agy");
-        fs::write(&executable, format!("#!/bin/sh\n{body}\n")).expect("write fake CLI");
+        let mut script = fs::File::create(&executable).expect("create fake CLI");
+        script
+            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .expect("write fake CLI");
+        drop(script);
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
             .expect("make fake CLI executable");
         Self {
@@ -52,7 +58,20 @@ impl Drop for FakeCli {
 }
 
 fn request(workspace: impl Into<PathBuf>, prompt: &str, timeout: Duration) -> ProviderRequest {
-    ProviderRequest::new(workspace, prompt, timeout)
+    ProviderRequest::new(workspace, prompt, timeout, ModelChoice::ProviderDefault)
+}
+
+fn named_model_request(
+    workspace: impl Into<PathBuf>,
+    prompt: &str,
+    timeout: Duration,
+) -> ProviderRequest {
+    ProviderRequest::new(
+        workspace,
+        prompt,
+        timeout,
+        ModelChoice::Named(ai_dev_orchestrator::ModelRef::new("gemini-test")),
+    )
 }
 
 #[test]
@@ -73,6 +92,8 @@ fn executes_headless_cli_in_workspace_and_maps_json_result() {
         .expect("provider succeeds");
 
     assert_eq!(result.exit_status(), Some(0));
+    assert_eq!(result.observed_provider().unwrap().as_str(), "antigravity");
+    assert!(result.observed_model().is_none());
     assert!(result.stdout().contains("\"status\":\"SUCCESS\""));
     assert!(result.stderr().starts_with("fake diagnostic:"));
     assert!(
@@ -91,6 +112,52 @@ fn executes_headless_cli_in_workspace_and_maps_json_result() {
             .iter()
             .any(|metric| metric.name() == "input_tokens" && metric.value() == "12")
     );
+}
+
+#[test]
+fn passes_named_model_and_types_invalid_model_selection() {
+    let cli = FakeCli::new(
+        r#"set -e; if [ "$1" = "--version" ]; then exit 0; fi; found=0; while [ "$#" -gt 0 ]; do if [ "$1" = "--model" ]; then shift; test "$1" = "gemini-test"; found=1; break; fi; shift; done; test "$found" = 1; printf '{"status":"SUCCESS","response":"done"}\n'"#,
+    );
+    let workspace = cli.directory.join("workspace");
+    fs::create_dir(&workspace).expect("create workspace");
+    let result = cli.provider().execute(&named_model_request(
+        workspace,
+        "hello",
+        Duration::from_secs(5),
+    ));
+    assert!(result.is_ok(), "named model execution failed: {result:?}");
+
+    let empty_model_request = ProviderRequest::new(
+        cli.directory.join("workspace"),
+        "hello",
+        Duration::from_secs(1),
+        ModelChoice::Named(ai_dev_orchestrator::ModelRef::new("")),
+    );
+    assert!(matches!(
+        cli.provider().execute(&empty_model_request),
+        Err(ProviderError::InvalidRequest(message)) if message.contains("model identifier")
+    ));
+
+    let cli = FakeCli::new(
+        r#"if [ "$1" = "--version" ]; then exit 0; fi; printf '{"status":"ERROR","error":"invalid model selection: unknown model"}\n'; exit 1"#,
+    );
+    let workspace = cli.directory.join("workspace");
+    fs::create_dir(&workspace).expect("create workspace");
+    assert!(matches!(
+        cli.provider().execute(&named_model_request(workspace, "hello", Duration::from_secs(1))),
+        Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "gemini-test"
+    ));
+
+    let cli = FakeCli::new(
+        r#"if [ "$1" = "--version" ]; then exit 0; fi; printf '{"status":"ERROR","error":"invalid model selection: unknown model"}\n'"#,
+    );
+    let workspace = cli.directory.join("workspace");
+    fs::create_dir(&workspace).expect("create workspace");
+    assert!(matches!(
+        cli.provider().execute(&named_model_request(workspace, "hello", Duration::from_secs(1))),
+        Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "gemini-test"
+    ));
 }
 
 #[test]

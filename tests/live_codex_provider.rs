@@ -1,4 +1,4 @@
-use ai_dev_orchestrator::{AgentProvider, CodexProvider, ProviderRequest};
+use ai_dev_orchestrator::{AgentProvider, CodexProvider, ModelChoice, ProviderRequest};
 use std::{env, time::Duration};
 
 #[test]
@@ -10,6 +10,7 @@ fn codex_cli_provider_live_smoke_test() {
         workspace,
         "Respond with exactly LIVE_PROVIDER_OK. Do not modify any files.",
         Duration::from_secs(120),
+        ModelChoice::ProviderDefault,
     );
     let result = CodexProvider::new()
         .execute(&request)
