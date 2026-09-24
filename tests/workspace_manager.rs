@@ -45,8 +45,9 @@ fn repository() -> PathBuf {
         &["config", "user.email", "test@example.invalid"],
     );
     git(&directory, &["config", "user.name", "Workspace Test"]);
+    fs::write(directory.join(".gitignore"), "*.secret\n").expect("write ignore file");
     fs::write(directory.join("README"), "base\n").expect("write initial file");
-    git(&directory, &["add", "README"]);
+    git(&directory, &["add", "README", ".gitignore"]);
     git(&directory, &["commit", "-m", "initial"]);
     directory
 }
@@ -143,10 +144,40 @@ fn dirty_cleanup_preserves_contents_until_force_is_requested() {
     let error = manager
         .cleanup(&workspace)
         .expect_err("ordinary cleanup must reject a dirty worktree");
-    assert!(matches!(error, WorkspaceError::Git(_)));
+    assert!(matches!(error, WorkspaceError::WorktreeNotClean { .. }));
     assert_eq!(
         fs::read_to_string(&changed_file).unwrap(),
         "uncommitted result\n"
+    );
+    assert!(workspace.path().is_dir());
+
+    manager
+        .cleanup_force(&workspace)
+        .expect("explicit force cleanup");
+    assert!(!workspace.path().exists());
+    fs::remove_dir_all(repository).expect("remove test repository");
+}
+
+#[test]
+fn ordinary_cleanup_preserves_ignored_files() {
+    let repository = repository();
+    let manager = WorkspaceManager::new(&repository).expect("resolve repository root");
+    let workspace = manager
+        .create(
+            &TaskId::new("ignored-task"),
+            &AttemptId::new("ignored-attempt"),
+        )
+        .expect("create isolated worktree");
+    let ignored_file = workspace.path().join("provider.secret");
+    fs::write(&ignored_file, "keep this data\n").expect("write ignored result");
+
+    let error = manager
+        .cleanup(&workspace)
+        .expect_err("ordinary cleanup must reject ignored files");
+    assert!(matches!(error, WorkspaceError::WorktreeNotClean { .. }));
+    assert_eq!(
+        fs::read_to_string(&ignored_file).unwrap(),
+        "keep this data\n"
     );
     assert!(workspace.path().is_dir());
 

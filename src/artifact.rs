@@ -36,7 +36,15 @@ pub enum ArtifactError {
     InvalidBaseCommit(String),
     InvalidTreeObject(String),
     RecoveryRequired(String),
-    WorkspaceChanged { expected: String, actual: String },
+    WorkspaceChanged {
+        expected: String,
+        actual: String,
+    },
+    MaterializationRetained {
+        failure: String,
+        workspace_path: PathBuf,
+        branch: String,
+    },
 }
 
 impl fmt::Display for ArtifactError {
@@ -59,6 +67,15 @@ impl fmt::Display for ArtifactError {
             Self::WorkspaceChanged { expected, actual } => write!(
                 formatter,
                 "workspace tree changed: expected {expected}, found {actual}"
+            ),
+            Self::MaterializationRetained {
+                failure,
+                workspace_path,
+                branch,
+            } => write!(
+                formatter,
+                "artifact materialization failed ({failure}); workspace was preserved for recovery at '{}' on branch '{branch}'",
+                workspace_path.display()
             ),
         }
     }
@@ -245,6 +262,54 @@ impl<'a> ArtifactManager<'a> {
             });
         }
         Ok(())
+    }
+
+    /// Materializes an immutable Artifact into a new managed worktree.
+    ///
+    /// The Artifact is read and checked against its ledger record, tree object,
+    /// and dedicated ref before any worktree is created. The new branch starts
+    /// at the Artifact's verified base commit, then the tree is installed only
+    /// after confirming that the newly-created worktree is clean and still at
+    /// that exact commit. Existing worktrees are never reused or reset.
+    pub fn materialize(
+        &self,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+        artifact_id: &str,
+    ) -> Result<Workspace, ArtifactError> {
+        let artifact = self.read(task_id, artifact_id)?;
+        if artifact.task_id() != task_id {
+            return Err(ArtifactError::NotFound(artifact_id.to_owned()));
+        }
+        if artifact.repository_root() != self.workspaces.repository_root() {
+            return Err(ArtifactError::RepositoryMismatch);
+        }
+        let base = self.workspaces.verify_commit_oid(artifact.base_commit())?;
+        let workspace = self.workspaces.create_at_base(task_id, attempt_id, &base)?;
+        let result = (|| {
+            self.workspaces.ensure_fresh_workspace(&workspace, &base)?;
+            self.run_git(
+                workspace.path(),
+                &["read-tree", "--reset", "-u", artifact.tree_oid()],
+                &[],
+            )?;
+            let actual = self.snapshot_tree(workspace.path())?;
+            if actual != artifact.tree_oid() {
+                return Err(ArtifactError::WorkspaceChanged {
+                    expected: artifact.tree_oid().to_owned(),
+                    actual,
+                });
+            }
+            Ok(())
+        })();
+        if let Err(failure) = result {
+            return Err(ArtifactError::MaterializationRetained {
+                failure: failure.to_string(),
+                workspace_path: workspace.path().to_owned(),
+                branch: workspace.branch().to_owned(),
+            });
+        }
+        Ok(workspace)
     }
 
     fn snapshot_tree(&self, workspace: &Path) -> Result<String, ArtifactError> {
@@ -439,7 +504,8 @@ fn process_error(error: ProcessError) -> String {
 mod tests {
     use super::*;
     use std::{
-        process::Command,
+        io::Write,
+        process::{Command, Stdio},
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -477,12 +543,37 @@ mod tests {
             .success()
     }
 
+    fn git_with_input(directory: &Path, args: &[&str], input: &[u8]) -> String {
+        let mut child = Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("git is installed");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin is piped")
+            .write_all(input)
+            .expect("write git input");
+        let output = child.wait_with_output().expect("wait for git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
     fn repository() -> PathBuf {
         let path = temporary_directory();
         git(&path, &["init", "-b", "main"]);
         git(&path, &["config", "user.email", "artifact@example.invalid"]);
         git(&path, &["config", "user.name", "Artifact Test"]);
-        fs::write(path.join(".gitignore"), "*.secret\n").expect("write ignore file");
+        fs::write(path.join(".gitignore"), "*.secret\nhook-owned.txt\n")
+            .expect("write ignore file");
         fs::write(path.join("source.txt"), "base\n").expect("write tracked source");
         git(&path, &["add", ".gitignore", "source.txt"]);
         git(&path, &["commit", "-m", "initial"]);
@@ -609,6 +700,294 @@ mod tests {
             );
         }
         fs::remove_file(ledger_db_path).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn materializes_artifact_in_fresh_worktree_pinned_to_recorded_base() {
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let task_id = TaskId::new("task-materialize");
+        let source_attempt = AttemptId::new("attempt-source");
+        let source = workspace_manager.create(&task_id, &source_attempt).unwrap();
+        let base = git(source.path(), &["rev-parse", "HEAD"]);
+        fs::write(source.path().join("source.txt"), "saved artifact\n").unwrap();
+        fs::write(source.path().join("added.txt"), "new file\n").unwrap();
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+        let artifact = artifacts
+            .capture(&source, &task_id, Some(&source_attempt), None, Some(&base))
+            .unwrap();
+        let source_status = git(source.path(), &["status", "--porcelain=v1", "-uall"]);
+
+        // Advance the repository's default HEAD after the artifact was saved.
+        fs::write(repository.join("source.txt"), "later main change\n").unwrap();
+        git(&repository, &["add", "source.txt"]);
+        git(&repository, &["commit", "-m", "advance main"]);
+        assert_ne!(
+            git(&repository, &["rev-parse", "HEAD"]),
+            artifact.base_commit()
+        );
+
+        let repair_attempt = AttemptId::new("attempt-repair");
+        let repaired = artifacts
+            .materialize(&task_id, &repair_attempt, artifact.id())
+            .unwrap();
+        assert_ne!(repaired.path(), source.path());
+        assert_eq!(
+            git(repaired.path(), &["rev-parse", "HEAD"]),
+            artifact.base_commit()
+        );
+        assert_eq!(
+            fs::read_to_string(repaired.path().join("source.txt")).unwrap(),
+            "saved artifact\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repaired.path().join("added.txt")).unwrap(),
+            "new file\n"
+        );
+        assert_eq!(
+            artifacts.snapshot_tree(repaired.path()).unwrap(),
+            artifact.tree_oid()
+        );
+        assert_eq!(
+            git(source.path(), &["status", "--porcelain=v1", "-uall"]),
+            source_status
+        );
+
+        workspace_manager.cleanup_force(&repaired).unwrap();
+        workspace_manager.cleanup_force(&source).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn invalid_or_foreign_artifact_is_rejected_before_worktree_creation() {
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let task_id = TaskId::new("task-materialize-guard");
+        let source_attempt = AttemptId::new("attempt-source-guard");
+        let source = workspace_manager.create(&task_id, &source_attempt).unwrap();
+        let base = git(source.path(), &["rev-parse", "HEAD"]);
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+        let artifact = artifacts
+            .capture(&source, &task_id, Some(&source_attempt), None, Some(&base))
+            .unwrap();
+        let attempted = AttemptId::new("attempt-rejected");
+
+        assert!(matches!(
+            artifacts.materialize(&TaskId::new("another-task"), &attempted, artifact.id()),
+            Err(ArtifactError::NotFound(_))
+        ));
+        assert!(
+            !workspace_manager
+                .worktree_path(&task_id, &attempted)
+                .exists()
+        );
+        assert!(matches!(
+            artifacts.materialize(&task_id, &attempted, "missing-artifact"),
+            Err(ArtifactError::NotFound(_))
+        ));
+        assert!(
+            !workspace_manager
+                .worktree_path(&task_id, &attempted)
+                .exists()
+        );
+
+        let replacement_tree = git(source.path(), &["mktree"]);
+        git(
+            source.path(),
+            &[
+                "update-ref",
+                artifact.ref_name(),
+                &replacement_tree,
+                artifact.tree_oid(),
+            ],
+        );
+        let tampered_attempt = AttemptId::new("attempt-tampered");
+        assert!(matches!(
+            artifacts.materialize(&task_id, &tampered_attempt, artifact.id()),
+            Err(ArtifactError::RecoveryRequired(_))
+        ));
+        assert!(
+            !workspace_manager
+                .worktree_path(&task_id, &tampered_attempt)
+                .exists()
+        );
+
+        workspace_manager.cleanup_force(&source).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_refuses_ignored_file_created_by_post_checkout_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let task_id = TaskId::new("task-hook-file");
+        let source_attempt = AttemptId::new("attempt-hook-source");
+        let source = workspace_manager.create(&task_id, &source_attempt).unwrap();
+        let base = git(source.path(), &["rev-parse", "HEAD"]);
+
+        // In the base commit the path is ignored. The saved Artifact removes
+        // that ignore rule and includes the file, so a checkout hook can place
+        // an ignored file at the path before Artifact materialization.
+        fs::write(source.path().join(".gitignore"), "*.secret\n").unwrap();
+        fs::write(source.path().join("hook-owned.txt"), "artifact version\n").unwrap();
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+        let artifact = artifacts
+            .capture(&source, &task_id, Some(&source_attempt), None, Some(&base))
+            .unwrap();
+        assert_eq!(
+            git(
+                source.path(),
+                &["show", &format!("{}:hook-owned.txt", artifact.tree_oid())]
+            ),
+            "artifact version"
+        );
+
+        let hooks = repository.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'hook version\\n' > hook-owned.txt\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                hooks.to_str().unwrap(),
+            ],
+        );
+
+        let repair_attempt = AttemptId::new("attempt-hook-repair");
+        let repair_path = workspace_manager.worktree_path(&task_id, &repair_attempt);
+        let repair_branch = workspace_manager.branch_name(&task_id, &repair_attempt);
+        assert!(matches!(
+            artifacts.materialize(&task_id, &repair_attempt, artifact.id()),
+            Err(ArtifactError::MaterializationRetained {
+                failure,
+                workspace_path,
+                branch,
+                ..
+            }) if workspace_path == repair_path && branch == repair_branch && failure.contains("hook-owned.txt")
+        ));
+        assert!(repair_path.exists(), "failed preparation retains worktree");
+        assert_eq!(
+            fs::read_to_string(repair_path.join("hook-owned.txt")).unwrap(),
+            "hook version\n",
+            "hook-generated content remains available for recovery"
+        );
+        assert!(
+            git_status(
+                &repository,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{repair_branch}")
+                ]
+            ),
+            "failed preparation retains its branch for recovery"
+        );
+
+        git(
+            &repository,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                repair_path.to_str().unwrap(),
+            ],
+        );
+        git(&repository, &["branch", "-D", &repair_branch]);
+        workspace_manager.cleanup_force(&source).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn read_tree_failure_preserves_new_worktree_and_branch() {
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let task_id = TaskId::new("task-unreadable-tree");
+        let source_attempt = AttemptId::new("attempt-unreadable-source");
+        let source = workspace_manager.create(&task_id, &source_attempt).unwrap();
+        let base = git(source.path(), &["rev-parse", "HEAD"]);
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+
+        // Construct a valid root tree that references a missing blob. Artifact
+        // readback can verify the root tree and ref, but read-tree cannot
+        // populate the materialized worktree from its unavailable child.
+        let missing_blob = "f".repeat(40);
+        let tree = git_with_input(
+            source.path(),
+            &["mktree", "--missing"],
+            format!("100644 blob {missing_blob}\tbroken.txt\n").as_bytes(),
+        );
+        let artifact = ArtifactRecord::new(
+            "artifact-unreadable-tree",
+            task_id.clone(),
+            Some(source_attempt.as_str().to_owned()),
+            None,
+            base,
+            &tree,
+            workspace_manager.repository_root(),
+            format!("{ARTIFACT_REF_PREFIX}artifact-unreadable-tree"),
+            ArtifactState::Available,
+        );
+        ledger.prepare_artifact(&artifact).unwrap();
+        git(
+            source.path(),
+            &[
+                "update-ref",
+                artifact.ref_name(),
+                artifact.tree_oid(),
+                &"0".repeat(tree.len()),
+            ],
+        );
+
+        let repair_attempt = AttemptId::new("attempt-unreadable-repair");
+        let repair_path = workspace_manager.worktree_path(&task_id, &repair_attempt);
+        let repair_branch = workspace_manager.branch_name(&task_id, &repair_attempt);
+        assert!(matches!(
+            artifacts.materialize(&task_id, &repair_attempt, artifact.id()),
+            Err(ArtifactError::MaterializationRetained {
+                workspace_path,
+                branch,
+                ..
+            }) if workspace_path == repair_path && branch == repair_branch
+        ));
+        assert!(repair_path.exists(), "failed read-tree preserves worktree");
+        assert!(git_status(
+            &repository,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{repair_branch}")
+            ]
+        ));
+        git(
+            &repository,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                repair_path.to_str().unwrap(),
+            ],
+        );
+        git(&repository, &["branch", "-D", &repair_branch]);
+
+        workspace_manager.cleanup_force(&source).unwrap();
         fs::remove_dir_all(repository).unwrap();
     }
 
