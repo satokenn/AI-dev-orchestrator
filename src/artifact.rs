@@ -874,10 +874,11 @@ mod tests {
         assert!(matches!(
             artifacts.materialize(&task_id, &repair_attempt, artifact.id()),
             Err(ArtifactError::MaterializationRetained {
+                failure,
                 workspace_path,
                 branch,
                 ..
-            }) if workspace_path == repair_path && branch == repair_branch
+            }) if workspace_path == repair_path && branch == repair_branch && failure.contains("hook-owned.txt")
         ));
         assert!(repair_path.exists(), "failed preparation retains worktree");
         assert_eq!(

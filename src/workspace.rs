@@ -418,8 +418,9 @@ impl WorkspaceManager {
             ],
         )?;
         if !status.stdout.is_empty() {
-            return Err(WorkspaceError::WorkspaceNotManaged {
+            return Err(WorkspaceError::WorktreeNotClean {
                 path: workspace.path.clone(),
+                status: String::from_utf8_lossy(&status.stdout).into_owned(),
             });
         }
         Ok(())
