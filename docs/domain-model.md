@@ -28,6 +28,7 @@ Rust型、SQLite migration、MCP transport、ProviderやAI reviewの実装は扱
 | --- | --- | --- |
 | 作業 | `Task` | 利用者の目的を完了まで追跡する単位 |
 | モデル実行 | `Attempt` | 指定したProvider / Modelへの1回の呼び出し |
+| Model選択 | `ModelChoice` | `Named`の識別子、または明示的な`ProviderDefault` |
 | 成果物 | `Artifact` | 管理対象workspaceの特定時点の内容。未コミット変更・新規ファイルを含む |
 | 機械検証 | `ValidationResult` | 指定した成果物に対するtest、lint、build等の結果 |
 | review結果 | `ReviewVerdict` | reviewerが対象成果物へ返した `approved`、`changes_requested`、`inconclusive` |
@@ -48,7 +49,9 @@ Task
 
 ## Attemptはモデル呼び出しだけを表す
 
-AttemptはProvider / Modelを指定して開始した1回のモデル呼び出しである。実装、修正、調査、reviewはroleやrelationで区別するが、モデルを呼んだなら別Attemptとして残す。Attemptには要求・実測のProvider / Model、instruction、入力・出力成果物、開始・終了、診断、AgentResult、usage / costを残す。AgentResultは自己申告であり、成功や完了の根拠ではない。
+AttemptはProvider / Modelを指定して開始した1回のモデル呼び出しである。実装、修正、調査、reviewはroleやrelationで区別するが、モデルを呼んだなら別Attemptとして残す。要求Providerは`provider`、要求Modelは必須の`ModelChoice`として保持する。Model指定なしの意味は`ModelChoice::ProviderDefault`であり、要求からfieldを省略しない。observed Provider / Modelは要求値と別fieldで保持し、Provider結果から実使用Modelを確認できない場合はunknownのままにする。instruction、入力・出力成果物、開始・終了、診断、AgentResult、usage / costも残す。AgentResultは自己申告であり、成功や完了の根拠ではない。
+
+Provider adapterはnamed Modelを対応するCLI / API引数へ渡し、provider defaultではその引数を省略する。`UnsupportedModel`はProviderがModel指定を拒否したことが明確な場合に返す。CLI群が実際に使ったModelを構造化出力で返さない場合、`observed_model`はunknownであり、要求値から複製しない。retryやreworkは新しいAttemptとなるため、Model変更は各Attemptの要求targetとして履歴に残る。
 
 | 状態 | 意味 |
 | --- | --- |
@@ -122,6 +125,7 @@ Codex自身が編集した場合はAttemptを作らない。管理済みArtifact
 現行実装と旧Ledgerでは、AttemptはProvider終了後に `Validating` へ進み、旧 `Succeeded` は「検証成功」、旧 `Failed` は「Provider実行または検証失敗」を意味する。この意味を新しいAttemptStateに無断で変換しない。
 
 - migrationは既存の状態、AgentResult、ValidationResult、時刻、診断を消去・上書きしない
+- 旧Attemptにはrequested Modelとobserved Provider / Modelの根拠がないため、それらはunknownとして保持する。`ProviderDefault`を推測で補わない
 - 旧レコードには `state_semantics_version: legacy_validation_coupled`（名称は実装時に確定）または同等の由来を保存し、旧 `Succeeded` は「当時の検証成功」と読む
 - 新規Operation Service経由のAttemptだけを `provider_call_v2` のような新しい意味論で保存し、`Succeeded` を「Provider呼び出し成功」と読む
 - 旧Attemptに根拠のないProvider成功、Artifact、verdict、CodexDecisionを推測して追加しない。Artifactを復元できない旧Validationは対象不明として保持する

@@ -171,7 +171,11 @@ fn aggregate_result_is_applied_to_an_attempt_once() {
     let result = CommandValidator::new(checks)
         .validate(&std::env::temp_dir())
         .expect("workspace is valid");
-    let mut attempt = Attempt::new(AttemptId::new("attempt"), ProviderRef::new("fake"));
+    let mut attempt = Attempt::new(
+        AttemptId::new("attempt"),
+        ProviderRef::new("fake"),
+        ai_dev_orchestrator::ModelChoice::ProviderDefault,
+    );
     attempt.start().expect("start attempt");
     attempt.finish().expect("finish attempt");
     attempt

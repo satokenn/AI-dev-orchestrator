@@ -13,6 +13,12 @@ Copilot の応答だけを stdout に出力させ、元の stdout / stderr と e
 `ProviderResult` から参照できます。`ProviderRequest::timeout()` と
 `CancellationToken` は `ProcessRunner` に渡されます。
 
+`ProviderRequest::model()` が `ModelChoice::Named` の場合は `--model <model>` を
+CLIへ渡します。`ProviderDefault` の場合はこの引数を省き、Copilot CLIの設定または
+既定Modelを使います。silent (`-s`) は通常表示される実使用Model情報を抑えるため、
+このadapterはobserved Providerを`copilot`、observed Modelをunknownとして返します。
+CLIがModel名を明確に拒否した場合は `ProviderError::UnsupportedModel` を返します。
+
 既定の tool permission は、ファイル変更用の `write` とリポジトリの検証・操作用の
 `shell` です。権限を狭める場合は `with_allowed_tools` で明示します。
 

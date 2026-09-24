@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::{
-    AgentProvider, AgentResult, CancellationToken, ProcessError, ProcessRequest, ProcessRunner,
-    ProviderError, ProviderRef, ProviderRequest, ProviderResult,
+    AgentProvider, AgentResult, CancellationToken, ModelChoice, ProcessError, ProcessRequest,
+    ProcessRunner, ProviderError, ProviderRef, ProviderRequest, ProviderResult,
 };
 
 const COPILOT_COMMAND: &str = "copilot";
@@ -120,10 +120,14 @@ impl CopilotProvider {
     }
 
     fn process_request(&self, request: &ProviderRequest) -> ProcessRequest {
-        ProcessRequest::new(self.executable.clone())
+        let mut process = ProcessRequest::new(self.executable.clone())
             .args(self.command_prefix.iter().cloned())
             .args(["-p", request.prompt(), "-s", "--no-ask-user"])
-            .arg(format!("--allow-tool={}", self.allowed_tools.join(",")))
+            .arg(format!("--allow-tool={}", self.allowed_tools.join(",")));
+        if let ModelChoice::Named(model) = request.model() {
+            process = process.args(["--model", model.as_str()]);
+        }
+        process
             .cwd(request.workspace().to_owned())
             .timeout(request.timeout())
     }
@@ -164,21 +168,23 @@ impl CopilotProvider {
         let output = self
             .runner
             .run_with_cancellation(self.process_request(request), cancellation)
-            .map_err(|error| self.map_process_error(error, request.timeout()))?;
+            .map_err(|error| self.map_process_error(error, request.timeout(), request.model()))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let agent_result = Some(AgentResult::new(stdout.clone(), output.status.success()));
-        Ok(ProviderResult::new(
-            stdout,
-            stderr,
-            output.exit_code(),
-            agent_result,
-            None,
-        ))
+        Ok(
+            ProviderResult::new(stdout, stderr, output.exit_code(), agent_result, None)
+                .with_observed_target(Some(self.reference.clone()), None),
+        )
     }
 
-    fn map_process_error(&self, error: ProcessError, timeout: Duration) -> ProviderError {
+    fn map_process_error(
+        &self,
+        error: ProcessError,
+        timeout: Duration,
+        model: &ModelChoice,
+    ) -> ProviderError {
         match error {
             ProcessError::Spawn(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ProviderError::Unavailable(format!(
@@ -218,7 +224,11 @@ impl CopilotProvider {
             ProcessError::NonZeroExit(output) => {
                 let diagnostic =
                     output_diagnostic(&output.stdout, &output.stderr, output.exit_code());
-                if looks_like_authentication_failure(&diagnostic) {
+                if let Some(error) =
+                    crate::provider::unsupported_model_error(&self.reference, model, &diagnostic)
+                {
+                    error
+                } else if looks_like_authentication_failure(&diagnostic) {
                     ProviderError::Unavailable(format!(
                         "GitHub Copilot CLI authentication failed; run `copilot` and use `/login`: {diagnostic}"
                     ))
@@ -289,7 +299,12 @@ mod tests {
     use std::{thread, time::Duration};
 
     fn request(timeout: Duration) -> ProviderRequest {
-        ProviderRequest::new(std::env::temp_dir(), "do the task", timeout)
+        ProviderRequest::new(
+            std::env::temp_dir(),
+            "do the task",
+            timeout,
+            ModelChoice::ProviderDefault,
+        )
     }
 
     #[test]
@@ -323,6 +338,30 @@ mod tests {
         assert_eq!(result.stderr(), "err");
         assert_eq!(result.exit_status(), Some(0));
         assert!(result.agent_result().unwrap().reported_success());
+        assert_eq!(result.observed_provider().unwrap().as_str(), "copilot");
+        assert!(result.observed_model().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passes_named_model_to_cli_and_types_unsupported_model() {
+        let request = ProviderRequest::new(
+            std::env::temp_dir(),
+            "do the task",
+            Duration::from_secs(1),
+            ModelChoice::Named(crate::ModelRef::new("claude-haiku-test")),
+        );
+        let provider = CopilotProvider::with_executable("sh").with_command_prefix(
+            "test \"$6\" = --model; test \"$7\" = claude-haiku-test; printf ok",
+        );
+        assert!(provider.execute(&request).is_ok());
+
+        let provider = CopilotProvider::with_executable("sh")
+            .with_command_prefix("printf 'unsupported model' >&2; exit 1");
+        assert!(matches!(
+            provider.execute(&request),
+            Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "claude-haiku-test"
+        ));
     }
 
     #[test]
@@ -425,6 +464,7 @@ mod tests {
             std::env::temp_dir().join("copilot-provider-workspace-does-not-exist"),
             "do the task",
             Duration::from_secs(1),
+            ModelChoice::ProviderDefault,
         );
 
         assert!(matches!(

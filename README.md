@@ -33,7 +33,7 @@ timeout / cancel時のprocess group停止、停止確認結果、部分ログと
 
 ## AgentProvider 契約
 
-Agent 実行先の違いは `AgentProvider` に閉じ込めます。実装は `ProviderRequest` の workspace、prompt、timeout を受け取り、`ProviderResult` の stdout、stderr、終了状態、任意の `AgentResult` と `UsageCost` を返します。実行に失敗した場合は `ProviderError`（不正な要求、実行失敗、タイムアウト、利用不能）を返します。
+Agent 実行先の違いは `AgentProvider` に閉じ込めます。`ProviderRequest` は workspace、prompt、timeout と必須の `ModelChoice`（named Modelまたは明示したProvider既定値）を受け取り、`ProviderResult` は stdout、stderr、終了状態、任意の `AgentResult` と `UsageCost`、観測できたProvider / Modelを返します。Provider出力から実Modelを確定できない場合、observed Modelはunknownのままです。実行に失敗した場合は `ProviderError`（不正な要求、未対応Model、実行失敗、タイムアウト、利用不能）を返します。
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
@@ -49,7 +49,7 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 ## Codex CLI Provider
 
-`CodexProvider` は `codex exec` を非対話モードで起動し、`ProviderRequest` の workspace を cwd として使用します。Codex CLI は `PATH` から解決され、実行時には workspace への書き込みを許可する `--sandbox workspace-write`、JSONL 出力の `--json`、実行状態を永続化しない `--ephemeral` を付けます。長時間実行は `execute_with_cancellation` に `CancellationToken` を渡して停止できます。
+`CodexProvider` は `codex exec` を非対話モードで起動し、`ProviderRequest` の workspace を cwd として使用します。named Modelなら `--model <model>` を渡し、`ProviderDefault`ならModel引数を渡さずCodex CLI設定を使います。Codex CLI は `PATH` から解決され、workspaceへの書き込みを許可する `--sandbox workspace-write`、JSONL 出力の `--json`、実行状態を永続化しない `--ephemeral` も付けます。現在のJSONL処理では実Modelを確認しないため、observed Modelはunknownです。長時間実行は `execute_with_cancellation` に `CancellationToken` を渡して停止できます。
 
 ## Codex Planner
 
@@ -84,7 +84,7 @@ CODEX_PROVIDER_LIVE_WORKSPACE=/tmp/codex-provider-live \
 
 ### GitHub Copilot CLI Provider
 
-`CopilotProvider` は `copilot -p` を非対話で起動し、`ProviderRequest` の workspace を cwd として使用します。実行時には `-s --no-ask-user` と、既定でファイル変更・リポジトリ操作を許可する `--allow-tool=write,shell` を付けます。必要な権限だけに絞る場合は `with_allowed_tools` を使用してください。timeout / cancellation は `execute_with_cancellation` から指定できます。
+`CopilotProvider` は `copilot -p` を非対話で起動し、`ProviderRequest` の workspace を cwd として使用します。named Modelなら `--model <model>` を渡し、`ProviderDefault`ならModel引数を渡さずCopilot CLI設定または既定値を使います。実行時には `-s --no-ask-user` と、既定でファイル変更・リポジトリ操作を許可する `--allow-tool=write,shell` も付けます。silent出力は実Model表示を抑制するため、observed Modelはunknownです。必要な権限だけに絞る場合は `with_allowed_tools` を使用してください。timeout / cancellation は `execute_with_cancellation` から指定できます。
 
 `ExecutionPolicy::new` と `with_timeout` は `Result` を返し、ゼロ値を構築時に拒否します。Planner 経路では `execute_validated_decision_with_policy` を通常入口として使い、`execute_decision_with_policy` は既存利用者向けの legacy 互換 API です。
 

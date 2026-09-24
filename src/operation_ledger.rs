@@ -7,9 +7,9 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::{ProviderRef, TaskId};
+use crate::{ModelChoice, ModelRef, ProviderRef, TaskId};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const DEFAULT_LOG_LIMIT: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -81,7 +81,7 @@ pub struct OperationRequest {
     payload: String,
     instruction: String,
     requested_provider: ProviderRef,
-    requested_model: Option<String>,
+    requested_model: Option<ModelChoice>,
 }
 
 impl OperationRequest {
@@ -92,7 +92,7 @@ impl OperationRequest {
         payload: impl Into<String>,
         instruction: impl Into<String>,
         requested_provider: ProviderRef,
-        requested_model: Option<String>,
+        requested_model: ModelChoice,
     ) -> Self {
         Self {
             request_id: request_id.into(),
@@ -100,6 +100,25 @@ impl OperationRequest {
             task_revision,
             payload: payload.into(),
             instruction: instruction.into(),
+            requested_provider,
+            requested_model: Some(requested_model),
+        }
+    }
+    fn restore(
+        request_id: String,
+        task_id: TaskId,
+        task_revision: u64,
+        payload: String,
+        instruction: String,
+        requested_provider: ProviderRef,
+        requested_model: Option<ModelChoice>,
+    ) -> Self {
+        Self {
+            request_id,
+            task_id,
+            task_revision,
+            payload,
+            instruction,
             requested_provider,
             requested_model,
         }
@@ -122,8 +141,8 @@ impl OperationRequest {
     pub fn requested_provider(&self) -> &ProviderRef {
         &self.requested_provider
     }
-    pub fn requested_model(&self) -> Option<&str> {
-        self.requested_model.as_deref()
+    pub fn requested_model(&self) -> Option<&ModelChoice> {
+        self.requested_model.as_ref()
     }
 }
 
@@ -147,24 +166,25 @@ impl OperationRecord {
         let status: String = row.get(6)?;
         Ok(Self {
             id: OperationId::new(row.get::<_, String>(0)?),
-            request: OperationRequest::new(
+            request: OperationRequest::restore(
                 row.get::<_, String>(1)?,
                 TaskId::new(task_id),
                 row.get::<_, i64>(3)? as u64,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 ProviderRef::new(row.get::<_, String>(7)?),
-                row.get(8)?,
+                decode_model_choice(row.get::<_, Option<String>>(8)?.as_deref(), row.get(9)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
             ),
             status: OperationStatus::from_str(&status)
                 .map_err(|_| rusqlite::Error::InvalidQuery)?,
-            accepted_at: row.get(9)?,
-            started_at: row.get(10)?,
-            finished_at: row.get(11)?,
-            observed_provider: row.get::<_, Option<String>>(12)?.map(ProviderRef::new),
-            observed_model: row.get(13)?,
-            diagnostic: row.get(14)?,
-            artifact_ref: row.get(15)?,
+            accepted_at: row.get(10)?,
+            started_at: row.get(11)?,
+            finished_at: row.get(12)?,
+            observed_provider: row.get::<_, Option<String>>(13)?.map(ProviderRef::new),
+            observed_model: row.get(14)?,
+            diagnostic: row.get(15)?,
+            artifact_ref: row.get(16)?,
         })
     }
     pub fn id(&self) -> &OperationId {
@@ -335,11 +355,12 @@ impl From<io::Error> for LedgerError {
 
 pub trait ExecutionLedger {
     fn accept_operation(&self, request: &OperationRequest) -> Result<OperationRecord, LedgerError>;
-    fn start_operation(
+    fn start_operation(&self, id: &OperationId) -> Result<(), LedgerError>;
+    fn record_observed_target(
         &self,
         id: &OperationId,
-        observed_provider: &ProviderRef,
-        observed_model: Option<&str>,
+        observed_provider: Option<&ProviderRef>,
+        observed_model: Option<&ModelRef>,
     ) -> Result<(), LedgerError>;
     fn get_operation(&self, id: &OperationId) -> Result<Option<OperationRecord>, LedgerError>;
     fn finish_operation(
@@ -369,7 +390,14 @@ impl SqliteExecutionLedger {
         if version > SCHEMA_VERSION {
             return Err(LedgerError::UnsupportedSchema(version));
         }
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL, instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT, status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT); CREATE TABLE IF NOT EXISTS task_revisions (task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence)); CREATE TABLE IF NOT EXISTS log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream)); CREATE TABLE IF NOT EXISTS validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT); CREATE TABLE IF NOT EXISTS budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT); PRAGMA user_version = 1;")?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL, instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT, requested_model_encoding INTEGER, status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT); CREATE TABLE IF NOT EXISTS task_revisions (task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence)); CREATE TABLE IF NOT EXISTS log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream)); CREATE TABLE IF NOT EXISTS validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT); CREATE TABLE IF NOT EXISTS budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT);")?;
+        if !operation_column_exists(&connection, "requested_model_encoding")? {
+            connection.execute(
+                "ALTER TABLE operations ADD COLUMN requested_model_encoding INTEGER",
+                [],
+            )?;
+        }
+        connection.execute_batch("PRAGMA user_version = 2;")?;
         Ok(Self {
             connection: Mutex::new(connection),
             log_limit: DEFAULT_LOG_LIMIT,
@@ -424,16 +452,11 @@ impl SqliteExecutionLedger {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
-    pub fn start_operation(
-        &self,
-        id: &OperationId,
-        observed_provider: &ProviderRef,
-        observed_model: Option<&str>,
-    ) -> Result<(), LedgerError> {
+    pub fn start_operation(&self, id: &OperationId) -> Result<(), LedgerError> {
         let mut connection = self.connection.lock().expect("ledger mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let started = now();
-        let changed = transaction.execute("UPDATE operations SET status='running', started_at=?2, observed_provider=?3, observed_model=?4 WHERE id=?1 AND status='accepted'", params![id.as_str(), started, observed_provider.as_str(), observed_model])?;
+        let changed = transaction.execute("UPDATE operations SET status='running', started_at=?2 WHERE id=?1 AND status='accepted'", params![id.as_str(), started])?;
         if changed != 1 {
             return Err(LedgerError::InvalidValue(format!(
                 "operation is not accepted: {}",
@@ -446,13 +469,43 @@ impl SqliteExecutionLedger {
             |row| row.get(0),
         )?;
         transaction.execute(
-            "INSERT INTO operation_events VALUES(?1,?2,'started',?3,?4)",
-            params![
-                id.as_str(),
-                sequence,
-                started,
-                observed_model.unwrap_or(observed_provider.as_str())
-            ],
+            "INSERT INTO operation_events VALUES(?1,?2,'started',?3,'')",
+            params![id.as_str(), sequence, started],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+    pub fn record_observed_target(
+        &self,
+        id: &OperationId,
+        observed_provider: Option<&ProviderRef>,
+        observed_model: Option<&ModelRef>,
+    ) -> Result<(), LedgerError> {
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE operations SET observed_provider=?2, observed_model=?3 WHERE id=?1 AND status='running'",
+            params![id.as_str(), observed_provider.map(ProviderRef::as_str), observed_model.map(ModelRef::as_str)],
+        )?;
+        if changed != 1 {
+            return Err(LedgerError::InvalidValue(format!(
+                "operation is not running: {}",
+                id.as_str()
+            )));
+        }
+        let sequence: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM operation_events WHERE operation_id=?1",
+            params![id.as_str()],
+            |row| row.get(0),
+        )?;
+        let detail = format!(
+            "provider={:?}; model={:?}",
+            observed_provider.map(ProviderRef::as_str),
+            observed_model.map(ModelRef::as_str)
+        );
+        transaction.execute(
+            "INSERT INTO operation_events VALUES(?1,?2,'observation',?3,?4)",
+            params![id.as_str(), sequence, now(), detail],
         )?;
         transaction.commit()?;
         Ok(())
@@ -604,7 +657,7 @@ impl SqliteExecutionLedger {
     }
     fn load(&self, id: &OperationId) -> Result<Option<OperationRecord>, LedgerError> {
         let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.query_row("SELECT id, request_id, task_id, task_revision, payload, instruction, status, requested_provider, requested_model, accepted_at, started_at, finished_at, observed_provider, observed_model, diagnostic, artifact_ref FROM operations WHERE id=?1", params![id.as_str()], OperationRecord::from_row).optional().map_err(Into::into)
+        connection.query_row("SELECT id, request_id, task_id, task_revision, payload, instruction, status, requested_provider, requested_model, requested_model_encoding, accepted_at, started_at, finished_at, observed_provider, observed_model, diagnostic, artifact_ref FROM operations WHERE id=?1", params![id.as_str()], OperationRecord::from_row).optional().map_err(Into::into)
     }
 }
 
@@ -627,7 +680,7 @@ impl ExecutionLedger for SqliteExecutionLedger {
     fn accept_operation(&self, request: &OperationRequest) -> Result<OperationRecord, LedgerError> {
         let mut connection = self.connection.lock().expect("ledger mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = transaction.query_row("SELECT id, request_id, task_id, task_revision, payload, instruction, status, requested_provider, requested_model, accepted_at, started_at, finished_at, observed_provider, observed_model, diagnostic, artifact_ref FROM operations WHERE request_id=?1", params![request.request_id()], OperationRecord::from_row).optional()? {
+        if let Some(existing) = transaction.query_row("SELECT id, request_id, task_id, task_revision, payload, instruction, status, requested_provider, requested_model, requested_model_encoding, accepted_at, started_at, finished_at, observed_provider, observed_model, diagnostic, artifact_ref FROM operations WHERE request_id=?1", params![request.request_id()], OperationRecord::from_row).optional()? {
             if existing.request.payload() == request.payload()
                 && existing.request.instruction() == request.instruction()
                 && existing.request.task_id() == request.task_id()
@@ -668,7 +721,8 @@ impl ExecutionLedger for SqliteExecutionLedger {
             now()
         ));
         let accepted = now();
-        transaction.execute("INSERT INTO operations(id,request_id,task_id,task_revision,payload,instruction,requested_provider,requested_model,status,accepted_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9)", params![id.as_str(), request.request_id(), request.task_id().as_str(), request.task_revision() as i64, request.payload(), request.instruction(), request.requested_provider().as_str(), request.requested_model(), accepted])?;
+        let encoded_model = request.requested_model().map(encode_model_choice);
+        transaction.execute("INSERT INTO operations(id,request_id,task_id,task_revision,payload,instruction,requested_provider,requested_model,requested_model_encoding,status,accepted_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'accepted',?10)", params![id.as_str(), request.request_id(), request.task_id().as_str(), request.task_revision() as i64, request.payload(), request.instruction(), request.requested_provider().as_str(), encoded_model.as_ref().map(|(value, _)| value.as_str()), encoded_model.as_ref().map(|(_, encoding)| *encoding), accepted])?;
         transaction.execute(
             "INSERT INTO operation_events VALUES(?1,0,'accepted',?2,?3)",
             params![id.as_str(), accepted, request.instruction()],
@@ -678,13 +732,16 @@ impl ExecutionLedger for SqliteExecutionLedger {
         self.load(&id)?
             .ok_or_else(|| LedgerError::InvalidValue("operation insert disappeared".into()))
     }
-    fn start_operation(
+    fn start_operation(&self, id: &OperationId) -> Result<(), LedgerError> {
+        SqliteExecutionLedger::start_operation(self, id)
+    }
+    fn record_observed_target(
         &self,
         id: &OperationId,
-        observed_provider: &ProviderRef,
-        observed_model: Option<&str>,
+        observed_provider: Option<&ProviderRef>,
+        observed_model: Option<&ModelRef>,
     ) -> Result<(), LedgerError> {
-        SqliteExecutionLedger::start_operation(self, id, observed_provider, observed_model)
+        SqliteExecutionLedger::record_observed_target(self, id, observed_provider, observed_model)
     }
     fn get_operation(&self, id: &OperationId) -> Result<Option<OperationRecord>, LedgerError> {
         self.load(id)
@@ -754,6 +811,56 @@ fn now() -> i64 {
         .as_millis() as i64
 }
 
+fn encode_model_choice(choice: &ModelChoice) -> (String, i64) {
+    let value = match choice {
+        ModelChoice::Named(model) => serde_json::json!({"kind":"named", "model":model.as_str()}),
+        ModelChoice::ProviderDefault => serde_json::json!({"kind":"provider_default"}),
+    };
+    (value.to_string(), 1)
+}
+
+fn decode_model_choice(
+    value: Option<&str>,
+    encoding: Option<i64>,
+) -> Result<Option<ModelChoice>, LedgerError> {
+    let Some(value) = value else { return Ok(None) };
+    if encoding.is_none() {
+        // Prior rows stored the selected model name directly; NULL meant no fact was recorded.
+        return Ok(Some(ModelChoice::Named(ModelRef::new(value))));
+    }
+    if encoding != Some(1) {
+        return Err(LedgerError::InvalidValue(format!(
+            "unsupported model choice encoding: {encoding:?}"
+        )));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(value).map_err(|error| {
+        LedgerError::InvalidValue(format!("invalid stored model choice: {error}"))
+    })?;
+    match (
+        parsed.get("kind").and_then(serde_json::Value::as_str),
+        parsed.get("model").and_then(serde_json::Value::as_str),
+    ) {
+        (Some("named"), Some(model)) if !model.is_empty() => {
+            Ok(Some(ModelChoice::Named(ModelRef::new(model))))
+        }
+        (Some("provider_default"), None) => Ok(Some(ModelChoice::ProviderDefault)),
+        _ => Err(LedgerError::InvalidValue(
+            "invalid stored model choice".into(),
+        )),
+    }
+}
+
+fn operation_column_exists(connection: &Connection, column: &str) -> Result<bool, rusqlite::Error> {
+    let mut statement = connection.prepare("PRAGMA table_info(operations)")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,7 +872,7 @@ mod tests {
             payload,
             "implement",
             ProviderRef::new("codex"),
-            Some("gpt".into()),
+            ModelChoice::Named(ModelRef::new("gpt")),
         )
     }
     #[test]
@@ -805,7 +912,7 @@ mod tests {
             "a",
             "implement",
             ProviderRef::new("copilot"),
-            Some("gpt".into()),
+            ModelChoice::Named(ModelRef::new("gpt")),
         );
         assert!(matches!(
             ledger.accept_operation(&different_provider),
@@ -821,20 +928,107 @@ mod tests {
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
         let unknown = OperationId::new("missing");
         assert!(matches!(
-            ledger.start_operation(&unknown, &ProviderRef::new("codex"), Some("gpt")),
+            ledger.start_operation(&unknown),
             Err(LedgerError::InvalidValue(_))
         ));
         let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
+        ledger.start_operation(operation.id()).unwrap();
         ledger
-            .start_operation(operation.id(), &ProviderRef::new("codex"), Some("gpt"))
+            .record_observed_target(operation.id(), None, None)
             .unwrap();
         ledger
             .finish_operation(operation.id(), OperationStatus::Succeeded, None)
             .unwrap();
+        assert_eq!(
+            ledger
+                .get_operation(operation.id())
+                .unwrap()
+                .unwrap()
+                .observed_model(),
+            None
+        );
         ledger
             .finish_operation(operation.id(), OperationStatus::Succeeded, None)
             .unwrap();
-        assert_eq!(ledger.events(operation.id()).unwrap().len(), 3);
+        assert_eq!(ledger.events(operation.id()).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn model_choice_is_persisted_explicitly_and_observation_is_separate() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let requested = OperationRequest::new(
+            "model-choice-request",
+            TaskId::new("task-choice"),
+            0,
+            "payload",
+            "instruction",
+            ProviderRef::new("codex"),
+            ModelChoice::ProviderDefault,
+        );
+        let operation = ledger.accept_operation(&requested).unwrap();
+        assert_eq!(
+            operation.request().requested_model(),
+            Some(&ModelChoice::ProviderDefault)
+        );
+        ledger.start_operation(operation.id()).unwrap();
+        assert_eq!(
+            ledger
+                .get_operation(operation.id())
+                .unwrap()
+                .unwrap()
+                .observed_model(),
+            None
+        );
+        ledger
+            .record_observed_target(
+                operation.id(),
+                Some(&ProviderRef::new("codex")),
+                Some(&ModelRef::new("gpt-observed")),
+            )
+            .unwrap();
+        let loaded = ledger.get_operation(operation.id()).unwrap().unwrap();
+        assert_eq!(
+            loaded.request().requested_model(),
+            Some(&ModelChoice::ProviderDefault)
+        );
+        assert_eq!(loaded.observed_provider().unwrap().as_str(), "codex");
+        assert_eq!(loaded.observed_model(), Some("gpt-observed"));
+    }
+
+    #[test]
+    fn schema_v1_migration_keeps_legacy_model_strings_and_nulls_unambiguous() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+             task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL,
+             instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT,
+             status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER,
+             observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT);
+             INSERT INTO operations (id, request_id, task_id, task_revision, payload, instruction,
+               requested_provider, requested_model, status, accepted_at)
+               VALUES ('legacy-named', 'r1', 't1', 0, '', '', 'codex',
+                 'model-choice:v1:{\"kind\":\"provider_default\"}', 'accepted', 1);
+             INSERT INTO operations (id, request_id, task_id, task_revision, payload, instruction,
+               requested_provider, requested_model, status, accepted_at)
+               VALUES ('legacy-unknown', 'r2', 't2', 0, '', '', 'codex', NULL, 'accepted', 1);
+             PRAGMA user_version = 1;",
+        ).unwrap();
+        let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
+        let legacy_named = ledger
+            .get_operation(&OperationId::new("legacy-named"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            legacy_named.request().requested_model(),
+            Some(&ModelChoice::Named(ModelRef::new(
+                "model-choice:v1:{\"kind\":\"provider_default\"}"
+            )))
+        );
+        let legacy_unknown = ledger
+            .get_operation(&OperationId::new("legacy-unknown"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_unknown.request().requested_model(), None);
     }
     #[test]
     fn recovery_marks_unknown_state_without_claiming_success() {

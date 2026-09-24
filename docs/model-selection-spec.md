@@ -73,7 +73,7 @@ Codexは、入力で要求された各roleについて次の4項目だけを返�
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "request_id": "selection-01J...",
   "assignments": [
     {
@@ -104,7 +104,7 @@ Codexは、入力で要求された各roleについて次の4項目だけを返�
 
 ## 仕様の基本規則
 
-- schema version は入力と出力の両方に必須とし、v1 は整数 `1` とする。
+- schema version は入力と出力の両方に必須とし、v2 は整数 `2` とする。
 - `request_id` は Rust が選定要求ごとに生成する。出力は同じ値をそのまま返し、別 snapshot の
   結果を誤適用しない。
 - Provider と Model は別の識別子で表し、実行対象は常に両方を含む。
@@ -123,7 +123,7 @@ Codexは、入力で要求された各roleについて次の4項目だけを返�
 <details>
 <summary>Rust型定義の詳細を表示する</summary>
 
-以下は v1 の意味と必須性を示す型案である。実装時は `serde` の tagged enum を使い、
+以下は v2 の意味と必須性を示す型案である。実装時は `serde` の tagged enum を使い、
 JSON field は `snake_case` とする。時刻は既存 Ledger と同じ Unix milliseconds、量は丸めや
 浮動小数点誤差を避けるため decimal string とする。
 
@@ -344,8 +344,11 @@ enum AttemptRelationSummary {
 }
 
 struct AttemptTarget {
+    /// Provider requested for this Attempt.
     provider: ProviderRef,
-    model: Evidence<ModelChoice>,
+    requested_model: Evidence<ModelChoice>,
+    observed_provider: Evidence<ProviderRef>,
+    observed_model: Evidence<ModelRef>,
 }
 
 struct AttemptFailureSummary {
@@ -384,7 +387,7 @@ struct RoleAssignment {
 }
 ```
 
-`SelectionRole` と `CapabilityRef` は v1 では拡張可能な non-empty string newtype とする。
+`SelectionRole` と `CapabilityRef` は v2 では拡張可能な non-empty string newtype とする。
 Issue #58では、実行時のroleをAttemptへ保持し、`ReviewSummary`をreviewer Attemptの専用結果として
 永続化する方針を採用した。`AttemptRelationSummary`はretry／escalation／review／reworkを区別する。
 既存Ledgerから確定できない`role`と`review`は省略し、履歴を推測で補わない。移行済みLedgerで
@@ -393,9 +396,11 @@ Domain上の不変条件とLedger migrationは
 [実装・レビュー・修正のドメイン設計](implementation-review-model.md)を正本とする。
 
 `provider_default` は「Model を指定しない」の暗黙表現ではない。Rust が候補として明示した場合だけ
-選べる判別値である。Provider が実際に解決した Model の記録方法は Issue #59 で定義する。
-既存 Ledger のように過去 Attempt の Model を記録していない場合は、`AttemptTarget.model` を
-`unknown` とする。選定候補と Planner 出力の `ExecutionTarget.model` に `unknown` は許可しない。
+選べる判別値である。Attempt summaryは要求値と実行後の観測値を別々に持つ。既存Ledgerのように
+過去Attemptの要求Modelを記録していない場合は`requested_model`、実使用Modelを観測できない場合は
+`observed_model`をそれぞれ`unknown`とする。過去実績はobserved Provider / Modelを優先し、unknownの
+観測をrequested targetから補完してはならない。選定候補とPlanner出力の`ExecutionTarget.model`に
+`unknown`は許可しない。
 
 </details>
 
@@ -408,7 +413,7 @@ Domain上の不変条件とLedger migrationは
 要求変更や設計判断を含み得るため入力対象とするが、secret、認証情報、raw provider log は
 snapshot 作成前に Rust 側で除外する。
 
-`requested_roles` は「今回どの担当を選ぶか」を表す。v1 の出力は各要素に対してちょうど1つの
+`requested_roles` は「今回どの担当を選ぶか」を表す。v2 の出力は各要素に対してちょうど1つの
 assignment を返す。実装担当とレビュー担当を同時に要求できるが、両者を異なる target にするかは
 Rust が組み立てる capability / policy と、Codex の意味的判断に従う。
 
@@ -450,7 +455,7 @@ API の実使用量は `actual_usage` に `measured` として、設定予算は
 
 ### 過去実績と現在 Task の Attempt 履歴
 
-`performance` は Provider / Model と、必要なら role ごとに Ledger から集計した期間付きの実績である。
+`performance` は observed Provider / Model と、必要なら role ごとに Ledger から集計した期間付きの実績である。
 母数を隠した成功率だけを渡さず、Attempt、終了状態、Validation、review、retry の件数を渡す。
 集計値は `computed`、source は `execution_ledger` とする。review が Domain / Ledger に未導入なら
 該当値を `unknown` とする。保存された `ReviewOutcome` は `Approved`、`ChangesRequested`、
@@ -478,7 +483,7 @@ Provider / Model の利用可否や価格を示さない。説明のため一部
 ```json
 {
   "input": {
-    "schema_version": 1,
+    "schema_version": 2,
     "request_id": "selection-01J...",
     "captured_at_ms": 1790000000000,
     "task": {
@@ -603,7 +608,7 @@ Provider / Model の利用可否や価格を示さない。説明のため一部
     "current_attempts": []
   },
   "output": {
-    "schema_version": 1,
+    "schema_version": 2,
     "request_id": "selection-01J...",
     "assignments": [
       {

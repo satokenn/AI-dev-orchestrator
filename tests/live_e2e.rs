@@ -18,6 +18,7 @@ impl AgentProvider for PromptProvider {
             request.workspace().to_owned(),
             format!("{}\n\n{}", request.prompt(), PROVIDER_INSTRUCTIONS),
             request.timeout(),
+            request.model().clone(),
         ))
     }
     fn check_availability(&self) -> Result<(), ProviderError> {
