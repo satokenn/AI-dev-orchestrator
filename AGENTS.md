@@ -106,6 +106,7 @@ cargo test --workspace --all-features
 作業時は、対象に応じて次の資料も参照する。新しい共通ルールや開発基盤ドキュメントを追加した場合は、ここに導線を追加する。
 
 - [`README.md`](README.md): プロジェクト概要と開発者向けの入口
+- [Repository-local 設定](docs/repository-config.md): repository固有のValidation command設定、初期化、境界と失敗時の扱い
 - [初期アーキテクチャ](docs/architecture.md): 主要コンポーネントの高レベル構造、責務境界、未決定事項
 - [モデル選定の入力・出力仕様](docs/model-selection-spec.md): Provider / Model選定の入力、出力、観測事実とCodex判断の責務境界
 - [実装・レビュー・修正を記録する設計](docs/implementation-review-model.md): 実装・レビュー・修正の履歴、レビュー結果、状態、Ledger保存単位

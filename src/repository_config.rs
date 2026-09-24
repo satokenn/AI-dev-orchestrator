@@ -125,7 +125,27 @@ pub fn init_repository(repository_root: &Path) -> Result<PathBuf, RepositoryConf
     }
     let path = root.join(REPOSITORY_CONFIG_PATH);
     let parent = path.parent().expect("config path has a parent");
-    fs::create_dir_all(parent).map_err(RepositoryConfigError::Io)?;
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(RepositoryConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "repository config directory must not be a symlink",
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(parent).map_err(RepositoryConfigError::Io)?;
+        }
+        Err(error) => return Err(RepositoryConfigError::Io(error)),
+    }
+    let canonical_parent = fs::canonicalize(parent).map_err(RepositoryConfigError::Io)?;
+    if !canonical_parent.starts_with(&root) {
+        return Err(RepositoryConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repository config directory resolves outside the repository",
+        )));
+    }
+    let path = canonical_parent.join("config.toml");
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)

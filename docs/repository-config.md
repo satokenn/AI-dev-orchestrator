@@ -1,19 +1,10 @@
-# Repository-local configuration
+# Repository-local 設定
 
-Repository-specific mechanical validation is configured in
-`.ai-dev-orchestrator/config.toml`. This keeps configuration beside the existing
-Ledger and managed-worktree data without renaming or migrating that data. The
-library function `init_repository(root)` creates the initial template and refuses
-to overwrite an existing config.
+Repository固有の機械検証は `.ai-dev-orchestrator/config.toml` に設定します。既存のLedger・管理worktreeと同じディレクトリ系統を使い、保存場所の改名やデータ移行は行いません。`init_repository(root)` は初期templateを作成します。既存設定を上書きせず、`.ai-dev-orchestrator` がsymlinkでRepository外を指す場合も拒否します。
 
-## Validation checks
+## Validation check
 
-Checks are explicit, structured process invocations. They run in declaration
-order, and arguments are passed as an argument array without shell-string
-concatenation. A configured cwd is resolved inside the target workspace; parent
-traversal and symlinks resolving outside that workspace are rejected before any
-check starts. Each timeout is in milliseconds and must be positive. Cancellation
-is passed to `ProcessRunner`, which applies the process-group stop contract.
+checkは構造化されたプロセス起動として記述し、配列の順に実行します。引数をshell文字列へ連結しません。cwdは対象workspace内で解決し、親dir参照やworkspace外へ解決されるsymlinkはcheck開始前に拒否します。timeoutは正のミリ秒で指定します。cancelはProcessRunnerへ渡され、process groupの停止契約が適用されます。
 
 ```toml
 schema_version = 1
@@ -25,14 +16,6 @@ checks = [
 ]
 ```
 
-An absent config file is an error when loading configuration. An empty or absent
-check list is represented by the validator but fails with `NoChecksConfigured`
-when invoked; it never produces an unconditional successful validation. Unknown
-TOML fields are rejected, so this config format has no credentials or secret
-storage field. Keep credentials in the external command's normal credential
-mechanism rather than writing them into this file.
+config fileがない状態での読込はエラーです。check listがない、または空の場合、Validatorは `NoChecksConfigured` で失敗し、無条件成功を返しません。未知のTOML fieldは拒否され、credentialやsecret用fieldは定義していません。credentialは外部commandが通常使う仕組みで管理し、このファイルへ書き込まないでください。
 
-The current public Validation result schema does not carry a config/profile
-identifier. Consequently this implementation does not claim to bind a validation
-result to a config version; that association remains open until the Domain and
-Operation result schemas define it.
+現在の公開Validation結果schemaにはconfig/profile識別子がありません。そのため、この実装はValidation結果をconfig versionへ関連付けません。DomainとOperationの結果schemaで保存先が定義されるまで、この条件は未対応であり、Issueは完了扱いになりません。

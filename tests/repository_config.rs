@@ -161,3 +161,23 @@ fn secret_fields_are_not_part_of_the_schema() {
     ));
     let _ = fs::remove_dir_all(root);
 }
+
+#[cfg(unix)]
+#[test]
+fn init_rejects_config_directory_symlink_escaping_repository() {
+    let root = repository("symlink-root");
+    let outside = repository("symlink-outside");
+    std::os::unix::fs::symlink(&outside, root.join(".ai-dev-orchestrator"))
+        .expect("create config directory symlink");
+
+    assert!(matches!(
+        init_repository(&root),
+        Err(RepositoryConfigError::Io(error))
+            if error.kind() == std::io::ErrorKind::InvalidInput
+    ));
+    assert!(!outside.join("config.toml").exists());
+
+    let _ = fs::remove_file(root.join(".ai-dev-orchestrator"));
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
+}
