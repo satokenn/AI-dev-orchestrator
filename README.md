@@ -59,6 +59,8 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 `RustValidator` は明示された workspace を cwd として、`cargo fmt`、`cargo clippy`、`cargo test` の機械的なチェックを順番に実行します。全チェックを内包した aggregate の `ValidationResult` を1件返し、各コマンドの終了状態と stdout / stderr の診断は `ValidationResult::checks()` から参照できます。1つでも失敗した場合は aggregate を成功として扱いません。`CommandValidator` と `ValidationCheck` を使えば、同じ `Validator` API で決定的なチェック列も構成できます。
 
+Repository-local の構造化checkは `.ai-dev-orchestrator/config.toml` に置き、`init_repository` で上書きしないtemplateを作成できます。command / args / cwd / timeoutを指定し、cwdは対象workspace内に限定されます。config未設定やcheck空集合は成功扱いになりません。設定形式と使用例は[repository-local config](docs/repository-config.md)を参照してください。
+
 ## Orchestrator Service
 
 以下は現在のCLI Orchestrator実装の説明です。現行LedgerではAttemptのSucceeded/FailedがValidation結果と結合した旧意味論です（`legacy_validation_coupled`）。新しいMCP Operation Serviceの契約ではAttempt stateはProvider呼出し結果のみを表します。両者を同一のruntime semanticsとして扱わないでください。

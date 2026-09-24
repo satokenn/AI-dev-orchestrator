@@ -3,10 +3,11 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::{
-    ProcessError, ProcessOutput, ProcessRequest, ProcessRunner, ValidationCheckResult,
-    ValidationResult,
+    CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner,
+    ValidationCheckResult, ValidationResult,
 };
 
 /// One mechanical check to run in a workspace.
@@ -16,6 +17,7 @@ pub struct ValidationCheck {
     command: OsString,
     args: Vec<OsString>,
     cwd: Option<PathBuf>,
+    timeout: Option<Duration>,
 }
 
 impl ValidationCheck {
@@ -27,6 +29,7 @@ impl ValidationCheck {
             command: command.into(),
             args: Vec::new(),
             cwd: None,
+            timeout: None,
         }
     }
 
@@ -49,6 +52,13 @@ impl ValidationCheck {
         self
     }
 
+    /// Sets a per-check timeout. Zero is rejected by `CommandValidator::validate`.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -65,11 +75,19 @@ impl ValidationCheck {
     pub fn cwd_ref(&self) -> Option<&Path> {
         self.cwd.as_deref()
     }
+    #[must_use]
+    pub const fn timeout_value(&self) -> Option<Duration> {
+        self.timeout
+    }
 
     fn request_with_cwd(&self, cwd: PathBuf) -> ProcessRequest {
-        ProcessRequest::new(self.command.clone())
+        let request = ProcessRequest::new(self.command.clone())
             .args(self.args.clone())
-            .cwd(cwd)
+            .cwd(cwd);
+        match self.timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
     }
 }
 
@@ -86,6 +104,10 @@ pub enum ValidatorError {
         reason: String,
     },
     NoChecksConfigured,
+    InvalidCheck {
+        name: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for ValidatorError {
@@ -107,6 +129,9 @@ impl fmt::Display for ValidatorError {
                 workspace.display()
             ),
             Self::NoChecksConfigured => formatter.write_str("no validation checks configured"),
+            Self::InvalidCheck { name, reason } => {
+                write!(formatter, "invalid validation check '{name}': {reason}")
+            }
         }
     }
 }
@@ -207,8 +232,33 @@ impl CommandValidator {
 
 impl Validator for CommandValidator {
     fn validate(&self, workspace: &Path) -> Result<ValidationResult, ValidatorError> {
+        self.validate_with_cancellation(workspace, CancellationToken::new())
+    }
+}
+
+impl CommandValidator {
+    /// Runs configured checks in order, passing one cancellation signal to every process.
+    pub fn validate_with_cancellation(
+        &self,
+        workspace: &Path,
+        token: CancellationToken,
+    ) -> Result<ValidationResult, ValidatorError> {
         if self.checks.is_empty() {
             return Err(ValidatorError::NoChecksConfigured);
+        }
+        for check in &self.checks {
+            if check.name.trim().is_empty() || check.command.is_empty() {
+                return Err(ValidatorError::InvalidCheck {
+                    name: check.name.clone(),
+                    reason: "name and command must not be empty".to_owned(),
+                });
+            }
+            if check.timeout.is_some_and(|timeout| timeout.is_zero()) {
+                return Err(ValidatorError::InvalidCheck {
+                    name: check.name.clone(),
+                    reason: "timeout must be greater than zero".to_owned(),
+                });
+            }
         }
         Self::validate_workspace(workspace)?;
         let resolved_cwds: Vec<_> = self
@@ -222,7 +272,7 @@ impl Validator for CommandValidator {
             .zip(resolved_cwds)
             .map(|(check, cwd)| {
                 let request = check.request_with_cwd(cwd);
-                match self.runner.run(request) {
+                match self.runner.run_with_cancellation(request, token.clone()) {
                     Ok(output) => result_from_output(check, output, true),
                     Err(error) => result_from_error(check, error),
                 }

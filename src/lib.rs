@@ -14,6 +14,7 @@ mod orchestrator;
 mod planner;
 mod process_runner;
 mod provider;
+mod repository_config;
 mod retry;
 mod validator;
 mod workspace;
@@ -52,6 +53,10 @@ pub use process_runner::{
     CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner, StopReason,
 };
 pub use provider::{AgentProvider, ProviderError, ProviderRequest, ProviderResult};
+pub use repository_config::{
+    REPOSITORY_CONFIG_PATH, RepositoryConfig, RepositoryConfigError, ValidationCheckConfig,
+    ValidationConfig, init_repository, load_repository_config,
+};
 pub use retry::{
     ExecutionPolicy, PolicyError, ProviderRegistry, ProviderResolutionError, ProviderResolver,
     RetryPolicy,
