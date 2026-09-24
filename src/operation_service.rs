@@ -617,7 +617,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         self.record_workspace_reference(operation_id, &workspace)?;
         if self
             .workspaces
-            .validate_provider_workspace(workspace.path())
+            .validate_provider_workspace_at_base(workspace.path(), &stored.base_commit)
             .is_err()
         {
             self.finish_without_start(
@@ -1417,6 +1417,54 @@ mod tests {
             .unwrap();
         assert_eq!(repeated.status(), ServiceOperationStatus::RecoveryRequired);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_checkout_ignored_file_is_preserved_and_provider_is_not_started() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(false, Duration::ZERO, false);
+        fs::write(repo.0.join(".gitignore"), "hook-secret.txt\n").unwrap();
+        git(&repo.0, &["add", ".gitignore"]);
+        git(&repo.0, &["commit", "-m", "ignore hook fixture"]);
+        let base = repo.commit();
+        let hooks = repo.0.join(".git").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'hook output must be preserved\\n' > hook-secret.txt\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let mut req = request(&repo, &task_id, 0, "post-checkout-hook");
+        req.input = BaseInput::new(&repo.0, base.clone());
+        let accepted = service.submit_attempt(&req).unwrap();
+        let result = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(result.status(), ServiceOperationStatus::Failed);
+        assert_eq!(result.attempt_state(), AttemptState::Queued);
+        assert_eq!(result.diagnostic_code(), Some("workspace_unavailable"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let workspace_path = result.workspace_path().unwrap();
+        assert_eq!(git(workspace_path, &["rev-parse", "HEAD"]), base);
+        assert_eq!(
+            fs::read_to_string(workspace_path.join("hook-secret.txt")).unwrap(),
+            "hook output must be preserved\n"
+        );
+
+        // The test owns this fixture and removes it explicitly after checking preservation.
         cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
     }
 

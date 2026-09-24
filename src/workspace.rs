@@ -89,6 +89,9 @@ pub enum WorkspaceError {
     WorkspaceNotManaged {
         path: PathBuf,
     },
+    ProviderWorkspaceNotFresh {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for WorkspaceError {
@@ -140,6 +143,11 @@ impl fmt::Display for WorkspaceError {
                     path.display()
                 )
             }
+            Self::ProviderWorkspaceNotFresh { path } => write!(
+                formatter,
+                "provider workspace is not clean at the requested base commit: {}",
+                path.display()
+            ),
         }
     }
 }
@@ -435,6 +443,42 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// Checks the managed worktree is still at the requested commit and contains no files.
+    /// This is intended for the first Provider call, before the agent can modify the workspace.
+    pub fn validate_provider_workspace_at_base(
+        &self,
+        path: impl AsRef<Path>,
+        expected_base: &str,
+    ) -> Result<(), WorkspaceError> {
+        self.validate_provider_workspace(path.as_ref())?;
+        let path =
+            fs::canonicalize(path.as_ref()).map_err(|_| WorkspaceError::WorkspaceNotManaged {
+                path: path.as_ref().to_owned(),
+            })?;
+        let head = self.run_git_at(
+            &path,
+            "verify Provider workspace base",
+            &["rev-parse", "--verify", "HEAD"],
+        )?;
+        if String::from_utf8_lossy(&head.stdout).trim() != expected_base {
+            return Err(WorkspaceError::ProviderWorkspaceNotFresh { path });
+        }
+        let status = self.run_git_at(
+            &path,
+            "verify Provider workspace is clean",
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+        )?;
+        if !status.stdout.is_empty() {
+            return Err(WorkspaceError::ProviderWorkspaceNotFresh { path });
+        }
+        Ok(())
+    }
+
     /// Alias emphasizing that this check is a precondition for Provider use.
     pub fn ensure_provider_workspace(&self, path: impl AsRef<Path>) -> Result<(), WorkspaceError> {
         self.validate_provider_workspace(path)
@@ -497,6 +541,21 @@ impl WorkspaceManager {
                 ProcessRequest::new("git")
                     .args(args.iter().copied())
                     .cwd(&self.repository_root),
+            )
+            .map_err(|error| git_error(operation, args.iter().copied(), error))
+    }
+
+    fn run_git_at(
+        &self,
+        cwd: &Path,
+        operation: &str,
+        args: &[&str],
+    ) -> Result<crate::ProcessOutput, WorkspaceError> {
+        self.runner
+            .run(
+                ProcessRequest::new("git")
+                    .args(args.iter().copied())
+                    .cwd(cwd),
             )
             .map_err(|error| git_error(operation, args.iter().copied(), error))
     }
