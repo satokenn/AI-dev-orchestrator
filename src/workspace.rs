@@ -80,6 +80,9 @@ pub enum WorkspaceError {
     PathCollision {
         path: PathBuf,
     },
+    InvalidBaseCommit {
+        value: String,
+    },
     MainWorktreeNotAllowed {
         path: PathBuf,
     },
@@ -118,6 +121,12 @@ impl fmt::Display for WorkspaceError {
                     formatter,
                     "workspace path already exists: {}",
                     path.display()
+                )
+            }
+            Self::InvalidBaseCommit { value } => {
+                write!(
+                    formatter,
+                    "base is not a verified full commit object ID: {value}"
                 )
             }
             Self::MainWorktreeNotAllowed { path } => {
@@ -293,6 +302,21 @@ impl WorkspaceManager {
 
     /// Creates a new branch and worktree for one attempt.
     pub fn create(&self, task: &TaskId, attempt: &AttemptId) -> Result<Workspace, WorkspaceError> {
+        let base = self.run_git("resolve default base", &["rev-parse", "--verify", "HEAD"])?;
+        let base = String::from_utf8_lossy(&base.stdout).trim().to_owned();
+        self.create_at_base(task, attempt, &base)
+    }
+
+    /// Creates a new branch and worktree from the exact verified commit OID.
+    /// Symbolic refs and abbreviated object IDs are rejected so a moving HEAD
+    /// cannot silently change the requested starting point.
+    pub fn create_at_base(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        base_commit: &str,
+    ) -> Result<Workspace, WorkspaceError> {
+        let base = self.verify_commit_oid(base_commit)?;
         let branch = self.branch_name(task, attempt);
         let path = self.worktree_path(task, attempt);
         if fs::symlink_metadata(&path).is_ok() {
@@ -315,6 +339,7 @@ impl WorkspaceManager {
             "-b",
             branch.as_str(),
             path_string.as_str(),
+            base.as_str(),
         ];
         if let Err(error) = self.run_git("create worktree", &args) {
             return Err(classify_creation_error(error, &branch, &path));
@@ -326,6 +351,63 @@ impl WorkspaceManager {
             branch,
             path,
         })
+    }
+
+    pub(crate) fn verify_commit_oid(&self, value: &str) -> Result<String, WorkspaceError> {
+        if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(WorkspaceError::InvalidBaseCommit {
+                value: value.to_owned(),
+            });
+        }
+        let expression = format!("{value}^{{commit}}");
+        let output = self
+            .run_git(
+                "verify base commit",
+                &["rev-parse", "--verify", "--end-of-options", &expression],
+            )
+            .map_err(|_| WorkspaceError::InvalidBaseCommit {
+                value: value.to_owned(),
+            })?;
+        let resolved = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if resolved != value {
+            return Err(WorkspaceError::InvalidBaseCommit {
+                value: value.to_owned(),
+            });
+        }
+        Ok(resolved)
+    }
+
+    pub(crate) fn ensure_fresh_workspace(
+        &self,
+        workspace: &Workspace,
+        base: &str,
+    ) -> Result<(), WorkspaceError> {
+        self.validate_artifact_workspace(
+            workspace,
+            &workspace.task_id,
+            Some(&workspace.attempt_id),
+        )?;
+        let output = self.run_git_at(
+            &workspace.path,
+            "verify worktree base",
+            &["rev-parse", "--verify", "HEAD"],
+        )?;
+        if String::from_utf8_lossy(&output.stdout).trim() != base {
+            return Err(WorkspaceError::WorkspaceNotManaged {
+                path: workspace.path.clone(),
+            });
+        }
+        let status = self.run_git_at(
+            &workspace.path,
+            "verify fresh worktree",
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        if !status.stdout.is_empty() {
+            return Err(WorkspaceError::WorkspaceNotManaged {
+                path: workspace.path.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Removes an owned clean worktree without discarding local changes.
@@ -347,6 +429,18 @@ impl WorkspaceManager {
     pub fn cleanup_force(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
         self.ensure_owned_workspace(workspace)?;
         self.remove_worktree(workspace, true)
+    }
+
+    /// Removes a newly-created workspace and its private attempt branch.
+    /// Use only before exposing the workspace to a Provider or caller.
+    pub(crate) fn discard_new(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
+        self.ensure_workspace_identity(workspace)?;
+        self.remove_worktree(workspace, true)?;
+        self.run_git(
+            "discard new workspace branch",
+            &["branch", "-D", &workspace.branch],
+        )?;
+        Ok(())
     }
 
     fn remove_worktree(&self, workspace: &Workspace, force: bool) -> Result<(), WorkspaceError> {
@@ -426,12 +520,24 @@ impl WorkspaceManager {
     }
 
     fn ensure_owned_workspace(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
+        self.ensure_workspace_identity(workspace)?;
+        self.validate_provider_workspace(&workspace.path)
+    }
+
+    fn ensure_workspace_identity(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
         if workspace.repository_root != self.repository_root {
             return Err(WorkspaceError::WorkspaceNotManaged {
                 path: workspace.path.clone(),
             });
         }
-        self.validate_provider_workspace(&workspace.path)
+        if workspace.path != self.worktree_path(&workspace.task_id, &workspace.attempt_id)
+            || workspace.branch != self.branch_name(&workspace.task_id, &workspace.attempt_id)
+        {
+            return Err(WorkspaceError::WorkspaceNotManaged {
+                path: workspace.path.clone(),
+            });
+        }
+        Ok(())
     }
 
     fn branch_exists(&self, branch: &str) -> Result<bool, WorkspaceError> {
@@ -474,6 +580,21 @@ impl WorkspaceManager {
                 ProcessRequest::new("git")
                     .args(args.iter().copied())
                     .cwd(&self.repository_root),
+            )
+            .map_err(|error| git_error(operation, args.iter().copied(), error))
+    }
+
+    fn run_git_at(
+        &self,
+        directory: &Path,
+        operation: &str,
+        args: &[&str],
+    ) -> Result<crate::ProcessOutput, WorkspaceError> {
+        self.runner
+            .run(
+                ProcessRequest::new("git")
+                    .args(args.iter().copied())
+                    .cwd(directory),
             )
             .map_err(|error| git_error(operation, args.iter().copied(), error))
     }

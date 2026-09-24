@@ -37,6 +37,7 @@ pub enum ArtifactError {
     InvalidTreeObject(String),
     RecoveryRequired(String),
     WorkspaceChanged { expected: String, actual: String },
+    MaterializationCleanup { failure: String, cleanup: String },
 }
 
 impl fmt::Display for ArtifactError {
@@ -59,6 +60,10 @@ impl fmt::Display for ArtifactError {
             Self::WorkspaceChanged { expected, actual } => write!(
                 formatter,
                 "workspace tree changed: expected {expected}, found {actual}"
+            ),
+            Self::MaterializationCleanup { failure, cleanup } => write!(
+                formatter,
+                "artifact materialization failed ({failure}); cleanup also failed ({cleanup})"
             ),
         }
     }
@@ -245,6 +250,56 @@ impl<'a> ArtifactManager<'a> {
             });
         }
         Ok(())
+    }
+
+    /// Materializes an immutable Artifact into a new managed worktree.
+    ///
+    /// The Artifact is read and checked against its ledger record, tree object,
+    /// and dedicated ref before any worktree is created. The new branch starts
+    /// at the Artifact's verified base commit, then the tree is installed only
+    /// after confirming that the newly-created worktree is clean and still at
+    /// that exact commit. Existing worktrees are never reused or reset.
+    pub fn materialize(
+        &self,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+        artifact_id: &str,
+    ) -> Result<Workspace, ArtifactError> {
+        let artifact = self.read(task_id, artifact_id)?;
+        if artifact.task_id() != task_id {
+            return Err(ArtifactError::NotFound(artifact_id.to_owned()));
+        }
+        if artifact.repository_root() != self.workspaces.repository_root() {
+            return Err(ArtifactError::RepositoryMismatch);
+        }
+        let base = self.workspaces.verify_commit_oid(artifact.base_commit())?;
+        let workspace = self.workspaces.create_at_base(task_id, attempt_id, &base)?;
+        let result = (|| {
+            self.workspaces.ensure_fresh_workspace(&workspace, &base)?;
+            self.run_git(
+                workspace.path(),
+                &["read-tree", "--reset", "-u", artifact.tree_oid()],
+                &[],
+            )?;
+            let actual = self.snapshot_tree(workspace.path())?;
+            if actual != artifact.tree_oid() {
+                return Err(ArtifactError::WorkspaceChanged {
+                    expected: artifact.tree_oid().to_owned(),
+                    actual,
+                });
+            }
+            Ok(())
+        })();
+        if let Err(failure) = result {
+            return match self.workspaces.discard_new(&workspace) {
+                Ok(()) => Err(failure),
+                Err(cleanup) => Err(ArtifactError::MaterializationCleanup {
+                    failure: failure.to_string(),
+                    cleanup: cleanup.to_string(),
+                }),
+            };
+        }
+        Ok(workspace)
     }
 
     fn snapshot_tree(&self, workspace: &Path) -> Result<String, ArtifactError> {
@@ -609,6 +664,122 @@ mod tests {
             );
         }
         fs::remove_file(ledger_db_path).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn materializes_artifact_in_fresh_worktree_pinned_to_recorded_base() {
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let task_id = TaskId::new("task-materialize");
+        let source_attempt = AttemptId::new("attempt-source");
+        let source = workspace_manager.create(&task_id, &source_attempt).unwrap();
+        let base = git(source.path(), &["rev-parse", "HEAD"]);
+        fs::write(source.path().join("source.txt"), "saved artifact\n").unwrap();
+        fs::write(source.path().join("added.txt"), "new file\n").unwrap();
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+        let artifact = artifacts
+            .capture(&source, &task_id, Some(&source_attempt), None, Some(&base))
+            .unwrap();
+        let source_status = git(source.path(), &["status", "--porcelain=v1", "-uall"]);
+
+        // Advance the repository's default HEAD after the artifact was saved.
+        fs::write(repository.join("source.txt"), "later main change\n").unwrap();
+        git(&repository, &["add", "source.txt"]);
+        git(&repository, &["commit", "-m", "advance main"]);
+        assert_ne!(
+            git(&repository, &["rev-parse", "HEAD"]),
+            artifact.base_commit()
+        );
+
+        let repair_attempt = AttemptId::new("attempt-repair");
+        let repaired = artifacts
+            .materialize(&task_id, &repair_attempt, artifact.id())
+            .unwrap();
+        assert_ne!(repaired.path(), source.path());
+        assert_eq!(
+            git(repaired.path(), &["rev-parse", "HEAD"]),
+            artifact.base_commit()
+        );
+        assert_eq!(
+            fs::read_to_string(repaired.path().join("source.txt")).unwrap(),
+            "saved artifact\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repaired.path().join("added.txt")).unwrap(),
+            "new file\n"
+        );
+        assert_eq!(
+            artifacts.snapshot_tree(repaired.path()).unwrap(),
+            artifact.tree_oid()
+        );
+        assert_eq!(
+            git(source.path(), &["status", "--porcelain=v1", "-uall"]),
+            source_status
+        );
+
+        workspace_manager.cleanup_force(&repaired).unwrap();
+        workspace_manager.cleanup_force(&source).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn invalid_or_foreign_artifact_is_rejected_before_worktree_creation() {
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let task_id = TaskId::new("task-materialize-guard");
+        let source_attempt = AttemptId::new("attempt-source-guard");
+        let source = workspace_manager.create(&task_id, &source_attempt).unwrap();
+        let base = git(source.path(), &["rev-parse", "HEAD"]);
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+        let artifact = artifacts
+            .capture(&source, &task_id, Some(&source_attempt), None, Some(&base))
+            .unwrap();
+        let attempted = AttemptId::new("attempt-rejected");
+
+        assert!(matches!(
+            artifacts.materialize(&TaskId::new("another-task"), &attempted, artifact.id()),
+            Err(ArtifactError::NotFound(_))
+        ));
+        assert!(
+            !workspace_manager
+                .worktree_path(&task_id, &attempted)
+                .exists()
+        );
+        assert!(matches!(
+            artifacts.materialize(&task_id, &attempted, "missing-artifact"),
+            Err(ArtifactError::NotFound(_))
+        ));
+        assert!(
+            !workspace_manager
+                .worktree_path(&task_id, &attempted)
+                .exists()
+        );
+
+        let replacement_tree = git(source.path(), &["mktree"]);
+        git(
+            source.path(),
+            &[
+                "update-ref",
+                artifact.ref_name(),
+                &replacement_tree,
+                artifact.tree_oid(),
+            ],
+        );
+        let tampered_attempt = AttemptId::new("attempt-tampered");
+        assert!(matches!(
+            artifacts.materialize(&task_id, &tampered_attempt, artifact.id()),
+            Err(ArtifactError::RecoveryRequired(_))
+        ));
+        assert!(
+            !workspace_manager
+                .worktree_path(&task_id, &tampered_attempt)
+                .exists()
+        );
+
+        workspace_manager.cleanup_force(&source).unwrap();
         fs::remove_dir_all(repository).unwrap();
     }
 

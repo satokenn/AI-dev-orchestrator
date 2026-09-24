@@ -50,6 +50,8 @@ Artifactのdigestは、そのworkspaceのGit object formatで計算したtree ob
 
 初回Artifactの`base_commit`はAttempt開始時のbase commitとする。後続Artifactは入力ArtifactのTaskと同じTaskに属し、`base_commit`を入力Artifactから引き継ぐ。出力treeとの差分を比較するときはこのbase commitを使う。`source_attempt_id`は生成元Attemptを示し、監督Codex自身による編集ではnullにできる。Artifact IDはLedgerが発行する不透明な識別子であり、Git tree OIDは内容digestとして別に返す。
 
+修正作業のworkspaceを用意するときは、保存ArtifactのLedger所属・専用ref・tree objectを確認し、Artifactの`base_commit`から新しいmanaged worktreeとbranchを作る。その新worktreeがcleanで、HEADが指定base commitと一致することを確かめてからArtifact treeを展開する。初期workspaceのHEADが後から変化しても、別Artifactや現在のHEADへ切り替えない。既存workspaceを再利用・resetせず、準備に失敗した新worktreeと未公開のbranchはProviderへ渡す前にcleanupする。現在の準備機能はArtifactのmaterializeを提供する段階であり、Attemptのinput/output Artifact記録やProvider実行への接続は#66 Operation Service統合Issueに残る。
+
 ## Attemptはモデル呼び出しだけを表す
 
 AttemptはProvider / Modelを指定して開始した1回のモデル呼び出しである。実装、修正、調査、reviewはroleやrelationで区別するが、モデルを呼んだなら別Attemptとして残す。Attemptには要求・実測のProvider / Model、instruction、入力・出力成果物、開始・終了、診断、AgentResult、usage / costを残す。AgentResultは自己申告であり、成功や完了の根拠ではない。
