@@ -6,7 +6,6 @@ use ai_dev_orchestrator::{
 };
 use std::{
     fs,
-    io::Write,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
@@ -33,13 +32,11 @@ impl FakeCli {
         ));
         fs::create_dir(&unique_directory).expect("create fake CLI directory");
         let executable = unique_directory.join("agy");
-        let mut script = fs::File::create(&executable).expect("create fake CLI");
-        script
-            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
-            .expect("write fake CLI");
-        drop(script);
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+        let temporary_script = unique_directory.join("agy.tmp");
+        fs::write(&temporary_script, format!("#!/bin/sh\n{body}\n")).expect("write fake CLI");
+        fs::set_permissions(&temporary_script, fs::Permissions::from_mode(0o755))
             .expect("make fake CLI executable");
+        fs::rename(&temporary_script, &executable).expect("publish fake CLI atomically");
         Self {
             directory: unique_directory,
             executable,
@@ -144,9 +141,17 @@ fn passes_named_model_and_types_invalid_model_selection() {
     );
     let workspace = cli.directory.join("workspace");
     fs::create_dir(&workspace).expect("create workspace");
+    let error = cli
+        .provider()
+        .execute(&named_model_request(
+            workspace,
+            "hello",
+            Duration::from_secs(1),
+        ))
+        .unwrap_err();
     assert!(matches!(
-        cli.provider().execute(&named_model_request(workspace, "hello", Duration::from_secs(1))),
-        Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "gemini-test"
+        error.kind(),
+        ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
     ));
 
     let cli = FakeCli::new(
@@ -154,9 +159,17 @@ fn passes_named_model_and_types_invalid_model_selection() {
     );
     let workspace = cli.directory.join("workspace");
     fs::create_dir(&workspace).expect("create workspace");
+    let error = cli
+        .provider()
+        .execute(&named_model_request(
+            workspace,
+            "hello",
+            Duration::from_secs(1),
+        ))
+        .unwrap_err();
     assert!(matches!(
-        cli.provider().execute(&named_model_request(workspace, "hello", Duration::from_secs(1))),
-        Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "gemini-test"
+        error.kind(),
+        ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
     ));
 }
 
@@ -194,10 +207,10 @@ fn reports_authentication_failure_as_unavailable() {
         Duration::from_secs(10),
     ));
 
-    assert!(matches!(
-        result,
-        Err(ProviderError::Unavailable(message)) if message.contains("authentication required")
-    ));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error.kind(), ProviderError::Unavailable(message) if message.contains("authentication required"))
+    );
 }
 
 #[test]
@@ -209,10 +222,11 @@ fn maps_timeout_to_provider_error() {
         Duration::from_secs(1),
     ));
 
-    assert!(matches!(
-        result,
-        Err(ProviderError::TimedOutWithOutput { timeout, stdout, .. }) if timeout == Duration::from_secs(1) && stdout == "partial"
-    ));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error.kind(), ProviderError::TimedOutWithOutput { timeout, stdout, .. } if *timeout == Duration::from_secs(1) && stdout == "partial")
+    );
+    assert_eq!(error.captured_output().unwrap().stdout(), b"partial");
 }
 
 #[test]
@@ -242,7 +256,8 @@ fn maps_cancellation_to_provider_error() {
     assert!(
         matches!(
             &result,
-            Err(ProviderError::CancelledWithOutput { stdout, .. }) if stdout == "partial"
+            Err(error) if matches!(error.kind(), ProviderError::CancelledWithOutput { stdout, .. } if stdout == "partial")
+                && error.captured_output().is_some_and(|output| output.stdout() == b"partial")
         ),
         "unexpected cancellation result: {result:?}"
     );

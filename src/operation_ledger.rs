@@ -7,9 +7,9 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::{ModelChoice, ModelRef, ProviderRef, TaskId};
+use crate::{ModelChoice, ModelRef, ProviderRef, TaskId, UsageCost, UsageMetric};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const DEFAULT_LOG_LIMIT: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -390,14 +390,14 @@ impl SqliteExecutionLedger {
         if version > SCHEMA_VERSION {
             return Err(LedgerError::UnsupportedSchema(version));
         }
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL, instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT, requested_model_encoding INTEGER, status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT); CREATE TABLE IF NOT EXISTS task_revisions (task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence)); CREATE TABLE IF NOT EXISTS log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream)); CREATE TABLE IF NOT EXISTS validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT); CREATE TABLE IF NOT EXISTS budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT);")?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL, instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT, requested_model_encoding INTEGER, status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT); CREATE TABLE IF NOT EXISTS task_revisions (task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence)); CREATE TABLE IF NOT EXISTS log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream)); CREATE TABLE IF NOT EXISTS validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT); CREATE TABLE IF NOT EXISTS operation_usage_metrics (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, unit TEXT NOT NULL, PRIMARY KEY(operation_id, sequence)); CREATE TABLE IF NOT EXISTS budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT);")?;
         if !operation_column_exists(&connection, "requested_model_encoding")? {
             connection.execute(
                 "ALTER TABLE operations ADD COLUMN requested_model_encoding INTEGER",
                 [],
             )?;
         }
-        connection.execute_batch("PRAGMA user_version = 2;")?;
+        connection.execute_batch("PRAGMA user_version = 3;")?;
         Ok(Self {
             connection: Mutex::new(connection),
             log_limit: DEFAULT_LOG_LIMIT,
@@ -517,8 +517,19 @@ impl SqliteExecutionLedger {
         directory: impl AsRef<Path>,
         content: &[u8],
     ) -> Result<LogReference, LedgerError> {
+        self.save_log_with_truncation(id, stream, directory, content, false)
+    }
+    /// Persists a raw process stream and carries forward truncation performed before ledger storage.
+    pub fn save_log_with_truncation(
+        &self,
+        id: &OperationId,
+        stream: &str,
+        directory: impl AsRef<Path>,
+        content: &[u8],
+        source_truncated: bool,
+    ) -> Result<LogReference, LedgerError> {
         let limit = self.log_limit.min(content.len());
-        let truncated = limit < content.len();
+        let truncated = source_truncated || limit < content.len();
         let directory = directory.as_ref();
         fs::create_dir_all(directory)?;
         let operation_component = safe_log_component(id.as_str())?;
@@ -597,6 +608,52 @@ impl SqliteExecutionLedger {
             ],
         )?;
         Ok(())
+    }
+    /// Saves every named provider metric without collapsing or estimating values.
+    pub fn save_usage_metrics(
+        &self,
+        id: &OperationId,
+        usage: &UsageCost,
+    ) -> Result<(), LedgerError> {
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM operation_usage_metrics WHERE operation_id=?1",
+            params![id.as_str()],
+        )?;
+        for (sequence, metric) in usage.metrics().iter().enumerate() {
+            let sequence = i64::try_from(sequence)
+                .map_err(|_| LedgerError::InvalidValue("usage sequence overflow".into()))?;
+            transaction.execute(
+                "INSERT INTO operation_usage_metrics
+                 (operation_id, sequence, name, value, unit) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    id.as_str(),
+                    sequence,
+                    metric.name(),
+                    metric.value(),
+                    metric.unit()
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+    pub fn usage_metrics(&self, id: &OperationId) -> Result<Option<UsageCost>, LedgerError> {
+        let connection = self.connection.lock().expect("ledger mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT name, value, unit FROM operation_usage_metrics
+             WHERE operation_id=?1 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map(params![id.as_str()], |row| {
+            Ok(UsageMetric::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let metrics = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok((!metrics.is_empty()).then(|| UsageCost::new(metrics)))
     }
     pub fn reserve_budget(&self, id: &OperationId, amount: &str) -> Result<(), LedgerError> {
         let connection = self.connection.lock().expect("ledger mutex poisoned");
@@ -890,6 +947,26 @@ mod tests {
         ));
     }
     #[test]
+    fn operation_usage_metrics_round_trip_without_collapsing_names_or_values() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let operation = ledger
+            .accept_operation(&request("usage", "payload"))
+            .unwrap();
+        let usage = UsageCost::new([
+            UsageMetric::new("input_tokens", "120", "tokens"),
+            UsageMetric::new("cached_input_tokens", "0", "tokens"),
+            UsageMetric::new("custom_metric", "exact-decimal", "requests"),
+        ]);
+
+        ledger.save_usage_metrics(operation.id(), &usage).unwrap();
+
+        assert_eq!(ledger.usage_metrics(operation.id()).unwrap(), Some(usage));
+        assert_eq!(
+            ledger.usage_metrics(&OperationId::new("missing")).unwrap(),
+            None
+        );
+    }
+    #[test]
     fn terminal_fact_cannot_be_overwritten() {
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
         let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
@@ -1031,6 +1108,47 @@ mod tests {
         assert_eq!(legacy_unknown.request().requested_model(), None);
     }
     #[test]
+    fn schema_v2_migration_adds_metric_storage_without_rewriting_legacy_usage() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+             task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL,
+             instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT,
+             requested_model_encoding INTEGER, status TEXT NOT NULL, accepted_at INTEGER NOT NULL,
+             started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT,
+             diagnostic TEXT, artifact_ref TEXT);
+             CREATE TABLE usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT,
+             cost TEXT, currency TEXT);
+             INSERT INTO usage VALUES ('legacy', '11', '7', NULL, NULL);
+             PRAGMA user_version = 2;",
+            )
+            .unwrap();
+
+        let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
+        let connection = ledger.connection.lock().unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let legacy: (String, String) = connection
+            .query_row(
+                "SELECT input_units, output_units FROM usage WHERE operation_id='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let metric_table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='operation_usage_metrics')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 3);
+        assert_eq!(legacy, ("11".into(), "7".into()));
+        assert!(metric_table_exists);
+    }
+    #[test]
     fn recovery_marks_unknown_state_without_claiming_success() {
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
         let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
@@ -1061,6 +1179,24 @@ mod tests {
         assert_eq!(reference.byte_count(), 3);
         assert!(reference.truncated());
         assert_eq!(fs::read(reference.path()).unwrap(), b"abc");
+        let _ = fs::remove_file(reference.path());
+    }
+
+    #[test]
+    fn raw_log_reference_preserves_upstream_truncation() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
+        let reference = ledger
+            .save_log_with_truncation(
+                operation.id(),
+                "stdout",
+                std::env::temp_dir().join(format!("ledger-source-truncated-{}", now())),
+                b"already limited",
+                true,
+            )
+            .unwrap();
+        assert!(reference.truncated());
+        assert_eq!(fs::read(reference.path()).unwrap(), b"already limited");
         let _ = fs::remove_file(reference.path());
     }
 

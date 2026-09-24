@@ -507,7 +507,9 @@ fn git_error(
             stopped,
             stdout,
             stderr,
+            output_truncated: _,
             diagnostic,
+            ..
         } => (
             None,
             stdout,
