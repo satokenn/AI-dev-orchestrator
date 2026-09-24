@@ -94,6 +94,36 @@ fn executes_headless_cli_in_workspace_and_maps_json_result() {
 }
 
 #[test]
+fn rejects_malformed_json_non_objects_and_incomplete_success_results() {
+    for stdout in [
+        "{not json",
+        "[\"SUCCESS\",\"done\"]",
+        "{\"response\":\"done\"}",
+        "{\"status\":\"SUCCESS\"}",
+    ] {
+        let cli = FakeCli::new(&format!(
+            "printf '%s' '{}'; printf 'fake stderr diagnostic' >&2",
+            stdout.replace('\'', "'\\''")
+        ));
+        let result = cli.provider().execute(&request(
+            cli.directory.clone(),
+            "hello",
+            Duration::from_secs(1),
+        ));
+
+        let error = match result {
+            Err(ProviderError::ExecutionFailed(message)) => message,
+            other => panic!("expected malformed result to fail, got {other:?}"),
+        };
+        assert!(error.contains(stdout), "raw stdout missing from {error:?}");
+        assert!(
+            error.contains("fake stderr diagnostic"),
+            "raw stderr missing from {error:?}"
+        );
+    }
+}
+
+#[test]
 fn reports_missing_cli_as_unavailable() {
     let provider =
         AntigravityProvider::with_executable("/definitely/not/installed/antigravity-cli");

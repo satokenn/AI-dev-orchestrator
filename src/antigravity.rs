@@ -93,9 +93,19 @@ impl AntigravityProvider {
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let parsed = parse_json_result(&stdout);
+        let parsed = parse_json_result(&stdout).map_err(|parse_error| {
+            let diagnostic = format!(
+                "invalid Antigravity JSON result ({parse_error}); {}",
+                format_diagnostic(&stdout, &stderr)
+            );
+            if is_authentication_error(&diagnostic, "") {
+                ProviderError::Unavailable(diagnostic)
+            } else {
+                ProviderError::ExecutionFailed(diagnostic)
+            }
+        })?;
 
-        if let Some(error) = parsed.as_ref().and_then(|result| result.error.as_deref()) {
+        if let Some(error) = parsed.error.as_deref() {
             return Err(if is_authentication_error(error, &stderr) {
                 ProviderError::Unavailable(error.to_owned())
             } else {
@@ -103,11 +113,7 @@ impl AntigravityProvider {
             });
         }
 
-        if parsed
-            .as_ref()
-            .and_then(|result| result.status.as_deref())
-            .is_some_and(|status| !status.eq_ignore_ascii_case("SUCCESS"))
-        {
+        if !parsed.status.eq_ignore_ascii_case("SUCCESS") {
             let diagnostic = format_diagnostic(&stdout, &stderr);
             return Err(if is_authentication_error(&diagnostic, "") {
                 ProviderError::Unavailable(diagnostic)
@@ -116,25 +122,17 @@ impl AntigravityProvider {
             });
         }
 
-        let agent_result = parsed.as_ref().map_or_else(
-            || Some(AgentResult::new(stdout.clone(), true)),
-            |result| {
-                Some(AgentResult::new(
-                    result.response.clone().unwrap_or_else(|| stdout.clone()),
-                    result
-                        .status
-                        .as_deref()
-                        .is_none_or(|status| status.eq_ignore_ascii_case("SUCCESS")),
-                ))
-            },
-        );
+        let agent_result = Some(AgentResult::new(
+            parsed.response.expect("SUCCESS result requires a response"),
+            true,
+        ));
 
         Ok(ProviderResult::new(
             stdout,
             stderr,
             output.exit_code(),
             agent_result,
-            parsed.and_then(|result| result.usage),
+            parsed.usage,
         ))
     }
 
@@ -148,6 +146,7 @@ impl AntigravityProvider {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let detail = parse_json_result(&stdout)
+                    .ok()
                     .and_then(|result| result.error)
                     .unwrap_or_else(|| format_diagnostic(&stdout, &stderr));
                 if is_authentication_error(&detail, &stderr) {
@@ -223,26 +222,33 @@ impl AgentProvider for AntigravityProvider {
 
 #[derive(Debug)]
 struct ParsedResult {
-    status: Option<String>,
+    status: String,
     response: Option<String>,
     error: Option<String>,
     usage: Option<UsageCost>,
 }
 
-fn parse_json_result(stdout: &str) -> Option<ParsedResult> {
-    let value = serde_json::from_str::<Value>(stdout).ok()?;
-    let object = value.as_object()?;
+fn parse_json_result(stdout: &str) -> Result<ParsedResult, String> {
+    let value = serde_json::from_str::<Value>(stdout).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "expected a JSON object".to_owned())?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing string field 'status'".to_owned())?;
+    let response = object
+        .get("response")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if status.eq_ignore_ascii_case("SUCCESS") && response.is_none() {
+        return Err("SUCCESS result is missing string field 'response'".to_owned());
+    }
     let usage = object.get("usage").and_then(parse_usage);
 
-    Some(ParsedResult {
-        status: object
-            .get("status")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        response: object
-            .get("response")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+    Ok(ParsedResult {
+        status: status.to_owned(),
+        response,
         error: object
             .get("error")
             .and_then(Value::as_str)
@@ -326,7 +332,7 @@ mod tests {
         )
         .expect("valid result");
 
-        assert_eq!(result.status.as_deref(), Some("SUCCESS"));
+        assert_eq!(result.status, "SUCCESS");
         assert_eq!(result.response.as_deref(), Some("done"));
         assert_eq!(result.usage.expect("usage").metrics()[0].value(), "12");
     }

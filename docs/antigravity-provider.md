@@ -13,6 +13,15 @@ agy -p <prompt> --output-format json
 `UsageMetric` に変換されます。元の stdout / stderr と exit status も
 `ProviderResult` から参照できます。
 
+exit status が 0 の場合も、stdout は結果オブジェクトとして検証されます。
+`status` は文字列で必須です。`status: "SUCCESS"` のときは文字列の
+`response` も必須で、欠落または型違い、不正 JSON、配列などのオブジェクト
+以外は `ProviderError::ExecutionFailed` になります。このエラー診断には
+解析理由と raw stdout / stderr が含まれます。`usage` は任意です。
+非成功 status の結果は成功として返さず、CLI の `error` または stdout / stderr
+の診断を `ExecutionFailed` として返します。認証エラーは引き続き
+`ProviderError::Unavailable` に分類します。
+
 ## 可用性と診断
 
 インストール確認は次のように行います。
