@@ -63,7 +63,7 @@ scripts/check-pr-policy.sh <pull-request-number> <owner/repository>
 
 ## GitHub Actions
 
-[`pr-policy.yml`](../.github/workflows/pr-policy.yml)は、PRの作成、本文編集、commit追加、reopen、Ready for reviewへの変更時に同じ検査を実行します。Workflowの権限は`contents: read`と`pull-requests: read`に限定しています。
+[`pr-policy.yml`](../.github/workflows/pr-policy.yml)は、`pull_request_target`でPRの作成、本文編集、commit追加、reopen、Ready for reviewへの変更時に検査を実行します。このイベントではworkflowがbase repository側の信頼できる定義から起動し、jobはrepositoryのdefault branchを明示してcheckoutします。checker、設定、テストもそのcheckoutから実行します。PR headはcheckoutも実行もしません。PR本文やbase、mergeable、変更数などの検査対象データはGitHubイベントpayloadから、stacked依存先はGitHub APIから読み取ります。Workflowの権限は`contents: read`と`pull-requests: read`に限定しています。
 
 [`post-merge-policy.yml`](../.github/workflows/post-merge-policy.yml)は、mergeされたPRの`merge_commit_sha`が、checkoutしたdefault branchから到達可能であることを確認します。merge commit、squash、rebaseの各方式でGitHub APIが返すmerge後のSHAを使用します。
 
@@ -91,7 +91,8 @@ scripts/sync-pr-ruleset.sh
 
 - Workflow tokenは読み取り権限だけを使用する。
 - 外部Actionは完全なcommit SHAへ固定する。
-- `pull_request_target`でPR headのコードをcheckoutまたは実行しない。
+- PR Policyは`pull_request_target`から起動し、checker・設定・テストをdefault branchから取得する。PR headをcheckoutまたは実行しない。
+- Policy関連ファイルを変更するPRでも、判定ロジックはPR変更の影響を受けない。workflow trust-boundary回帰テストがイベント種別とcheckout参照先を検査する。
 - Rulesetの同期は管理者が差分をレビューし、Policy workflowのmerge後に実行する。
 - 機械検査の成功を、目的・設計・PR粒度の意味的な妥当性と同一視しない。
 
