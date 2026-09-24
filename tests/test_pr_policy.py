@@ -155,12 +155,13 @@ class PostMergeTests(unittest.TestCase):
 class WorkflowTrustBoundaryTests(unittest.TestCase):
     def test_pr_policy_uses_default_branch_sources(self):
         workflow = (ROOT / ".github/workflows/pr-policy.yml").read_text(encoding="utf-8")
-
+        self.assertNotRegex(workflow, r"(?m)^  pull_request:")
         self.assertRegex(workflow, r"(?m)^  pull_request_target:")
         self.assertRegex(
             workflow,
             r"(?ms)uses: actions/checkout@[^\n]+\n\s+with:\n\s+ref: \$\{\{ github\.event\.repository\.default_branch \}\}",
         )
+        self.assertRegex(workflow, r"(?ms)permissions:\n  contents: read\n  pull-requests: read")
         self.assertIn("python3 -m unittest discover -s tests -v", workflow)
         self.assertIn("python3 scripts/pr_policy.py preflight", workflow)
         self.assertIn("--config .github/pr-policy.json", workflow)
@@ -168,6 +169,14 @@ class WorkflowTrustBoundaryTests(unittest.TestCase):
             workflow,
             r"(?m)^\s+ref: \$\{\{ github\.event\.pull_request\.(?:head|base)",
         )
+
+    def test_pr_policy_remains_a_required_main_check(self):
+        ruleset = json.loads(
+            (ROOT / ".github/rulesets/main-pr-policy.json").read_text(encoding="utf-8")
+        )
+        required_checks = ruleset["rules"][0]["parameters"]["required_status_checks"]
+
+        self.assertIn({"context": "PR Policy"}, required_checks)
 
 
 if __name__ == "__main__":

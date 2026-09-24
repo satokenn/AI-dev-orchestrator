@@ -63,7 +63,9 @@ scripts/check-pr-policy.sh <pull-request-number> <owner/repository>
 
 ## GitHub Actions
 
-[`pr-policy.yml`](../.github/workflows/pr-policy.yml)は、`pull_request_target`でPRの作成、本文編集、commit追加、reopen、Ready for reviewへの変更時に検査を実行します。このイベントではworkflowがbase repository側の信頼できる定義から起動し、jobはrepositoryのdefault branchを明示してcheckoutします。checker、設定、テストもそのcheckoutから実行します。PR headはcheckoutも実行もしません。PR本文やbase、mergeable、変更数などの検査対象データはGitHubイベントpayloadから、stacked依存先はGitHub APIから読み取ります。Workflowの権限は`contents: read`と`pull-requests: read`に限定しています。
+[`pr-policy.yml`](../.github/workflows/pr-policy.yml)は、`pull_request_target`でPRの作成、本文編集、commit追加、reopen、Ready for reviewへの変更時に検査を実行します。このイベントではworkflowがbase repository側の信頼できるdefault branchの定義から起動し、jobもrepositoryのdefault branchを明示してcheckoutします。checker、設定、テストもそのcheckoutから実行します。PR headはcheckoutも実行もしません。PR本文やbase、mergeable、変更数などの検査対象データはGitHubイベントpayloadから、stacked依存先はGitHub APIから読み取ります。Workflowの権限は`contents: read`と`pull-requests: read`に限定しています。
+
+GitHubは、head branch名がcommit SHAに似た特定のpatternに一致する場合、セキュリティ上の理由で[`pull_request_target` workflowを起動しないことがあります](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target)。作業branchには`agent/`や`feature/`など用途を示すprefixを使い、SHAに見える名前を避けてください。`PR Policy` checkが表示されない場合はmergeしてはいけません。main rulesetはこのcheckを必須にしているため、checkが未生成・未完了ならmergeはblockedのままです。branch名を修正した後、`PR Policy` checkが作成され成功したことを確認してください。PR headから成功checkを代替発行したり、required checkを迂回したりしてはいけません。
 
 [`post-merge-policy.yml`](../.github/workflows/post-merge-policy.yml)は、mergeされたPRの`merge_commit_sha`が、checkoutしたdefault branchから到達可能であることを確認します。merge commit、squash、rebaseの各方式でGitHub APIが返すmerge後のSHAを使用します。
 
