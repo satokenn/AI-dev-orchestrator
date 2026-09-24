@@ -28,10 +28,30 @@ class RulesetDeclarationTests(unittest.TestCase):
     def test_required_rust_contexts_match_ci_job_names_and_commands(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         jobs_section = workflow.split("jobs:\n", maxsplit=1)[1]
-        job_names = {
-            line.removeprefix("    name: ")
-            for line in jobs_section.splitlines()
-            if line.startswith("    name: ")
+        jobs: dict[str, list[str]] = {}
+        current_job: str | None = None
+        current_lines: list[str] = []
+        for line in jobs_section.splitlines():
+            if line.startswith("  ") and not line.startswith("    ") and line.endswith(":"):
+                if current_job is not None:
+                    jobs[current_job] = current_lines
+                current_job = line[2:-1]
+                current_lines = []
+            elif current_job is not None:
+                current_lines.append(line)
+        if current_job is not None:
+            jobs[current_job] = current_lines
+
+        named_jobs = {
+            next(
+                (
+                    line.removeprefix("    name: ")
+                    for line in lines
+                    if line.startswith("    name: ")
+                ),
+                job_id,
+            ): lines
+            for job_id, lines in jobs.items()
         }
         declared_contexts = {
             entry["context"]
@@ -40,14 +60,16 @@ class RulesetDeclarationTests(unittest.TestCase):
             for entry in rule["parameters"]["required_status_checks"]
         }
 
-        self.assertTrue({"Format", "Clippy", "Test"}.issubset(job_names))
+        self.assertTrue({"Format", "Clippy", "Test"}.issubset(named_jobs))
         self.assertTrue({"Format", "Clippy", "Test"}.issubset(declared_contexts))
-        for command in (
-            "cargo fmt --all -- --check",
-            "cargo clippy --workspace --all-targets --all-features -- -D warnings",
-            "cargo test --workspace --all-features",
-        ):
-            self.assertIn(f"run: {command}", workflow)
+        expected_commands = {
+            "Format": "cargo fmt --all -- --check",
+            "Clippy": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+            "Test": "cargo test --workspace --all-features",
+        }
+        for job_name, command in expected_commands.items():
+            with self.subTest(job=job_name):
+                self.assertIn(f"run: {command}", "\n".join(named_jobs[job_name]))
 
     def test_missing_ci_context_is_reported(self):
         declared = copy.deepcopy(DECLARED)
