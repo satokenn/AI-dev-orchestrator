@@ -83,6 +83,10 @@ pub enum WorkspaceError {
     InvalidBaseCommit {
         value: String,
     },
+    WorktreeNotClean {
+        path: PathBuf,
+        status: String,
+    },
     MainWorktreeNotAllowed {
         path: PathBuf,
     },
@@ -129,6 +133,12 @@ impl fmt::Display for WorkspaceError {
                     "base is not a verified full commit object ID: {value}"
                 )
             }
+            Self::WorktreeNotClean { path, status } => write!(
+                formatter,
+                "worktree contains tracked, untracked, or ignored content and was preserved at '{}': {}",
+                path.display(),
+                status.trim()
+            ),
             Self::MainWorktreeNotAllowed { path } => {
                 write!(
                     formatter,
@@ -436,19 +446,25 @@ impl WorkspaceManager {
         self.remove_worktree(workspace, true)
     }
 
-    /// Removes a newly-created workspace and its private attempt branch.
-    /// Use only before exposing the workspace to a Provider or caller.
-    pub(crate) fn discard_new(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
-        self.ensure_workspace_identity(workspace)?;
-        self.remove_worktree(workspace, true)?;
-        self.run_git(
-            "discard new workspace branch",
-            &["branch", "-D", &workspace.branch],
-        )?;
-        Ok(())
-    }
-
     fn remove_worktree(&self, workspace: &Workspace, force: bool) -> Result<(), WorkspaceError> {
+        if !force {
+            let status = self.run_git_at(
+                &workspace.path,
+                "check worktree before cleanup",
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                ],
+            )?;
+            if !status.stdout.is_empty() {
+                return Err(WorkspaceError::WorktreeNotClean {
+                    path: workspace.path.clone(),
+                    status: String::from_utf8_lossy(&status.stdout).into_owned(),
+                });
+            }
+        }
         let path_string = workspace.path.to_string_lossy().into_owned();
         let mut args = vec!["worktree", "remove"];
         if force {

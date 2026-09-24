@@ -36,8 +36,15 @@ pub enum ArtifactError {
     InvalidBaseCommit(String),
     InvalidTreeObject(String),
     RecoveryRequired(String),
-    WorkspaceChanged { expected: String, actual: String },
-    MaterializationCleanup { failure: String, cleanup: String },
+    WorkspaceChanged {
+        expected: String,
+        actual: String,
+    },
+    MaterializationRetained {
+        failure: String,
+        workspace_path: PathBuf,
+        branch: String,
+    },
 }
 
 impl fmt::Display for ArtifactError {
@@ -61,9 +68,14 @@ impl fmt::Display for ArtifactError {
                 formatter,
                 "workspace tree changed: expected {expected}, found {actual}"
             ),
-            Self::MaterializationCleanup { failure, cleanup } => write!(
+            Self::MaterializationRetained {
+                failure,
+                workspace_path,
+                branch,
+            } => write!(
                 formatter,
-                "artifact materialization failed ({failure}); cleanup also failed ({cleanup})"
+                "artifact materialization failed ({failure}); workspace was preserved for recovery at '{}' on branch '{branch}'",
+                workspace_path.display()
             ),
         }
     }
@@ -291,13 +303,11 @@ impl<'a> ArtifactManager<'a> {
             Ok(())
         })();
         if let Err(failure) = result {
-            return match self.workspaces.discard_new(&workspace) {
-                Ok(()) => Err(failure),
-                Err(cleanup) => Err(ArtifactError::MaterializationCleanup {
-                    failure: failure.to_string(),
-                    cleanup: cleanup.to_string(),
-                }),
-            };
+            return Err(ArtifactError::MaterializationRetained {
+                failure: failure.to_string(),
+                workspace_path: workspace.path().to_owned(),
+                branch: workspace.branch().to_owned(),
+            });
         }
         Ok(workspace)
     }
@@ -848,20 +858,35 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                hooks.to_str().unwrap(),
+            ],
+        );
 
         let repair_attempt = AttemptId::new("attempt-hook-repair");
         let repair_path = workspace_manager.worktree_path(&task_id, &repair_attempt);
         let repair_branch = workspace_manager.branch_name(&task_id, &repair_attempt);
         assert!(matches!(
             artifacts.materialize(&task_id, &repair_attempt, artifact.id()),
-            Err(ArtifactError::Workspace(_))
+            Err(ArtifactError::MaterializationRetained {
+                workspace_path,
+                branch,
+                ..
+            }) if workspace_path == repair_path && branch == repair_branch
         ));
-        assert!(
-            !repair_path.exists(),
-            "failed preparation removes new worktree"
+        assert!(repair_path.exists(), "failed preparation retains worktree");
+        assert_eq!(
+            fs::read_to_string(repair_path.join("hook-owned.txt")).unwrap(),
+            "hook version\n",
+            "hook-generated content remains available for recovery"
         );
         assert!(
-            !git_status(
+            git_status(
                 &repository,
                 &[
                     "show-ref",
@@ -870,15 +895,25 @@ mod tests {
                     &format!("refs/heads/{repair_branch}")
                 ]
             ),
-            "failed preparation removes its private branch"
+            "failed preparation retains its branch for recovery"
         );
 
+        git(
+            &repository,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                repair_path.to_str().unwrap(),
+            ],
+        );
+        git(&repository, &["branch", "-D", &repair_branch]);
         workspace_manager.cleanup_force(&source).unwrap();
         fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]
-    fn read_tree_failure_discards_new_worktree_and_branch() {
+    fn read_tree_failure_preserves_new_worktree_and_branch() {
         let repository = repository();
         let workspace_manager = WorkspaceManager::new(&repository).unwrap();
         let task_id = TaskId::new("task-unreadable-tree");
@@ -924,10 +959,14 @@ mod tests {
         let repair_branch = workspace_manager.branch_name(&task_id, &repair_attempt);
         assert!(matches!(
             artifacts.materialize(&task_id, &repair_attempt, artifact.id()),
-            Err(ArtifactError::Git(_))
+            Err(ArtifactError::MaterializationRetained {
+                workspace_path,
+                branch,
+                ..
+            }) if workspace_path == repair_path && branch == repair_branch
         ));
-        assert!(!repair_path.exists());
-        assert!(!git_status(
+        assert!(repair_path.exists(), "failed read-tree preserves worktree");
+        assert!(git_status(
             &repository,
             &[
                 "show-ref",
@@ -936,6 +975,16 @@ mod tests {
                 &format!("refs/heads/{repair_branch}")
             ]
         ));
+        git(
+            &repository,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                repair_path.to_str().unwrap(),
+            ],
+        );
+        git(&repository, &["branch", "-D", &repair_branch]);
 
         workspace_manager.cleanup_force(&source).unwrap();
         fs::remove_dir_all(repository).unwrap();
