@@ -134,7 +134,11 @@ def check_active_ruleset(
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Find the named active ruleset through a read-only API callback."""
     try:
-        rulesets = api(f"repos/{repository}/rulesets")
+        # The repository endpoint includes organization and enterprise rulesets
+        # by default. This check validates the repository-owned declaration.
+        rulesets = api(
+            f"repos/{repository}/rulesets?includes_parents=false&per_page=100"
+        )
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         return None, [f"GitHub Ruleset一覧を取得できません: {error}"]
     if not isinstance(rulesets, list):
@@ -163,14 +167,24 @@ def check_active_ruleset(
 
 
 def _gh_api(endpoint: str) -> Any:
+    command = ["gh", "api"]
+    if endpoint.endswith("/rulesets?includes_parents=false&per_page=100"):
+        # `--paginate` follows Link headers; `--slurp` keeps each page as JSON.
+        command.extend(["--paginate", "--slurp"])
+    command.append(endpoint)
     try:
         result = subprocess.run(
-            ["gh", "api", endpoint], check=True, capture_output=True, text=True
+            command, check=True, capture_output=True, text=True
         )
     except subprocess.CalledProcessError as error:
         diagnostic = (error.stderr or error.stdout or "").strip()
         raise RuntimeError(diagnostic or f"gh api exited with status {error.returncode}") from error
-    return json.loads(result.stdout)
+    response = json.loads(result.stdout)
+    if len(command) > 3 and isinstance(response, list):
+        # --slurp yields one array per page. Flatten pages for the caller.
+        if all(isinstance(page, list) for page in response):
+            return [item for page in response for item in page]
+    return response
 
 
 def main() -> int:

@@ -108,7 +108,7 @@ python3 scripts/pr_ruleset.py
 python3 scripts/pr_ruleset.py owner/repository
 ```
 
-検査はRuleset一覧から同名Rulesetを特定して詳細を取得し、active状態、`main`対象条件、全Required Check context、strict設定を比較します。`PASS`は一致、`FAIL` (終了status `1`)は宣言と有効設定の不一致、取得・認証・設定エラー (終了status `2`)は比較未完了を表します。不一致時は診断の`不足`と`余分`を確認し、宣言または管理者が行ったRuleset設定のどちらが意図と異なるかを修正して、同じ読み取り専用検査を再実行します。同期コマンドはrepository設定を変更するため、PR上の未mergeファイルから自動実行しません。
+検査はrepository自身のRuleset一覧（親organization / enterpriseから継承するRulesetを除外）を全ページ取得し、同名Rulesetを特定して詳細を取得します。active状態、`main`対象条件、全Required Check context、strict設定を比較します。`PASS`は一致、`FAIL` (終了status `1`)は宣言と有効設定の不一致、取得・認証・設定エラー (終了status `2`)は比較未完了を表します。不一致時は診断の`不足`と`余分`を確認し、宣言または管理者が行ったRuleset設定のどちらが意図と異なるかを修正して、同じ読み取り専用検査を再実行します。同期コマンドはrepository設定を変更するため、PR上の未mergeファイルから自動実行しません。
 
 ## 安全上の制約
 
@@ -121,6 +121,7 @@ python3 scripts/pr_ruleset.py owner/repository
 ## 参考資料
 
 - [Available rules for rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
+- [Rulesets REST API](https://docs.github.com/en/rest/repos/rules)
 - [Events that trigger workflows](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)
 - [Secure use reference](https://docs.github.com/en/actions/reference/security/secure-use)
 - [REST API endpoints for pull requests](https://docs.github.com/en/rest/pulls/pulls)

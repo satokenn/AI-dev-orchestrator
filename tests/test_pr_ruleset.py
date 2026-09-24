@@ -3,9 +3,10 @@ from __future__ import annotations
 import copy
 import json
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
-from scripts.pr_ruleset import check_active_ruleset, validate_ruleset
+from scripts.pr_ruleset import _gh_api, check_active_ruleset, validate_ruleset
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,7 +106,7 @@ class ActiveRulesetLookupTests(unittest.TestCase):
 
         def api(endpoint):
             calls.append(endpoint)
-            if endpoint == "repos/example/project/rulesets":
+            if endpoint == "repos/example/project/rulesets?includes_parents=false&per_page=100":
                 return [{"id": expected["id"], "name": expected["name"]}]
             if endpoint == f"repos/example/project/rulesets/{expected['id']}":
                 return expected
@@ -118,8 +119,47 @@ class ActiveRulesetLookupTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                "repos/example/project/rulesets",
+                "repos/example/project/rulesets?includes_parents=false&per_page=100",
                 f"repos/example/project/rulesets/{expected['id']}",
+            ],
+        )
+
+    def test_ruleset_on_later_page_is_found(self):
+        expected = actual_ruleset()
+        calls = []
+        first_page = [{"id": index, "name": f"other-{index}"} for index in range(100)]
+        second_page = [{"id": expected["id"], "name": expected["name"]}]
+
+        def api(endpoint):
+            calls.append(endpoint)
+            if endpoint.endswith("includes_parents=false&per_page=100"):
+                return first_page + second_page
+            if endpoint == f"repos/example/project/rulesets/{expected['id']}":
+                return expected
+            raise AssertionError(f"unexpected API endpoint: {endpoint}")
+
+        actual, errors = check_active_ruleset("example/project", DECLARED, api)
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(errors, [])
+
+    @patch("scripts.pr_ruleset.subprocess.run")
+    def test_list_api_follows_and_flattens_all_pages(self, run):
+        run.return_value.stdout = json.dumps([[{"id": 1}], [{"id": 2}]])
+
+        result = _gh_api(
+            "repos/example/project/rulesets?includes_parents=false&per_page=100"
+        )
+
+        self.assertEqual(result, [{"id": 1}, {"id": 2}])
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                "repos/example/project/rulesets?includes_parents=false&per_page=100",
             ],
         )
 
