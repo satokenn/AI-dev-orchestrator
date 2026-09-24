@@ -29,32 +29,18 @@ const DEFAULT_LEDGER: &str = ".ai-dev-orchestrator/ledger.sqlite3";
 
 struct LedgerRunLock {
     _file: File,
+    ledger_path: PathBuf,
 }
 
 impl LedgerRunLock {
     fn acquire(ledger_path: &Path) -> Result<Self, String> {
-        let parent = ledger_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "cannot create ledger directory {}: {error}",
-                parent.display()
-            )
-        })?;
-        let canonical_parent = parent.canonicalize().map_err(|error| {
-            format!(
-                "cannot resolve ledger directory {}: {error}",
-                parent.display()
-            )
-        })?;
-        let mut lock_name = ledger_path
+        let canonical_ledger = canonical_ledger_path(ledger_path)?;
+        let mut lock_name = canonical_ledger
             .file_name()
             .ok_or_else(|| "ledger path has no file name".to_owned())?
             .to_os_string();
         lock_name.push(".operations.lock");
-        let lock_path = canonical_parent.join(lock_name);
+        let lock_path = canonical_ledger.with_file_name(lock_name);
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -72,8 +58,68 @@ impl LedgerRunLock {
                 )
             }
         })?;
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            ledger_path: canonical_ledger,
+        })
     }
+}
+
+fn canonical_ledger_path(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "cannot create ledger directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        format!(
+            "cannot resolve ledger directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "ledger path has no file name".to_owned())?;
+    let unresolved = canonical_parent.join(file_name);
+    let canonical = match fs::symlink_metadata(&unresolved) {
+        Ok(_) => fs::canonicalize(&unresolved)
+            .map_err(|error| format!("cannot resolve ledger file {}: {error}", path.display()))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => unresolved,
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect ledger file {}: {error}",
+                path.display()
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match fs::metadata(&canonical) {
+            Ok(metadata) if metadata.nlink() > 1 => {
+                return Err(format!(
+                    "hard-linked ledger files are not supported: {}",
+                    canonical.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect ledger file {}: {error}",
+                    canonical.display()
+                ));
+            }
+        }
+    }
+
+    Ok(canonical)
 }
 
 fn open_ledger_for_run(path: &Path) -> Result<SqliteExecutionLedger, String> {
@@ -256,14 +302,15 @@ impl CliRuntime for ProductionRuntime {
                 return OPERATION_ERROR;
             }
         };
-        let ledger = match open_ledger_for_run(&request.ledger) {
+        let ledger_path = &_run_lock.ledger_path;
+        let ledger = match open_ledger_for_run(ledger_path) {
             Ok(ledger) => ledger,
             Err(error) => {
                 eprintln!("{error}");
                 return OPERATION_ERROR;
             }
         };
-        let operation_ledger = match open_operation_ledger_for_run(&request.ledger, &_run_lock) {
+        let operation_ledger = match open_operation_ledger_for_run(ledger_path, &_run_lock) {
             Ok(ledger) => ledger,
             Err(error) => {
                 eprintln!("{error}");
@@ -590,11 +637,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliRuntime, LedgerRunLock, ProductionRuntime, RunRequest, open_operation_ledger_for_run,
+        CliRuntime, LedgerRunLock, ProductionRuntime, RunRequest, canonical_ledger_path,
+        open_operation_ledger_for_run,
     };
     use crate::{
         EventKind, OperationLedger, OperationRequest, OperationStatus, ProviderRef,
-        SqliteOperationLedger, TaskId,
+        SqliteExecutionLedger, SqliteOperationLedger, TaskId,
     };
     use std::{
         fs,
@@ -682,6 +730,13 @@ mod tests {
         let ledger_path = std::path::PathBuf::from(std::env::var(CHILD_LEDGER).unwrap());
         let marker = std::path::PathBuf::from(std::env::var(CHILD_MARKER).unwrap());
         match mode.as_str() {
+            "lock" => match LedgerRunLock::acquire(&ledger_path) {
+                Err(error) if error.contains("ledger is busy") => {
+                    fs::write(marker, "busy").unwrap();
+                }
+                Err(error) => fs::write(marker, format!("error: {error}")).unwrap(),
+                Ok(_lock) => fs::write(marker, "acquired").unwrap(),
+            },
             "run" => {
                 let result = ProductionRuntime.run_issue(&RunRequest {
                     repository: "owner/repo".to_owned(),
@@ -729,6 +784,50 @@ mod tests {
             OperationStatus::RecoveryRequired
         );
         drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_uses_same_lock_and_operation_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_path("ledger-lock-symlink");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        SqliteExecutionLedger::open(&path).unwrap();
+        let id = seed_operation(&path, false);
+        let alias = root.join("ledger-alias.sqlite3");
+        symlink(&path, &alias).unwrap();
+
+        let canonical = canonical_ledger_path(&path).unwrap();
+        assert_eq!(canonical_ledger_path(&alias).unwrap(), canonical);
+        let lock = LedgerRunLock::acquire(&path).unwrap();
+        let marker = root.join("child-result");
+        let mut child = spawn_lock_child("lock", &alias, &marker);
+        assert_eq!(wait_for_marker(&mut child, &marker), "busy");
+        assert!(child.wait().unwrap().success());
+
+        let ledger = open_operation_ledger_for_run(&canonical, &lock).unwrap();
+        assert!(ledger.get_operation(&id).unwrap().is_some());
+        drop(ledger);
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_ledger_is_rejected_before_lock_or_recovery() {
+        let root = temporary_path("ledger-hard-link");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        let alias = root.join("ledger-alias.sqlite3");
+        SqliteExecutionLedger::open(&path).unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+
+        let error = canonical_ledger_path(&alias).unwrap_err();
+        assert!(error.contains("hard-linked ledger files are not supported"));
+        assert!(LedgerRunLock::acquire(&alias).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -809,15 +908,10 @@ mod tests {
                 operation.diagnostic().unwrap()
             );
         }
+        assert!(recovered.recover().unwrap().is_empty());
+        assert_eq!(recovered.events(&accepted_id).unwrap().len(), 2);
+        assert_eq!(recovered.events(&running_id).unwrap().len(), 3);
         drop(recovered);
-
-        // Reopening after recovery is idempotent and does not append another event.
-        drop(lock);
-        let lock = LedgerRunLock::acquire(&path).unwrap();
-        let reopened = open_operation_ledger_for_run(&path, &lock).unwrap();
-        assert_eq!(reopened.events(&accepted_id).unwrap().len(), 2);
-        assert_eq!(reopened.events(&running_id).unwrap().len(), 3);
-        drop(reopened);
         drop(lock);
         fs::remove_dir_all(root).unwrap();
     }
