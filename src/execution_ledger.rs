@@ -102,9 +102,9 @@ pub struct HistoricalPerformance {
     provider_call_failed: u64,
     provider_call_cancelled: u64,
     provider_call_pending: u64,
-    validation_passed: u64,
-    validation_failed: u64,
-    validation_observations: u64,
+    validation_passed: Option<u64>,
+    validation_failed: Option<u64>,
+    validation_observations: Option<u64>,
     unavailable: Vec<&'static str>,
 }
 
@@ -169,15 +169,15 @@ impl HistoricalPerformance {
         self.provider_call_pending
     }
     #[must_use]
-    pub const fn validation_passed(&self) -> u64 {
+    pub const fn validation_passed(&self) -> Option<u64> {
         self.validation_passed
     }
     #[must_use]
-    pub const fn validation_failed(&self) -> u64 {
+    pub const fn validation_failed(&self) -> Option<u64> {
         self.validation_failed
     }
     #[must_use]
-    pub const fn validation_observations(&self) -> u64 {
+    pub const fn validation_observations(&self) -> Option<u64> {
         self.validation_observations
     }
     #[must_use]
@@ -916,8 +916,10 @@ impl SqliteExecutionLedger {
                     }
                 }
             }
-            counts.validation_passed += validation_passed;
-            counts.validation_failed += validation_observations - validation_passed;
+            if semantics == "legacy_validation_coupled" {
+                counts.validation_passed += validation_passed;
+                counts.validation_failed += validation_observations - validation_passed;
+            }
         }
         let entries = groups
             .into_iter()
@@ -931,7 +933,12 @@ impl SqliteExecutionLedger {
                     unavailable.push(
                         "legacy Attempt terminal states do not represent Provider call outcomes",
                     );
+                } else {
+                    unavailable.push(
+                        "V2 Validation is Artifact-scoped but the Ledger stores no Artifact identity for it",
+                    );
                 }
+                let validation_available = target.semantics == "legacy_validation_coupled";
                 HistoricalPerformance {
                     target,
                     window,
@@ -940,9 +947,10 @@ impl SqliteExecutionLedger {
                     provider_call_failed: counts.failed,
                     provider_call_cancelled: counts.cancelled,
                     provider_call_pending: counts.pending,
-                    validation_passed: counts.validation_passed,
-                    validation_failed: counts.validation_failed,
-                    validation_observations: counts.validation_passed + counts.validation_failed,
+                    validation_passed: validation_available.then_some(counts.validation_passed),
+                    validation_failed: validation_available.then_some(counts.validation_failed),
+                    validation_observations: validation_available
+                        .then_some(counts.validation_passed + counts.validation_failed),
                     unavailable,
                 }
             })
@@ -1572,8 +1580,15 @@ mod tests {
             .unwrap();
         assert_eq!(observed.attempts(), 1);
         assert_eq!(observed.provider_call_succeeded(), 1);
-        assert_eq!(observed.validation_observations(), 1);
-        assert_eq!(observed.validation_passed(), 1);
+        assert_eq!(observed.validation_observations(), None);
+        assert_eq!(observed.validation_passed(), None);
+        assert_eq!(observed.validation_failed(), None);
+        assert!(
+            observed
+                .unavailable()
+                .iter()
+                .any(|reason| { reason.contains("V2 Validation is Artifact-scoped") })
+        );
         assert_eq!(
             observed.target().requested_model(),
             &PerformanceRequestedModel::Named("requested-a".into())
@@ -1608,6 +1623,8 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("legacy Attempt terminal states"))
         );
+        assert_eq!(legacy_entry.validation_observations(), Some(1));
+        assert_eq!(legacy_entry.validation_passed(), Some(1));
     }
 
     #[test]
