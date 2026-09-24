@@ -32,7 +32,8 @@ CLI が PATH にない場合は `ProviderError::Unavailable` になります。�
 `observe_model_catalog()` は `agy models` の候補 ID / 表示名を `ModelCatalogSource::ProviderCli`、
 コマンド名、取得時刻付きで返します。CLI出力は安定した機械形式ではないため、起動失敗、非0終了、
 timeout、不正UTF-8、切り詰め、未対応形式は固定コードの `unknown_reason` を持つ空の observation
-になります。診断にはCLIのstdout / stderrを含めません。
+になります。parser は `Fetching available models...` 行の有無を許容しますが、それ以外の前置きや
+不正なID / 表示名の行は受け入れません。診断にはCLIのstdout / stderrを含めません。
 列挙された ID はアカウントでの利用権や実行成功を保証しないため、この結果だけから Model
 availability を `available` にしてはいけません。
 

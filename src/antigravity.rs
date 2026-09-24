@@ -309,9 +309,12 @@ impl AntigravityProvider {
 }
 
 fn parse_model_catalog(output: &str) -> Option<Vec<ModelCatalogEntry>> {
-    let mut lines = output.lines();
-    if lines.next()?.trim_end_matches('\r') != "Fetching available models..." {
-        return None;
+    let mut lines = output.lines().peekable();
+    if lines
+        .peek()
+        .is_some_and(|line| line.trim_end_matches('\r') == "Fetching available models...")
+    {
+        lines.next();
     }
     let mut entries = Vec::new();
     for line in lines {
@@ -496,13 +499,15 @@ mod tests {
 
     #[test]
     fn parses_observed_model_catalog_fixture() {
-        let entries = parse_model_catalog(
+        for fixture in [
             "Fetching available models...\nclaude-sonnet-4\tClaude Sonnet 4\ngemini-2.5-pro\tGemini 2.5 Pro\n",
-        )
-        .expect("fixture format");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].id, "claude-sonnet-4");
-        assert_eq!(entries[0].label, "Claude Sonnet 4");
+            "claude-sonnet-4\tClaude Sonnet 4\ngemini-2.5-pro\tGemini 2.5 Pro\n",
+        ] {
+            let entries = parse_model_catalog(fixture).expect("fixture format");
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].id, "claude-sonnet-4");
+            assert_eq!(entries[0].label, "Claude Sonnet 4");
+        }
         assert_eq!(
             ModelCatalogSource::ProviderCli,
             ModelCatalogObservation::unknown("test").source
