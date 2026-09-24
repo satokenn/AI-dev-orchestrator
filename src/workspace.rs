@@ -68,6 +68,9 @@ pub enum WorkspaceError {
         path: PathBuf,
         reason: String,
     },
+    InvalidBaseCommit {
+        value: String,
+    },
     Io {
         operation: String,
         path: PathBuf,
@@ -86,6 +89,9 @@ pub enum WorkspaceError {
     WorkspaceNotManaged {
         path: PathBuf,
     },
+    ProviderWorkspaceNotFresh {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for WorkspaceError {
@@ -97,6 +103,9 @@ impl fmt::Display for WorkspaceError {
                     "invalid repository path '{}': {reason}",
                     path.display()
                 )
+            }
+            Self::InvalidBaseCommit { value } => {
+                write!(formatter, "invalid full base commit object ID: {value}")
             }
             Self::Io {
                 operation,
@@ -134,6 +143,11 @@ impl fmt::Display for WorkspaceError {
                     path.display()
                 )
             }
+            Self::ProviderWorkspaceNotFresh { path } => write!(
+                formatter,
+                "provider workspace is not clean at the requested base commit: {}",
+                path.display()
+            ),
         }
     }
 }
@@ -291,6 +305,51 @@ impl WorkspaceManager {
 
     /// Creates a new branch and worktree for one attempt.
     pub fn create(&self, task: &TaskId, attempt: &AttemptId) -> Result<Workspace, WorkspaceError> {
+        self.create_at_revision(task, attempt, None)
+    }
+
+    /// Creates a new worktree pinned to a complete commit object ID.
+    pub fn create_at_base(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        commit_oid: &str,
+    ) -> Result<Workspace, WorkspaceError> {
+        self.verify_base_commit(commit_oid)?;
+        self.create_at_revision(task, attempt, Some(commit_oid))
+    }
+
+    pub fn verify_base_commit(&self, commit_oid: &str) -> Result<(), WorkspaceError> {
+        if !matches!(commit_oid.len(), 40 | 64)
+            || !commit_oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(WorkspaceError::InvalidBaseCommit {
+                value: commit_oid.to_owned(),
+            });
+        }
+        let expression = format!("{commit_oid}^{{commit}}");
+        let resolved = self
+            .run_git(
+                "verify base commit",
+                &["rev-parse", "--verify", "--end-of-options", &expression],
+            )
+            .map_err(|_| WorkspaceError::InvalidBaseCommit {
+                value: commit_oid.to_owned(),
+            })?;
+        if String::from_utf8_lossy(&resolved.stdout).trim() != commit_oid {
+            return Err(WorkspaceError::InvalidBaseCommit {
+                value: commit_oid.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn create_at_revision(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        revision: Option<&str>,
+    ) -> Result<Workspace, WorkspaceError> {
         let branch = self.branch_name(task, attempt);
         let path = self.worktree_path(task, attempt);
         if fs::symlink_metadata(&path).is_ok() {
@@ -307,13 +366,16 @@ impl WorkspaceManager {
             },
         )?;
         let path_string = path.to_string_lossy().into_owned();
-        let args = [
+        let mut args = vec![
             "worktree",
             "add",
             "-b",
             branch.as_str(),
             path_string.as_str(),
         ];
+        if let Some(revision) = revision {
+            args.push(revision);
+        }
         if let Err(error) = self.run_git("create worktree", &args) {
             return Err(classify_creation_error(error, &branch, &path));
         }
@@ -381,6 +443,43 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// Checks the managed worktree matches the requested base and has no local changes,
+    /// untracked files, or ignored content.
+    /// This is intended for the first Provider call, before the agent can modify the workspace.
+    pub fn validate_provider_workspace_at_base(
+        &self,
+        path: impl AsRef<Path>,
+        expected_base: &str,
+    ) -> Result<(), WorkspaceError> {
+        self.validate_provider_workspace(path.as_ref())?;
+        let path =
+            fs::canonicalize(path.as_ref()).map_err(|_| WorkspaceError::WorkspaceNotManaged {
+                path: path.as_ref().to_owned(),
+            })?;
+        let head = self.run_git_at(
+            &path,
+            "verify Provider workspace base",
+            &["rev-parse", "--verify", "HEAD"],
+        )?;
+        if String::from_utf8_lossy(&head.stdout).trim() != expected_base {
+            return Err(WorkspaceError::ProviderWorkspaceNotFresh { path });
+        }
+        let status = self.run_git_at(
+            &path,
+            "verify Provider workspace is clean",
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+        )?;
+        if !status.stdout.is_empty() {
+            return Err(WorkspaceError::ProviderWorkspaceNotFresh { path });
+        }
+        Ok(())
+    }
+
     /// Alias emphasizing that this check is a precondition for Provider use.
     pub fn ensure_provider_workspace(&self, path: impl AsRef<Path>) -> Result<(), WorkspaceError> {
         self.validate_provider_workspace(path)
@@ -443,6 +542,21 @@ impl WorkspaceManager {
                 ProcessRequest::new("git")
                     .args(args.iter().copied())
                     .cwd(&self.repository_root),
+            )
+            .map_err(|error| git_error(operation, args.iter().copied(), error))
+    }
+
+    fn run_git_at(
+        &self,
+        cwd: &Path,
+        operation: &str,
+        args: &[&str],
+    ) -> Result<crate::ProcessOutput, WorkspaceError> {
+        self.runner
+            .run(
+                ProcessRequest::new("git")
+                    .args(args.iter().copied())
+                    .cwd(cwd),
             )
             .map_err(|error| git_error(operation, args.iter().copied(), error))
     }
