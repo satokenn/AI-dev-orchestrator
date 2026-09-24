@@ -14,6 +14,8 @@ Rust workspace の作成後は、次のコマンドを Pull Request の必須検
 | lint | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | rustc と Clippy の warning がなく、終了コードが 0 になる |
 | test | `cargo test --workspace --all-features` | 対象となる Unit / Integration / Doc Test が全て成功する |
 
+Pull Requestでは、この3検証をGitHub Actionsの`Format`、`Clippy`、`Test` checkとして実行し、`PR Policy`とともに`main` RulesetのRequired Checkにする。いずれかが失敗、未報告、または未完了ならマージできない。Ruleset宣言は[main-pr-policy.json](../.github/rulesets/main-pr-policy.json)を参照し、GitHub上の有効設定との一致は[Ruleset確認手順](pr-policy.md#required-checkの同期と確認)で検査する。
+
 `cargo build` は初期の独立した必須項目にはしません。Clippy とテストでもコンパイルを行うためです。リリース成果物固有のbuild検証が必要になった場合は、対象とコマンドを後続Issueで追加します。
 
 ## formatter

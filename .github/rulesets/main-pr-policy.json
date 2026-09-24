@@ -20,6 +20,15 @@
         "required_status_checks": [
           {
             "context": "PR Policy"
+          },
+          {
+            "context": "Format"
+          },
+          {
+            "context": "Clippy"
+          },
+          {
+            "context": "Test"
           }
         ]
       }
