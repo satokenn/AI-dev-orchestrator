@@ -401,6 +401,24 @@ impl WorkspaceManager {
                     path: workspace.path.clone(),
                 });
             }
+        } else {
+            // Supervisor-owned edits have no source Attempt, but the workspace
+            // still belongs to exactly one Task. Check both deterministic
+            // components so a managed worktree cannot be relabeled as another
+            // Task's artifact.
+            let task_component = branch_component(task.as_str());
+            let expected_parent = self.worktree_root.join(&task_component);
+            let attempt_component = workspace.path.file_name().and_then(|name| name.to_str());
+            let expected_branch_prefix = format!("orchestrator/task/{task_component}/attempt/");
+            let expected_branch =
+                attempt_component.map(|attempt| format!("{expected_branch_prefix}{attempt}"));
+            if workspace.path.parent() != Some(expected_parent.as_path())
+                || expected_branch.as_deref() != Some(workspace.branch.as_str())
+            {
+                return Err(WorkspaceError::WorkspaceNotManaged {
+                    path: workspace.path.clone(),
+                });
+            }
         }
         Ok(())
     }

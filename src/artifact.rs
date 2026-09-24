@@ -580,6 +580,43 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_artifact_requires_workspace_task_identity() {
+        let repository = repository();
+        let workspace_manager = WorkspaceManager::new(&repository).unwrap();
+        let workspace_task = TaskId::new("task-a");
+        let other_task = TaskId::new("task-b");
+        let attempt_id = AttemptId::new("attempt-a");
+        let workspace = workspace_manager
+            .create(&workspace_task, &attempt_id)
+            .unwrap();
+        fs::write(workspace.path().join("source.txt"), "supervisor edit\n").unwrap();
+        let base = git(workspace.path(), &["rev-parse", "HEAD"]);
+        let ledger = SqliteOperationLedger::open_in_memory().unwrap();
+        let artifacts = ArtifactManager::new(&workspace_manager, &ledger);
+
+        assert!(matches!(
+            artifacts.capture(&workspace, &other_task, None, None, Some(&base)),
+            Err(ArtifactError::Workspace(_))
+        ));
+
+        let artifact = artifacts
+            .capture(&workspace, &workspace_task, None, None, Some(&base))
+            .unwrap();
+        assert_eq!(artifact.task_id(), &workspace_task);
+        assert_eq!(artifact.source_attempt_id(), None);
+        assert_eq!(
+            git(
+                workspace.path(),
+                &["show", &format!("{}:source.txt", artifact.tree_oid())]
+            ),
+            "supervisor edit"
+        );
+
+        workspace_manager.cleanup_force(&workspace).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
     fn readback_recovers_database_ref_intermediate_states() {
         let repository = repository();
         let workspace_manager = WorkspaceManager::new(&repository).unwrap();
