@@ -4,7 +4,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     path::Path,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::Value;
@@ -17,6 +17,37 @@ use crate::{
 
 const DEFAULT_EXECUTABLE: &str = "agy";
 const PROVIDER_NAME: &str = "antigravity";
+const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One model identifier printed by `agy models`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelCatalogEntry {
+    pub id: String,
+    pub label: String,
+}
+
+/// A point-in-time listing from the Provider CLI. This is not an entitlement or
+/// execution guarantee; callers must keep model availability unknown.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelCatalogObservation {
+    pub entries: Vec<ModelCatalogEntry>,
+    pub unknown_reason: Option<String>,
+    pub source: &'static str,
+    pub reference: &'static str,
+    pub observed_at_ms: i64,
+}
+
+impl ModelCatalogObservation {
+    fn unknown(reason: impl Into<String>) -> Self {
+        Self {
+            entries: Vec::new(),
+            unknown_reason: Some(reason.into()),
+            source: "ProviderCli",
+            reference: "agy models",
+            observed_at_ms: now_ms(),
+        }
+    }
+}
 
 /// Provider for the official Antigravity CLI (`agy`).
 #[derive(Clone, Debug)]
@@ -72,6 +103,44 @@ impl AntigravityProvider {
                 )),
                 other => ProviderError::Unavailable(process_error_message(other)),
             })
+    }
+
+    /// Lists candidate model IDs reported by `agy models`.
+    ///
+    /// The CLI's human-readable output is not a stable machine contract. Any
+    /// unfamiliar, incomplete, or ambiguous output therefore produces an
+    /// unknown observation. A listed ID does not prove account entitlement or
+    /// successful execution.
+    pub fn observe_model_catalog(&self) -> ModelCatalogObservation {
+        let result = self.runner.run(
+            ProcessRequest::new(self.executable.clone())
+                .arg("models")
+                .timeout(MODEL_LIST_TIMEOUT),
+        );
+        let output = match result {
+            Ok(output) if !output.output_truncated => output,
+            Ok(_) => return ModelCatalogObservation::unknown("agy models output was truncated"),
+            Err(ProcessError::TimedOut(_)) => {
+                return ModelCatalogObservation::unknown("agy models timed out");
+            }
+            Err(error) => {
+                return ModelCatalogObservation::unknown(format!("agy models failed: {error:?}"));
+            }
+        };
+        let text = match String::from_utf8(output.stdout) {
+            Ok(text) => text,
+            Err(_) => return ModelCatalogObservation::unknown("agy models output was not UTF-8"),
+        };
+        match parse_model_catalog(&text) {
+            Some(entries) => ModelCatalogObservation {
+                entries,
+                unknown_reason: None,
+                source: "ProviderCli",
+                reference: "agy models",
+                observed_at_ms: now_ms(),
+            },
+            None => ModelCatalogObservation::unknown("agy models output was empty or ambiguous"),
+        }
     }
 
     /// Executes Antigravity while observing a caller-owned cancellation token.
@@ -220,6 +289,44 @@ impl AntigravityProvider {
     }
 }
 
+fn parse_model_catalog(output: &str) -> Option<Vec<ModelCatalogEntry>> {
+    let mut lines = output.lines();
+    if lines.next()?.trim_end_matches('\r') != "Fetching available models..." {
+        return None;
+    }
+    let mut entries = Vec::new();
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let (id, label) = line.split_once('\t')?;
+        if id.is_empty()
+            || label.trim().is_empty()
+            || id.chars().any(char::is_whitespace)
+            || label.contains('\t')
+            || entries
+                .iter()
+                .any(|entry: &ModelCatalogEntry| entry.id == id)
+        {
+            return None;
+        }
+        entries.push(ModelCatalogEntry {
+            id: id.to_owned(),
+            label: label.trim().to_owned(),
+        });
+    }
+    (!entries.is_empty()).then_some(entries)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 impl AgentProvider for AntigravityProvider {
     fn provider_ref(&self) -> &ProviderRef {
         &self.provider_ref
@@ -359,5 +466,52 @@ mod tests {
             "model failed",
             "permission denied"
         ));
+    }
+
+    #[test]
+    fn parses_observed_model_catalog_fixture() {
+        let entries = parse_model_catalog(
+            "Fetching available models...\nclaude-sonnet-4\tClaude Sonnet 4\ngemini-2.5-pro\tGemini 2.5 Pro\n",
+        )
+        .expect("fixture format");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "claude-sonnet-4");
+        assert_eq!(entries[0].label, "Claude Sonnet 4");
+    }
+
+    #[test]
+    fn rejects_empty_duplicate_and_ambiguous_catalogs() {
+        for output in [
+            "",
+            "Fetching available models...\n",
+            "Fetching available models...\nmodel-without-label\n",
+            "Fetching available models...\nmodel\tLabel\textra\n",
+            "Fetching available models...\nmodel\tFirst\nmodel\tDuplicate\n",
+            "Unexpected output\nmodel\tLabel\n",
+        ] {
+            assert!(parse_model_catalog(output).is_none(), "accepted {output:?}");
+        }
+    }
+
+    #[test]
+    fn failed_and_timed_out_catalog_commands_are_unknown() {
+        for script in ["#!/bin/sh\nexit 7\n", "#!/bin/sh\nsleep 20\n"] {
+            let path = std::env::temp_dir().join(format!(
+                "agy-models-fixture-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            std::fs::write(&path, script).expect("write fixture");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("make executable");
+            }
+            let observation = AntigravityProvider::with_executable(&path).observe_model_catalog();
+            assert!(observation.entries.is_empty());
+            assert!(observation.unknown_reason.is_some());
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

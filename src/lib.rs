@@ -18,7 +18,7 @@ mod retry;
 mod validator;
 mod workspace;
 
-pub use antigravity::AntigravityProvider;
+pub use antigravity::{AntigravityProvider, ModelCatalogEntry, ModelCatalogObservation};
 pub use codex_provider::CodexProvider;
 pub use copilot_provider::CopilotProvider;
 pub use domain::{

@@ -8,6 +8,12 @@
 存在しない。この文書も、特定の Model が利用可能または安価だとは定めない。後述の Provider名、
 Model名、利用量、金額は、データ形式を説明するための架空の値である。
 
+Antigravity CLI の `agy models` が出力する ID は、Provider CLI が列挙した候補として記録できる。
+これは snapshot 時点の候補一覧に限られ、アカウント entitlement、認証状態、実行成功を証明しない。
+したがって、この一覧だけを根拠に Model availability を `available` としてはならず、availability は
+別の根拠がなければ `unknown` のままにする。CLI の出力形式は安定した機械可読契約ではないため、
+取得失敗、timeout、切り詰め、空または解釈できない出力は候補を捏造せず unknown として扱う。
+
 > [!IMPORTANT]
 > この文書は後続実装のための仕様である。この文書を追加するだけでは実行時の動作は変わらない。
 
