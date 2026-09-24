@@ -1,7 +1,8 @@
 //! Application service for one Task / Attempt execution.
 
-use std::{fmt, path::Path, time::Duration};
+use std::{fmt, path::Path, sync::Arc, time::Duration};
 
+use crate::operation_ledger::{ExecutionLedger, OperationId, OperationRequest, OperationStatus};
 use crate::{
     AgentProvider, Attempt, AttemptId, DomainError, ExecutionPolicy, PlannerDecision, PolicyError,
     ProviderError, ProviderRequest, ProviderResolutionError, ProviderResolver, ProviderResult,
@@ -92,6 +93,7 @@ pub enum OrchestratorError {
     UnknownProvider(ProviderResolutionError),
     RetryNotAllowed,
     Policy(PolicyError),
+    Ledger(crate::operation_ledger::LedgerError),
 }
 
 impl OrchestratorError {
@@ -105,7 +107,8 @@ impl OrchestratorError {
             Self::MaxAttempts { .. }
             | Self::UnknownProvider(_)
             | Self::RetryNotAllowed
-            | Self::Policy(_) => None,
+            | Self::Policy(_)
+            | Self::Ledger(_) => None,
         }
     }
 
@@ -120,7 +123,8 @@ impl OrchestratorError {
             Self::MaxAttempts { .. }
             | Self::UnknownProvider(_)
             | Self::RetryNotAllowed
-            | Self::Policy(_) => None,
+            | Self::Policy(_)
+            | Self::Ledger(_) => None,
         }
     }
 
@@ -150,6 +154,7 @@ impl fmt::Display for OrchestratorError {
             Self::UnknownProvider(error) => error.fmt(formatter),
             Self::RetryNotAllowed => formatter.write_str("retry is not allowed by policy"),
             Self::Policy(error) => write!(formatter, "execution policy rejected request: {error}"),
+            Self::Ledger(error) => write!(formatter, "operation ledger failed: {error}"),
         }
     }
 }
@@ -163,16 +168,17 @@ impl std::error::Error for OrchestratorError {
             Self::Validator { error, .. } => Some(error),
             Self::MaxAttempts { .. } | Self::UnknownProvider(_) | Self::RetryNotAllowed => None,
             Self::Policy(error) => Some(error),
+            Self::Ledger(error) => Some(error),
         }
     }
 }
 
 /// Coordinates one Provider execution followed by one aggregate validation.
-#[derive(Debug)]
 pub struct Orchestrator<W, P, V> {
     workspace_manager: W,
     provider: P,
     validator: V,
+    operation_ledger: Option<Arc<dyn ExecutionLedger + Send + Sync>>,
 }
 
 impl<W, P, V> Orchestrator<W, P, V>
@@ -187,7 +193,13 @@ where
             workspace_manager,
             provider,
             validator,
+            operation_ledger: None,
         }
+    }
+
+    pub fn with_operation_ledger(mut self, ledger: Arc<dyn ExecutionLedger + Send + Sync>) -> Self {
+        self.operation_ledger = Some(ledger);
+        self
     }
 
     /// Executes one Attempt using the Task description as the Provider prompt.
@@ -230,6 +242,27 @@ where
             .start()
             .map_err(OrchestratorError::Domain)?;
 
+        let operation_id = if let Some(ledger) = &self.operation_ledger {
+            let request = OperationRequest::new(
+                format!("attempt:{}", attempt_id.as_str()),
+                task.id().clone(),
+                task.attempts().len() as u64,
+                task.description(),
+                task.description(),
+                provider.provider_ref().clone(),
+                None,
+            );
+            let operation = ledger
+                .accept_operation(&request)
+                .map_err(OrchestratorError::Ledger)?;
+            ledger
+                .start_operation(operation.id(), provider.provider_ref(), None)
+                .map_err(OrchestratorError::Ledger)?;
+            Some(operation.id().clone())
+        } else {
+            None
+        };
+
         let workspace = match self.workspace_manager.create_for_task_attempt(
             task,
             task.attempt(&attempt_id)
@@ -241,6 +274,12 @@ where
                     task,
                     &attempt_id,
                     crate::AttemptFailureReason::Workspace,
+                )?;
+                finish_operation(
+                    self.operation_ledger.as_deref(),
+                    operation_id.as_ref(),
+                    OperationStatus::Failed,
+                    Some(&error.to_string()),
                 )?;
                 return Err(OrchestratorError::Workspace {
                     error: Box::new(error),
@@ -254,6 +293,12 @@ where
             .validate_provider_workspace(workspace.path())
         {
             fail_attempt_with_reason(task, &attempt_id, crate::AttemptFailureReason::Workspace)?;
+            finish_operation(
+                self.operation_ledger.as_deref(),
+                operation_id.as_ref(),
+                OperationStatus::Failed,
+                Some(&error.to_string()),
+            )?;
             return Err(OrchestratorError::Workspace {
                 error: Box::new(error),
                 attempt: Box::new(attempt_snapshot(task, &attempt_id)),
@@ -266,6 +311,12 @@ where
             Ok(result) => result,
             Err(error) => {
                 fail_attempt_with_provider_error(task, &attempt_id, &error)?;
+                finish_operation(
+                    self.operation_ledger.as_deref(),
+                    operation_id.as_ref(),
+                    provider_error_status(&error),
+                    Some(&error.to_string()),
+                )?;
                 return Err(OrchestratorError::Provider {
                     error,
                     attempt: Box::new(attempt_snapshot(task, &attempt_id)),
@@ -297,6 +348,12 @@ where
                     &attempt_id,
                     crate::AttemptFailureReason::Validation,
                 )?;
+                finish_operation(
+                    self.operation_ledger.as_deref(),
+                    operation_id.as_ref(),
+                    OperationStatus::Failed,
+                    Some(&error.to_string()),
+                )?;
                 return Err(OrchestratorError::Validator {
                     error,
                     attempt: Box::new(attempt_snapshot(task, &attempt_id)),
@@ -308,6 +365,16 @@ where
             .expect("newly added attempt must be owned by its task")
             .apply_validation(validation_result.clone())
             .map_err(OrchestratorError::Domain)?;
+        finish_operation(
+            self.operation_ledger.as_deref(),
+            operation_id.as_ref(),
+            if validation_result.passed() {
+                OperationStatus::Succeeded
+            } else {
+                OperationStatus::InvalidOutput
+            },
+            Some(validation_result.summary()),
+        )?;
 
         Ok(OrchestrationReport {
             attempt: attempt_snapshot(task, &attempt_id),
@@ -604,4 +671,31 @@ fn fail_attempt_with_provider_error(
             .fail_with_reason(crate::AttemptFailureReason::Provider)
             .map_err(OrchestratorError::Domain)
     }
+}
+
+fn provider_error_status(error: &ProviderError) -> OperationStatus {
+    match error {
+        ProviderError::Cancelled | ProviderError::CancelledWithOutput { .. } => {
+            OperationStatus::Cancelled
+        }
+        ProviderError::TimedOut { .. } | ProviderError::TimedOutWithOutput { .. } => {
+            OperationStatus::TimedOut
+        }
+        ProviderError::Interrupted { .. } => OperationStatus::Interrupted,
+        _ => OperationStatus::Failed,
+    }
+}
+
+fn finish_operation(
+    ledger: Option<&(dyn ExecutionLedger + Send + Sync)>,
+    operation_id: Option<&OperationId>,
+    status: OperationStatus,
+    diagnostic: Option<&str>,
+) -> Result<(), OrchestratorError> {
+    if let (Some(ledger), Some(operation_id)) = (ledger, operation_id) {
+        ledger
+            .finish_operation(operation_id, status, diagnostic)
+            .map_err(OrchestratorError::Ledger)?;
+    }
+    Ok(())
 }

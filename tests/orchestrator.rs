@@ -1,7 +1,7 @@
 use ai_dev_orchestrator::{
-    AgentProvider, AgentResult, AttemptId, Orchestrator, OrchestratorError, ProviderError,
-    ProviderRef, ProviderRequest, ProviderResult, Task, TaskId, TaskRole, UsageCost,
-    ValidationResult, Validator, ValidatorError, WorkspaceManager,
+    AgentProvider, AgentResult, AttemptId, OperationLedger, Orchestrator, OrchestratorError,
+    ProviderError, ProviderRef, ProviderRequest, ProviderResult, SqliteOperationLedger, Task,
+    TaskId, TaskRole, UsageCost, ValidationResult, Validator, ValidatorError, WorkspaceManager,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -116,7 +116,9 @@ fn successful_attempt_records_agent_result_and_validation_once() {
         calls: validator_calls.clone(),
         result: Ok(ValidationResult::new("checks passed", true)),
     };
-    let service = Orchestrator::new(manager.clone(), provider, validator);
+    let operation_ledger = Arc::new(SqliteOperationLedger::open_in_memory().unwrap());
+    let service = Orchestrator::new(manager.clone(), provider, validator)
+        .with_operation_ledger(operation_ledger.clone());
     let mut task = task();
 
     let report = service
@@ -149,6 +151,26 @@ fn successful_attempt_records_agent_result_and_validation_once() {
         report.workspace().path()
     );
     assert!(report.workspace().path().exists());
+    let operation = operation_ledger
+        .accept_operation(&ai_dev_orchestrator::OperationRequest::new(
+            "attempt:attempt-1",
+            task.id().clone(),
+            1,
+            task.description(),
+            task.description(),
+            ProviderRef::new("fake-provider"),
+            None,
+        ))
+        .expect("operation is persisted");
+    assert_eq!(
+        operation_ledger
+            .get_operation(operation.id())
+            .unwrap()
+            .unwrap()
+            .status(),
+        ai_dev_orchestrator::OperationStatus::Succeeded
+    );
+    assert_eq!(operation_ledger.events(operation.id()).unwrap().len(), 3);
     manager
         .cleanup(report.workspace())
         .expect("clean workspace");

@@ -2,6 +2,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -10,8 +11,9 @@ use crate::{
     CopilotProvider, ExecutionPolicy, GhIssueSource, GhPullRequestGateway, GhRepositoryEffects,
     GitHubWorkflow, IssueExecutor, IssueRef, IssueSnapshot, IssueSource, Orchestrator,
     PlannerRequest, PlannerService, ProviderAvailability, ProviderRef, ProviderRegistry,
-    ProviderResolver, PublicationRecord, PublishResult, RustValidator, SqliteExecutionLedger, Task,
-    TaskId, TaskRole, ValidationResult, WorkflowError, WorkspaceManager, prepare_issue_publication,
+    ProviderResolver, PublicationRecord, PublishResult, RustValidator, SqliteExecutionLedger,
+    SqliteOperationLedger, Task, TaskId, TaskRole, ValidationResult, WorkflowError,
+    WorkspaceManager, prepare_issue_publication,
 };
 
 pub const SUCCESS: i32 = 0;
@@ -113,6 +115,7 @@ pub struct ProductionRuntime;
 struct ProductionIssueExecutor {
     root: PathBuf,
     ledger: SqliteExecutionLedger,
+    operation_ledger: Arc<SqliteOperationLedger>,
 }
 impl IssueExecutor for ProductionIssueExecutor {
     fn execute_issue(
@@ -148,7 +151,8 @@ impl IssueExecutor for ProductionIssueExecutor {
             .map_err(|e| WorkflowError::Validation(e.to_string()))?;
         let manager = WorkspaceManager::new(&self.root)
             .map_err(|e| WorkflowError::Repository(e.to_string()))?;
-        let orchestrator = Orchestrator::new(manager, registry, RustValidator::new());
+        let orchestrator = Orchestrator::new(manager, registry, RustValidator::new())
+            .with_operation_ledger(self.operation_ledger.clone());
         let report = orchestrator
             .execute_validated_decision_with_policy(
                 task,
@@ -229,9 +233,17 @@ impl CliRuntime for ProductionRuntime {
                 };
             }
         }
+        let operation_ledger = match SqliteOperationLedger::open(&request.ledger) {
+            Ok(ledger) => Arc::new(ledger),
+            Err(error) => {
+                eprintln!("cannot open operation ledger: {error}");
+                return OPERATION_ERROR;
+            }
+        };
         let executor = ProductionIssueExecutor {
             root: request.repository_root.clone(),
             ledger,
+            operation_ledger,
         };
         let issue = IssueRef::new(&request.repository, request.issue);
         let branch = format!("ai-dev/issue-{}", request.issue);

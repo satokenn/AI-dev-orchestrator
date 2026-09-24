@@ -37,6 +37,10 @@ Agent 実行先の違いは `AgentProvider` に閉じ込めます。実装は `P
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
+## Operation Ledger
+
+`Orchestrator` は、設定された `SqliteOperationLedger` に外部 Provider の起動前の受理・開始を記録し、workspace 準備、Provider実行、validation の結果を終了状態として保存します。CLI は指定された実行Ledgerのサイドカーへ自動的にOperation Ledgerを保存します。`SqliteOperationLedger` は同じ request ID の再送を同じ operation として返し、異なる payload、古い Task revision、同一 Task の実行中操作を拒否します。終了事実、event、validation、review、usage / budget、publication 参照、上限付き raw log、再起動時の `recovery_required` 診断を保存します。
+
 ## WorkspaceManager
 
 `WorkspaceManager` は Git リポジトリの root を解決し、リポジトリ外の管理ディレクトリに Task / Attempt ごとの専用 branch と Git worktree を作成します。Provider を実行する前に `validate_provider_workspace`（または `ensure_provider_workspace`）で実行先を検証してください。main の working tree や、Manager が作成していないパスは拒否されます。

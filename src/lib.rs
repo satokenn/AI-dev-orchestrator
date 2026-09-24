@@ -9,6 +9,7 @@ mod copilot_provider;
 mod domain;
 mod execution_ledger;
 mod github_workflow;
+mod operation_ledger;
 mod orchestrator;
 mod planner;
 mod process_runner;
@@ -32,6 +33,12 @@ pub use github_workflow::{
     PublicationPhase, PublicationRecord, PublishResult, PullRequestGateway, PullRequestPayload,
     PushRequest, RepositoryEffects, ValidatedPublication, WorkflowError, issue_to_task,
     prepare_issue_publication,
+};
+pub use operation_ledger::{
+    EventKind, ExecutionLedger as OperationLedger, LedgerError as OperationLedgerError,
+    LogReference, OperationEvent, OperationId, OperationRecord, OperationRequest, OperationStatus,
+    PublicationReference, RecoveryRecord, ReviewRecord,
+    SqliteExecutionLedger as SqliteOperationLedger, UsageRecord, ValidationRecord,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,
