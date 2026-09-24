@@ -545,7 +545,6 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if task.attempts().len() >= self.max_attempts {
             return Err(ServiceError::PolicyDenied("maximum attempts reached"));
         }
-        self.check_execution_count_budget(&transaction, &request.task_id)?;
         let busy: Option<String> = transaction.query_row(
             "SELECT id FROM service_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
             params![request.task_id.as_str()], |row| row.get(0),
@@ -553,6 +552,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if let Some(id) = busy {
             return Err(ServiceError::Busy(OperationId::new(id)));
         }
+        self.check_execution_count_budget(&transaction, &request.task_id)?;
 
         if task.state() == TaskState::Pending {
             task.start()?;
@@ -906,7 +906,22 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if status != "accepted" {
             return Ok(false);
         }
-        self.check_execution_count_budget(&tx, &TaskId::new(task_id.clone()))?;
+        match self.check_execution_count_budget(&tx, &TaskId::new(task_id.clone())) {
+            Ok(()) => {}
+            Err(error @ ServiceError::BudgetExhausted { .. }) => {
+                let changed = tx.execute(
+                    "UPDATE service_operations SET status='failed',finished_at=?2,diagnostic_code='budget_exhausted' WHERE id=?1 AND status='accepted'",
+                    params![operation_id.as_str(), now_ms()],
+                )?;
+                if changed != 1 {
+                    return Err(ServiceError::InvalidStoredState);
+                }
+                bump_revision(&tx, &TaskId::new(task_id))?;
+                tx.commit()?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
         let started = now_ms();
         let changed=tx.execute("UPDATE service_operations SET status='running',started_at=?2 WHERE id=?1 AND status='accepted'",params![operation_id.as_str(),started])?;
         if changed != 1 {
@@ -1512,6 +1527,69 @@ mod tests {
     }
 
     #[test]
+    fn budget_exhaustion_at_claim_ends_accepted_operation_and_releases_task() {
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(false, Duration::ZERO, false);
+        let unrestricted =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let first = unrestricted
+            .submit_attempt(&request(&repo, &task_id, 0, "budget-reconfigure-a"))
+            .unwrap();
+        let first_result = unrestricted
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(first_result.status(), ServiceOperationStatus::Completed);
+
+        let revision: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let second = unrestricted
+            .submit_attempt(&request(
+                &repo,
+                &task_id,
+                revision as u64,
+                "budget-reconfigure-b",
+            ))
+            .unwrap();
+        let limited =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_execution_count_budget(Some(TaskExecutionCountBudget::new(
+                    std::num::NonZeroU64::new(1).unwrap(),
+                )));
+
+        assert!(matches!(
+            limited.submit_attempt(&request(
+                &repo,
+                &task_id,
+                second.revision(),
+                "budget-reconfigure-c"
+            )),
+            Err(ServiceError::Busy(active)) if active == *second.operation_id()
+        ));
+        assert!(matches!(
+            limited.run(second.operation_id(), CancellationToken::new()),
+            Err(ServiceError::BudgetExhausted { limit: 1 })
+        ));
+        let rejected = limited.get_operation(second.operation_id()).unwrap();
+        assert_eq!(rejected.status(), ServiceOperationStatus::Failed);
+        assert_eq!(rejected.attempt_state(), AttemptState::Queued);
+        assert_eq!(rejected.diagnostic_code(), Some("budget_exhausted"));
+        let replay = limited
+            .run(second.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(replay.status(), ServiceOperationStatus::Failed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn provider_timeout_is_recorded_without_raw_streams() {
         let (repo, ledger, workspace, providers, calls, _, task_id) =
             service_parts(true, Duration::ZERO, false);
@@ -1798,7 +1876,7 @@ mod tests {
                 revision as u64,
                 "crash-recovery-retry"
             )),
-            Err(ServiceError::BudgetExhausted { limit: 1 })
+            Err(ServiceError::Busy(active)) if active == *accepted.operation_id()
         ));
     }
 }

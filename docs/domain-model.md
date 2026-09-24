@@ -124,7 +124,7 @@ Codex自身が編集した場合はAttemptを作らない。管理済みArtifact
 
 Rust API利用側が `TaskExecutionCountBudget` を明示してOperation Serviceへ渡した場合だけ、Task scopeのhard上限を適用する。`None` はbudget無効を表し、Provider観測情報からbudgetを推測しない。現在のmetricは `execution` 単位のService claim数であり、受付transactionと実行claim transactionの両方で検査する。実行claim数は `started_at` のあるOperation数として同じLedgerから読み、claimと同じ即時transactionで上限を再検査するため、同一Operationの再送、並行claim、`recovery_required` への遷移で二重計上しない。上限到達は `BudgetExhausted`、budget未設定は制限なしで区別される。
 
-上限を消費する時点はProvider availability / workspace準備より前のOperation claimである。このためclaim後、Provider呼出し前に失敗した場合も枠を消費する。ここで保証するのはOperation Serviceがclaimする回数であり、Provider内の再試行や外部accountのtoken・credit消費量ではない。後者を保証するには別のProvider側制約が必要となる。
+上限を消費する時点はProvider availability / workspace準備より前のOperation claimである。このためclaim後、Provider呼出し前に失敗した場合も枠を消費する。受付後にService policyが変わってclaim時点で上限超過となったOperationは、即時transactionで `failed` / `budget_exhausted` として終端化し、Taskをbusy状態に残さない。同じOperationを再度runしてもProviderを呼ばず、保存済み失敗を返す。ここで保証するのはOperation Serviceがclaimする回数であり、Provider内の再試行や外部accountのtoken・credit消費量ではない。後者を保証するには別のProvider側制約が必要となる。
 
 ## 旧データとの互換性
 
