@@ -736,14 +736,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn process_group_stop_returns_with_an_escaped_stdin_reader() {
-        use std::process::Command;
-
         let marker = std::env::temp_dir().join(format!(
             "process-runner-stdin-escaped-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&marker);
-        let script = "import os, time\npid = os.fork()\nif pid == 0:\n    os.setsid()\n    null = os.open(os.devnull, os.O_WRONLY)\n    os.dup2(null, 1)\n    os.dup2(null, 2)\n    os.dup(0)\n    with open(os.environ['MARKER'], 'w') as marker: marker.write(str(os.getpid()))\n    time.sleep(10)\n    os._exit(0)\nos._exit(0)";
+        let script = "import os, time\npid = os.fork()\nif pid == 0:\n    os.setsid()\n    null = os.open(os.devnull, os.O_WRONLY)\n    os.dup2(null, 1)\n    os.dup2(null, 2)\n    os.dup(0)\n    with open(os.environ['MARKER'], 'w') as marker: marker.write(str(os.getpid()))\n    time.sleep(10)\n    os._exit(0)\ndeadline = time.monotonic() + 1\nwhile not os.path.exists(os.environ['MARKER']):\n    if time.monotonic() >= deadline: os._exit(2)\n    time.sleep(0.005)\nos._exit(0)";
         let started = Instant::now();
         let result = ProcessRunner.run(
             ProcessRequest::new("python3")
@@ -752,10 +750,19 @@ mod tests {
                 .stdin_bytes(vec![b's'; 4 * 1024 * 1024])
                 .timeout(Duration::from_secs(2)),
         );
-        let escaped_pid = std::fs::read_to_string(&marker).expect("escaped reader marker");
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", escaped_pid.trim()])
-            .status();
+        let marker_deadline = Instant::now() + Duration::from_secs(1);
+        let escaped_pid = loop {
+            if let Ok(contents) = std::fs::read_to_string(&marker) {
+                if let Ok(pid) = contents.trim().parse::<u32>() {
+                    break EscapedReaderProcess(pid);
+                }
+            }
+            assert!(
+                Instant::now() < marker_deadline,
+                "escaped reader marker was not created"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
         let _ = std::fs::remove_file(marker);
 
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -767,6 +774,19 @@ mod tests {
                 ..
             })
         ));
+        drop(escaped_pid);
+    }
+
+    #[cfg(unix)]
+    struct EscapedReaderProcess(u32);
+
+    #[cfg(unix)]
+    impl Drop for EscapedReaderProcess {
+        fn drop(&mut self) {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &self.0.to_string()])
+                .status();
+        }
     }
 
     #[cfg(unix)]
