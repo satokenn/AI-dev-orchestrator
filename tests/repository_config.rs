@@ -111,6 +111,61 @@ fn invalid_timeout_is_rejected_before_validator_can_run() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn unsupported_numeric_schema_version_precedes_unknown_field_validation() {
+    let root = repository("unsupported-version");
+    init_repository(&root).expect("initialize");
+    fs::write(
+        root.join(REPOSITORY_CONFIG_PATH),
+        "schema_version = 2\nfuture_setting = true\n",
+    )
+    .expect("write future config");
+
+    assert!(matches!(
+        load_repository_config(&root),
+        Err(RepositoryConfigError::UnsupportedVersion(2))
+    ));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn malformed_or_out_of_range_schema_version_remains_a_parse_error() {
+    let root = repository("invalid-version");
+    init_repository(&root).expect("initialize");
+    for source in [
+        "validation = {}\n", // missing version
+        "schema_version = '2'\n",
+        "schema_version = -1\n",
+        "schema_version = 4294967296\n",
+    ] {
+        fs::write(root.join(REPOSITORY_CONFIG_PATH), source).expect("write invalid config");
+        assert!(matches!(
+            load_repository_config(&root),
+            Err(RepositoryConfigError::Parse(_))
+        ));
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn version_one_still_rejects_unknown_fields() {
+    let root = repository("version-one-unknown");
+    init_repository(&root).expect("initialize");
+    fs::write(
+        root.join(REPOSITORY_CONFIG_PATH),
+        "schema_version = 1\nfuture_setting = true\n",
+    )
+    .expect("write config");
+
+    assert!(matches!(
+        load_repository_config(&root),
+        Err(RepositoryConfigError::Parse(_))
+    ));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 fn configured_timeout_is_passed_to_process_runner() {

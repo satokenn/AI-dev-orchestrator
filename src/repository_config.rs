@@ -27,6 +27,11 @@ pub struct RepositoryConfig {
     pub validation: Option<ValidationConfig>,
 }
 
+#[derive(Deserialize)]
+struct SchemaVersionHeader {
+    schema_version: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationConfig {
@@ -210,12 +215,15 @@ pub fn load_repository_config(
     // Standard-library path checks do not provide descriptor-relative open semantics,
     // so concurrent replacement of these paths remains outside this guarantee.
     let source = fs::read_to_string(canonical_config).map_err(RepositoryConfigError::Io)?;
-    let config: RepositoryConfig = toml::from_str(&source).map_err(RepositoryConfigError::Parse)?;
-    if config.schema_version != 1 {
+    let header: SchemaVersionHeader =
+        toml::from_str(&source).map_err(RepositoryConfigError::Parse)?;
+    if header.schema_version != 1 {
         return Err(RepositoryConfigError::UnsupportedVersion(
-            config.schema_version,
+            header.schema_version,
         ));
     }
+    // Keep version 1 strict, including rejection of fields introduced by later schemas.
+    let config: RepositoryConfig = toml::from_str(&source).map_err(RepositoryConfigError::Parse)?;
     // Validate before a caller can start any subprocess.
     config.command_validator()?;
     Ok(config)
