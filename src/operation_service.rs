@@ -12,6 +12,7 @@ use crate::{
     DomainError, LedgerError, ModelChoice, ModelRef, OperationId, ProviderError, ProviderRef,
     ProviderRequest, ProviderResolver, SqliteExecutionLedger, TaskId, TaskRole, TaskState,
     UsageCost, UsageMetric, WorkspaceError, WorkspaceManager,
+    artifact::{ArtifactError, ArtifactManager},
     execution_ledger::{
         attempt_state_to_str, failure_reason_to_str, model_choice_kind, model_choice_name,
         task_state_to_str,
@@ -22,6 +23,33 @@ use crate::{
 pub struct BaseInput {
     repository: PathBuf,
     commit: String,
+}
+
+/// A previously captured Task artifact selected as this Attempt's input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactInput {
+    artifact_id: String,
+}
+
+impl ArtifactInput {
+    #[must_use]
+    pub fn new(artifact_id: impl Into<String>) -> Self {
+        Self {
+            artifact_id: artifact_id.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+}
+
+/// Explicitly chooses an initial commit or a prior Artifact as Attempt input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttemptInput {
+    Base(BaseInput),
+    Artifact(ArtifactInput),
 }
 
 impl BaseInput {
@@ -53,7 +81,7 @@ pub struct AttemptRunRequest {
     model_id: ModelChoice,
     instruction: String,
     role: TaskRole,
-    input: BaseInput,
+    input: AttemptInput,
     timeout: Option<Duration>,
 }
 
@@ -78,9 +106,39 @@ impl AttemptRunRequest {
             model_id,
             instruction: instruction.into(),
             role,
-            input,
+            input: AttemptInput::Base(input),
             timeout: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn with_artifact(
+        request_id: impl Into<String>,
+        task_id: TaskId,
+        expected_revision: u64,
+        provider_id: ProviderRef,
+        model_id: ModelChoice,
+        instruction: impl Into<String>,
+        role: TaskRole,
+        input: ArtifactInput,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            task_id,
+            expected_revision,
+            provider_id,
+            model_id,
+            instruction: instruction.into(),
+            role,
+            input: AttemptInput::Artifact(input),
+            timeout: None,
+        }
+    }
+
+    #[must_use]
+    pub fn input(&self) -> &AttemptInput {
+        &self.input
     }
 
     #[must_use]
@@ -157,6 +215,8 @@ pub struct OperationSnapshot {
     operation_id: OperationId,
     task_id: TaskId,
     attempt_id: AttemptId,
+    input_artifact_id: Option<String>,
+    output_artifact_id: Option<String>,
     status: ServiceOperationStatus,
     attempt_state: AttemptState,
     requested_provider: ProviderRef,
@@ -184,6 +244,14 @@ impl OperationSnapshot {
     #[must_use]
     pub fn attempt_id(&self) -> &AttemptId {
         &self.attempt_id
+    }
+    #[must_use]
+    pub fn input_artifact_id(&self) -> Option<&str> {
+        self.input_artifact_id.as_deref()
+    }
+    #[must_use]
+    pub fn output_artifact_id(&self) -> Option<&str> {
+        self.output_artifact_id.as_deref()
     }
     #[must_use]
     pub const fn status(&self) -> ServiceOperationStatus {
@@ -254,6 +322,7 @@ pub enum ServiceError {
     InvalidStoredState,
     InvalidStateTransition(DomainError),
     Workspace(WorkspaceError),
+    Artifact(ArtifactError),
     Ledger(LedgerError),
     Sqlite(rusqlite::Error),
 }
@@ -288,6 +357,7 @@ impl std::fmt::Display for ServiceError {
             }
             Self::InvalidStateTransition(error) => error.fmt(formatter),
             Self::Workspace(_) => formatter.write_str("workspace preparation failed"),
+            Self::Artifact(_) => formatter.write_str("artifact operation failed"),
             Self::Ledger(error) => error.fmt(formatter),
             Self::Sqlite(error) => write!(formatter, "operation service database error: {error}"),
         }
@@ -309,6 +379,11 @@ impl From<rusqlite::Error> for ServiceError {
 impl From<WorkspaceError> for ServiceError {
     fn from(error: WorkspaceError) -> Self {
         Self::Workspace(error)
+    }
+}
+impl From<ArtifactError> for ServiceError {
+    fn from(error: ArtifactError) -> Self {
+        Self::Artifact(error)
     }
 }
 impl From<DomainError> for ServiceError {
@@ -355,18 +430,25 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         request: &AttemptRunRequest,
     ) -> Result<Option<OperationAcceptance>, ServiceError> {
         let connection = self.ledger.lock_connection()?;
-        Self::idempotent_acceptance_with_connection(&connection, request)
+        Self::idempotent_acceptance_with_connection(
+            &connection,
+            request,
+            self.workspaces.repository_root(),
+        )
     }
 
     fn idempotent_acceptance_with_connection(
         connection: &rusqlite::Connection,
         request: &AttemptRunRequest,
+        repository_root: &std::path::Path,
     ) -> Result<Option<OperationAcceptance>, ServiceError> {
         let existing = connection
             .query_row(
-                "SELECT id,attempt_id,expected_revision,task_id,provider,model_kind,model_name,
-                    instruction,role,repository,base_commit,timeout_override_ms
-             FROM service_operations WHERE request_id=?1",
+                "SELECT operation.id,operation.attempt_id,operation.expected_revision,operation.task_id,operation.provider,operation.model_kind,operation.model_name,
+                    operation.instruction,operation.role,operation.repository,operation.base_commit,operation.timeout_override_ms,relation.input_artifact_id
+             FROM service_operations operation LEFT JOIN service_attempt_artifacts relation
+               ON relation.task_id=operation.task_id AND relation.attempt_id=operation.attempt_id
+             WHERE operation.request_id=?1",
                 params![request.request_id],
                 |row| {
                     Ok((
@@ -382,6 +464,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                         row.get::<_, String>(9)?,
                         row.get::<_, String>(10)?,
                         row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
                     ))
                 },
             )
@@ -399,6 +482,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             repository,
             commit,
             timeout_override,
+            input_artifact_id,
         )) = existing
         else {
             return Ok(None);
@@ -406,6 +490,20 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let request_override = request
             .timeout
             .map(|value| i64::try_from(value.as_millis()).unwrap_or(i64::MAX));
+        let input_matches = match &request.input {
+            AttemptInput::Base(input) => {
+                let requested_repository = std::fs::canonicalize(input.repository()).ok();
+                input_artifact_id.is_none()
+                    && requested_repository
+                        .as_ref()
+                        .is_some_and(|path| path.to_string_lossy() == repository)
+                    && commit == input.commit()
+            }
+            AttemptInput::Artifact(input) => {
+                input_artifact_id.as_deref() == Some(input.artifact_id())
+                    && repository == repository_root.to_string_lossy()
+            }
+        };
         if task != request.task_id.as_str()
             || revision as u64 != request.expected_revision
             || provider != request.provider_id.as_str()
@@ -413,8 +511,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             || name.as_deref() != model_choice_name(&request.model_id)
             || instruction != request.instruction
             || role != request.role.as_str()
-            || repository != request.input.repository().to_string_lossy()
-            || commit != request.input.commit()
+            || !input_matches
             || timeout_override != request_override
         {
             return Err(ServiceError::IdempotencyConflict);
@@ -458,14 +555,28 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ));
         }
 
-        let requested_repo = std::fs::canonicalize(request.input.repository())
-            .map_err(|_| ServiceError::InvalidRequest("repository is unavailable"))?;
-        if requested_repo != self.workspaces.repository_root() {
-            return Err(ServiceError::PolicyDenied(
-                "BaseInput repository does not match the configured workspace",
-            ));
-        }
-        self.workspaces.verify_base_commit(request.input.commit())?;
+        let (repository, base_commit, input_artifact_id) = match &request.input {
+            AttemptInput::Base(input) => {
+                let requested_repo = std::fs::canonicalize(input.repository())
+                    .map_err(|_| ServiceError::InvalidRequest("repository is unavailable"))?;
+                if requested_repo != self.workspaces.repository_root() {
+                    return Err(ServiceError::PolicyDenied(
+                        "BaseInput repository does not match the configured workspace",
+                    ));
+                }
+                self.workspaces.verify_base_commit(input.commit())?;
+                (requested_repo, input.commit().to_owned(), None)
+            }
+            AttemptInput::Artifact(input) => {
+                let artifact = ArtifactManager::new(self.workspaces, self.ledger)
+                    .verify_input(&request.task_id, input.artifact_id())?;
+                (
+                    self.workspaces.repository_root().to_owned(),
+                    artifact.base_commit().to_owned(),
+                    Some(input.artifact_id().to_owned()),
+                )
+            }
+        };
         let provider = self
             .providers
             .resolve(&request.provider_id)
@@ -476,8 +587,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
 
         let mut connection = self.ledger.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(accepted) = Self::idempotent_acceptance_with_connection(&transaction, request)?
-        {
+        if let Some(accepted) = Self::idempotent_acceptance_with_connection(
+            &transaction,
+            request,
+            self.workspaces.repository_root(),
+        )? {
             return Ok(accepted);
         }
 
@@ -518,6 +632,25 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             return Err(ServiceError::Busy(OperationId::new(id)));
         }
 
+        if let Some(artifact_id) = input_artifact_id.as_deref() {
+            let stored_artifact: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT base_commit,repository_root FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
+                    params![request.task_id.as_str(), artifact_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (stored_base, stored_repository) =
+                stored_artifact.ok_or(ServiceError::Artifact(ArtifactError::NotFound))?;
+            if stored_base != base_commit
+                || std::path::PathBuf::from(stored_repository) != repository
+            {
+                return Err(ServiceError::Artifact(ArtifactError::Invalid(
+                    "artifact input changed during request validation".into(),
+                )));
+            }
+        }
+
         if task.state() == TaskState::Pending {
             task.start()?;
         }
@@ -551,12 +684,13 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             .timeout
             .map(|value| i64::try_from(value.as_millis()).unwrap_or(i64::MAX));
         transaction.execute(
-            "INSERT INTO service_operations(id,request_id,task_id,attempt_id,expected_revision,provider,model_kind,model_name,instruction,role,repository,base_commit,timeout_override_ms,timeout_ms,status,accepted_at)
+                "INSERT INTO service_operations(id,request_id,task_id,attempt_id,expected_revision,provider,model_kind,model_name,instruction,role,repository,base_commit,timeout_override_ms,timeout_ms,status,accepted_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'accepted',?15)",
             params![operation_id.as_str(), request.request_id, request.task_id.as_str(), attempt_id.as_str(), actual_revision as i64,
                 request.provider_id.as_str(), model_choice_kind(&request.model_id), model_choice_name(&request.model_id), request.instruction,
-                request.role.as_str(), request.input.repository().to_string_lossy().as_ref(), request.input.commit(), timeout_override_ms, timeout_ms as i64, accepted_at],
+                request.role.as_str(), repository.to_string_lossy().as_ref(), base_commit, timeout_override_ms, timeout_ms as i64, accepted_at],
         )?;
+        transaction.execute("INSERT INTO service_attempt_artifacts(task_id,attempt_id,input_artifact_id) VALUES(?1,?2,?3)", params![request.task_id.as_str(), attempt_id.as_str(), input_artifact_id])?;
         transaction.commit()?;
         Ok(OperationAcceptance {
             operation_id,
@@ -615,14 +749,23 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             }
         };
         self.record_workspace_reference(operation_id, &workspace)?;
-        if self
-            .workspaces
-            .validate_provider_workspace_at_base(workspace.path(), &stored.base_commit)
-            .is_err()
-        {
+        let prepared = if let Some(input_id) = stored.input_artifact_id.as_deref() {
+            ArtifactManager::new(self.workspaces, self.ledger)
+                .materialize(&workspace, &stored.task_id, &stored.attempt_id, input_id)
+                .is_ok()
+        } else {
+            self.workspaces
+                .validate_provider_workspace_at_base(workspace.path(), &stored.base_commit)
+                .is_ok()
+        };
+        if !prepared {
             self.finish_without_start(
                 operation_id,
-                "workspace_unavailable",
+                if stored.input_artifact_id.is_some() {
+                    "artifact_unavailable"
+                } else {
+                    "workspace_unavailable"
+                },
                 ServiceOperationStatus::Failed,
             )?;
             return self.get_operation(operation_id);
@@ -639,6 +782,19 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         match provider_result {
             Ok(result) => {
                 let usage = result.usage().cloned();
+                match ArtifactManager::new(self.workspaces, self.ledger).capture(
+                    &workspace,
+                    &stored.task_id,
+                    &stored.attempt_id,
+                    stored.input_artifact_id.as_deref(),
+                    &stored.base_commit,
+                ) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        self.finish_recovery_required(operation_id, "artifact_capture_failed")?;
+                        return self.get_operation(operation_id);
+                    }
+                }
                 self.finish_attempt(
                     operation_id,
                     ServiceOperationStatus::Completed,
@@ -658,6 +814,19 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                     }
                 ) {
                     self.finish_recovery_required(operation_id, "provider_interrupted")?;
+                    return self.get_operation(operation_id);
+                }
+                if ArtifactManager::new(self.workspaces, self.ledger)
+                    .capture(
+                        &workspace,
+                        &stored.task_id,
+                        &stored.attempt_id,
+                        stored.input_artifact_id.as_deref(),
+                        &stored.base_commit,
+                    )
+                    .is_err()
+                {
+                    self.finish_recovery_required(operation_id, "artifact_capture_failed")?;
                     return self.get_operation(operation_id);
                 }
                 let (status, reason, code) = match error.kind() {
@@ -745,10 +914,16 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        let (input_artifact_id, output_artifact_id): (Option<String>, Option<String>) = connection.query_row(
+            "SELECT relation.input_artifact_id,CASE WHEN artifact.state='available' THEN relation.output_artifact_id ELSE NULL END FROM service_attempt_artifacts relation LEFT JOIN service_artifacts artifact ON artifact.task_id=relation.task_id AND artifact.id=relation.output_artifact_id WHERE relation.task_id=?1 AND relation.attempt_id=?2",
+            params![task, attempt], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?.unwrap_or((None, None));
         Ok(OperationSnapshot {
             operation_id: operation_id.clone(),
             task_id: TaskId::new(task),
             attempt_id: AttemptId::new(attempt),
+            input_artifact_id,
+            output_artifact_id,
             status: ServiceOperationStatus::from_str(&status)?,
             attempt_state: parse_attempt_state(&attempt_status)?,
             requested_provider: ProviderRef::new(provider),
@@ -855,7 +1030,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
 
     fn load_request(&self, operation_id: &OperationId) -> Result<StoredRequest, ServiceError> {
         let connection = self.ledger.lock_connection()?;
-        connection.query_row("SELECT task_id,attempt_id,provider,instruction,base_commit,timeout_ms,status FROM service_operations WHERE id=?1",params![operation_id.as_str()],|row|Ok(StoredRequest{task_id:TaskId::new(row.get::<_,String>(0)?),attempt_id:AttemptId::new(row.get::<_,String>(1)?),provider:ProviderRef::new(row.get::<_,String>(2)?),instruction:row.get(3)?,base_commit:row.get(4)?,timeout_ms:row.get::<_,i64>(5)? as u64,status:ServiceOperationStatus::from_str(&row.get::<_,String>(6)?).map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?.ok_or(ServiceError::OperationNotFound)
+        connection.query_row("SELECT operation.task_id,operation.attempt_id,operation.provider,operation.instruction,operation.base_commit,operation.timeout_ms,operation.status,relation.input_artifact_id FROM service_operations operation LEFT JOIN service_attempt_artifacts relation ON relation.task_id=operation.task_id AND relation.attempt_id=operation.attempt_id WHERE operation.id=?1",params![operation_id.as_str()],|row|Ok(StoredRequest{task_id:TaskId::new(row.get::<_,String>(0)?),attempt_id:AttemptId::new(row.get::<_,String>(1)?),provider:ProviderRef::new(row.get::<_,String>(2)?),instruction:row.get(3)?,base_commit:row.get(4)?,timeout_ms:row.get::<_,i64>(5)? as u64,status:ServiceOperationStatus::from_str(&row.get::<_,String>(6)?).map_err(|_|rusqlite::Error::InvalidQuery)?,input_artifact_id:row.get(7)?})).optional()?.ok_or(ServiceError::OperationNotFound)
     }
 
     /// Claims an accepted operation before availability checks or workspace side effects.
@@ -980,6 +1155,14 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if attempt.semantics() != AttemptSemantics::ProviderCallV2 {
             return Err(ServiceError::InvalidStoredState);
         }
+        let output_state: Option<String> = tx.query_row(
+            "SELECT artifact.state FROM service_attempt_artifacts relation JOIN service_artifacts artifact ON artifact.task_id=relation.task_id AND artifact.id=relation.output_artifact_id WHERE relation.task_id=?1 AND relation.attempt_id=?2",
+            params![task_id.as_str(), attempt_id.as_str()],
+            |row| row.get(0),
+        ).optional()?;
+        if output_state.as_deref() != Some("available") {
+            return Err(ServiceError::InvalidStoredState);
+        }
         if let Some(provider) = observed_provider.clone() {
             attempt.record_observed_target(Some(provider), observed_model.clone());
         }
@@ -1020,6 +1203,7 @@ struct StoredRequest {
     base_commit: String,
     timeout_ms: u64,
     status: ServiceOperationStatus,
+    input_artifact_id: Option<String>,
 }
 
 fn insert_queued_attempt(
@@ -1146,6 +1330,9 @@ mod tests {
         unknown_interrupt: bool,
         execute_delay: Duration,
         reference: ProviderRef,
+        write_output: Option<(String, String)>,
+        write_ignored: Option<(String, String)>,
+        require_file: Option<(String, String)>,
     }
 
     impl AgentProvider for FakeProvider {
@@ -1156,6 +1343,18 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             thread::sleep(self.execute_delay);
             assert_eq!(request.model(), &ModelChoice::ProviderDefault);
+            if let Some((path, contents)) = &self.require_file {
+                assert_eq!(
+                    fs::read_to_string(request.workspace().join(path)).unwrap(),
+                    *contents
+                );
+            }
+            if let Some((path, contents)) = &self.write_output {
+                fs::write(request.workspace().join(path), contents).unwrap();
+            }
+            if let Some((path, contents)) = &self.write_ignored {
+                fs::write(request.workspace().join(path), contents).unwrap();
+            }
             if self.unknown_interrupt {
                 return Err(ProviderError::Interrupted {
                     reason: crate::StopReason::TimedOut,
@@ -1255,6 +1454,9 @@ mod tests {
             unknown_interrupt,
             execute_delay,
             reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            require_file: None,
         });
         (repo, ledger, workspace, providers, calls, checks, task_id)
     }
@@ -1312,6 +1514,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.status(), ServiceOperationStatus::Completed);
         assert_eq!(result.attempt_state(), AttemptState::Succeeded);
+        assert!(result.output_artifact_id().is_some());
         assert_eq!(result.observed_model(), None);
         assert_eq!(
             result.usage(),
@@ -1350,6 +1553,228 @@ mod tests {
             )
         );
         assert!(result.workspace_branch().is_some());
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+    }
+
+    #[test]
+    fn artifact_input_rework_is_task_scoped_and_captures_output() {
+        let repo = Repo::new();
+        fs::write(repo.0.join(".gitignore"), "*.excluded\n").unwrap();
+        git(&repo.0, &["add", ".gitignore"]);
+        git(&repo.0, &["commit", "-m", "ignore generated fixture"]);
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = TaskId::new("artifact-rework-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "task description",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let first_provider = FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: Some(("persisted-result-6f32.txt".into(), "saved result".into())),
+            write_ignored: Some((
+                "secret-output-6f32.excluded".into(),
+                "should not persist".into(),
+            )),
+            require_file: None,
+        };
+        let mut first_registry = ProviderRegistry::new();
+        first_registry.register(first_provider);
+        let first_service = OperationService::new(
+            &ledger,
+            &workspace,
+            &first_registry,
+            4,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let first = first_service
+            .submit_attempt(&request(&repo, &task_id, 0, "first-artifact"))
+            .unwrap();
+        let first_result = first_service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        let artifact_id = first_result.output_artifact_id().unwrap().to_owned();
+        assert!(
+            workspace
+                .worktree_path(&task_id, first_result.attempt_id())
+                .join("persisted-result-6f32.txt")
+                .exists()
+        );
+        let tree: String = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT tree_oid FROM service_artifacts WHERE id=?1",
+                params![artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            git(&repo.0, &["ls-tree", "-r", "--name-only", &tree])
+                .contains("persisted-result-6f32.txt")
+        );
+        assert!(
+            !git(&repo.0, &["ls-tree", "-r", "--name-only", &tree])
+                .contains("secret-output-6f32.excluded")
+        );
+        let persisted_state: String = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM service_artifacts WHERE task_id=?1 AND id=?2",
+                params![task_id.as_str(), artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_state, "available");
+        let artifact_ref: String = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT ref_name FROM service_artifacts WHERE task_id=?1 AND id=?2",
+                params![task_id.as_str(), artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        git(&repo.0, &["update-ref", "-d", &artifact_ref]);
+        ArtifactManager::new(&workspace, &ledger)
+            .verify_input(&task_id, &artifact_id)
+            .unwrap();
+        assert_eq!(git(&repo.0, &["rev-parse", &artifact_ref]), tree);
+
+        let revision: u64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second_provider = FakeProvider {
+            calls: calls.clone(),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: Some(("revision.txt".into(), "second".into())),
+            write_ignored: None,
+            require_file: Some(("persisted-result-6f32.txt".into(), "saved result".into())),
+        };
+        let mut second_registry = ProviderRegistry::new();
+        second_registry.register(second_provider);
+        let second_service = OperationService::new(
+            &ledger,
+            &workspace,
+            &second_registry,
+            4,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let other_task = TaskId::new("artifact-rework-other-task");
+        ledger
+            .save_task(&Task::new(
+                other_task.clone(),
+                "unrelated task",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let foreign_input = AttemptRunRequest::with_artifact(
+            "foreign-artifact",
+            other_task,
+            0,
+            ProviderRef::new("fake"),
+            ModelChoice::ProviderDefault,
+            "must reject",
+            TaskRole::new("implementer"),
+            ArtifactInput::new(&artifact_id),
+        );
+        assert!(matches!(
+            second_service.submit_attempt(&foreign_input),
+            Err(ServiceError::Artifact(ArtifactError::NotFound))
+        ));
+        let req = AttemptRunRequest::with_artifact(
+            "second-artifact",
+            task_id.clone(),
+            revision,
+            ProviderRef::new("fake"),
+            ModelChoice::ProviderDefault,
+            "continue from prior result",
+            TaskRole::new("implementer"),
+            ArtifactInput::new(&artifact_id),
+        );
+        let accepted = second_service.submit_attempt(&req).unwrap();
+        assert_eq!(
+            second_service.submit_attempt(&req).unwrap().operation_id(),
+            accepted.operation_id()
+        );
+        let changed_input = AttemptRunRequest::with_artifact(
+            "second-artifact",
+            task_id.clone(),
+            revision,
+            ProviderRef::new("fake"),
+            ModelChoice::ProviderDefault,
+            "continue from prior result",
+            TaskRole::new("implementer"),
+            ArtifactInput::new("different-artifact"),
+        );
+        assert!(matches!(
+            second_service.submit_attempt(&changed_input),
+            Err(ServiceError::IdempotencyConflict)
+        ));
+        let result = second_service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(result.status(), ServiceOperationStatus::Completed);
+        assert_eq!(result.input_artifact_id(), Some(artifact_id.as_str()));
+        assert!(result.output_artifact_id().is_some());
+        assert_ne!(result.output_artifact_id(), result.input_artifact_id());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let corrupt_ref: String = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT ref_name FROM service_artifacts WHERE id=?1",
+                params![artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let replacement_tree: String = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT tree_oid FROM service_artifacts WHERE id=?1",
+                params![result.output_artifact_id().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        git(&repo.0, &["update-ref", &corrupt_ref, &replacement_tree]);
+        assert!(matches!(
+            ArtifactManager::new(&workspace, &ledger).verify_input(&task_id, &artifact_id),
+            Err(ArtifactError::RecoveryRequired)
+        ));
+        let artifact_state: String = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM service_artifacts WHERE id=?1",
+                params![artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(artifact_state, "recovery_required");
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, first_result.attempt_id());
         cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
     }
 
@@ -1452,7 +1877,7 @@ mod tests {
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
         let mut req = request(&repo, &task_id, 0, "post-checkout-hook");
-        req.input = BaseInput::new(&repo.0, base.clone());
+        req.input = AttemptInput::Base(BaseInput::new(&repo.0, base.clone()));
         let accepted = service.submit_attempt(&req).unwrap();
         let result = service
             .run(accepted.operation_id(), CancellationToken::new())
@@ -1539,6 +1964,9 @@ mod tests {
             unknown_interrupt: false,
             execute_delay: Duration::from_millis(250),
             reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            require_file: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))

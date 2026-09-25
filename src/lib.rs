@@ -3,6 +3,7 @@
 //! AI Dev Orchestrator core domain.
 
 mod antigravity;
+mod artifact;
 pub mod cli;
 mod codex_provider;
 mod copilot_provider;
@@ -20,6 +21,7 @@ mod validator;
 mod workspace;
 
 pub use antigravity::AntigravityProvider;
+pub use artifact::{ArtifactRecord, ArtifactState};
 pub use codex_provider::CodexProvider;
 pub use copilot_provider::CopilotProvider;
 pub use domain::{
@@ -42,8 +44,8 @@ pub use operation_ledger::{
     SqliteExecutionLedger as SqliteOperationLedger, UsageRecord, ValidationRecord,
 };
 pub use operation_service::{
-    AttemptRunRequest, BaseInput, OperationAcceptance, OperationService, OperationSnapshot,
-    ServiceError, ServiceOperationStatus,
+    ArtifactInput, AttemptInput, AttemptRunRequest, BaseInput, OperationAcceptance,
+    OperationService, OperationSnapshot, ServiceError, ServiceOperationStatus,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,
