@@ -268,11 +268,7 @@ impl GitHubArtifactPublicationGateway {
         timeout: Duration,
         stdin_bytes: Option<Vec<u8>>,
     ) -> Result<String, PublicationGatewayError> {
-        let mut request = ProcessRequest::new(self.gh_executable.clone())
-            .cwd(repository)
-            .timeout(timeout);
-        request.args = args.iter().map(std::ffi::OsString::from).collect();
-        request.stdin_bytes = stdin_bytes;
+        let request = self.gh_request(repository, args, timeout, stdin_bytes);
         let output = ProcessRunner.run(request).map_err(map_process_error)?;
         if output.output_truncated {
             return Err(PublicationGatewayError::InvalidResponse);
@@ -280,6 +276,21 @@ impl GitHubArtifactPublicationGateway {
         String::from_utf8(output.stdout)
             .map(|value| value.trim().to_owned())
             .map_err(|_| PublicationGatewayError::InvalidResponse)
+    }
+
+    fn gh_request(
+        &self,
+        repository: &Path,
+        args: &[&str],
+        timeout: Duration,
+        stdin_bytes: Option<Vec<u8>>,
+    ) -> ProcessRequest {
+        let mut request = ProcessRequest::new(self.gh_executable.clone())
+            .cwd(repository)
+            .timeout(timeout);
+        request.args = args.iter().map(std::ffi::OsString::from).collect();
+        request.stdin_bytes = stdin_bytes;
+        request
     }
 }
 
@@ -449,9 +460,13 @@ fn verify_pull_request_content(
     value: &Value,
     payload: &ArtifactPublicationPayload,
 ) -> Result<(), PublicationGatewayError> {
-    if value.get("title").and_then(Value::as_str) != Some(payload.title())
-        || value.get("body").and_then(Value::as_str) != Some(payload.body())
-    {
+    let title_matches = value.get("title").and_then(Value::as_str) == Some(payload.title());
+    let body_matches = match value.get("body") {
+        Some(Value::String(body)) => body == payload.body(),
+        Some(Value::Null) => payload.body().is_empty(),
+        _ => false,
+    };
+    if !title_matches || !body_matches {
         return Err(PublicationGatewayError::ExistingPullRequestMismatch);
     }
     Ok(())
@@ -505,17 +520,7 @@ fn verify_pull_request(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::{
-        fs,
-        os::unix::fs::PermissionsExt,
-        sync::atomic::{AtomicU64, Ordering},
-    };
-
     use super::*;
-
-    #[cfg(unix)]
-    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn api_pull_request_response_requires_exact_draft_identity() {
@@ -533,50 +538,78 @@ mod tests {
         assert_eq!(pull_request.base_branch(), "main");
     }
 
+    #[test]
+    fn pull_request_null_body_matches_only_an_empty_requested_body() {
+        let empty_payload = ArtifactPublicationPayload::new("main", "feature", "title", "");
+        verify_pull_request_content(&json!({"title": "title", "body": null}), &empty_payload)
+            .expect("GitHub null body represents an empty body");
+
+        let nonempty_payload = ArtifactPublicationPayload::new("main", "feature", "title", "body");
+        assert_eq!(
+            verify_pull_request_content(
+                &json!({"title": "title", "body": null}),
+                &nonempty_payload,
+            ),
+            Err(PublicationGatewayError::ExistingPullRequestMismatch)
+        );
+    }
+
+    #[test]
+    fn pull_request_non_string_body_is_rejected() {
+        let payload = ArtifactPublicationPayload::new("main", "feature", "title", "");
+        assert_eq!(
+            verify_pull_request_content(&json!({"title": "title", "body": 42}), &payload),
+            Err(PublicationGatewayError::ExistingPullRequestMismatch)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn gh_api_publication_payload_is_stdin_only() {
-        let directory = std::env::temp_dir().join(format!(
-            "gh-api-stdin-test-{}-{}",
-            std::process::id(),
-            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&directory).expect("isolated test directory is created");
-        let executable = directory.join("fake-gh");
-        fs::write(
-            &executable,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\"\ncount=$(wc -c | tr -d ' ')\nprintf 'stdin-bytes=%s\\n' \"$count\"\n",
-        )
-        .expect("fake CLI is written");
-        let mut permissions = fs::metadata(&executable)
-            .expect("fake CLI metadata is available")
-            .permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&executable, permissions).expect("fake CLI is executable");
-
-        let gateway = GitHubArtifactPublicationGateway::with_executables("git", executable);
+        let gateway = GitHubArtifactPublicationGateway::with_executables("git", "fake-gh");
         let body = b"private title and body".to_vec();
-        let result = gateway
-            .gh_output_with_stdin(
-                Path::new("."),
-                &[
-                    "api",
-                    "repos/example/project/pulls",
-                    "--method",
-                    "POST",
-                    "--input",
-                    "-",
-                ],
-                Duration::from_secs(2),
-                Some(body.clone()),
+        let args = [
+            "api",
+            "repos/example/project/pulls",
+            "--method",
+            "POST",
+            "--input",
+            "-",
+        ];
+        let request = gateway.gh_request(
+            Path::new("."),
+            &args,
+            Duration::from_secs(2),
+            Some(body.clone()),
+        );
+        let request_args = request
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(request_args, args);
+        assert_eq!(request.stdin_bytes.as_deref(), Some(body.as_slice()));
+        assert!(!request_args.join(" ").contains("private title and body"));
+
+        let result = ProcessRunner
+            .run(
+                ProcessRequest::new("sh")
+                    .args([
+                        "-c",
+                        "printf 'argv=%s\\n' \"$*\"; count=$(wc -c | tr -d ' '); printf 'stdin-bytes=%s\\n' \"$count\"",
+                        "fake-gh",
+                    ])
+                    .args(request.args)
+                    .stdin_bytes(body.clone())
+                    .timeout(Duration::from_secs(2)),
             )
-            .expect("fake CLI consumes stdin");
-        assert!(result.contains("--input\n-\n"));
+            .expect("shell fixture consumes stdin");
+        let result = String::from_utf8(result.stdout).expect("fixture output is UTF-8");
+        assert!(result.contains("--input -"));
         assert!(
             result.contains(&format!("stdin-bytes={}", body.len())),
             "unexpected fake CLI output: {result:?}"
         );
         assert!(!result.contains("private title and body"));
-        fs::remove_dir_all(directory).expect("test files are removed");
     }
 }

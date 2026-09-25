@@ -591,10 +591,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reports_process_group_stop_when_stdin_writer_does_not_drain() {
+        let marker =
+            std::env::temp_dir().join(format!("process-runner-stdin-held-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = "( exec 3<&0; : > \"$MARKER\"; exec sleep 10 <&3 >/dev/null 2>&1 ) <&0 &
+while [ ! -f \"$MARKER\" ]; do sleep 0.01; done
+exit 0";
         let request = ProcessRequest::new("sh")
-            .args(["-c", "sleep 10 </dev/stdin >/dev/null 2>&1 & exit 0"])
-            .stdin_bytes(vec![b'x'; 1024 * 1024]);
-        match ProcessRunner.run(request) {
+            .args(["-c", script])
+            .env("MARKER", marker.as_os_str())
+            .stdin_bytes(vec![b'x'; 1024 * 1024])
+            .timeout(Duration::from_secs(2));
+        let result = ProcessRunner.run(request);
+        let _ = std::fs::remove_file(marker);
+        match result {
             Err(ProcessError::Interrupted {
                 reason: StopReason::PipeHeld,
                 stopped,
@@ -603,6 +613,9 @@ mod tests {
             }) => {
                 assert!(stopped, "managed process group was stopped");
                 assert!(diagnostic.contains("stdin writer"));
+            }
+            Err(ProcessError::Stdin(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                panic!("fixture closed stdin before holding it in the descendant")
             }
             result => panic!("unexpected result: {result:?}"),
         }

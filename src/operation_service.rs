@@ -2096,24 +2096,42 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         }
         let pending_publications = {
             let mut statement = tx.prepare(
-                "SELECT id,task_id FROM service_artifact_publication_operations
+                "SELECT id,task_id,status FROM service_artifact_publication_operations
                  WHERE status IN ('accepted','running') ORDER BY rowid",
             )?;
             statement
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        for (operation_id, task_text) in pending_publications {
+        for (operation_id, task_text, status) in pending_publications {
             let task_id = TaskId::new(task_text);
-            tx.execute(
-                "UPDATE service_artifact_publication_operations
-                 SET status='recovery_required',phase='recovery_required',
-                     error_code='interrupted',finished_at=?2,revision=revision+1
-                 WHERE id=?1 AND status IN ('accepted','running')",
-                params![operation_id, now_ms()],
-            )?;
+            match status.as_str() {
+                "accepted" => {
+                    tx.execute(
+                        "UPDATE service_artifact_publication_operations
+                         SET status='failed',phase='failed',
+                             error_code='interrupted_before_start',finished_at=?2,revision=revision+1
+                         WHERE id=?1 AND status='accepted'",
+                        params![operation_id, now_ms()],
+                    )?;
+                }
+                "running" => {
+                    tx.execute(
+                        "UPDATE service_artifact_publication_operations
+                         SET status='recovery_required',phase='recovery_required',
+                             error_code='interrupted',finished_at=?2,revision=revision+1
+                         WHERE id=?1 AND status='running'",
+                        params![operation_id, now_ms()],
+                    )?;
+                }
+                _ => return Err(ServiceError::InvalidStoredState),
+            }
             bump_revision(&tx, &task_id)?;
             recovered.push(OperationId::new(operation_id));
         }
@@ -3966,7 +3984,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_never_replays_an_accepted_publication() {
+    fn startup_recovery_fails_an_unclaimed_publication_without_replay() {
         let fixture = artifact_publication_fixture();
         let events = Arc::new(Mutex::new(Vec::new()));
         let scanner = FakeSecretScanner {
@@ -3998,9 +4016,66 @@ mod tests {
         let snapshot = service
             .run_artifact_publication(&acceptance, &request)
             .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::Failed);
+        assert_eq!(snapshot.phase(), ArtifactPublicationPhase::Failed);
+        assert_eq!(snapshot.error_code(), Some("interrupted_before_start"));
+        assert_eq!(events.lock().unwrap().len(), 2);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn startup_recovery_marks_a_claimed_publication_as_recovery_required() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "publication-running-recovery");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        {
+            let connection = fixture.ledger.lock_connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE service_artifact_publication_operations
+                     SET status='running',phase='committing'
+                     WHERE id=?1",
+                    params![acceptance.operation_id().as_str()],
+                )
+                .unwrap();
+        }
+
+        let recovered = service.recover_incomplete_operations().unwrap();
+        assert_eq!(recovered, [acceptance.operation_id().clone()]);
+        let snapshot = service
+            .get_artifact_publication_operation(acceptance.operation_id())
+            .unwrap();
         assert_eq!(snapshot.state(), ServiceOperationStatus::RecoveryRequired);
         assert_eq!(snapshot.phase(), ArtifactPublicationPhase::RecoveryRequired);
-        assert_eq!(events.lock().unwrap().len(), 2);
+        assert_eq!(snapshot.error_code(), Some("interrupted"));
+        assert_eq!(*events.lock().unwrap(), ["scan_artifact", "scan_payload"]);
         cleanup_fixture_worktree(
             &fixture.repo,
             &fixture.workspace,

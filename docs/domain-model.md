@@ -130,7 +130,7 @@ Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`�
 
 公開操作はProvider Attemptを偽装せず、専用の受付・phase・結果Ledgerへ保存する。呼び出し側は`publish_artifact`で受付を行い、返されたoperationと同じrequest/payloadで`run_artifact_publication`を起動し、`get_artifact_publication_operation`で結果を読む。LedgerにはArtifact tree、validation/decision ID、作成commit SHA、Draft PR番号・URL・状態を保存し、title/body等のraw payloadは保存しない。冪等照合には長さ付きfield列から計算したSHA-256 digestを使う。Artifact treeと完全なpublication payloadは受付前と外部効果直前の両方でscanする。後段で検出・失敗した場合は副作用前に`failed`で閉じる。GitHub CLIにはtitle/bodyをargvや一時ファイルに渡さず、ProcessRunnerが提供するstdin bytesで`gh api --input -`へ直接渡す。stdinは`write_all`で全byte送信し、stdout/stderr captureへ混ぜない。有限timeoutとcancel後は管理process group停止後にwriter threadの停止も期限付きで確認し、未停止なら固定diagnostic付き`Interrupted`として返す。PR作成結果が曖昧なtimeoutや不整合は`recovery_required`として保持し、自動で再実行しない。
 
-このMVPはMCP/CLIの`publication.publish`・`operation.get`にはまだ接続されておらず、Rust Serviceに専用の`publish_artifact` / `get_artifact_publication_operation` APIを提供する段階である。既存の`operation.get`はProvider Attempt操作用のまま。公開用cancel APIと起動時のpublication recoveryは未接続で、起動時には中断した受付を`recovery_required`へ移すだけで外部操作を再実行しない。したがって、MCP wire契約全体を実装済みとは扱わない。
+このMVPはMCP/CLIの`publication.publish`・`operation.get`にはまだ接続されておらず、Rust Serviceに専用の`publish_artifact` / `get_artifact_publication_operation` APIを提供する段階である。既存の`operation.get`はProvider Attempt操作用のまま。公開用cancel APIは未接続である。起動時に未claimの`accepted` publicationは外部効果が始まっていないため`failed`（`interrupted_before_start`）へ移し、実行claim後の`running` publicationは外部効果の有無を断定できないため`recovery_required`へ移す。どちらも外部操作を再実行しない。SQLite schema v12はPublication専用Ledger tableを追加し、schema v11を開くと既存recordを保持してmigrationする。したがって、MCP wire契約全体を実装済みとは扱わない。
 
 ## 旧データとの互換性
 
