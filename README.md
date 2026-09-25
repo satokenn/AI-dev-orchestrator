@@ -37,6 +37,10 @@ Agent 実行先の違いは `AgentProvider` に閉じ込めます。`ProviderReq
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
+## Providerの現在状態を観測する
+
+`CodexProvider`、`CopilotProvider`、`AntigravityProvider` の `observe_current()` は、3秒以内の `--version` probeでCLIの起動有無を観測し、情報源と時刻を付けて返します。CLIの起動成功だけでは認証済みやModel利用可能とは判断せず、それらは `unknown` のままです。この部分実装はquota、API利用量・料金、budgetの取得や `task.get_context` への接続を行いません。詳細は[Providerの現在状態を観測する](docs/current-provider-observations.md)を参照してください。
+
 ## Operation Ledger
 
 `Orchestrator` は、設定された `SqliteOperationLedger` に外部 Provider の起動前の受理・開始を記録し、workspace 準備、Provider実行、validation の結果を終了状態として保存します。CLI は指定された実行Ledgerのサイドカーへ自動的にOperation Ledgerを保存します。`SqliteOperationLedger` は同じ request ID の再送を同じ operation として返し、異なる payload、古い Task revision、同一 Task の実行中操作を拒否します。終了事実、event、validation、review、usage / budget、publication 参照、上限付き raw log、再起動時の `recovery_required` 診断を保存します。
