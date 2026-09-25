@@ -1337,6 +1337,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if request.request_id.trim().is_empty() {
             return Err(ServiceError::InvalidRequest("request_id must not be empty"));
         }
+        if request.payload.base_branch() == request.payload.head_branch() {
+            return Err(ServiceError::InvalidRequest(
+                "publication base and head branches must differ",
+            ));
+        }
         if !valid_git_branch(request.payload.base_branch())
             || !valid_git_branch(request.payload.head_branch())
         {
@@ -3822,6 +3827,67 @@ mod tests {
             service.publish_artifact(&publication_request(&fixture, "scanner-required")),
             Err(ServiceError::PolicyDenied(
                 "SecretScanner is not configured"
+            ))
+        ));
+        assert!(events.lock().unwrap().is_empty());
+        let count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_artifact_publication_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_rejects_identical_base_and_head_branches_before_scanning_or_effects() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = ArtifactPublicationRequest::new(
+            "same-publication-branches",
+            fixture.task_id.clone(),
+            fixture.revision,
+            fixture.artifact_id.clone(),
+            fixture.validation_id.clone(),
+            fixture.decision_id.clone(),
+            ArtifactPublicationPayload::new("main", "main", "title", "body"),
+        );
+
+        assert!(matches!(
+            service.publish_artifact(&request),
+            Err(ServiceError::InvalidRequest(
+                "publication base and head branches must differ"
             ))
         ));
         assert!(events.lock().unwrap().is_empty());
