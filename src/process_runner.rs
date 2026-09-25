@@ -161,13 +161,20 @@ impl ProcessRunner {
         let mut command = Command::new(&request.command);
         command
             .args(&request.args)
-            .stdin(if stdin_bytes.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        let mut stdin_writer = stdin_bytes
+            .map(|bytes| NonblockingStdin::attach(&mut command, bytes))
+            .transpose()
+            .map_err(ProcessError::Spawn)?;
+        #[cfg(not(unix))]
+        command.stdin(if stdin_bytes.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         if let Some(cwd) = request.cwd {
             command.current_dir(cwd);
         }
@@ -185,10 +192,13 @@ impl ProcessRunner {
         let stderr = Arc::new(Mutex::new(CapturedBytes::default()));
         let stdout_reader = take_pipe(&mut child, true, Arc::clone(&stdout))?;
         let stderr_reader = take_pipe(&mut child, false, Arc::clone(&stderr))?;
-        let stdin_writer = match stdin_bytes {
-            Some(bytes) => Some(write_stdin(&mut child, bytes)?),
-            None => None,
-        };
+        #[cfg(not(unix))]
+        let stdin_writer = stdin_bytes
+            .map(|bytes| write_stdin(&mut child, bytes))
+            .transpose()?;
+        let mut stdin_error = None;
+        #[cfg(unix)]
+        let mut stdin_incomplete = false;
         let mut reason = loop {
             if token.is_cancelled() {
                 break Some(StopReason::Cancelled);
@@ -197,10 +207,35 @@ impl ProcessRunner {
                 break Some(StopReason::TimedOut);
             }
             if child.try_wait().map_err(ProcessError::Io)?.is_some() {
+                #[cfg(unix)]
+                if stdin_writer
+                    .as_ref()
+                    .is_some_and(|writer| !writer.is_complete())
+                {
+                    stdin_incomplete = true;
+                    break Some(StopReason::PipeHeld);
+                }
                 break None;
+            }
+            #[cfg(unix)]
+            let stdin_finished = if let Some(writer) = stdin_writer.as_mut() {
+                if let Err(error) = writer.write_available() {
+                    stdin_error = Some(error);
+                    true
+                } else {
+                    writer.is_complete()
+                }
+            } else {
+                false
+            };
+            #[cfg(unix)]
+            if stdin_finished {
+                stdin_writer = None;
             }
             thread::sleep(Duration::from_millis(5));
         };
+        #[cfg(unix)]
+        drop(stdin_writer);
         let stopped = if let Some(_reason) = reason {
             stop_process_group(&mut child, STOP_GRACE_PERIOD)?
         } else {
@@ -225,7 +260,10 @@ impl ProcessRunner {
         let drain_deadline = Instant::now() + PIPE_DRAIN_PERIOD;
         let stdout_done = join_pipe_until(stdout_reader, drain_deadline);
         let stderr_done = join_pipe_until(stderr_reader, drain_deadline);
+        #[cfg(not(unix))]
         let stdin_done = stdin_writer.map(|handle| join_stdin_until(handle, drain_deadline));
+        #[cfg(unix)]
+        let stdin_done: Option<Result<io::Result<()>, ()>> = None;
         let stdin_writer_hung = matches!(stdin_done, Some(Err(())));
         if (stdout_done.is_err() || stderr_done.is_err() || stdin_writer_hung) && reason.is_none() {
             reason = Some(StopReason::PipeHeld);
@@ -260,7 +298,11 @@ impl ProcessRunner {
             stdout_truncated: stdout_capture.truncated,
             stderr_truncated: stderr_capture.truncated,
         };
-        if stdin_writer_hung {
+        #[cfg(unix)]
+        let stdin_not_drained = stdin_incomplete;
+        #[cfg(not(unix))]
+        let stdin_not_drained = false;
+        if stdin_writer_hung || stdin_not_drained {
             return Err(ProcessError::Interrupted {
                 reason: reason.unwrap_or(StopReason::PipeHeld),
                 stopped: process_group_stopped,
@@ -269,7 +311,9 @@ impl ProcessRunner {
                 output_truncated: output.output_truncated,
                 stdout_truncated: output.stdout_truncated,
                 stderr_truncated: output.stderr_truncated,
-                diagnostic: if process_group_stopped {
+                diagnostic: if stdin_not_drained {
+                    "stdin payload was not fully delivered before the managed process group stopped"
+                } else if process_group_stopped {
                     "stdin writer did not stop after the managed process group stopped"
                 } else {
                     "stdin writer did not stop; managed process group stop was not confirmed"
@@ -278,6 +322,9 @@ impl ProcessRunner {
             });
         }
         if reason.is_none() {
+            if let Some(error) = stdin_error {
+                return Err(ProcessError::Stdin(error));
+            }
             if let Some(Ok(Err(error))) = stdin_done {
                 return Err(ProcessError::Stdin(error));
             }
@@ -335,6 +382,7 @@ fn take_pipe(
     pipe.ok_or_else(|| ProcessError::Io(io::Error::other("missing output pipe")))
 }
 
+#[cfg(not(unix))]
 fn write_stdin(
     child: &mut Child,
     bytes: Vec<u8>,
@@ -410,6 +458,72 @@ fn join_pipe_until(
     handle.join().map_err(|_| ())?.map_err(|_| ())
 }
 
+#[cfg(unix)]
+struct NonblockingStdin {
+    stream: Option<std::os::unix::net::UnixStream>,
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+#[cfg(unix)]
+impl NonblockingStdin {
+    fn attach(command: &mut Command, bytes: Vec<u8>) -> io::Result<Self> {
+        use std::os::unix::net::UnixStream;
+
+        let (writer, child_stdin) = UnixStream::pair()?;
+        writer.set_nonblocking(true)?;
+        command.stdin(Stdio::from(std::os::fd::OwnedFd::from(child_stdin)));
+        Ok(Self {
+            stream: Some(writer),
+            bytes,
+            offset: 0,
+        })
+    }
+
+    fn write_available(&mut self) -> io::Result<()> {
+        if self.offset == self.bytes.len() {
+            self.finish();
+            return Ok(());
+        }
+
+        match self
+            .stream
+            .as_mut()
+            .expect("stdin stream remains open until all bytes are written")
+            .write(&self.bytes[self.offset..])
+        {
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write stdin payload",
+            )),
+            Ok(count) => {
+                self.offset += count;
+                if self.offset == self.bytes.len() {
+                    self.finish();
+                }
+                Ok(())
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::Interrupted =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    const fn is_complete(&self) -> bool {
+        self.offset >= self.bytes.len()
+    }
+
+    fn finish(&mut self) {
+        self.stream = None;
+        self.bytes.clear();
+    }
+}
+
+#[cfg(not(unix))]
 fn join_stdin_until(
     handle: thread::JoinHandle<io::Result<()>>,
     deadline: Instant,
@@ -570,7 +684,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn writes_all_stdin_bytes_without_capturing_them() {
-        let input = vec![b'x'; 128 * 1024];
+        let input = vec![b'x'; 2 * 1024 * 1024];
         let request = ProcessRequest::new("wc")
             .arg("-c")
             .stdin_bytes(input.clone())
@@ -610,13 +724,49 @@ mod tests {
                 ..
             }) => {
                 assert!(stopped, "managed process group was stopped");
-                assert!(diagnostic.contains("stdin writer"));
+                assert!(diagnostic.contains("stdin"));
             }
             Err(ProcessError::Stdin(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
                 panic!("fixture closed stdin before holding it in the descendant")
             }
             result => panic!("unexpected result: {result:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_stop_returns_with_an_escaped_stdin_reader() {
+        use std::process::Command;
+
+        let marker = std::env::temp_dir().join(format!(
+            "process-runner-stdin-escaped-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script = "import os, time\npid = os.fork()\nif pid == 0:\n    os.setsid()\n    null = os.open(os.devnull, os.O_WRONLY)\n    os.dup2(null, 1)\n    os.dup2(null, 2)\n    os.dup(0)\n    with open(os.environ['MARKER'], 'w') as marker: marker.write(str(os.getpid()))\n    time.sleep(10)\n    os._exit(0)\nos._exit(0)";
+        let started = Instant::now();
+        let result = ProcessRunner.run(
+            ProcessRequest::new("python3")
+                .args(["-c", script])
+                .env("MARKER", marker.as_os_str())
+                .stdin_bytes(vec![b's'; 4 * 1024 * 1024])
+                .timeout(Duration::from_secs(2)),
+        );
+        let escaped_pid = std::fs::read_to_string(&marker).expect("escaped reader marker");
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", escaped_pid.trim()])
+            .status();
+        let _ = std::fs::remove_file(marker);
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            result,
+            Err(ProcessError::Interrupted {
+                reason: StopReason::PipeHeld,
+                stopped: true,
+                ..
+            })
+        ));
     }
 
     #[cfg(unix)]
