@@ -4,9 +4,13 @@
 //! It does not select a target or expose Provider output and raw diagnostics.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
 use crate::{
     Attempt, AttemptFailureReason, AttemptId, AttemptSemantics, AttemptState, CancellationToken,
@@ -18,6 +22,10 @@ use crate::{
         CodexDecisionKind,
     },
     artifact::{ArtifactError, ArtifactManager},
+    artifact_publication::{
+        ArtifactPublicationGateway, ArtifactPublicationPayload, DraftPullRequest, SecretScanResult,
+        SecretScanner,
+    },
     execution_ledger::{
         attempt_state_to_str, failure_reason_to_str, model_choice_kind, model_choice_name,
         task_state_to_str,
@@ -153,6 +161,41 @@ impl AttemptRunRequest {
     }
 }
 
+/// A request to publish one exact Artifact using its saved Validation and Codex acceptance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactPublicationRequest {
+    request_id: String,
+    task_id: TaskId,
+    expected_revision: u64,
+    artifact_id: String,
+    validation_id: String,
+    decision_id: String,
+    payload: ArtifactPublicationPayload,
+}
+
+impl ArtifactPublicationRequest {
+    #[must_use]
+    pub fn new(
+        request_id: impl Into<String>,
+        task_id: TaskId,
+        expected_revision: u64,
+        artifact_id: impl Into<String>,
+        validation_id: impl Into<String>,
+        decision_id: impl Into<String>,
+        payload: ArtifactPublicationPayload,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            task_id,
+            expected_revision,
+            artifact_id: artifact_id.into(),
+            validation_id: validation_id.into(),
+            decision_id: decision_id.into(),
+            payload,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceOperationStatus {
     Accepted,
@@ -161,6 +204,168 @@ pub enum ServiceOperationStatus {
     Failed,
     Cancelled,
     RecoveryRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactPublicationPhase {
+    Accepted,
+    Scanned,
+    Committing,
+    Committed,
+    Pushing,
+    Pushed,
+    CreatingDraft,
+    Published,
+    Failed,
+    RecoveryRequired,
+}
+
+impl ArtifactPublicationPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Scanned => "scanned",
+            Self::Committing => "committing",
+            Self::Committed => "committed",
+            Self::Pushing => "pushing",
+            Self::Pushed => "pushed",
+            Self::CreatingDraft => "creating_draft",
+            Self::Published => "published",
+            Self::Failed => "failed",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, ServiceError> {
+        match value {
+            "accepted" => Ok(Self::Accepted),
+            "scanned" => Ok(Self::Scanned),
+            "committing" => Ok(Self::Committing),
+            "committed" => Ok(Self::Committed),
+            "pushing" => Ok(Self::Pushing),
+            "pushed" => Ok(Self::Pushed),
+            "creating_draft" => Ok(Self::CreatingDraft),
+            "published" => Ok(Self::Published),
+            "failed" => Ok(Self::Failed),
+            "recovery_required" => Ok(Self::RecoveryRequired),
+            _ => Err(ServiceError::InvalidStoredState),
+        }
+    }
+}
+
+/// Acceptance for `publication.publish`; it intentionally has no Attempt ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactPublicationAcceptance {
+    operation_id: OperationId,
+    request_id: String,
+    task_id: TaskId,
+    revision: u64,
+    status: ServiceOperationStatus,
+}
+
+impl ArtifactPublicationAcceptance {
+    #[must_use]
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    #[must_use]
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    #[must_use]
+    pub const fn status(&self) -> ServiceOperationStatus {
+        self.status
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactPublicationSnapshot {
+    operation_id: OperationId,
+    request_id: String,
+    task_id: TaskId,
+    artifact_id: String,
+    tree_oid: String,
+    validation_id: String,
+    decision_id: String,
+    commit_sha: Option<String>,
+    pull_request: Option<DraftPullRequest>,
+    state: ServiceOperationStatus,
+    phase: ArtifactPublicationPhase,
+    revision: u64,
+    error_code: Option<String>,
+    accepted_at_ms: i64,
+    finished_at_ms: Option<i64>,
+}
+
+impl ArtifactPublicationSnapshot {
+    #[must_use]
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    #[must_use]
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    #[must_use]
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+    #[must_use]
+    pub fn tree_oid(&self) -> &str {
+        &self.tree_oid
+    }
+    #[must_use]
+    pub fn validation_id(&self) -> &str {
+        &self.validation_id
+    }
+    #[must_use]
+    pub fn decision_id(&self) -> &str {
+        &self.decision_id
+    }
+    #[must_use]
+    pub fn commit_sha(&self) -> Option<&str> {
+        self.commit_sha.as_deref()
+    }
+    #[must_use]
+    pub fn pull_request(&self) -> Option<&DraftPullRequest> {
+        self.pull_request.as_ref()
+    }
+    #[must_use]
+    pub const fn state(&self) -> ServiceOperationStatus {
+        self.state
+    }
+    #[must_use]
+    pub const fn phase(&self) -> ArtifactPublicationPhase {
+        self.phase
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    #[must_use]
+    pub fn error_code(&self) -> Option<&str> {
+        self.error_code.as_deref()
+    }
+    #[must_use]
+    pub const fn accepted_at_ms(&self) -> i64 {
+        self.accepted_at_ms
+    }
+    #[must_use]
+    pub const fn finished_at_ms(&self) -> Option<i64> {
+        self.finished_at_ms
+    }
 }
 
 impl ServiceOperationStatus {
@@ -326,6 +531,8 @@ pub enum ServiceError {
     OperationNotFound,
     InvalidStoredState,
     ValidationFailed,
+    PublicationFailed,
+    PublicationRecoveryRequired,
     InvalidStateTransition(DomainError),
     Workspace(WorkspaceError),
     Artifact(ArtifactError),
@@ -363,6 +570,12 @@ impl std::fmt::Display for ServiceError {
             }
             Self::ValidationFailed => {
                 formatter.write_str("Artifact validation could not be completed safely")
+            }
+            Self::PublicationFailed => {
+                formatter.write_str("Artifact publication failed before remote effects")
+            }
+            Self::PublicationRecoveryRequired => {
+                formatter.write_str("Artifact publication requires recovery; it was not replayed")
             }
             Self::InvalidStateTransition(error) => error.fmt(formatter),
             Self::Workspace(_) => formatter.write_str("workspace preparation failed"),
@@ -413,6 +626,8 @@ pub struct OperationService<'a, P> {
     providers: &'a P,
     max_attempts: usize,
     default_timeout: Duration,
+    secret_scanner: Option<&'a dyn SecretScanner>,
+    publication_gateway: Option<&'a dyn ArtifactPublicationGateway>,
 }
 
 impl<'a, P: ProviderResolver> OperationService<'a, P> {
@@ -437,7 +652,26 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             providers,
             max_attempts,
             default_timeout,
+            secret_scanner: None,
+            publication_gateway: None,
         })
+    }
+
+    /// Injects the caller's secret scanning policy. Publication is denied when absent.
+    #[must_use]
+    pub fn with_secret_scanner(mut self, scanner: &'a dyn SecretScanner) -> Self {
+        self.secret_scanner = Some(scanner);
+        self
+    }
+
+    /// Injects the Git/GitHub publication adapter used after both scans pass.
+    #[must_use]
+    pub fn with_artifact_publication_gateway(
+        mut self,
+        gateway: &'a dyn ArtifactPublicationGateway,
+    ) -> Self {
+        self.publication_gateway = Some(gateway);
+        self
     }
 
     fn idempotent_acceptance(
@@ -644,6 +878,14 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             params![request.task_id.as_str()], |row| row.get(0),
         ).optional()?;
         if let Some(id) = busy {
+            return Err(ServiceError::Busy(OperationId::new(id)));
+        }
+        let active_publication: Option<String> = transaction.query_row(
+            "SELECT id FROM service_artifact_publication_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
+            params![request.task_id.as_str()],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(id) = active_publication {
             return Err(ServiceError::Busy(OperationId::new(id)));
         }
 
@@ -1071,6 +1313,689 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             .map_err(ServiceError::from)
     }
 
+    /// Scans and durably accepts publication of exactly this Artifact.
+    /// External effects are started separately by `run_artifact_publication`.
+    /// Raw title/body and Artifact text are never persisted; only a request digest is stored.
+    pub fn publish_artifact(
+        &self,
+        request: &ArtifactPublicationRequest,
+    ) -> Result<ArtifactPublicationAcceptance, ServiceError> {
+        if request.request_id.trim().is_empty() {
+            return Err(ServiceError::InvalidRequest("request_id must not be empty"));
+        }
+        if !valid_git_branch(request.payload.base_branch())
+            || !valid_git_branch(request.payload.head_branch())
+        {
+            return Err(ServiceError::InvalidRequest(
+                "publication branch name is invalid",
+            ));
+        }
+        let scanner = self.secret_scanner.ok_or(ServiceError::PolicyDenied(
+            "SecretScanner is not configured",
+        ))?;
+        self.publication_gateway.ok_or(ServiceError::PolicyDenied(
+            "Artifact publication gateway is not configured",
+        ))?;
+        let digest = publication_request_digest(request);
+        if let Some(acceptance) = self.find_publication_acceptance(&request.request_id, &digest)? {
+            return Ok(acceptance);
+        }
+
+        let artifacts = ArtifactManager::new(self.workspaces, self.ledger);
+        let permit = artifacts
+            .publication_permit(
+                &request.task_id,
+                &request.artifact_id,
+                &request.validation_id,
+                &request.decision_id,
+                request.expected_revision,
+            )
+            .map_err(ServiceError::from)?;
+        let artifact = artifacts
+            .verify_input(&request.task_id, &request.artifact_id)
+            .map_err(ServiceError::from)?;
+        if artifact.tree_oid() != permit.tree_oid()
+            || artifact.base_commit() != permit.base_commit()
+        {
+            return Err(ServiceError::PolicyDenied(
+                "Artifact changed after evidence was checked",
+            ));
+        }
+
+        let artifact_scan = scanner
+            .scan_artifact_tree(artifact.repository_root(), artifact.tree_oid())
+            .map_err(|_| ServiceError::PolicyDenied("secret scan could not complete safely"))?;
+        let payload_scan = scanner
+            .scan_publication_payload(&request.payload)
+            .map_err(|_| ServiceError::PolicyDenied("secret scan could not complete safely"))?;
+        if artifact_scan != SecretScanResult::Clean || payload_scan != SecretScanResult::Clean {
+            return Err(ServiceError::PolicyDenied(
+                "secret scan found sensitive content",
+            ));
+        }
+
+        let (acceptance, _) = self.accept_artifact_publication(request, &permit, &digest)?;
+        Ok(acceptance)
+    }
+
+    /// Executes an accepted publication with the exact request payload held by the caller.
+    /// It rechecks the digest, evidence, Artifact tree, and secret scans before any external effect.
+    pub fn run_artifact_publication(
+        &self,
+        acceptance: &ArtifactPublicationAcceptance,
+        request: &ArtifactPublicationRequest,
+    ) -> Result<ArtifactPublicationSnapshot, ServiceError> {
+        if acceptance.request_id != request.request_id || acceptance.task_id != request.task_id {
+            return Err(ServiceError::IdempotencyConflict);
+        }
+        let snapshot = self.get_artifact_publication_operation(&acceptance.operation_id)?;
+        if snapshot.request_id != request.request_id || snapshot.task_id != request.task_id {
+            return Err(ServiceError::IdempotencyConflict);
+        }
+        if snapshot.state != ServiceOperationStatus::Accepted {
+            return Ok(snapshot);
+        }
+        let scanner = self.secret_scanner.ok_or(ServiceError::PolicyDenied(
+            "SecretScanner is not configured",
+        ))?;
+        let gateway = self.publication_gateway.ok_or(ServiceError::PolicyDenied(
+            "Artifact publication gateway is not configured",
+        ))?;
+        let digest = publication_request_digest(request);
+        let (stored_digest, current_revision): (String, i64) = {
+            let connection = self.ledger.lock_connection()?;
+            connection.query_row(
+                "SELECT publication.request_digest,task_revision.revision
+                 FROM service_artifact_publication_operations publication
+                 JOIN service_task_revisions task_revision ON task_revision.task_id=publication.task_id
+                 WHERE publication.id=?1 AND publication.status='accepted'",
+                params![acceptance.operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        };
+        if stored_digest != digest {
+            return Err(ServiceError::IdempotencyConflict);
+        }
+        let current_revision =
+            u64::try_from(current_revision).map_err(|_| ServiceError::InvalidStoredState)?;
+        self.set_publication_running(&acceptance.operation_id, ArtifactPublicationPhase::Accepted)?;
+        if current_revision != acceptance.revision {
+            self.finish_publication(
+                &acceptance.operation_id,
+                ServiceOperationStatus::Failed,
+                "publication_stale_revision",
+                None,
+                None,
+            )?;
+            return Err(ServiceError::StaleRevision {
+                expected: acceptance.revision,
+                actual: current_revision,
+            });
+        }
+        let permit = match ArtifactManager::new(self.workspaces, self.ledger).publication_permit(
+            &request.task_id,
+            &request.artifact_id,
+            &request.validation_id,
+            &request.decision_id,
+            current_revision,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.finish_publication(
+                    &acceptance.operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_evidence_mismatch",
+                    None,
+                    None,
+                )?;
+                return Err(ServiceError::from(error));
+            }
+        };
+        if permit.tree_oid() != snapshot.tree_oid {
+            self.finish_publication(
+                &acceptance.operation_id,
+                ServiceOperationStatus::Failed,
+                "publication_artifact_mismatch",
+                None,
+                None,
+            )?;
+            return Err(ServiceError::PolicyDenied(
+                "Artifact changed after publication was accepted",
+            ));
+        }
+        let artifact = match ArtifactManager::new(self.workspaces, self.ledger)
+            .verify_input(&request.task_id, &request.artifact_id)
+        {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                self.finish_publication(
+                    &acceptance.operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_artifact_unavailable",
+                    None,
+                    None,
+                )?;
+                return Err(ServiceError::from(error));
+            }
+        };
+        let artifact_scan =
+            match scanner.scan_artifact_tree(artifact.repository_root(), artifact.tree_oid()) {
+                Ok(result) => result,
+                Err(_) => {
+                    self.finish_publication(
+                        &acceptance.operation_id,
+                        ServiceOperationStatus::Failed,
+                        "publication_scan_failed",
+                        None,
+                        None,
+                    )?;
+                    return Err(ServiceError::PolicyDenied(
+                        "secret scan could not complete safely",
+                    ));
+                }
+            };
+        let payload_scan = match scanner.scan_publication_payload(&request.payload) {
+            Ok(result) => result,
+            Err(_) => {
+                self.finish_publication(
+                    &acceptance.operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_scan_failed",
+                    None,
+                    None,
+                )?;
+                return Err(ServiceError::PolicyDenied(
+                    "secret scan could not complete safely",
+                ));
+            }
+        };
+        if artifact_scan != SecretScanResult::Clean || payload_scan != SecretScanResult::Clean {
+            self.finish_publication(
+                &acceptance.operation_id,
+                ServiceOperationStatus::Failed,
+                "publication_secret_detected",
+                None,
+                None,
+            )?;
+            return Err(ServiceError::PolicyDenied(
+                "secret scan found sensitive content",
+            ));
+        }
+        self.save_publication_phase(
+            &acceptance.operation_id,
+            ArtifactPublicationPhase::Scanned,
+            None,
+        )?;
+        self.execute_artifact_publication(
+            &acceptance.operation_id,
+            &artifact,
+            &permit,
+            &request.payload,
+            gateway,
+        )?;
+        self.get_artifact_publication_operation(&acceptance.operation_id)
+    }
+
+    /// Reads the durable result for a publication operation. This is separate from
+    /// `get_operation`, whose current contract is provider-Attempt-specific.
+    pub fn get_artifact_publication_operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<ArtifactPublicationSnapshot, ServiceError> {
+        let connection = self.ledger.lock_connection()?;
+        let row = connection.query_row(
+            "SELECT request_id,task_id,artifact_id,tree_oid,validation_id,decision_id,commit_sha,
+                    pull_request_number,pull_request_url,is_draft,status,phase,revision,error_code,
+                    accepted_at,finished_at,head_branch,base_branch
+             FROM service_artifact_publication_operations WHERE id=?1",
+            params![operation_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?, row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?, row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, String>(10)?, row.get::<_, String>(11)?,
+                    row.get::<_, i64>(12)?, row.get::<_, Option<String>>(13)?,
+                    row.get::<_, i64>(14)?, row.get::<_, Option<i64>>(15)?,
+                    row.get::<_, String>(16)?, row.get::<_, String>(17)?,
+                ))
+            },
+        ).optional()?.ok_or(ServiceError::OperationNotFound)?;
+        let pull_request = match (row.7, row.8, row.9) {
+            (Some(number), Some(url), Some(draft)) => Some(DraftPullRequest::new(
+                u64::try_from(number).map_err(|_| ServiceError::InvalidStoredState)?,
+                url,
+                draft != 0,
+                row.6.clone().ok_or(ServiceError::InvalidStoredState)?,
+                row.16.clone(),
+                row.17.clone(),
+            )),
+            (None, None, None) => None,
+            _ => return Err(ServiceError::InvalidStoredState),
+        };
+        Ok(ArtifactPublicationSnapshot {
+            operation_id: operation_id.clone(),
+            request_id: row.0,
+            task_id: TaskId::new(row.1),
+            artifact_id: row.2,
+            tree_oid: row.3,
+            validation_id: row.4,
+            decision_id: row.5,
+            commit_sha: row.6,
+            pull_request,
+            state: ServiceOperationStatus::from_str(&row.10)?,
+            phase: ArtifactPublicationPhase::from_str(&row.11)?,
+            revision: u64::try_from(row.12).map_err(|_| ServiceError::InvalidStoredState)?,
+            error_code: row.13,
+            accepted_at_ms: row.14,
+            finished_at_ms: row.15,
+        })
+    }
+
+    fn find_publication_acceptance(
+        &self,
+        request_id: &str,
+        digest: &str,
+    ) -> Result<Option<ArtifactPublicationAcceptance>, ServiceError> {
+        let connection = self.ledger.lock_connection()?;
+        let row: Option<(String, String, String, i64, String)> = connection
+            .query_row(
+                "SELECT id,task_id,request_digest,revision,status
+                 FROM service_artifact_publication_operations WHERE request_id=?1",
+                params![request_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(id, task_id, stored_digest, revision, status)| {
+            if stored_digest != digest {
+                return Err(ServiceError::IdempotencyConflict);
+            }
+            Ok(ArtifactPublicationAcceptance {
+                operation_id: OperationId::new(id),
+                request_id: request_id.to_owned(),
+                task_id: TaskId::new(task_id),
+                revision: u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?,
+                status: ServiceOperationStatus::from_str(&status)?,
+            })
+        })
+        .transpose()
+    }
+
+    fn accept_artifact_publication(
+        &self,
+        request: &ArtifactPublicationRequest,
+        permit: &ArtifactPublicationPermit,
+        digest: &str,
+    ) -> Result<(ArtifactPublicationAcceptance, bool), ServiceError> {
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((id, task, stored_digest, revision, status)) = tx
+            .query_row(
+                "SELECT id,task_id,request_digest,revision,status
+                 FROM service_artifact_publication_operations WHERE request_id=?1",
+                params![request.request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if stored_digest != digest {
+                return Err(ServiceError::IdempotencyConflict);
+            }
+            let acceptance = ArtifactPublicationAcceptance {
+                operation_id: OperationId::new(id),
+                request_id: request.request_id.clone(),
+                task_id: TaskId::new(task),
+                revision: u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?,
+                status: ServiceOperationStatus::from_str(&status)?,
+            };
+            tx.commit()?;
+            return Ok((acceptance, false));
+        }
+        let task_state: String = tx
+            .query_row(
+                "SELECT state FROM tasks WHERE id=?1",
+                params![request.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ServiceError::TaskNotFound)?;
+        if matches!(task_state.as_str(), "completed" | "failed" | "cancelled") {
+            return Err(ServiceError::PolicyDenied("Task is closed"));
+        }
+        let revision: i64 = tx
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![request.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ServiceError::TaskNotFound)?;
+        let revision = u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?;
+        if revision != request.expected_revision {
+            return Err(ServiceError::StaleRevision {
+                expected: request.expected_revision,
+                actual: revision,
+            });
+        }
+        let active_attempt: Option<String> = tx.query_row(
+            "SELECT id FROM service_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
+            params![request.task_id.as_str()], |row| row.get(0),
+        ).optional()?;
+        if let Some(id) = active_attempt {
+            return Err(ServiceError::Busy(OperationId::new(id)));
+        }
+        let active_publication: Option<String> = tx.query_row(
+            "SELECT id FROM service_artifact_publication_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
+            params![request.task_id.as_str()], |row| row.get(0),
+        ).optional()?;
+        if let Some(id) = active_publication {
+            return Err(ServiceError::Busy(OperationId::new(id)));
+        }
+        let artifact_tree: Option<String> = tx.query_row(
+            "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
+            params![request.task_id.as_str(), request.artifact_id], |row| row.get(0),
+        ).optional()?;
+        if artifact_tree.as_deref() != Some(permit.tree_oid()) {
+            return Err(ServiceError::Artifact(ArtifactError::RecoveryRequired));
+        }
+        let next_revision = revision
+            .checked_add(1)
+            .filter(|value| *value <= i64::MAX as u64)
+            .ok_or(ServiceError::InvalidStoredState)?;
+        tx.execute(
+            "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+            params![request.task_id.as_str(), next_revision as i64],
+        )?;
+        let row_id: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(rowid),0)+1 FROM service_artifact_publication_operations",
+            [],
+            |row| row.get(0),
+        )?;
+        let accepted_at = now_ms();
+        let operation_id = OperationId::new(format!("service-publication-{row_id}-{accepted_at}"));
+        let request_digest = digest;
+        tx.execute(
+            "INSERT INTO service_artifact_publication_operations(
+                id,request_id,task_id,request_digest,artifact_id,tree_oid,base_commit,
+                validation_id,decision_id,base_branch,head_branch,status,phase,
+                accepted_revision,revision,accepted_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'accepted','scanned',?12,?13,?14)",
+            params![
+                operation_id.as_str(),
+                request.request_id,
+                request.task_id.as_str(),
+                request_digest,
+                request.artifact_id,
+                permit.tree_oid(),
+                permit.base_commit(),
+                permit.validation_id(),
+                permit.decision_id(),
+                request.payload.base_branch(),
+                request.payload.head_branch(),
+                request.expected_revision as i64,
+                next_revision as i64,
+                accepted_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok((
+            ArtifactPublicationAcceptance {
+                operation_id,
+                request_id: request.request_id.clone(),
+                task_id: request.task_id.clone(),
+                revision: next_revision,
+                status: ServiceOperationStatus::Accepted,
+            },
+            true,
+        ))
+    }
+
+    fn execute_artifact_publication(
+        &self,
+        operation_id: &OperationId,
+        artifact: &crate::ArtifactRecord,
+        permit: &ArtifactPublicationPermit,
+        payload: &ArtifactPublicationPayload,
+        gateway: &dyn ArtifactPublicationGateway,
+    ) -> Result<(), ServiceError> {
+        self.save_publication_phase(operation_id, ArtifactPublicationPhase::Committing, None)?;
+        let commit_sha = match gateway.commit_tree(
+            artifact.repository_root(),
+            permit.tree_oid(),
+            permit.base_commit(),
+            "Publish validated Artifact",
+            self.default_timeout,
+        ) {
+            Ok(sha) => sha,
+            Err(_) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_commit_failed",
+                    None,
+                    None,
+                )?;
+                return Err(ServiceError::PublicationFailed);
+            }
+        };
+        if !valid_git_oid(&commit_sha)
+            || !commit_matches_tree_and_base(
+                artifact.repository_root(),
+                &commit_sha,
+                permit.tree_oid(),
+                permit.base_commit(),
+                self.default_timeout,
+            )
+        {
+            self.finish_publication(
+                operation_id,
+                ServiceOperationStatus::Failed,
+                "publication_commit_mismatch",
+                None,
+                None,
+            )?;
+            return Err(ServiceError::PublicationFailed);
+        }
+        self.save_publication_phase(
+            operation_id,
+            ArtifactPublicationPhase::Committed,
+            Some(&commit_sha),
+        )?;
+
+        self.save_publication_phase(
+            operation_id,
+            ArtifactPublicationPhase::Pushing,
+            Some(&commit_sha),
+        )?;
+        if gateway
+            .push_commit(
+                artifact.repository_root(),
+                &commit_sha,
+                payload.head_branch(),
+                self.default_timeout,
+            )
+            .is_err()
+        {
+            self.finish_publication(
+                operation_id,
+                ServiceOperationStatus::RecoveryRequired,
+                "publication_push_ambiguous",
+                Some(&commit_sha),
+                None,
+            )?;
+            return Err(ServiceError::PublicationRecoveryRequired);
+        }
+        self.save_publication_phase(
+            operation_id,
+            ArtifactPublicationPhase::Pushed,
+            Some(&commit_sha),
+        )?;
+
+        self.save_publication_phase(
+            operation_id,
+            ArtifactPublicationPhase::CreatingDraft,
+            Some(&commit_sha),
+        )?;
+        let pull_request = match gateway.create_or_find_draft_pull_request(
+            artifact.repository_root(),
+            payload,
+            &commit_sha,
+            self.default_timeout,
+        ) {
+            Ok(pull_request) => pull_request,
+            Err(_) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::RecoveryRequired,
+                    "publication_pr_ambiguous",
+                    Some(&commit_sha),
+                    None,
+                )?;
+                return Err(ServiceError::PublicationRecoveryRequired);
+            }
+        };
+        if !pull_request.is_draft()
+            || pull_request.head_sha() != commit_sha
+            || pull_request.head_branch() != payload.head_branch()
+            || pull_request.base_branch() != payload.base_branch()
+            || pull_request.number() == 0
+            || !pull_request.url().starts_with("https://")
+        {
+            self.finish_publication(
+                operation_id,
+                ServiceOperationStatus::RecoveryRequired,
+                "publication_pr_mismatch",
+                Some(&commit_sha),
+                None,
+            )?;
+            return Err(ServiceError::PublicationRecoveryRequired);
+        }
+        self.finish_publication(
+            operation_id,
+            ServiceOperationStatus::Completed,
+            "",
+            Some(&commit_sha),
+            Some(&pull_request),
+        )?;
+        Ok(())
+    }
+
+    fn set_publication_running(
+        &self,
+        operation_id: &OperationId,
+        phase: ArtifactPublicationPhase,
+    ) -> Result<(), ServiceError> {
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE service_artifact_publication_operations SET status='running',phase=?2,started_at=?3
+             WHERE id=?1 AND status='accepted'",
+            params![operation_id.as_str(), phase.as_str(), now_ms()],
+        )?;
+        if changed != 1 {
+            return Err(ServiceError::PublicationRecoveryRequired);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn save_publication_phase(
+        &self,
+        operation_id: &OperationId,
+        phase: ArtifactPublicationPhase,
+        commit_sha: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let connection = self.ledger.lock_connection()?;
+        let changed = connection.execute(
+            "UPDATE service_artifact_publication_operations SET phase=?2,commit_sha=COALESCE(?3,commit_sha)
+             WHERE id=?1 AND status='running'",
+            params![operation_id.as_str(), phase.as_str(), commit_sha],
+        )?;
+        if changed != 1 {
+            return Err(ServiceError::PublicationRecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn finish_publication(
+        &self,
+        operation_id: &OperationId,
+        status: ServiceOperationStatus,
+        error_code: &str,
+        commit_sha: Option<&str>,
+        pull_request: Option<&DraftPullRequest>,
+    ) -> Result<(), ServiceError> {
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task: String = tx
+            .query_row(
+                "SELECT task_id FROM service_artifact_publication_operations WHERE id=?1",
+                params![operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ServiceError::OperationNotFound)?;
+        let phase = match status {
+            ServiceOperationStatus::Completed => ArtifactPublicationPhase::Published,
+            ServiceOperationStatus::Failed => ArtifactPublicationPhase::Failed,
+            ServiceOperationStatus::RecoveryRequired => ArtifactPublicationPhase::RecoveryRequired,
+            _ => return Err(ServiceError::InvalidStoredState),
+        };
+        let next_revision: i64 = tx
+            .query_row(
+                "SELECT revision+1 FROM service_task_revisions WHERE task_id=?1",
+                params![task],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ServiceError::TaskNotFound)?;
+        tx.execute(
+            "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+            params![task, next_revision],
+        )?;
+        tx.execute(
+            "UPDATE service_artifact_publication_operations SET status=?2,phase=?3,revision=?4,
+                error_code=?5,commit_sha=COALESCE(?6,commit_sha),pull_request_number=?7,
+                pull_request_url=?8,is_draft=?9,finished_at=?10 WHERE id=?1 AND status='running'",
+            params![
+                operation_id.as_str(),
+                status.as_str(),
+                phase.as_str(),
+                next_revision,
+                if error_code.is_empty() {
+                    None
+                } else {
+                    Some(error_code)
+                },
+                commit_sha,
+                pull_request.map(|pr| pr.number() as i64),
+                pull_request.map(DraftPullRequest::url),
+                pull_request.map(|pr| i64::from(pr.is_draft())),
+                now_ms(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn record_workspace_reference(
         &self,
         operation_id: &OperationId,
@@ -1150,6 +2075,29 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             }
             tx.execute(
                 "UPDATE service_operations SET status='recovery_required',finished_at=?2,diagnostic_code='interrupted' WHERE id=?1 AND status='running'",
+                params![operation_id, now_ms()],
+            )?;
+            bump_revision(&tx, &task_id)?;
+            recovered.push(OperationId::new(operation_id));
+        }
+        let pending_publications = {
+            let mut statement = tx.prepare(
+                "SELECT id,task_id FROM service_artifact_publication_operations
+                 WHERE status IN ('accepted','running') ORDER BY rowid",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (operation_id, task_text) in pending_publications {
+            let task_id = TaskId::new(task_text);
+            tx.execute(
+                "UPDATE service_artifact_publication_operations
+                 SET status='recovery_required',phase='recovery_required',
+                     error_code='interrupted',finished_at=?2,revision=revision+1
+                 WHERE id=?1 AND status IN ('accepted','running')",
                 params![operation_id, now_ms()],
             )?;
             bump_revision(&tx, &task_id)?;
@@ -1357,6 +2305,84 @@ fn bump_revision(tx: &rusqlite::Transaction<'_>, task_id: &TaskId) -> Result<(),
     Ok(())
 }
 
+fn publication_request_digest(request: &ArtifactPublicationRequest) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ai-dev-orchestrator-publication-v1\0");
+    let expected_revision = request.expected_revision.to_string();
+    for field in [
+        request.request_id.as_bytes(),
+        request.task_id.as_str().as_bytes(),
+        expected_revision.as_bytes(),
+        request.artifact_id.as_bytes(),
+        request.validation_id.as_bytes(),
+        request.decision_id.as_bytes(),
+        request.payload.base_branch().as_bytes(),
+        request.payload.head_branch().as_bytes(),
+        request.payload.title().as_bytes(),
+        request.payload.body().as_bytes(),
+    ] {
+        digest.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(field);
+    }
+    let bytes = digest.finalize();
+    let mut hex = String::with_capacity(7 + bytes.len() * 2);
+    hex.push_str("sha256:");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn valid_git_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.starts_with('-')
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.ends_with('.')
+        && !branch.contains("..")
+        && !branch.contains("@{")
+        && branch
+            .split('/')
+            .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+        && !branch
+            .bytes()
+            .any(|byte| byte <= b' ' || byte == 0x7f || b"~^:?*[\\".contains(&byte))
+}
+
+fn valid_git_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn commit_matches_tree_and_base(
+    repository: &Path,
+    commit_sha: &str,
+    expected_tree: &str,
+    expected_base: &str,
+    timeout: Duration,
+) -> bool {
+    if !valid_git_oid(commit_sha) {
+        return false;
+    }
+    let output = match crate::process_runner::ProcessRunner.run(
+        crate::process_runner::ProcessRequest::new("git")
+            .arg("-C")
+            .arg(repository.as_os_str().to_owned())
+            .args(["show", "--no-patch", "--format=%T%n%P", commit_sha])
+            .timeout(timeout),
+    ) {
+        Ok(output) if !output.output_truncated => output,
+        _ => return false,
+    };
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    lines.next() == Some(expected_tree)
+        && lines.next() == Some(expected_base)
+        && lines.next().is_none()
+}
+
 fn parse_attempt_state(value: &str) -> Result<AttemptState, ServiceError> {
     match value {
         "queued" => Ok(AttemptState::Queued),
@@ -1383,7 +2409,7 @@ mod tests {
         fs,
         process::Command,
         sync::{
-            Arc, Barrier,
+            Arc, Barrier, Mutex,
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         thread,
@@ -1391,8 +2417,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AgentProvider, AgentResult, ProviderError, ProviderRegistry, ProviderResult, Task,
-        UsageCost,
+        AgentProvider, AgentResult, ProviderError, ProviderRegistry, ProviderResult,
+        PublicationGatewayError, SecretScanError, Task, UsageCost,
     };
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
@@ -1519,6 +2545,232 @@ mod tests {
             self.availability_checks.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    struct FakeSecretScanner {
+        artifact_result: Result<SecretScanResult, SecretScanError>,
+        payload_result: Result<SecretScanResult, SecretScanError>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl SecretScanner for FakeSecretScanner {
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_artifact");
+            self.artifact_result
+        }
+
+        fn scan_publication_payload(
+            &self,
+            _payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_payload");
+            self.payload_result
+        }
+    }
+
+    struct CleanThenFindingScanner {
+        payload_scans: AtomicUsize,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl SecretScanner for CleanThenFindingScanner {
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_artifact");
+            Ok(SecretScanResult::Clean)
+        }
+
+        fn scan_publication_payload(
+            &self,
+            _payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_payload");
+            if self.payload_scans.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(SecretScanResult::Clean)
+            } else {
+                Ok(SecretScanResult::Findings)
+            }
+        }
+    }
+
+    struct FakeArtifactPublicationGateway {
+        repository: PathBuf,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        fail_push: bool,
+        fail_pull_request: bool,
+    }
+
+    impl ArtifactPublicationGateway for FakeArtifactPublicationGateway {
+        fn commit_tree(
+            &self,
+            _repository: &Path,
+            tree_oid: &str,
+            base_commit: &str,
+            message: &str,
+            _timeout: Duration,
+        ) -> Result<String, PublicationGatewayError> {
+            self.events.lock().unwrap().push("commit");
+            Ok(git(
+                &self.repository,
+                &["commit-tree", tree_oid, "-p", base_commit, "-m", message],
+            ))
+        }
+
+        fn push_commit(
+            &self,
+            _repository: &Path,
+            _commit_sha: &str,
+            _head_branch: &str,
+            _timeout: Duration,
+        ) -> Result<(), PublicationGatewayError> {
+            self.events.lock().unwrap().push("push");
+            if self.fail_push {
+                Err(PublicationGatewayError::CommandFailed)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn create_or_find_draft_pull_request(
+            &self,
+            _repository: &Path,
+            payload: &ArtifactPublicationPayload,
+            commit_sha: &str,
+            _timeout: Duration,
+        ) -> Result<DraftPullRequest, PublicationGatewayError> {
+            self.events.lock().unwrap().push("draft_pr");
+            if self.fail_pull_request {
+                return Err(PublicationGatewayError::CommandFailed);
+            }
+            Ok(DraftPullRequest::new(
+                17,
+                "https://github.test/owner/repo/pull/17",
+                true,
+                commit_sha,
+                payload.head_branch(),
+                payload.base_branch(),
+            ))
+        }
+    }
+
+    struct ArtifactPublicationFixture {
+        repo: Repo,
+        ledger: SqliteExecutionLedger,
+        workspace: WorkspaceManager,
+        providers: ProviderRegistry,
+        task_id: TaskId,
+        artifact_id: String,
+        validation_id: String,
+        decision_id: String,
+        revision: u64,
+        attempt_id: AttemptId,
+    }
+
+    fn artifact_publication_fixture() -> ArtifactPublicationFixture {
+        use crate::{CommandValidator, ValidationCheck};
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = TaskId::new("publication-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "publication task",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            require_file: None,
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let accepted = service
+            .submit_attempt(&request(&repo, &task_id, 0, "publication-source"))
+            .unwrap();
+        let completed = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        let artifact_id = completed.output_artifact_id().unwrap().to_owned();
+        let validation = service
+            .validate_artifact(
+                &task_id,
+                &artifact_id,
+                task_revision(&ledger, &task_id),
+                &CommandValidator::new([ValidationCheck::new("passes", "true")]),
+            )
+            .unwrap();
+        let decision = service
+            .record_artifact_decision(
+                &task_id,
+                &artifact_id,
+                task_revision(&ledger, &task_id),
+                CodexDecisionKind::Accepted,
+                "Accepted for publication",
+                &[("validation".into(), validation.id().into())],
+            )
+            .unwrap();
+        let revision = task_revision(&ledger, &task_id);
+        ArtifactPublicationFixture {
+            repo,
+            ledger,
+            workspace,
+            providers,
+            task_id,
+            artifact_id,
+            validation_id: validation.id().to_owned(),
+            decision_id: decision.id().to_owned(),
+            revision,
+            attempt_id: accepted.attempt_id().clone(),
+        }
+    }
+
+    fn task_revision(ledger: &SqliteExecutionLedger, task_id: &TaskId) -> u64 {
+        ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64
+    }
+
+    fn publication_request(
+        fixture: &ArtifactPublicationFixture,
+        request_id: &str,
+    ) -> ArtifactPublicationRequest {
+        ArtifactPublicationRequest::new(
+            request_id,
+            fixture.task_id.clone(),
+            fixture.revision,
+            fixture.artifact_id.clone(),
+            fixture.validation_id.clone(),
+            fixture.decision_id.clone(),
+            ArtifactPublicationPayload::new(
+                "main",
+                "codex/artifact-publication",
+                "payload-title-private-marker",
+                "payload-body-private-marker",
+            ),
+        )
     }
 
     #[derive(Default)]
@@ -2343,5 +3595,427 @@ mod tests {
             &["worktree", "remove", "--force", &retained_path_text],
         );
         cleanup_fixture_worktree(&repo, &workspace, &task_id, completed.attempt_id());
+    }
+
+    #[test]
+    fn publication_requires_a_scanner_before_recording_or_gateway_effects() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_artifact_publication_gateway(&gateway);
+        assert!(matches!(
+            service.publish_artifact(&publication_request(&fixture, "scanner-required")),
+            Err(ServiceError::PolicyDenied(
+                "SecretScanner is not configured"
+            ))
+        ));
+        assert!(events.lock().unwrap().is_empty());
+        let count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_artifact_publication_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_scans_before_effects_and_persists_exact_draft_evidence_without_payload_text() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "publish-artifact-once");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        assert_eq!(acceptance.status(), ServiceOperationStatus::Accepted);
+        let accepted_snapshot = service
+            .get_artifact_publication_operation(acceptance.operation_id())
+            .unwrap();
+        assert_eq!(accepted_snapshot.state(), ServiceOperationStatus::Accepted);
+        assert_eq!(accepted_snapshot.phase(), ArtifactPublicationPhase::Scanned);
+        assert_eq!(*events.lock().unwrap(), ["scan_artifact", "scan_payload"]);
+        let snapshot = service
+            .run_artifact_publication(&acceptance, &request)
+            .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::Completed);
+        assert_eq!(snapshot.phase(), ArtifactPublicationPhase::Published);
+        assert_eq!(snapshot.artifact_id(), fixture.artifact_id);
+        assert!(valid_git_oid(snapshot.commit_sha().unwrap()));
+        let pull_request = snapshot.pull_request().unwrap();
+        assert_eq!(pull_request.number(), 17);
+        assert!(pull_request.is_draft());
+        assert_eq!(pull_request.head_sha(), snapshot.commit_sha().unwrap());
+        let commit_meta = git(
+            &fixture.repo.0,
+            &[
+                "show",
+                "--no-patch",
+                "--format=%T%n%P",
+                snapshot.commit_sha().unwrap(),
+            ],
+        );
+        assert_eq!(commit_meta.lines().next(), Some(snapshot.tree_oid()));
+        assert_eq!(
+            commit_meta.lines().nth(1),
+            Some(git(&fixture.repo.0, &["rev-parse", "HEAD"]).as_str())
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "scan_artifact",
+                "scan_payload",
+                "scan_artifact",
+                "scan_payload",
+                "commit",
+                "push",
+                "draft_pr"
+            ]
+        );
+
+        let duplicate = service.publish_artifact(&request).unwrap();
+        assert_eq!(duplicate.operation_id(), acceptance.operation_id());
+        assert_eq!(duplicate.status(), ServiceOperationStatus::Completed);
+        assert_eq!(events.lock().unwrap().len(), 7);
+        let mut changed = request.clone();
+        changed.payload = ArtifactPublicationPayload::new(
+            "main",
+            "codex/artifact-publication",
+            "payload-title-private-marker",
+            "different-body",
+        );
+        assert!(matches!(
+            service.publish_artifact(&changed),
+            Err(ServiceError::IdempotencyConflict)
+        ));
+
+        let connection = fixture.ledger.lock_connection().unwrap();
+        let columns = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(service_artifact_publication_operations)")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            !columns
+                .iter()
+                .any(|column| column == "title" || column == "body")
+        );
+        let digest: String = connection
+            .query_row(
+                "SELECT request_digest FROM service_artifact_publication_operations WHERE id=?1",
+                params![acceptance.operation_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(digest.starts_with("sha256:") && digest.len() == 71);
+        assert!(!digest.contains("payload-title-private-marker"));
+        drop(connection);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_rescans_before_run_and_marks_changed_payload_rejected() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = CleanThenFindingScanner {
+            payload_scans: AtomicUsize::new(0),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "payload-changed-after-acceptance");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        assert_eq!(acceptance.status(), ServiceOperationStatus::Accepted);
+        assert!(matches!(
+            service.run_artifact_publication(&acceptance, &request),
+            Err(ServiceError::PolicyDenied(
+                "secret scan found sensitive content"
+            ))
+        ));
+        let snapshot = service
+            .get_artifact_publication_operation(acceptance.operation_id())
+            .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::Failed);
+        assert_eq!(snapshot.phase(), ArtifactPublicationPhase::Failed);
+        assert_eq!(snapshot.error_code(), Some("publication_secret_detected"));
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "scan_artifact",
+                "scan_payload",
+                "scan_artifact",
+                "scan_payload"
+            ]
+        );
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn startup_recovery_never_replays_an_accepted_publication() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "publication-startup-recovery");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        assert_eq!(*events.lock().unwrap(), ["scan_artifact", "scan_payload"]);
+        let recovered = service.recover_incomplete_operations().unwrap();
+        assert_eq!(recovered, [acceptance.operation_id().clone()]);
+        let snapshot = service
+            .run_artifact_publication(&acceptance, &request)
+            .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(snapshot.phase(), ArtifactPublicationPhase::RecoveryRequired);
+        assert_eq!(events.lock().unwrap().len(), 2);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_runner_rejects_a_revision_change_after_acceptance() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "publication-stale-after-acceptance");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "UPDATE service_task_revisions SET revision=revision+1 WHERE task_id=?1",
+                params![fixture.task_id.as_str()],
+            )
+            .unwrap();
+        assert!(matches!(
+            service.run_artifact_publication(&acceptance, &request),
+            Err(ServiceError::StaleRevision { .. })
+        ));
+        let snapshot = service
+            .get_artifact_publication_operation(acceptance.operation_id())
+            .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::Failed);
+        assert_eq!(snapshot.error_code(), Some("publication_stale_revision"));
+        assert_eq!(*events.lock().unwrap(), ["scan_artifact", "scan_payload"]);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_scan_findings_and_ambiguous_push_fail_closed_without_replay() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Findings),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "secret-denied");
+        assert!(matches!(
+            service.publish_artifact(&request),
+            Err(ServiceError::PolicyDenied(
+                "secret scan found sensitive content"
+            ))
+        ));
+        assert_eq!(*events.lock().unwrap(), ["scan_artifact", "scan_payload"]);
+        let count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_artifact_publication_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let clean_scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let uncertain_gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: true,
+            fail_pull_request: false,
+        };
+        let recovery_service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&clean_scanner)
+        .with_artifact_publication_gateway(&uncertain_gateway);
+        let request = publication_request(&fixture, "push-may-have-completed");
+        let acceptance = recovery_service.publish_artifact(&request).unwrap();
+        assert!(matches!(
+            recovery_service.run_artifact_publication(&acceptance, &request),
+            Err(ServiceError::PublicationRecoveryRequired)
+        ));
+        let operation_id: OperationId = {
+            let connection = fixture.ledger.lock_connection().unwrap();
+            OperationId::new(connection.query_row(
+                "SELECT id FROM service_artifact_publication_operations WHERE request_id=?1",
+                params![request.request_id],
+                |row| row.get::<_, String>(0),
+            ).unwrap())
+        };
+        let snapshot = recovery_service
+            .get_artifact_publication_operation(&operation_id)
+            .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(snapshot.phase(), ArtifactPublicationPhase::RecoveryRequired);
+        assert_eq!(snapshot.error_code(), Some("publication_push_ambiguous"));
+        assert!(snapshot.commit_sha().is_some());
+        assert!(snapshot.pull_request().is_none());
+        let events_before_retry = events.lock().unwrap().len();
+        let retry = recovery_service.publish_artifact(&request).unwrap();
+        assert_eq!(retry.operation_id(), &operation_id);
+        assert_eq!(retry.status(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(events.lock().unwrap().len(), events_before_retry);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
     }
 }

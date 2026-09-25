@@ -1006,8 +1006,35 @@ fn create_service_schema(connection: &Connection) -> Result<(), rusqlite::Error>
              unit TEXT NOT NULL,
              PRIMARY KEY(operation_id, sequence)
          );
+         CREATE TABLE IF NOT EXISTS service_artifact_publication_operations (
+             id TEXT PRIMARY KEY NOT NULL,
+             request_id TEXT NOT NULL UNIQUE,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             request_digest TEXT NOT NULL,
+             artifact_id TEXT NOT NULL,
+             tree_oid TEXT NOT NULL,
+             base_commit TEXT NOT NULL,
+             validation_id TEXT NOT NULL,
+             decision_id TEXT NOT NULL,
+             base_branch TEXT NOT NULL,
+             head_branch TEXT NOT NULL,
+             status TEXT NOT NULL CHECK(status IN ('accepted','running','completed','failed','recovery_required')),
+             phase TEXT NOT NULL,
+             commit_sha TEXT,
+             pull_request_number INTEGER,
+             pull_request_url TEXT,
+             is_draft INTEGER CHECK(is_draft IS NULL OR is_draft IN (0,1)),
+             error_code TEXT,
+             accepted_revision INTEGER NOT NULL,
+             revision INTEGER NOT NULL,
+             accepted_at INTEGER NOT NULL,
+             started_at INTEGER,
+             finished_at INTEGER
+         );
          CREATE INDEX IF NOT EXISTS service_operations_task_status
              ON service_operations(task_id, status);
+         CREATE INDEX IF NOT EXISTS service_artifact_publications_task_status
+             ON service_artifact_publication_operations(task_id, status);
          INSERT OR IGNORE INTO service_task_revisions(task_id, revision)
              SELECT id, 0 FROM tasks;",
     )

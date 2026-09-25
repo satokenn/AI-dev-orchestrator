@@ -126,7 +126,11 @@ Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`�
 
 `validate_artifact`はArtifactを新しい管理worktreeへ展開し、検査の前後でGit treeが変わっていないことを確認してValidationの成功状態をArtifact ID・tree OIDへ結び付ける。検査後もtreeが同一なら一時worktreeを安全に削除する。treeが変わった場合はValidationを記録せず、変更されたworktreeを管理下に残す。validation summary、check名、diagnostic本文にはsecretが含まれる可能性があるため、redaction設定がないMVPではLedgerに保存しない。`record_artifact_decision`は監督Codexの判断を別recordとして保存し、機械検証から採否を自動生成しない。現在のMVPで判断に添付できる`EvidenceRef`は同一Task・Artifactに属するValidationだけで、review・publication・CI証拠は未対応のため拒否する。
 
-`require_artifact_publication_evidence`は、指定IDのpassed Validationとaccepted CodexDecisionが同じTask、Artifact、tree OIDを指す場合だけ`ArtifactPublicationPermit`を返す。permitにはArtifact ID、tree OID、base commit、両証拠IDが含まれる。MVPではこのpermitをcommit / push / Pull Request作成へ接続していない。MCP tool、configured secret scan、公開用tree/SHA記録も未実装なので、permitだけでは公開を許可しない。
+`require_artifact_publication_evidence`は、指定IDのpassed Validationとaccepted CodexDecisionが同じTask、Artifact、tree OIDを指す場合だけ`ArtifactPublicationPermit`を返す。permitにはArtifact ID、tree OID、base commit、両証拠IDが含まれる。Publication MVPでは、Rust `OperationService` に呼び出し側が明示注入した`SecretScanner`とpublication gatewayがなければ公開を拒否する。両者が設定されている場合も、Artifactのtree全体とPR title/body等のpayloadを外部効果前に走査し、検出・失敗・利用不能は`policy_denied`となる。
+
+公開操作はProvider Attemptを偽装せず、専用の受付・phase・結果Ledgerへ保存する。呼び出し側は`publish_artifact`で受付を行い、返されたoperationと同じrequest/payloadで`run_artifact_publication`を起動し、`get_artifact_publication_operation`で結果を読む。LedgerにはArtifact tree、validation/decision ID、作成commit SHA、Draft PR番号・URL・状態を保存し、title/body等のraw payloadは保存しない。冪等照合には長さ付きfield列から計算したSHA-256 digestを使う。Artifact treeと完全なpublication payloadは受付前と外部効果直前の両方でscanする。後段で検出・失敗した場合は副作用前に`failed`で閉じる。GitHub CLIにはtitle/bodyをargvへ渡さず、0600の一時JSONファイル経由で渡し、有限timeoutと上限付き出力 captureを使う。PR作成結果が曖昧なtimeoutや不整合は`recovery_required`として保持し、自動で再実行しない。
+
+このMVPはMCP/CLIの`publication.publish`・`operation.get`にはまだ接続されておらず、Rust Serviceに専用の`publish_artifact` / `get_artifact_publication_operation` APIを提供する段階である。既存の`operation.get`はProvider Attempt操作用のまま。公開用cancel APIと起動時のpublication recoveryは未接続で、起動時には中断した受付を`recovery_required`へ移すだけで外部操作を再実行しない。したがって、MCP wire契約全体を実装済みとは扱わない。
 
 ## 旧データとの互換性
 
