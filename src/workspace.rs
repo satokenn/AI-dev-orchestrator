@@ -635,7 +635,7 @@ fn git_error(
     error: ProcessError,
 ) -> WorkspaceError {
     let (status, stdout, stderr) = match error {
-        ProcessError::Spawn(error) | ProcessError::Io(error) => {
+        ProcessError::Spawn(error) | ProcessError::Io(error) | ProcessError::Stdin(error) => {
             (None, Vec::new(), error.to_string())
         }
         ProcessError::NonZeroExit(output)

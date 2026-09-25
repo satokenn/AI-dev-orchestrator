@@ -131,7 +131,7 @@ type PublicationTaskRow = (
     Option<String>,
 );
 
-const LATEST_SCHEMA_VERSION: u32 = 11;
+const LATEST_SCHEMA_VERSION: u32 = 12;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -271,6 +271,7 @@ impl SqliteExecutionLedger {
         create_service_schema(&transaction)?;
         create_artifact_service_schema(&transaction)?;
         create_artifact_evidence_schema(&transaction)?;
+        create_artifact_publication_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -917,6 +918,7 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
                 create_artifact_service_schema(connection)?;
             }
             11 => create_artifact_evidence_schema(connection)?,
+            12 => create_artifact_publication_schema(connection)?,
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
@@ -1010,6 +1012,38 @@ fn create_service_schema(connection: &Connection) -> Result<(), rusqlite::Error>
              ON service_operations(task_id, status);
          INSERT OR IGNORE INTO service_task_revisions(task_id, revision)
              SELECT id, 0 FROM tasks;",
+    )
+}
+
+fn create_artifact_publication_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_artifact_publication_operations (
+             id TEXT PRIMARY KEY NOT NULL,
+             request_id TEXT NOT NULL UNIQUE,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             request_digest TEXT NOT NULL,
+             artifact_id TEXT NOT NULL,
+             tree_oid TEXT NOT NULL,
+             base_commit TEXT NOT NULL,
+             validation_id TEXT NOT NULL,
+             decision_id TEXT NOT NULL,
+             base_branch TEXT NOT NULL,
+             head_branch TEXT NOT NULL,
+             status TEXT NOT NULL CHECK(status IN ('accepted','running','completed','failed','recovery_required')),
+             phase TEXT NOT NULL,
+             commit_sha TEXT,
+             pull_request_number INTEGER,
+             pull_request_url TEXT,
+             is_draft INTEGER CHECK(is_draft IS NULL OR is_draft IN (0,1)),
+             error_code TEXT,
+             accepted_revision INTEGER NOT NULL,
+             revision INTEGER NOT NULL,
+             accepted_at INTEGER NOT NULL,
+             started_at INTEGER,
+             finished_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS service_artifact_publications_task_status
+             ON service_artifact_publication_operations(task_id, status);",
     )
 }
 
@@ -1476,14 +1510,62 @@ mod tests {
     }
 
     #[test]
+    fn schema_v11_migration_adds_artifact_publication_table() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_latest_schema(&connection).unwrap();
+        create_service_schema(&connection).unwrap();
+        create_artifact_service_schema(&connection).unwrap();
+        create_artifact_evidence_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks(id,description,role,state) VALUES ('task-v11','existing','developer','active')",
+                [],
+            )
+            .unwrap();
+        set_schema_version(&connection, 11).unwrap();
+
+        let has_publication_table: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifact_publication_operations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_publication_table);
+
+        let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
+        let migrated = ledger.lock_connection().unwrap();
+        let version: u32 = migrated
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
+        let has_publication_table: bool = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifact_publication_operations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_publication_table);
+        let preserved_task: String = migrated
+            .query_row(
+                "SELECT description FROM tasks WHERE id='task-v11'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_task, "existing");
+    }
+
+    #[test]
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 12;")
+            .execute_batch("PRAGMA user_version = 13;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(12))
+            Err(LedgerError::UnsupportedSchemaVersion(13))
         ));
     }
 }

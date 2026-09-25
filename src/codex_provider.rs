@@ -176,7 +176,7 @@ impl CodexProvider {
             ProcessError::Spawn(error) => {
                 ProviderError::Unavailable(format!("Codex CLI could not be started: {error}"))
             }
-            ProcessError::Io(error) => {
+            ProcessError::Io(error) | ProcessError::Stdin(error) => {
                 ProviderError::ExecutionFailed(format!("Codex process I/O failed: {error}"))
             }
             ProcessError::TimedOut(output) => {

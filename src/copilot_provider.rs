@@ -101,9 +101,9 @@ impl CopilotProvider {
                     "GitHub Copilot CLI '{}' was not found or could not be started: {error}",
                     self.executable.to_string_lossy()
                 )),
-                ProcessError::Io(error) => ProviderError::Unavailable(format!(
-                    "GitHub Copilot CLI availability check failed: {error}"
-                )),
+                ProcessError::Io(error) | ProcessError::Stdin(error) => ProviderError::Unavailable(
+                    format!("GitHub Copilot CLI availability check failed: {error}"),
+                ),
                 ProcessError::NonZeroExit(output) => ProviderError::Unavailable(format!(
                     "GitHub Copilot CLI availability check failed: {}",
                     output_diagnostic(&output.stdout, &output.stderr, output.exit_code())
@@ -198,7 +198,7 @@ impl CopilotProvider {
             ProcessError::Spawn(error) => ProviderError::Unavailable(format!(
                 "GitHub Copilot CLI could not be started: {error}"
             )),
-            ProcessError::Io(error) => {
+            ProcessError::Io(error) | ProcessError::Stdin(error) => {
                 ProviderError::ExecutionFailed(format!("Copilot process I/O failed: {error}"))
             }
             ProcessError::TimedOut(output) => {

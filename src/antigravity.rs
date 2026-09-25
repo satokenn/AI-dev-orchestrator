@@ -157,7 +157,9 @@ impl AntigravityProvider {
             ProcessError::Spawn(error) => {
                 ProviderError::Unavailable(format_spawn_error(self.executable.as_os_str(), error))
             }
-            ProcessError::Io(error) => ProviderError::ExecutionFailed(error.to_string()),
+            ProcessError::Io(error) | ProcessError::Stdin(error) => {
+                ProviderError::ExecutionFailed(error.to_string())
+            }
             ProcessError::NonZeroExit(output) => {
                 let captured = CapturedOutput::from_process_output(&output);
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -341,7 +343,9 @@ fn format_spawn_error(executable: &OsStr, error: std::io::Error) -> String {
 
 fn process_error_message(error: ProcessError) -> String {
     match error {
-        ProcessError::Spawn(error) | ProcessError::Io(error) => error.to_string(),
+        ProcessError::Spawn(error) | ProcessError::Io(error) | ProcessError::Stdin(error) => {
+            error.to_string()
+        }
         ProcessError::NonZeroExit(output)
         | ProcessError::TimedOut(output)
         | ProcessError::Cancelled(output) => format_diagnostic(

@@ -50,6 +50,9 @@ impl ArtifactRecord {
     pub fn tree_oid(&self) -> &str {
         &self.tree_oid
     }
+    pub fn repository_root(&self) -> &Path {
+        &self.repository_root
+    }
     pub fn state(&self) -> ArtifactState {
         self.state
     }
@@ -451,6 +454,7 @@ impl<'a> ArtifactManager<'a> {
                 actual: u64::try_from(revision).unwrap_or_default(),
             });
         }
+        Self::ensure_no_active_publication(&tx, task)?;
         let still_available: Option<String> = tx.query_row(
             "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
             params![task.as_str(), artifact_id],
@@ -524,6 +528,7 @@ impl<'a> ArtifactManager<'a> {
                 actual: u64::try_from(revision).unwrap_or_default(),
             });
         }
+        Self::ensure_no_active_publication(&tx, task)?;
         let still_available: Option<String> = tx.query_row(
             "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
             params![task.as_str(), artifact_id],
@@ -633,6 +638,23 @@ impl<'a> ArtifactManager<'a> {
             validation_id: validation_id.to_owned(),
             decision_id: decision_id.to_owned(),
         })
+    }
+
+    fn ensure_no_active_publication(
+        tx: &rusqlite::Transaction<'_>,
+        task: &TaskId,
+    ) -> Result<(), ArtifactError> {
+        let active: Option<String> = tx.query_row(
+            "SELECT id FROM service_artifact_publication_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
+            params![task.as_str()],
+            |row| row.get(0),
+        ).optional()?;
+        if active.is_some() {
+            return Err(ArtifactError::Invalid(
+                "Task has an active publication operation".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn cleanup_validation_workspace(
