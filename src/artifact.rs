@@ -563,7 +563,7 @@ impl<'a> ArtifactManager<'a> {
             |row| row.get(0),
         )?;
         let decision_matches: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM artifact_codex_decisions WHERE id=?1 AND task_id=?2 AND artifact_id=?3 AND tree_oid=?4 AND decision='accepted')",
+            "SELECT EXISTS(SELECT 1 FROM artifact_codex_decisions WHERE id=?1 AND task_id=?2 AND artifact_id=?3 AND tree_oid=?4 AND decision='accepted' AND rowid=(SELECT MAX(rowid) FROM artifact_codex_decisions WHERE task_id=?2 AND artifact_id=?3))",
             params![decision_id, task.as_str(), artifact_id, artifact.tree_oid()],
             |row| row.get(0),
         )?;

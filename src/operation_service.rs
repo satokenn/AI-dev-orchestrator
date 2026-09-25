@@ -2195,6 +2195,28 @@ mod tests {
         assert_eq!(permit.artifact_id(), artifact_id);
         assert_eq!(permit.tree_oid(), validation.tree_oid());
 
+        let rejected_decision = service
+            .record_artifact_decision(
+                &task_id,
+                &artifact_id,
+                revision(),
+                CodexDecisionKind::Rejected,
+                "The accepted decision was superseded.",
+                &[("validation".into(), validation.id().into())],
+            )
+            .unwrap();
+        assert!(matches!(
+            service.require_artifact_publication_evidence(
+                &task_id,
+                &artifact_id,
+                validation.id(),
+                decision_id.id(),
+                revision(),
+            ),
+            Err(ServiceError::Artifact(ArtifactError::Invalid(_)))
+        ));
+        assert_eq!(rejected_decision.revision(), revision());
+
         let rejected = service.validate_artifact(
             &task_id,
             &artifact_id,
