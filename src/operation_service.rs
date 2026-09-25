@@ -759,10 +759,13 @@ fn is_absolute_uri(value: &str) -> bool {
     let Some((scheme, rest)) = value.split_once(':') else {
         return false;
     };
-    if !scheme.chars().enumerate().all(|(index, character)| {
-        character.is_ascii_alphabetic()
-            || (index > 0 && (character.is_ascii_digit() || matches!(character, '+' | '-' | '.')))
-    }) {
+    if scheme.is_empty()
+        || !scheme.chars().enumerate().all(|(index, character)| {
+            character.is_ascii_alphabetic()
+                || (index > 0
+                    && (character.is_ascii_digit() || matches!(character, '+' | '-' | '.')))
+        })
+    {
         return false;
     }
     let bytes = rest.as_bytes();
@@ -988,6 +991,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         caller: &str,
         request: &TaskCreateRequest,
     ) -> Result<TaskCreationResult, ServiceError> {
+        if caller.is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "caller identity must not be empty",
+            ));
+        }
         validate_task_create(request)?;
         let payload = task_request_json(request);
         let mut connection = self.ledger.lock_connection()?;
@@ -2990,6 +2998,35 @@ mod tests {
         );
         assert!(matches!(
             service.create_task("caller", &invalid_uri),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+        let empty_scheme = TaskCreateRequest::new(
+            "bad-3",
+            TaskSource::Issue,
+            "Title",
+            "Description",
+            vec![],
+            Some(TaskIssueSnapshot {
+                url: ":rest".into(),
+                number: 1,
+                title: "Issue".into(),
+                body: "Body".into(),
+            }),
+        );
+        assert!(matches!(
+            service.create_task("caller", &empty_scheme),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+        let valid_manual = TaskCreateRequest::new(
+            "bad-4",
+            TaskSource::Manual,
+            "Title",
+            "Description",
+            vec![],
+            None,
+        );
+        assert!(matches!(
+            service.create_task("", &valid_manual),
             Err(ServiceError::InvalidRequest(_))
         ));
         let connection = ledger.lock_connection().unwrap();
