@@ -131,7 +131,7 @@ type PublicationTaskRow = (
     Option<String>,
 );
 
-const LATEST_SCHEMA_VERSION: u32 = 9;
+const LATEST_SCHEMA_VERSION: u32 = 10;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -269,6 +269,7 @@ impl SqliteExecutionLedger {
             migrate_schema(&transaction, version)?;
         }
         create_service_schema(&transaction)?;
+        create_artifact_service_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -911,6 +912,9 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
                     "TEXT",
                 )?;
             }
+            10 => {
+                create_artifact_service_schema(connection)?;
+            }
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
@@ -962,6 +966,39 @@ fn create_service_schema(connection: &Connection) -> Result<(), rusqlite::Error>
              ON service_operations(task_id, status);
          INSERT OR IGNORE INTO service_task_revisions(task_id, revision)
              SELECT id, 0 FROM tasks;",
+    )
+}
+
+fn create_artifact_service_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_artifacts (
+             id TEXT NOT NULL,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             source_attempt_id TEXT,
+             input_artifact_id TEXT,
+             base_commit TEXT NOT NULL,
+             tree_oid TEXT NOT NULL,
+             repository_root TEXT NOT NULL,
+             ref_name TEXT NOT NULL UNIQUE,
+             state TEXT NOT NULL CHECK(state IN ('pending_ref','available','recovery_required')),
+             created_at INTEGER NOT NULL,
+             PRIMARY KEY(task_id, id),
+             FOREIGN KEY(task_id, source_attempt_id) REFERENCES attempts(task_id, id),
+             FOREIGN KEY(task_id, input_artifact_id) REFERENCES service_artifacts(task_id, id) ON DELETE RESTRICT
+         );
+         CREATE TABLE IF NOT EXISTS service_attempt_artifacts (
+             task_id TEXT NOT NULL,
+             attempt_id TEXT NOT NULL,
+             input_artifact_id TEXT,
+             output_artifact_id TEXT,
+             PRIMARY KEY(task_id, attempt_id),
+             FOREIGN KEY(task_id, attempt_id) REFERENCES attempts(task_id, id) ON DELETE CASCADE,
+             FOREIGN KEY(task_id, input_artifact_id) REFERENCES service_artifacts(task_id, id),
+             FOREIGN KEY(task_id, output_artifact_id) REFERENCES service_artifacts(task_id, id)
+         );
+         CREATE INDEX IF NOT EXISTS service_artifacts_task_created ON service_artifacts(task_id, created_at);
+         INSERT OR IGNORE INTO service_attempt_artifacts(task_id,attempt_id,input_artifact_id,output_artifact_id)
+             SELECT task_id,attempt_id,NULL,NULL FROM service_operations;",
     )
 }
 
@@ -1379,17 +1416,26 @@ mod tests {
         assert_eq!(publication.base(), None);
         assert_eq!(publication.title(), None);
         assert_eq!(publication.body(), None);
+        let connection = ledger.lock_connection().unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+        let artifact_table: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifacts')", [], |row| row.get(0)).unwrap();
+        assert!(artifact_table);
+        let attempt_artifact_table: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_attempt_artifacts')", [], |row| row.get(0)).unwrap();
+        assert!(attempt_artifact_table);
     }
 
     #[test]
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 10;")
+            .execute_batch("PRAGMA user_version = 11;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(10))
+            Err(LedgerError::UnsupportedSchemaVersion(11))
         ));
     }
 }

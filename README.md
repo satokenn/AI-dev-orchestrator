@@ -67,9 +67,9 @@ JSONLの最後の`item.completed` / `agent_message.text`を`AgentResult`へ、�
 
 ### MCP Operation Service（中核実装）
 
-`OperationService` は監督側が明示した `attempt.run` を単一のExecution Ledger DBで受け付け、request ID・Task revision・busy状態を検査してOperationとQueued Attemptを原子的に保存します。現在実行できる入力は同じrepositoryの完全なbase commitを指定する `BaseInput` と `ProviderDefault` です。named Modelは信頼できるcatalogが用意されるまで実行前に拒否します。成功・timeout・cancel・中断状態と汎用usageを保存し、Providerのstdout/stderr、AgentResult、秘密を含む診断本文は保存・返却しません。
+`OperationService` は監督側が明示した `attempt.run` を単一のExecution Ledger DBで受け付け、request ID・Task revision・busy状態を検査してOperation、Attempt、入力Artifact relationを原子的に保存します。入力は同じrepositoryの完全なbase commitを指定する `BaseInput`、または同一Taskの保存済み成果物を指定する `ArtifactInput` です。ArtifactInputはTask所属、Git tree、専用ref、記録済みbase commitを確認してから、base commitから作った新しい管理worktreeに展開します。Provider終了後は、tracked変更とignoredでない新規ファイルをGit treeと専用refに保存し、Attemptの出力Artifactとして同じLedger DBへ記録します。named Modelは信頼できるcatalogが用意されるまで実行前に拒否します。成功・timeout・cancel・中断状態と汎用usageを保存し、Providerのstdout/stderr、AgentResult、秘密を含む診断本文は保存・返却しません。
 
-Provider起動前にworkspaceのHEADが指定commitと一致し、tracked・untracked・ignored fileが空であることも確認します。hook等が内容を作った場合はProviderを起動せず、workspaceと内容を保持します。実行中のOperationはworkspace pathとbranchを参照として記録し、結果確認・Artifact連携までは自動削除しません。プロセス再起動時は `recover_incomplete_operations()` を新しい依頼を受け付ける前に呼び、running Operationを `recovery_required` として閉じます。中断結果を推測せず、同じOperationを再実行しません。これはRust Service APIの中核実装であり、MCP transport、ArtifactInput、redacted log保存、named Model catalog、CLIへの配線は別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
+Provider起動前にworkspaceのHEADが指定base commitと一致し、tracked・untracked・ignored fileが空であることも確認します。ArtifactInputでは新しいworktreeがcleanであることを確認してから成果物treeを展開し、tree一致を再検証します。hook等が内容を作った場合はProviderを起動せず、workspaceと内容を保持します。Operationはworkspace pathとbranchを参照として記録し、成果物保存前にworkspaceを自動削除しません。Git refの保存中断はArtifactを `pending_ref` として残し、復旧時にtree/refを照合できない場合は利用を拒否します。プロセス再起動時は `recover_incomplete_operations()` を新しい依頼を受け付ける前に呼び、running Operationを `recovery_required` として閉じます。中断結果を推測せず、同じOperationを再実行しません。Validation、review、Codex採否、publicationを同一Artifactへ結び付ける公開ゲートは後続接続が必要です。MCP transport、redacted log保存、named Model catalog、CLIへの配線も別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
 
 Service利用側は明示したbase commitで受付し、返されたIDで同期実行または後から状態取得を行います。
 

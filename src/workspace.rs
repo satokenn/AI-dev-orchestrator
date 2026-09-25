@@ -480,6 +480,38 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// Confirms that a workspace is the exact managed worktree for this Task and Attempt.
+    /// Sanitized paths are compared to the manager's canonical path derivation; callers
+    /// must not infer ownership from a path prefix alone.
+    pub(crate) fn validate_artifact_workspace(
+        &self,
+        workspace: &Workspace,
+        task: &TaskId,
+        attempt: &AttemptId,
+    ) -> Result<(), WorkspaceError> {
+        if workspace.repository_root != self.repository_root
+            || workspace.path != self.worktree_path(task, attempt)
+            || workspace.branch != self.branch_name(task, attempt)
+        {
+            return Err(WorkspaceError::WorkspaceNotManaged {
+                path: workspace.path.clone(),
+            });
+        }
+        self.validate_provider_workspace(&workspace.path)
+    }
+
+    /// Ensures a new ArtifactInput worktree is still clean and pinned to its recorded base.
+    pub(crate) fn ensure_fresh_artifact_workspace(
+        &self,
+        workspace: &Workspace,
+        task: &TaskId,
+        attempt: &AttemptId,
+        base: &str,
+    ) -> Result<(), WorkspaceError> {
+        self.validate_artifact_workspace(workspace, task, attempt)?;
+        self.validate_provider_workspace_at_base(&workspace.path, base)
+    }
+
     /// Alias emphasizing that this check is a precondition for Provider use.
     pub fn ensure_provider_workspace(&self, path: impl AsRef<Path>) -> Result<(), WorkspaceError> {
         self.validate_provider_workspace(path)
