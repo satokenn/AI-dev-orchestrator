@@ -132,6 +132,14 @@ Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`�
 
 このMVPはMCP/CLIの`publication.publish`・`operation.get`にはまだ接続されておらず、Rust Serviceに専用の`publish_artifact` / `get_artifact_publication_operation` APIを提供する段階である。既存の`operation.get`はProvider Attempt操作用のまま。公開用cancel APIは未接続である。起動時に未claimの`accepted` publicationは外部効果が始まっていないため`failed`（`interrupted_before_start`）へ移し、実行claim後の`running` publicationは外部効果の有無を断定できないため`recovery_required`へ移す。どちらも外部操作を再実行しない。SQLite schema v12はPublication専用Ledger tableを追加し、schema v11を開くと既存recordを保持してmigrationする。したがって、MCP wire契約全体を実装済みとは扱わない。
 
+### CI観測runtimeの準備実装
+
+Issue #79 の内部準備runtimeは、PR head SHA、check状態、Required Check集合をObservationとしてLedgerへ保存する。Publicationの保存SHAとの照合、Operation Serviceでの受付、MCP応答への接続は未実装であり、直接指定したCI観測をPublication証拠として扱わない。
+
+Required Check集合をRuleset由来として確定するには、classic branch protection APIからHTTP 200を受け取り、classic側のRequired Checkが空だと確認したうえで、対象branchのRulesetを取得できなければならない。404、権限不足、取得失敗、応答形式不明、classic側にRequired Checkがある場合は集合とaggregateを`unknown`にする。GitHubは保護設定のないbranchにも404を返すため、この保守的な条件では通常の未保護branchやread権限が足りない環境で、Ruleset側のcheckが成功していても`unknown`が続くことがある。classic branch protectionとtrusted configurationのcheck集合は現在のwire sourceで表現できないため、Ruleset由来へ混ぜない。
+
+PRの`wait`は最初に観測したhead SHAを固定する。再poll時にPR詳細を取得できなければ、その古いSHAを現在のheadとみなさず、直前のObservation IDを添えてUnavailableで停止する。commit SHAだけを直接指定した場合はbase branchを確定できないため、Required Check集合とaggregateは`unknown`である。
+
 ## 旧データとの互換性
 
 現行実装と旧Ledgerでは、AttemptはProvider終了後に `Validating` へ進み、旧 `Succeeded` は「検証成功」、旧 `Failed` は「Provider実行または検証失敗」を意味する。この意味を新しいAttemptStateに無断で変換しない。

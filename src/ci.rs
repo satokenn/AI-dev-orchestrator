@@ -1,6 +1,7 @@
 //! Read-only CI observation and aggregation for a pinned GitHub target.
 
 use std::{
+    collections::HashSet,
     fmt,
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -453,6 +454,10 @@ pub enum CiError {
         actual: String,
         last_observation_id: String,
     },
+    Unavailable {
+        reason: String,
+        last_observation_id: Option<String>,
+    },
     Timeout {
         last_observation_id: Option<String>,
     },
@@ -475,6 +480,17 @@ impl fmt::Display for CiError {
                 f,
                 "PR head changed from {expected} to {actual}; last observation {last_observation_id}"
             ),
+            Self::Unavailable {
+                reason,
+                last_observation_id: Some(id),
+            } => write!(
+                f,
+                "CI observation unavailable: {reason}; last observation {id}"
+            ),
+            Self::Unavailable {
+                reason,
+                last_observation_id: None,
+            } => write!(f, "CI observation unavailable: {reason}"),
             Self::Timeout {
                 last_observation_id: Some(id),
             } => write!(f, "CI wait deadline elapsed; last observation {id}"),
@@ -632,6 +648,12 @@ impl<'a, P: CiProvider> CiRuntime<'a, P> {
                         last_observation_id: last
                             .map(|observation| observation.id)
                             .expect("checked above"),
+                    });
+                }
+                Err(CiError::Provider(CiProviderError::Unavailable(reason))) => {
+                    return Err(CiError::Unavailable {
+                        reason,
+                        last_observation_id: last.map(|observation| observation.id),
                     });
                 }
                 Err(error) => return Err(error),
@@ -862,9 +884,7 @@ impl CiProvider for GhCiProvider {
                 (repository.clone(), None, sha.clone(), None)
             }
             CiQueryTarget::PullRequest {
-                repository,
-                number,
-                expected_head_sha,
+                repository, number, ..
             } => {
                 let pr_result = remaining_timeout(deadline).and_then(|remaining| {
                     self.api_json(&format!("repos/{repository}/pulls/{number}"), remaining)
@@ -894,12 +914,6 @@ impl CiProvider for GhCiProvider {
                             .to_owned();
                         (repository.clone(), Some(*number), sha, Some(base))
                     }
-                    Err(_) if expected_head_sha.is_some() => (
-                        repository.clone(),
-                        Some(*number),
-                        expected_head_sha.clone().unwrap_or_default(),
-                        None,
-                    ),
                     Err(error) => return Err(error),
                 }
             }
@@ -1155,8 +1169,12 @@ fn parse_check_runs(value: &Value) -> Result<Vec<RawCiCheck>, CiProviderError> {
                 .unwrap_or("unknown");
             let conclusion = run.get("conclusion").and_then(Value::as_str);
             let detail_state = match (status, conclusion) {
-                ("queued" | "in_progress", _) => CiCheckDetailState::Pending,
-                ("completed", Some("success")) => CiCheckDetailState::Passed,
+                ("queued" | "in_progress" | "pending" | "waiting" | "requested", _) => {
+                    CiCheckDetailState::Pending
+                }
+                ("completed", Some("success" | "neutral" | "skipped")) => {
+                    CiCheckDetailState::Passed
+                }
                 ("completed", Some("cancelled")) => CiCheckDetailState::Cancelled,
                 (
                     "completed",
@@ -1186,6 +1204,7 @@ fn parse_check_runs(value: &Value) -> Result<Vec<RawCiCheck>, CiProviderError> {
 
 fn parse_statuses(value: &Value) -> Result<Vec<RawCiCheck>, CiProviderError> {
     let mut checks = Vec::new();
+    let mut seen_contexts = HashSet::new();
     for page in page_values(value) {
         let statuses = page.as_array().ok_or_else(|| {
             CiProviderError::InvalidResponse("commit statuses response was not an array".into())
@@ -1198,6 +1217,9 @@ fn parse_statuses(value: &Value) -> Result<Vec<RawCiCheck>, CiProviderError> {
                     CiProviderError::InvalidResponse("commit status omitted context".into())
                 })?
                 .to_owned();
+            if !seen_contexts.insert(name.clone()) {
+                continue;
+            }
             let detail_state = match status
                 .get("state")
                 .and_then(Value::as_str)
@@ -1280,8 +1302,9 @@ mod tests {
     }
 
     struct FakeProvider {
-        snapshots: Mutex<VecDeque<CiProviderSnapshot>>,
+        responses: Mutex<VecDeque<Result<CiProviderSnapshot, CiProviderError>>>,
         fallback: CiProviderSnapshot,
+        queries: Mutex<Vec<CiQueryTarget>>,
     }
 
     impl FakeProvider {
@@ -1289,8 +1312,17 @@ mod tests {
             let snapshots = snapshots.into_iter().collect::<VecDeque<_>>();
             let fallback = snapshots.back().expect("fixture snapshot").clone();
             Self {
-                snapshots: Mutex::new(snapshots),
+                responses: Mutex::new(snapshots.into_iter().map(Ok).collect()),
                 fallback,
+                queries: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn unavailable_after(first: CiProviderSnapshot, error: CiProviderError) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from([Ok(first.clone()), Err(error)])),
+                fallback: first,
+                queries: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1298,15 +1330,15 @@ mod tests {
     impl CiProvider for FakeProvider {
         fn observe(
             &self,
-            _: &CiQueryTarget,
+            target: &CiQueryTarget,
             _: Duration,
         ) -> Result<CiProviderSnapshot, CiProviderError> {
-            Ok(self
-                .snapshots
+            self.queries.lock().unwrap().push(target.clone());
+            self.responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| self.fallback.clone()))
+                .unwrap_or_else(|| Ok(self.fallback.clone()))
         }
     }
 
@@ -1430,6 +1462,48 @@ mod tests {
     }
 
     #[test]
+    fn statuses_keep_only_the_newest_result_for_each_context() {
+        let statuses = serde_json::json!([[
+            {
+                "context": "build",
+                "state": "success",
+                "target_url": "https://example.test/new"
+            },
+            {
+                "context": "build",
+                "state": "failure",
+                "target_url": "https://example.test/old"
+            }
+        ]]);
+        let parsed = parse_statuses(&statuses).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].detail_state, CiCheckDetailState::Passed);
+        assert_eq!(parsed[0].url.as_deref(), Some("https://example.test/new"));
+    }
+
+    #[test]
+    fn neutral_and_skipped_check_runs_are_passed_and_waiting_states_are_pending() {
+        for conclusion in ["neutral", "skipped"] {
+            let runs = serde_json::json!([{
+                "check_runs": [{"name": "build", "status": "completed", "conclusion": conclusion}]
+            }]);
+            assert_eq!(
+                parse_check_runs(&runs).unwrap()[0].detail_state,
+                CiCheckDetailState::Passed
+            );
+        }
+        for status in ["pending", "waiting", "requested"] {
+            let runs = serde_json::json!([{
+                "check_runs": [{"name": "build", "status": status, "conclusion": null}]
+            }]);
+            assert_eq!(
+                parse_check_runs(&runs).unwrap()[0].detail_state,
+                CiCheckDetailState::Pending
+            );
+        }
+    }
+
+    #[test]
     fn wait_timeout_returns_last_persisted_observation() {
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
         let provider = FakeProvider::new([snapshot(&"a".repeat(40), CiCheckDetailState::Pending)]);
@@ -1504,6 +1578,51 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(last.target().head_sha(), "a".repeat(40));
+    }
+
+    #[test]
+    fn wait_stops_as_unavailable_when_pr_head_cannot_be_reconfirmed() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = save_task(&ledger, "ci-unavailable-task");
+        let first = snapshot(&"a".repeat(40), CiCheckDetailState::Pending);
+        let provider = FakeProvider::unavailable_after(
+            first,
+            CiProviderError::Unavailable("PR details request failed".into()),
+        );
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let error = runtime
+            .wait(
+                &task_id,
+                &CiQueryTarget::PullRequest {
+                    repository: "owner/repo".into(),
+                    number: 4,
+                    expected_head_sha: None,
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+        let CiError::Unavailable {
+            reason,
+            last_observation_id: Some(id),
+        } = error
+        else {
+            panic!("expected unavailable with last observation: {error:?}");
+        };
+        assert_eq!(reason, "PR details request failed");
+        let last = ledger.get_ci_observation(&id).unwrap().unwrap();
+        assert_eq!(last.target().head_sha(), "a".repeat(40));
+        assert!(matches!(
+            provider.queries.lock().unwrap().get(1),
+            Some(CiQueryTarget::PullRequest {
+                expected_head_sha: Some(sha), ..
+            }) if sha == &"a".repeat(40)
+        ));
     }
 
     #[test]
