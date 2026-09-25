@@ -1227,7 +1227,12 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             }
         };
         if let Err(error) = artifacts.materialize(&workspace, task_id, &attempt_id, artifact_id) {
-            return match artifacts.cleanup_validation_workspace(&workspace, &initial_tree) {
+            return match artifacts.cleanup_validation_workspace(
+                task_id,
+                &attempt_id,
+                &workspace,
+                &initial_tree,
+            ) {
                 Ok(()) => Err(ServiceError::from(error)),
                 Err(cleanup_error) => Err(ServiceError::Artifact(
                     ArtifactManager::retained_workspace_error(
@@ -1245,8 +1250,12 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let result: ValidationResult = match validator.validate(workspace.path()) {
             Ok(result) => result,
             Err(error) => {
-                return match artifacts.cleanup_validation_workspace(&workspace, artifact.tree_oid())
-                {
+                return match artifacts.cleanup_unchanged_artifact_validation_workspace(
+                    task_id,
+                    &attempt_id,
+                    artifact_id,
+                    &workspace,
+                ) {
                     Ok(()) => Err(ServiceError::ValidationFailed),
                     Err(cleanup_error) => Err(ServiceError::Artifact(
                         ArtifactManager::retained_workspace_error(
@@ -1263,7 +1272,12 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ));
         }
         artifacts
-            .cleanup_validation_workspace(&workspace, artifact.tree_oid())
+            .cleanup_unchanged_artifact_validation_workspace(
+                task_id,
+                &attempt_id,
+                artifact_id,
+                &workspace,
+            )
             .map_err(ServiceError::from)?;
         artifacts
             .record_validation(task_id, artifact_id, expected_revision, result)
@@ -2778,6 +2792,54 @@ mod tests {
         workspace: std::sync::Mutex<Option<PathBuf>>,
     }
 
+    #[derive(Default)]
+    struct TrackingValidator {
+        workspace: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    impl crate::Validator for TrackingValidator {
+        fn validate(
+            &self,
+            workspace: &std::path::Path,
+        ) -> Result<ValidationResult, crate::ValidatorError> {
+            *self.workspace.lock().unwrap() = Some(workspace.to_owned());
+            Ok(ValidationResult::from_checks(
+                "passed",
+                [crate::ValidationCheckResult::new(
+                    "passes",
+                    true,
+                    Some(0),
+                    "",
+                )],
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct IgnoredFileValidator {
+        workspace: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    impl crate::Validator for IgnoredFileValidator {
+        fn validate(
+            &self,
+            workspace: &std::path::Path,
+        ) -> Result<ValidationResult, crate::ValidatorError> {
+            *self.workspace.lock().unwrap() = Some(workspace.to_owned());
+            fs::write(workspace.join("ignored-validation.txt"), "not in Artifact")
+                .expect("write ignored validation output");
+            Ok(ValidationResult::from_checks(
+                "passed",
+                [crate::ValidationCheckResult::new(
+                    "passes",
+                    true,
+                    Some(0),
+                    "",
+                )],
+            ))
+        }
+    }
+
     impl crate::Validator for FailingValidator {
         fn validate(
             &self,
@@ -3450,8 +3512,35 @@ mod tests {
     fn artifact_validation_gate_uses_an_immutable_snapshot_and_exact_decision() {
         use crate::{CommandValidator, ValidationCheck};
 
-        let (repo, ledger, workspace, providers, _, _, task_id) =
-            service_parts(false, Duration::ZERO, false);
+        let repo = Repo::new();
+        fs::write(repo.0.join(".gitignore"), "ignored-validation.txt\n").unwrap();
+        git(&repo.0, &["add", ".gitignore"]);
+        git(
+            &repo.0,
+            &["commit", "-m", "ignore validation fixture output"],
+        );
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = TaskId::new("artifact-evidence-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "task description",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: Some(("artifact-new-file.txt".into(), "artifact content".into())),
+            write_ignored: None,
+            require_file: None,
+        });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
@@ -3483,6 +3572,11 @@ mod tests {
             .run(accepted.operation_id(), CancellationToken::new())
             .unwrap();
         let artifact_id = completed.output_artifact_id().unwrap().to_owned();
+        let artifact_tree = ArtifactManager::new(&workspace, &ledger)
+            .verify_input(&task_id, &artifact_id)
+            .unwrap()
+            .tree_oid()
+            .to_owned();
         let revision = || -> u64 {
             ledger
                 .lock_connection()
@@ -3501,14 +3595,55 @@ mod tests {
         ));
         let failed_workspace = failing_validator.workspace.lock().unwrap().clone().unwrap();
         assert!(!failed_workspace.exists());
-        let validation = service
-            .validate_artifact(
-                &task_id,
-                &artifact_id,
-                revision(),
-                &CommandValidator::new([ValidationCheck::new("passes", "true")]),
+        let validation_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_validations WHERE task_id=?1 AND artifact_id=?2",
+                params![task_id.as_str(), artifact_id],
+                |row| row.get(0),
             )
             .unwrap();
+        assert_eq!(validation_count, 0);
+        assert!(
+            git(&repo.0, &["ls-tree", "-r", "--name-only", &artifact_tree])
+                .contains("artifact-new-file.txt")
+        );
+        let ignored_validator = IgnoredFileValidator::default();
+        let ignored_result =
+            service.validate_artifact(&task_id, &artifact_id, revision(), &ignored_validator);
+        let ignored_path = match ignored_result {
+            Err(ServiceError::Artifact(ArtifactError::WorkspaceRetained { path, .. })) => path,
+            other => panic!("ignored validation output must be retained: {other:?}"),
+        };
+        assert!(ignored_path.exists());
+        assert!(ignored_path.join("ignored-validation.txt").exists());
+        let validation_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_validations WHERE task_id=?1 AND artifact_id=?2",
+                params![task_id.as_str(), artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(validation_count, 0);
+        let ignored_path_text = ignored_path.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &["worktree", "remove", "--force", &ignored_path_text],
+        );
+        let tracking_validator = TrackingValidator::default();
+        let validation = service
+            .validate_artifact(&task_id, &artifact_id, revision(), &tracking_validator)
+            .unwrap();
+        let successful_workspace = tracking_validator
+            .workspace
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert!(!successful_workspace.exists());
         assert!(validation.passed());
         assert_eq!(validation.revision(), revision());
         let other_validation = service
@@ -3589,6 +3724,16 @@ mod tests {
             other => panic!("mutated validation worktree should be retained: {other:?}"),
         };
         assert!(retained_path.exists());
+        let validation_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_validations WHERE task_id=?1 AND artifact_id=?2",
+                params![task_id.as_str(), artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(validation_count, 2);
         let retained_path_text = retained_path.to_string_lossy().into_owned();
         git(
             &repo.0,
