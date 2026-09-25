@@ -1406,8 +1406,23 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if snapshot.request_id != request.request_id || snapshot.task_id != request.task_id {
             return Err(ServiceError::IdempotencyConflict);
         }
-        if snapshot.state != ServiceOperationStatus::Accepted {
-            return Ok(snapshot);
+        let digest = publication_request_digest(request);
+        let (stored_digest, current_revision, stored_status): (String, i64, String) = {
+            let connection = self.ledger.lock_connection()?;
+            connection.query_row(
+                "SELECT publication.request_digest,task_revision.revision,publication.status
+                 FROM service_artifact_publication_operations publication
+                 JOIN service_task_revisions task_revision ON task_revision.task_id=publication.task_id
+                 WHERE publication.id=?1",
+                params![acceptance.operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
+        };
+        if stored_digest != digest {
+            return Err(ServiceError::IdempotencyConflict);
+        }
+        if snapshot.state != ServiceOperationStatus::Accepted || stored_status != "accepted" {
+            return self.get_artifact_publication_operation(&acceptance.operation_id);
         }
         let scanner = self.secret_scanner.ok_or(ServiceError::PolicyDenied(
             "SecretScanner is not configured",
@@ -1415,24 +1430,13 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let gateway = self.publication_gateway.ok_or(ServiceError::PolicyDenied(
             "Artifact publication gateway is not configured",
         ))?;
-        let digest = publication_request_digest(request);
-        let (stored_digest, current_revision): (String, i64) = {
-            let connection = self.ledger.lock_connection()?;
-            connection.query_row(
-                "SELECT publication.request_digest,task_revision.revision
-                 FROM service_artifact_publication_operations publication
-                 JOIN service_task_revisions task_revision ON task_revision.task_id=publication.task_id
-                 WHERE publication.id=?1 AND publication.status='accepted'",
-                params![acceptance.operation_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?
-        };
-        if stored_digest != digest {
-            return Err(ServiceError::IdempotencyConflict);
-        }
         let current_revision =
             u64::try_from(current_revision).map_err(|_| ServiceError::InvalidStoredState)?;
-        self.set_publication_running(&acceptance.operation_id, ArtifactPublicationPhase::Accepted)?;
+        if !self
+            .set_publication_running(&acceptance.operation_id, ArtifactPublicationPhase::Accepted)?
+        {
+            return self.get_artifact_publication_operation(&acceptance.operation_id);
+        }
         if current_revision != acceptance.revision {
             self.finish_publication(
                 &acceptance.operation_id,
@@ -1916,7 +1920,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         &self,
         operation_id: &OperationId,
         phase: ArtifactPublicationPhase,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
@@ -1924,11 +1928,15 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
              WHERE id=?1 AND status='accepted'",
             params![operation_id.as_str(), phase.as_str(), now_ms()],
         )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
         if changed != 1 {
             return Err(ServiceError::PublicationRecoveryRequired);
         }
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     fn save_publication_phase(
@@ -2601,6 +2609,36 @@ mod tests {
         ) -> Result<SecretScanResult, SecretScanError> {
             self.events.lock().unwrap().push("scan_payload");
             self.payload_result
+        }
+    }
+
+    struct BlockingSecretScanner {
+        artifact_scans: AtomicUsize,
+        entered: Barrier,
+        release: Barrier,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl SecretScanner for BlockingSecretScanner {
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_artifact");
+            if self.artifact_scans.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.entered.wait();
+                self.release.wait();
+            }
+            Ok(SecretScanResult::Clean)
+        }
+
+        fn scan_publication_payload(
+            &self,
+            _payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_payload");
+            Ok(SecretScanResult::Clean)
         }
     }
 
@@ -3770,10 +3808,11 @@ mod tests {
             fail_push: false,
             fail_pull_request: false,
         };
+        let providers = ProviderRegistry::new();
         let service = OperationService::new(
             &fixture.ledger,
             &fixture.workspace,
-            &fixture.providers,
+            &providers,
             3,
             Duration::from_secs(30),
         )
@@ -3892,6 +3931,10 @@ mod tests {
             service.publish_artifact(&changed),
             Err(ServiceError::IdempotencyConflict)
         ));
+        assert!(matches!(
+            service.run_artifact_publication(&acceptance, &changed),
+            Err(ServiceError::IdempotencyConflict)
+        ));
 
         let connection = fixture.ledger.lock_connection().unwrap();
         let columns = {
@@ -3919,6 +3962,85 @@ mod tests {
         assert!(digest.starts_with("sha256:") && digest.len() == 71);
         assert!(!digest.contains("payload-title-private-marker"));
         drop(connection);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn concurrent_publication_runs_share_one_claim_and_one_effect_sequence() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = BlockingSecretScanner {
+            artifact_scans: AtomicUsize::new(0),
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "publication-parallel-run");
+        let acceptance = service.publish_artifact(&request).unwrap();
+
+        let ledger = &fixture.ledger;
+        let workspace = &fixture.workspace;
+        let scanner_ref = &scanner;
+        let gateway_ref = &gateway;
+        let first_acceptance = acceptance.clone();
+        let first_request = request.clone();
+        let (first, concurrent) = std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                let first_providers = ProviderRegistry::new();
+                let first_service = OperationService::new(
+                    ledger,
+                    workspace,
+                    &first_providers,
+                    3,
+                    Duration::from_secs(30),
+                )
+                .unwrap()
+                .with_secret_scanner(scanner_ref)
+                .with_artifact_publication_gateway(gateway_ref);
+                first_service.run_artifact_publication(&first_acceptance, &first_request)
+            });
+            scanner.entered.wait();
+            let concurrent = service.run_artifact_publication(&acceptance, &request);
+            scanner.release.wait();
+            (first.join().unwrap(), concurrent)
+        });
+        let first = first.unwrap();
+        let concurrent = concurrent.unwrap();
+        assert_eq!(first.state(), ServiceOperationStatus::Completed);
+        assert_eq!(concurrent.state(), ServiceOperationStatus::Running);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "scan_artifact",
+                "scan_payload",
+                "scan_artifact",
+                "scan_payload",
+                "commit",
+                "push",
+                "draft_pr"
+            ]
+        );
         cleanup_fixture_worktree(
             &fixture.repo,
             &fixture.workspace,

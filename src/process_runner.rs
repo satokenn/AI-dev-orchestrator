@@ -594,7 +594,7 @@ mod tests {
         let marker =
             std::env::temp_dir().join(format!("process-runner-stdin-held-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
-        let script = "( exec 3<&0; : > \"$MARKER\"; exec sleep 10 <&3 >/dev/null 2>&1 ) <&0 &
+        let script = "python3 -c 'import os, time; os.dup(0); open(os.environ[\"MARKER\"], \"w\").close(); time.sleep(10)' <&0 >/dev/null 2>&1 &
 while [ ! -f \"$MARKER\" ]; do sleep 0.01; done
 exit 0";
         let request = ProcessRequest::new("sh")
