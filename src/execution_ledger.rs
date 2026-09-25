@@ -136,7 +136,7 @@ type PublicationTaskRow = (
     Option<String>,
 );
 
-const LATEST_SCHEMA_VERSION: u32 = 10;
+const LATEST_SCHEMA_VERSION: u32 = 11;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -290,6 +290,7 @@ impl SqliteExecutionLedger {
             migrate_schema(&transaction, version)?;
         }
         create_service_schema(&transaction)?;
+        create_task_creation_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -957,11 +958,32 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
                          NULL FROM attempts a;",
                 )?;
             }
+            11 => create_task_creation_schema(connection)?,
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
     }
     Ok(())
+}
+
+fn create_task_creation_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_request_snapshots (
+             task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             request_json TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS task_create_idempotency (
+             caller TEXT NOT NULL,
+             tool_name TEXT NOT NULL,
+             request_id TEXT NOT NULL,
+             request_json TEXT NOT NULL,
+             task_id TEXT NOT NULL REFERENCES tasks(id),
+             PRIMARY KEY(caller, tool_name, request_id)
+         );
+         CREATE TABLE IF NOT EXISTS service_task_id_sequence (
+             id INTEGER PRIMARY KEY AUTOINCREMENT
+         );",
+    )
 }
 
 fn create_service_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -1501,17 +1523,98 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unspecified_role, (None, "legacy_unspecified".into()));
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+        let has_task_snapshot_table: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_request_snapshots')",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(has_task_snapshot_table);
+    }
+
+    #[test]
+    fn schema_v10_migration_adds_task_create_tables_and_preserves_attempt_history() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_latest_schema(&connection).unwrap();
+        create_service_schema(&connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO tasks(id,description,role,state)
+                     VALUES ('task-v10','existing task','implementer','active');
+                 INSERT INTO attempts(task_id,id,provider,state,semantics_version)
+                     VALUES ('task-v10','attempt-v10','codex','failed','provider_call_v2');
+                 INSERT INTO service_attempt_history
+                     (task_id,attempt_id,sequence,role,relation_kind,related_attempt_id)
+                     VALUES ('task-v10','attempt-v10',1,'implementer','initial',NULL);
+                 PRAGMA user_version = 10;",
+            )
+            .unwrap();
+
+        let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
+        let connection = ledger.lock_connection().unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+
+        let task: (String, String, String) = connection
+            .query_row(
+                "SELECT description, role, state FROM tasks WHERE id='task-v10'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            task,
+            (
+                "existing task".into(),
+                "implementer".into(),
+                "active".into()
+            )
+        );
+        let attempt: (String, String) = connection
+            .query_row(
+                "SELECT state, semantics_version FROM attempts
+                 WHERE task_id='task-v10' AND id='attempt-v10'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt, ("failed".into(), "provider_call_v2".into()));
+        let history: (i64, String, String) = connection
+            .query_row(
+                "SELECT sequence, role, relation_kind FROM service_attempt_history
+                 WHERE task_id='task-v10' AND attempt_id='attempt-v10'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(history, (1, "implementer".into(), "initial".into()));
+        let snapshot_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_request_snapshots WHERE task_id='task-v10')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !snapshot_exists,
+            "migration must not infer a task.create request"
+        );
     }
 
     #[test]
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 11;")
+            .execute_batch("PRAGMA user_version = 12;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(11))
+            Err(LedgerError::UnsupportedSchemaVersion(12))
         ));
     }
 }
