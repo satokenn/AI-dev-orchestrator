@@ -32,6 +32,149 @@ use crate::{
     },
 };
 
+/// Origin recorded in the immutable request snapshot for a newly created Task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskSource {
+    Issue,
+    Manual,
+}
+
+impl TaskSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+/// Issue details captured by the caller at task creation time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskIssueSnapshot {
+    pub url: String,
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+}
+
+/// Input to the service-side `task.create` operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskCreateRequest {
+    request_id: String,
+    source: TaskSource,
+    title: String,
+    description: String,
+    constraints: Vec<String>,
+    issue: Option<TaskIssueSnapshot>,
+}
+
+impl TaskCreateRequest {
+    #[must_use]
+    pub fn new(
+        request_id: impl Into<String>,
+        source: TaskSource,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        constraints: Vec<String>,
+        issue: Option<TaskIssueSnapshot>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            source,
+            title: title.into(),
+            description: description.into(),
+            constraints,
+            issue,
+        }
+    }
+}
+
+/// The immutable request portion returned in a task.create snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskRequestSnapshot {
+    source: TaskSource,
+    title: String,
+    description: String,
+    constraints: Vec<String>,
+    issue: Option<TaskIssueSnapshot>,
+}
+
+impl TaskRequestSnapshot {
+    #[must_use]
+    pub const fn source(&self) -> TaskSource {
+        self.source
+    }
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+    #[must_use]
+    pub fn constraints(&self) -> &[String] {
+        &self.constraints
+    }
+    #[must_use]
+    pub const fn issue(&self) -> Option<&TaskIssueSnapshot> {
+        self.issue.as_ref()
+    }
+}
+
+/// Durable result returned by `task.create`, including its original request snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskCreationResult {
+    request_id: String,
+    task_id: TaskId,
+    revision: u64,
+    state: TaskState,
+    request: TaskRequestSnapshot,
+}
+
+impl TaskCreationResult {
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    #[must_use]
+    pub const fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    #[must_use]
+    pub const fn state(&self) -> TaskState {
+        self.state
+    }
+    #[must_use]
+    pub const fn source(&self) -> TaskSource {
+        self.request.source
+    }
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.request.title
+    }
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.request.description
+    }
+    #[must_use]
+    pub fn constraints(&self) -> &[String] {
+        &self.request.constraints
+    }
+    #[must_use]
+    pub const fn issue(&self) -> Option<&TaskIssueSnapshot> {
+        self.request.issue.as_ref()
+    }
+    #[must_use]
+    pub const fn request(&self) -> &TaskRequestSnapshot {
+        &self.request
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaseInput {
     repository: PathBuf,
@@ -588,6 +731,170 @@ impl std::fmt::Display for ServiceError {
 
 impl std::error::Error for ServiceError {}
 
+fn validate_task_create(request: &TaskCreateRequest) -> Result<(), ServiceError> {
+    match (request.source, request.issue.as_ref()) {
+        (TaskSource::Issue, None) => {
+            return Err(ServiceError::InvalidRequest(
+                "issue source requires an issue snapshot",
+            ));
+        }
+        (TaskSource::Manual, Some(_)) => {
+            return Err(ServiceError::InvalidRequest(
+                "manual source must omit the issue snapshot",
+            ));
+        }
+        _ => {}
+    }
+    if let Some(issue) = &request.issue {
+        if !is_absolute_uri(&issue.url) || issue.number == 0 {
+            return Err(ServiceError::InvalidRequest(
+                "issue snapshot has an invalid URI or issue number",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_absolute_uri(value: &str) -> bool {
+    let Some((scheme, rest)) = value.split_once(':') else {
+        return false;
+    };
+    if !scheme.chars().enumerate().all(|(index, character)| {
+        character.is_ascii_alphabetic()
+            || (index > 0 && (character.is_ascii_digit() || matches!(character, '+' | '-' | '.')))
+    }) {
+        return false;
+    }
+    let bytes = rest.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        let valid = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b':'
+                    | b'/'
+                    | b'?'
+                    | b'#'
+                    | b'['
+                    | b']'
+                    | b'@'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+            );
+        if !valid {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn task_request_json(request: &TaskCreateRequest) -> String {
+    let issue = request.issue.as_ref().map(|issue| {
+        serde_json::json!({
+            "url": issue.url, "number": issue.number, "title": issue.title, "body": issue.body
+        })
+    });
+    serde_json::json!({
+        "source": request.source.as_str(), "title": request.title,
+        "description": request.description, "constraints": request.constraints,
+        "issue": issue
+    })
+    .to_string()
+}
+
+fn load_task_creation_result(
+    connection: &rusqlite::Connection,
+    request_id: &str,
+    task_id: &str,
+) -> Result<TaskCreationResult, ServiceError> {
+    let json: String = connection.query_row(
+        "SELECT request_json FROM task_request_snapshots WHERE task_id=?1",
+        params![task_id],
+        |row| row.get(0),
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|_| ServiceError::InvalidStoredState)?;
+    let source = match value["source"].as_str() {
+        Some("issue") => TaskSource::Issue,
+        Some("manual") => TaskSource::Manual,
+        _ => return Err(ServiceError::InvalidStoredState),
+    };
+    let issue = if value["issue"].is_null() {
+        None
+    } else {
+        Some(TaskIssueSnapshot {
+            url: value["issue"]["url"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            number: value["issue"]["number"]
+                .as_u64()
+                .ok_or(ServiceError::InvalidStoredState)?,
+            title: value["issue"]["title"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            body: value["issue"]["body"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+        })
+    };
+    let constraints = value["constraints"]
+        .as_array()
+        .ok_or(ServiceError::InvalidStoredState)?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or(ServiceError::InvalidStoredState)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(TaskCreationResult {
+        request_id: request_id.to_owned(),
+        task_id: TaskId::new(task_id),
+        revision: 0,
+        state: TaskState::Pending,
+        request: TaskRequestSnapshot {
+            source,
+            title: value["title"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            description: value["description"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            constraints,
+            issue,
+        },
+    })
+}
+
 impl From<LedgerError> for ServiceError {
     fn from(error: LedgerError) -> Self {
         Self::Ledger(error)
@@ -672,6 +979,79 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
     ) -> Self {
         self.publication_gateway = Some(gateway);
         self
+    }
+
+    /// Creates a pending Task and its revision zero snapshot atomically. The
+    /// caller scopes the task.create request ID; replay returns the first result.
+    pub fn create_task(
+        &self,
+        caller: &str,
+        request: &TaskCreateRequest,
+    ) -> Result<TaskCreationResult, ServiceError> {
+        validate_task_create(request)?;
+        let payload = task_request_json(request);
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                "SELECT request_json, task_id FROM task_create_idempotency
+             WHERE caller=?1 AND tool_name='task.create' AND request_id=?2",
+                params![caller, request.request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((stored, task_id)) = existing {
+            if stored != payload {
+                return Err(ServiceError::IdempotencyConflict);
+            }
+            let result = load_task_creation_result(&tx, &request.request_id, &task_id)?;
+            tx.commit()?;
+            return Ok(result);
+        }
+
+        tx.execute("INSERT INTO service_task_id_sequence DEFAULT VALUES", [])?;
+        let sequence = tx.last_insert_rowid();
+        let mut task_id = TaskId::new(format!("task-create-{sequence}"));
+        while tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",
+            params![task_id.as_str()],
+            |row| row.get::<_, bool>(0),
+        )? {
+            tx.execute("INSERT INTO service_task_id_sequence DEFAULT VALUES", [])?;
+            task_id = TaskId::new(format!("task-create-{}", tx.last_insert_rowid()));
+        }
+        tx.execute(
+            "INSERT INTO tasks(id,description,role,state) VALUES(?1,?2,'unspecified','pending')",
+            params![task_id.as_str(), request.description],
+        )?;
+        tx.execute(
+            "INSERT INTO service_task_revisions(task_id,revision) VALUES(?1,0)",
+            params![task_id.as_str()],
+        )?;
+        tx.execute(
+            "INSERT INTO task_request_snapshots(task_id,request_json) VALUES(?1,?2)",
+            params![task_id.as_str(), payload],
+        )?;
+        tx.execute(
+            "INSERT INTO task_create_idempotency(caller,tool_name,request_id,request_json,task_id)
+             VALUES(?1,'task.create',?2,?3,?4)",
+            params![caller, request.request_id, payload, task_id.as_str()],
+        )?;
+        let result = TaskCreationResult {
+            request_id: request.request_id.clone(),
+            task_id,
+            revision: 0,
+            state: TaskState::Pending,
+            request: TaskRequestSnapshot {
+                source: request.source,
+                title: request.title.clone(),
+                description: request.description.clone(),
+                constraints: request.constraints.clone(),
+                issue: request.issue.clone(),
+            },
+        };
+        tx.commit()?;
+        Ok(result)
     }
 
     fn idempotent_acceptance(
@@ -2522,6 +2902,142 @@ mod tests {
             let path_text = path.to_string_lossy().into_owned();
             git(&repo.0, &["worktree", "remove", "--force", &path_text]);
         }
+    }
+
+    #[test]
+    fn task_create_persists_pending_task_and_scoped_idempotency() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let request = TaskCreateRequest::new(
+            "create-1",
+            TaskSource::Manual,
+            "Title",
+            "Description",
+            vec!["keep behavior".into()],
+            None,
+        );
+
+        let first = service.create_task("caller-a", &request).unwrap();
+        assert_eq!(first.revision(), 0);
+        assert_eq!(first.state(), TaskState::Pending);
+        assert_eq!(first.title(), "Title");
+        assert_eq!(first.constraints(), &["keep behavior"]);
+        let mut task = ledger.get_task(first.task_id()).unwrap().unwrap();
+        assert_eq!(task.state(), TaskState::Pending);
+        assert_eq!(task.role().as_str(), "unspecified");
+        assert_eq!(task.description(), "Description");
+        task.start().unwrap();
+        ledger.save_task(&task).unwrap();
+
+        let replay = service.create_task("caller-a", &request).unwrap();
+        assert_eq!(replay, first);
+        assert!(matches!(
+            service.create_task(
+                "caller-a",
+                &TaskCreateRequest::new(
+                    "create-1",
+                    TaskSource::Manual,
+                    "Changed",
+                    "Description",
+                    vec!["keep behavior".into()],
+                    None
+                )
+            ),
+            Err(ServiceError::IdempotencyConflict)
+        ));
+        let other_caller = service.create_task("caller-b", &request).unwrap();
+        assert_ne!(other_caller.task_id(), first.task_id());
+    }
+
+    #[test]
+    fn task_create_validates_issue_shape_before_persisting() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let missing_issue = TaskCreateRequest::new(
+            "bad-1",
+            TaskSource::Issue,
+            "Title",
+            "Description",
+            vec![],
+            None,
+        );
+        assert!(matches!(
+            service.create_task("caller", &missing_issue),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+        let invalid_uri = TaskCreateRequest::new(
+            "bad-2",
+            TaskSource::Issue,
+            "Title",
+            "Description",
+            vec![],
+            Some(TaskIssueSnapshot {
+                url: "not-a-uri".into(),
+                number: 1,
+                title: "Issue".into(),
+                body: "Body".into(),
+            }),
+        );
+        assert!(matches!(
+            service.create_task("caller", &invalid_uri),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_count, 0);
+    }
+
+    #[test]
+    fn task_create_replay_survives_reopening_the_ledger() {
+        let repo = Repo::new();
+        let database = repo.0.join("ledger.sqlite3");
+        let providers = ProviderRegistry::new();
+        let request = TaskCreateRequest::new(
+            "durable-1",
+            TaskSource::Issue,
+            "Snapshot title",
+            "Snapshot description",
+            vec!["constraint".into()],
+            Some(TaskIssueSnapshot {
+                url: "https://example.test/issues/4".into(),
+                number: 4,
+                title: "Issue title".into(),
+                body: "Issue body".into(),
+            }),
+        );
+        let first = {
+            let ledger = SqliteExecutionLedger::open(&database).unwrap();
+            let workspace = WorkspaceManager::new(&repo.0).unwrap();
+            let service =
+                OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                    .unwrap();
+            service.create_task("durable-caller", &request).unwrap()
+        };
+        let reopened = SqliteExecutionLedger::open(&database).unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service = OperationService::new(
+            &reopened,
+            &workspace,
+            &providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let replay = service.create_task("durable-caller", &request).unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(replay.issue(), request.issue.as_ref());
     }
 
     #[derive(Clone)]
