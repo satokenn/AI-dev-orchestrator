@@ -637,9 +637,23 @@ impl<'a> ArtifactManager<'a> {
 
     pub(crate) fn cleanup_validation_workspace(
         &self,
+        task: &TaskId,
+        attempt: &AttemptId,
         workspace: &Workspace,
         expected_tree: &str,
     ) -> Result<(), ArtifactError> {
+        if !is_validation_attempt(attempt) {
+            return Err(ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: "worktree is not identified as a validation workspace".into(),
+            });
+        }
+        self.workspaces
+            .validate_artifact_workspace(workspace, task, attempt)
+            .map_err(|error| ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: error.to_string(),
+            })?;
         if let Err(error) = self.verify_workspace_tree(workspace.path(), expected_tree) {
             return Err(ArtifactError::WorkspaceRetained {
                 path: workspace.path().to_owned(),
@@ -652,6 +666,104 @@ impl<'a> ArtifactManager<'a> {
                 path: workspace.path().to_owned(),
                 reason: error.to_string(),
             })?;
+        Ok(())
+    }
+
+    /// Force-removes a validation-only worktree only after proving that its complete
+    /// Git tree still equals the saved Artifact tree. Validation worktrees are created
+    /// privately by the Service; any mismatch or failed ownership check preserves it.
+    pub(crate) fn cleanup_unchanged_artifact_validation_workspace(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        artifact_id: &str,
+        workspace: &Workspace,
+    ) -> Result<(), ArtifactError> {
+        if !is_validation_attempt(attempt) {
+            return Err(ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: "worktree is not identified as a validation workspace".into(),
+            });
+        }
+        let artifact =
+            self.read(task, artifact_id)
+                .map_err(|error| ArtifactError::WorkspaceRetained {
+                    path: workspace.path().to_owned(),
+                    reason: error.to_string(),
+                })?;
+        self.workspaces
+            .validate_artifact_workspace(workspace, task, attempt)
+            .map_err(|error| ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: error.to_string(),
+            })?;
+        if let Err(error) = self.verify_workspace_tree(workspace.path(), artifact.tree_oid()) {
+            return Err(ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: error.to_string(),
+            });
+        }
+        let ignored = self
+            .run_git(
+                workspace.path(),
+                &[
+                    "ls-files",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "-z",
+                ],
+                &[],
+            )
+            .map_err(|error| ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: error.to_string(),
+            })?;
+        if ignored.output_truncated || !ignored.stdout.is_empty() {
+            return Err(ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: if ignored.output_truncated {
+                    "ignored-file scan was incomplete".into()
+                } else {
+                    "ignored files are not part of the saved Artifact tree".into()
+                },
+            });
+        }
+        let modes = self
+            .run_git(
+                &artifact.repository_root,
+                &[
+                    "ls-tree",
+                    "-r",
+                    "--format=%(objectmode)",
+                    artifact.tree_oid(),
+                ],
+                &[],
+            )
+            .map_err(|error| ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: error.to_string(),
+            })?;
+        if modes.output_truncated
+            || String::from_utf8_lossy(&modes.stdout)
+                .lines()
+                .any(|mode| mode == "160000")
+        {
+            return Err(ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: if modes.output_truncated {
+                    "Artifact tree mode scan was incomplete".into()
+                } else {
+                    "Artifact contains a submodule whose working contents are not represented by its Git tree".into()
+                },
+            });
+        }
+        self.workspaces.cleanup_force(workspace).map_err(|error| {
+            ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
         Ok(())
     }
 
@@ -825,6 +937,13 @@ impl<'a> ArtifactManager<'a> {
             .run(request)
             .map_err(|e| ArtifactError::Git(process_error(e)))
     }
+}
+
+fn is_validation_attempt(attempt: &AttemptId) -> bool {
+    attempt
+        .as_str()
+        .strip_prefix("validation-")
+        .is_some_and(|suffix| !suffix.is_empty())
 }
 
 struct TempIndex(PathBuf);
