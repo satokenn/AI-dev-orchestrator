@@ -11,6 +11,7 @@ mod copilot_provider;
 mod domain;
 mod execution_ledger;
 mod github_workflow;
+mod model_observation;
 mod operation_ledger;
 mod operation_service;
 mod orchestrator;
@@ -45,6 +46,10 @@ pub use github_workflow::{
     PublicationPhase, PublicationRecord, PublishResult, PullRequestGateway, PullRequestPayload,
     PushRequest, RepositoryEffects, ValidatedPublication, WorkflowError, issue_to_task,
     prepare_issue_publication,
+};
+pub use model_observation::{
+    AttemptTargetObservation, AvailabilityObservation, AvailabilityStatus, Evidence, EvidenceBasis,
+    EvidenceSource, EvidenceSourceKind, ModelAvailabilityObservation, ProviderObservation,
 };
 pub use operation_ledger::{
     EventKind, ExecutionLedger as OperationLedger, LedgerError as OperationLedgerError,
