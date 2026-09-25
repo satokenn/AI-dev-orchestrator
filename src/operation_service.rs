@@ -3,6 +3,7 @@
 //! This core service accepts explicit Provider / Model and BaseInput requests.
 //! It does not select a target or expose Provider output and raw diagnostics.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{path::PathBuf, time::Duration};
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -11,7 +12,11 @@ use crate::{
     Attempt, AttemptFailureReason, AttemptId, AttemptSemantics, AttemptState, CancellationToken,
     DomainError, LedgerError, ModelChoice, ModelRef, OperationId, ProviderError, ProviderRef,
     ProviderRequest, ProviderResolver, SqliteExecutionLedger, TaskId, TaskRole, TaskState,
-    UsageCost, UsageMetric, WorkspaceError, WorkspaceManager,
+    UsageCost, UsageMetric, ValidationResult, Validator, WorkspaceError, WorkspaceManager,
+    artifact::{
+        ArtifactCodexDecisionRecord, ArtifactPublicationPermit, ArtifactValidationRecord,
+        CodexDecisionKind,
+    },
     artifact::{ArtifactError, ArtifactManager},
     execution_ledger::{
         attempt_state_to_str, failure_reason_to_str, model_choice_kind, model_choice_name,
@@ -320,6 +325,7 @@ pub enum ServiceError {
     IdempotencyConflict,
     OperationNotFound,
     InvalidStoredState,
+    ValidationFailed,
     InvalidStateTransition(DomainError),
     Workspace(WorkspaceError),
     Artifact(ArtifactError),
@@ -354,6 +360,9 @@ impl std::fmt::Display for ServiceError {
             Self::OperationNotFound => formatter.write_str("operation was not found"),
             Self::InvalidStoredState => {
                 formatter.write_str("invalid stored Operation Service state")
+            }
+            Self::ValidationFailed => {
+                formatter.write_str("Artifact validation could not be completed safely")
             }
             Self::InvalidStateTransition(error) => error.fmt(formatter),
             Self::Workspace(_) => formatter.write_str("workspace preparation failed"),
@@ -938,6 +947,82 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             started_at_ms: started,
             finished_at_ms: finished,
         })
+    }
+
+    /// Runs the configured validator on a fresh worktree restored from the immutable Artifact.
+    /// A result is recorded only if the same Git tree is present before and after validation.
+    pub fn validate_artifact(
+        &self,
+        task_id: &TaskId,
+        artifact_id: &str,
+        expected_revision: u64,
+        validator: &dyn Validator,
+    ) -> Result<ArtifactValidationRecord, ServiceError> {
+        static NEXT_VALIDATION: AtomicU64 = AtomicU64::new(0);
+        let artifacts = ArtifactManager::new(self.workspaces, self.ledger);
+        artifacts.check_revision(task_id, expected_revision)?;
+        let artifact = artifacts.verify_input(task_id, artifact_id)?;
+        let attempt_id = AttemptId::new(format!(
+            "validation-{}-{}",
+            now_ms(),
+            NEXT_VALIDATION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let workspace =
+            self.workspaces
+                .create_at_base(task_id, &attempt_id, artifact.base_commit())?;
+        artifacts.materialize(&workspace, task_id, &attempt_id, artifact_id)?;
+        artifacts.verify_workspace_tree(workspace.path(), artifact.tree_oid())?;
+        let result: ValidationResult = validator
+            .validate(workspace.path())
+            .map_err(|_| ServiceError::ValidationFailed)?;
+        artifacts.verify_workspace_tree(workspace.path(), artifact.tree_oid())?;
+        self.workspaces.cleanup(&workspace)?;
+        artifacts
+            .record_validation(task_id, artifact_id, expected_revision, result)
+            .map_err(ServiceError::from)
+    }
+
+    /// Records the supervisor Codex's decision without deriving it from mechanical evidence.
+    pub fn record_artifact_decision(
+        &self,
+        task_id: &TaskId,
+        artifact_id: &str,
+        expected_revision: u64,
+        decision: CodexDecisionKind,
+        reason: &str,
+        evidence: &[(String, String)],
+    ) -> Result<ArtifactCodexDecisionRecord, ServiceError> {
+        ArtifactManager::new(self.workspaces, self.ledger)
+            .record_decision(
+                task_id,
+                artifact_id,
+                expected_revision,
+                decision,
+                reason,
+                evidence,
+            )
+            .map_err(ServiceError::from)
+    }
+
+    /// Checks exact Artifact, passing Validation and accepted Codex decision identity.
+    /// This returns evidence only; it does not commit, push, scan, or create a Pull Request.
+    pub fn require_artifact_publication_evidence(
+        &self,
+        task_id: &TaskId,
+        artifact_id: &str,
+        validation_id: &str,
+        decision_id: &str,
+        expected_revision: u64,
+    ) -> Result<ArtifactPublicationPermit, ServiceError> {
+        ArtifactManager::new(self.workspaces, self.ledger)
+            .publication_permit(
+                task_id,
+                artifact_id,
+                validation_id,
+                decision_id,
+                expected_revision,
+            )
+            .map_err(ServiceError::from)
     }
 
     fn record_workspace_reference(
@@ -2046,5 +2131,83 @@ mod tests {
             .unwrap();
         assert_eq!(repeated.status(), ServiceOperationStatus::RecoveryRequired);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn artifact_validation_gate_uses_an_immutable_snapshot_and_exact_decision() {
+        use crate::{CommandValidator, ValidationCheck};
+
+        let (repo, ledger, workspace, providers, _, _, task_id) =
+            service_parts(false, Duration::ZERO, false);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let accepted = service
+            .submit_attempt(&request(&repo, &task_id, 0, "artifact-evidence-run"))
+            .unwrap();
+        let completed = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        let artifact_id = completed.output_artifact_id().unwrap().to_owned();
+        let revision = || -> u64 {
+            ledger
+                .lock_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap() as u64
+        };
+        let validation = service
+            .validate_artifact(
+                &task_id,
+                &artifact_id,
+                revision(),
+                &CommandValidator::new([ValidationCheck::new("passes", "true")]),
+            )
+            .unwrap();
+        assert!(validation.passed());
+        assert_eq!(validation.revision(), revision());
+        let decision_id = service
+            .record_artifact_decision(
+                &task_id,
+                &artifact_id,
+                revision(),
+                CodexDecisionKind::Accepted,
+                "The supervisor accepted this artifact.",
+                &[("validation".into(), validation.id().into())],
+            )
+            .unwrap();
+        assert_eq!(decision_id.artifact_id(), artifact_id);
+        assert_eq!(decision_id.tree_oid(), validation.tree_oid());
+        assert_eq!(decision_id.revision(), revision());
+        let permit = service
+            .require_artifact_publication_evidence(
+                &task_id,
+                &artifact_id,
+                validation.id(),
+                decision_id.id(),
+                revision(),
+            )
+            .unwrap();
+        assert_eq!(permit.artifact_id(), artifact_id);
+        assert_eq!(permit.tree_oid(), validation.tree_oid());
+
+        let rejected = service.validate_artifact(
+            &task_id,
+            &artifact_id,
+            revision(),
+            &CommandValidator::new([
+                ValidationCheck::new("mutates", "sh").args(["-c", "printf changed >> README.md"])
+            ]),
+        );
+        assert!(matches!(
+            rejected,
+            Err(ServiceError::Artifact(
+                ArtifactError::WorkspaceChanged { .. }
+            ))
+        ));
     }
 }

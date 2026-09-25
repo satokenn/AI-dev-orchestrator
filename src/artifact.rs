@@ -12,7 +12,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::{
     AttemptId, LedgerError, ProcessError, ProcessRequest, ProcessRunner, SqliteExecutionLedger,
-    TaskId, Workspace, WorkspaceError, WorkspaceManager,
+    TaskId, ValidationResult, Workspace, WorkspaceError, WorkspaceManager,
 };
 
 const REF_PREFIX: &str = "refs/ai-dev-orchestrator/artifacts/";
@@ -60,6 +60,124 @@ pub enum ArtifactState {
     PendingRef,
     Available,
     RecoveryRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexDecisionKind {
+    Accepted,
+    Rejected,
+    ChangesRequested,
+}
+
+impl CodexDecisionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::ChangesRequested => "changes_requested",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactValidationRecord {
+    id: String,
+    task_id: TaskId,
+    artifact_id: String,
+    tree_oid: String,
+    passed: bool,
+    check_count: usize,
+    revision: u64,
+}
+
+impl ArtifactValidationRecord {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+    pub fn tree_oid(&self) -> &str {
+        &self.tree_oid
+    }
+    pub const fn passed(&self) -> bool {
+        self.passed
+    }
+    pub const fn check_count(&self) -> usize {
+        self.check_count
+    }
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactCodexDecisionRecord {
+    id: String,
+    task_id: TaskId,
+    artifact_id: String,
+    tree_oid: String,
+    decision: CodexDecisionKind,
+    reason: String,
+    evidence: Vec<(String, String)>,
+    revision: u64,
+}
+
+impl ArtifactCodexDecisionRecord {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+    pub fn tree_oid(&self) -> &str {
+        &self.tree_oid
+    }
+    pub const fn decision(&self) -> CodexDecisionKind {
+        self.decision
+    }
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+    pub fn evidence(&self) -> &[(String, String)] {
+        &self.evidence
+    }
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactPublicationPermit {
+    artifact_id: String,
+    tree_oid: String,
+    base_commit: String,
+    validation_id: String,
+    decision_id: String,
+}
+
+impl ArtifactPublicationPermit {
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+    pub fn tree_oid(&self) -> &str {
+        &self.tree_oid
+    }
+    pub fn base_commit(&self) -> &str {
+        &self.base_commit
+    }
+    pub fn validation_id(&self) -> &str {
+        &self.validation_id
+    }
+    pub fn decision_id(&self) -> &str {
+        &self.decision_id
+    }
 }
 
 #[derive(Debug)]
@@ -252,6 +370,231 @@ impl<'a> ArtifactManager<'a> {
         id: &str,
     ) -> Result<ArtifactRecord, ArtifactError> {
         self.read(task, id)
+    }
+
+    pub(crate) fn check_revision(
+        &self,
+        task: &TaskId,
+        expected_revision: u64,
+    ) -> Result<(), ArtifactError> {
+        let connection = self.ledger.lock_connection()?;
+        let revision: Option<i64> = connection
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if revision.and_then(|value| u64::try_from(value).ok()) != Some(expected_revision) {
+            return Err(ArtifactError::Invalid("stale Task revision".into()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_validation(
+        &self,
+        task: &TaskId,
+        artifact_id: &str,
+        expected_revision: u64,
+        result: ValidationResult,
+    ) -> Result<ArtifactValidationRecord, ArtifactError> {
+        if result.passed() && result.checks().is_empty() {
+            return Err(ArtifactError::Invalid(
+                "a passed validation must contain at least one check".into(),
+            ));
+        }
+        let artifact = self.read(task, artifact_id)?;
+        let id = format!("validation-{}", new_id());
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revision: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let revision = revision.ok_or_else(|| ArtifactError::Invalid("Task not found".into()))?;
+        if u64::try_from(revision).ok() != Some(expected_revision) {
+            return Err(ArtifactError::Invalid("stale Task revision".into()));
+        }
+        let still_available: Option<String> = tx.query_row(
+            "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
+            params![task.as_str(), artifact_id],
+            |row| row.get(0),
+        ).optional()?;
+        if still_available.as_deref() != Some(artifact.tree_oid()) {
+            return Err(ArtifactError::RecoveryRequired);
+        }
+        tx.execute(
+            "INSERT INTO artifact_validations(id,task_id,artifact_id,tree_oid,summary,passed,created_at) VALUES(?1,?2,?3,?4,'validation outcome recorded; raw diagnostics withheld',?5,?6)",
+            params![id, task.as_str(), artifact_id, artifact.tree_oid(), i64::from(result.passed()), now_ms()],
+        )?;
+        for (sequence, check) in result.checks().iter().enumerate() {
+            tx.execute(
+                "INSERT INTO artifact_validation_checks(validation_id,sequence,name,passed,exit_status,diagnostics) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![id, i64::try_from(sequence).map_err(|_| ArtifactError::Invalid("too many validation checks".into()))?, format!("check-{}", sequence + 1), i64::from(check.passed()), check.exit_status(), "raw diagnostics withheld until redaction is configured"],
+            )?;
+        }
+        let next_revision = expected_revision
+            .checked_add(1)
+            .filter(|value| *value <= i64::MAX as u64)
+            .ok_or_else(|| ArtifactError::Invalid("Task revision overflow".into()))?;
+        tx.execute(
+            "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+            params![task.as_str(), next_revision as i64],
+        )?;
+        tx.commit()?;
+        Ok(ArtifactValidationRecord {
+            id,
+            task_id: task.clone(),
+            artifact_id: artifact_id.to_owned(),
+            tree_oid: artifact.tree_oid,
+            passed: result.passed(),
+            check_count: result.checks().len(),
+            revision: next_revision,
+        })
+    }
+
+    pub(crate) fn record_decision(
+        &self,
+        task: &TaskId,
+        artifact_id: &str,
+        expected_revision: u64,
+        decision: CodexDecisionKind,
+        reason: &str,
+        evidence: &[(String, String)],
+    ) -> Result<ArtifactCodexDecisionRecord, ArtifactError> {
+        if reason.trim().is_empty() {
+            return Err(ArtifactError::Invalid(
+                "decision reason must not be empty".into(),
+            ));
+        }
+        let artifact = self.read(task, artifact_id)?;
+        let id = format!("decision-{}", new_id());
+        let evidence_json = serde_json::to_string(evidence)
+            .map_err(|error| ArtifactError::Invalid(error.to_string()))?;
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revision: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let revision = revision.ok_or_else(|| ArtifactError::Invalid("Task not found".into()))?;
+        if u64::try_from(revision).ok() != Some(expected_revision) {
+            return Err(ArtifactError::Invalid("stale Task revision".into()));
+        }
+        let still_available: Option<String> = tx.query_row(
+            "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
+            params![task.as_str(), artifact_id],
+            |row| row.get(0),
+        ).optional()?;
+        if still_available.as_deref() != Some(artifact.tree_oid()) {
+            return Err(ArtifactError::RecoveryRequired);
+        }
+        for (kind, evidence_id) in evidence {
+            if kind != "validation" {
+                return Err(ArtifactError::Invalid(
+                    "this MVP only accepts stored Validation evidence".into(),
+                ));
+            }
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM artifact_validations WHERE id=?1 AND task_id=?2 AND artifact_id=?3)",
+                params![evidence_id, task.as_str(), artifact_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(ArtifactError::Invalid(
+                    "evidence belongs to another Artifact or is missing".into(),
+                ));
+            }
+        }
+        let next_revision = expected_revision
+            .checked_add(1)
+            .filter(|value| *value <= i64::MAX as u64)
+            .ok_or_else(|| ArtifactError::Invalid("Task revision overflow".into()))?;
+        tx.execute(
+            "INSERT INTO artifact_codex_decisions(id,task_id,artifact_id,tree_oid,decision,reason,evidence_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, task.as_str(), artifact_id, artifact.tree_oid(), decision.as_str(), reason, evidence_json, now_ms()],
+        )?;
+        tx.execute(
+            "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+            params![task.as_str(), next_revision as i64],
+        )?;
+        tx.commit()?;
+        Ok(ArtifactCodexDecisionRecord {
+            id,
+            task_id: task.clone(),
+            artifact_id: artifact_id.to_owned(),
+            tree_oid: artifact.tree_oid,
+            decision,
+            reason: reason.to_owned(),
+            evidence: evidence.to_vec(),
+            revision: next_revision,
+        })
+    }
+
+    pub(crate) fn publication_permit(
+        &self,
+        task: &TaskId,
+        artifact_id: &str,
+        validation_id: &str,
+        decision_id: &str,
+        expected_revision: u64,
+    ) -> Result<ArtifactPublicationPermit, ArtifactError> {
+        let artifact = self.read(task, artifact_id)?;
+        let connection = self.ledger.lock_connection()?;
+        let revision: Option<i64> = connection
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if revision.and_then(|value| u64::try_from(value).ok()) != Some(expected_revision) {
+            return Err(ArtifactError::Invalid("stale Task revision".into()));
+        }
+        let validation_matches: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifact_validations WHERE id=?1 AND task_id=?2 AND artifact_id=?3 AND tree_oid=?4 AND passed=1)",
+            params![validation_id, task.as_str(), artifact_id, artifact.tree_oid()],
+            |row| row.get(0),
+        )?;
+        let decision_matches: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifact_codex_decisions WHERE id=?1 AND task_id=?2 AND artifact_id=?3 AND tree_oid=?4 AND decision='accepted')",
+            params![decision_id, task.as_str(), artifact_id, artifact.tree_oid()],
+            |row| row.get(0),
+        )?;
+        if !validation_matches || !decision_matches {
+            return Err(ArtifactError::Invalid(
+                "publication evidence is missing, unsuccessful, or belongs to another Artifact"
+                    .into(),
+            ));
+        }
+        Ok(ArtifactPublicationPermit {
+            artifact_id: artifact.id,
+            tree_oid: artifact.tree_oid,
+            base_commit: artifact.base_commit,
+            validation_id: validation_id.to_owned(),
+            decision_id: decision_id.to_owned(),
+        })
+    }
+
+    pub(crate) fn verify_workspace_tree(
+        &self,
+        path: &Path,
+        expected: &str,
+    ) -> Result<(), ArtifactError> {
+        let actual = self.snapshot(path)?;
+        if actual != expected {
+            return Err(ArtifactError::WorkspaceChanged {
+                expected: expected.to_owned(),
+                actual,
+            });
+        }
+        Ok(())
     }
 
     fn load(&self, task: &TaskId, id: &str) -> Result<Option<ArtifactRecord>, ArtifactError> {
@@ -456,9 +799,12 @@ fn process_error(error: ProcessError) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactError, ArtifactManager, REF_PREFIX, is_missing_git_object_diagnostic, new_id,
+        ArtifactError, ArtifactManager, CodexDecisionKind, REF_PREFIX,
+        is_missing_git_object_diagnostic, new_id,
     };
-    use crate::{SqliteExecutionLedger, Task, TaskId, TaskRole, WorkspaceManager};
+    use crate::{
+        SqliteExecutionLedger, Task, TaskId, TaskRole, ValidationResult, WorkspaceManager,
+    };
     use std::{fs, process::Command};
 
     #[test]
@@ -473,6 +819,114 @@ mod tests {
             b"fatal: cannot open .git/objects: I/O error"
         ));
         assert!(!is_missing_git_object_diagnostic(b""));
+    }
+
+    #[test]
+    fn validation_and_acceptance_are_bound_to_the_same_artifact_tree() {
+        let root = std::env::temp_dir().join(format!("artifact-evidence-{}", new_id()));
+        fs::create_dir_all(&root).unwrap();
+        let repository = root.join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        fs::write(repository.join("tracked.txt"), "content\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        let repository = fs::canonicalize(repository).unwrap();
+        let task = TaskId::new("artifact-evidence-task");
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        ledger
+            .save_task(&Task::new(
+                task.clone(),
+                "evidence",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let insert_artifact = |id: &str| {
+            ledger.lock_connection().unwrap().execute(
+                "INSERT INTO service_artifacts(id,task_id,base_commit,tree_oid,repository_root,ref_name,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,'available',0)",
+                rusqlite::params![id, task.as_str(), base, tree, repository.to_string_lossy().as_ref(), format!("{REF_PREFIX}{id}")],
+            ).unwrap();
+        };
+        insert_artifact("artifact-a");
+        insert_artifact("artifact-b");
+        let workspaces = WorkspaceManager::new(&repository).unwrap();
+        let manager = ArtifactManager::new(&workspaces, &ledger);
+        let validation = manager
+            .record_validation(
+                &task,
+                "artifact-a",
+                0,
+                ValidationResult::from_check("test", "passed", true, Some(0), "secret-ish output"),
+            )
+            .unwrap();
+        assert!(validation.passed());
+        assert_eq!(validation.check_count(), 1);
+        let diagnostics: String = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT diagnostics FROM artifact_validation_checks WHERE validation_id=?1",
+                rusqlite::params![validation.id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!diagnostics.contains("secret-ish output"));
+        assert!(diagnostics.contains("withheld"));
+
+        let decision = manager
+            .record_decision(
+                &task,
+                "artifact-a",
+                1,
+                CodexDecisionKind::Accepted,
+                "The reviewed change satisfies the task.",
+                &[("validation".into(), validation.id().into())],
+            )
+            .unwrap();
+        let permit = manager
+            .publication_permit(&task, "artifact-a", validation.id(), decision.id(), 2)
+            .unwrap();
+        assert_eq!(permit.tree_oid(), tree);
+        assert_eq!(permit.artifact_id(), "artifact-a");
+
+        let other_decision = manager
+            .record_decision(
+                &task,
+                "artifact-b",
+                2,
+                CodexDecisionKind::Accepted,
+                "Different Artifact.",
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.publication_permit(
+                &task,
+                "artifact-a",
+                validation.id(),
+                other_decision.id(),
+                3
+            ),
+            Err(ArtifactError::Invalid(_))
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
