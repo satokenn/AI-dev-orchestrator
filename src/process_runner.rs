@@ -594,10 +594,8 @@ mod tests {
         let marker =
             std::env::temp_dir().join(format!("process-runner-stdin-held-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
-        let script = "python3 -c 'import os, time; os.dup(0); open(os.environ[\"MARKER\"], \"w\").close(); time.sleep(10)' <&0 >/dev/null 2>&1 &
-while [ ! -f \"$MARKER\" ]; do sleep 0.01; done
-exit 0";
-        let request = ProcessRequest::new("sh")
+        let script = "import os, time\npid = os.fork()\nif pid == 0:\n    null = os.open(os.devnull, os.O_WRONLY)\n    os.dup2(null, 1)\n    os.dup2(null, 2)\n    os.dup(0)\n    open(os.environ['MARKER'], 'w').close()\n    time.sleep(10)\n    os._exit(0)\ndeadline = time.monotonic() + 1\nwhile not os.path.exists(os.environ['MARKER']):\n    if time.monotonic() >= deadline:\n        os._exit(2)\n    time.sleep(0.005)\nos._exit(0)";
+        let request = ProcessRequest::new("python3")
             .args(["-c", script])
             .env("MARKER", marker.as_os_str())
             .stdin_bytes(vec![b'x'; 1024 * 1024])
