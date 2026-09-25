@@ -1,6 +1,7 @@
 //! Git-tree Artifacts persisted in the same SQLite file as Tasks and Attempts.
 
 use std::{
+    ffi::OsString,
     fmt, fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -110,6 +111,7 @@ pub(crate) struct ArtifactManager<'a> {
     workspaces: &'a WorkspaceManager,
     ledger: &'a SqliteExecutionLedger,
     runner: ProcessRunner,
+    git_executable: OsString,
 }
 
 impl<'a> ArtifactManager<'a> {
@@ -118,6 +120,7 @@ impl<'a> ArtifactManager<'a> {
             workspaces,
             ledger,
             runner: ProcessRunner,
+            git_executable: OsString::from("git"),
         }
     }
 
@@ -139,9 +142,12 @@ impl<'a> ArtifactManager<'a> {
         if record.state == ArtifactState::RecoveryRequired {
             return Err(ArtifactError::RecoveryRequired);
         }
-        if self.ensure_tree(&record).is_err() {
-            self.set_state(task, id, ArtifactState::RecoveryRequired)?;
-            return Err(ArtifactError::RecoveryRequired);
+        if let Err(error) = self.ensure_tree(&record) {
+            if matches!(error, ArtifactError::Invalid(_)) {
+                self.set_state(task, id, ArtifactState::RecoveryRequired)?;
+                return Err(ArtifactError::RecoveryRequired);
+            }
+            return Err(error);
         }
         match self.ref_target(&record)? {
             Some(target) if target == record.tree_oid => {}
@@ -317,15 +323,23 @@ impl<'a> ArtifactManager<'a> {
         if !is_oid(&record.tree_oid) {
             return Err(ArtifactError::Invalid("invalid Git tree object ID".into()));
         }
-        let output = self
-            .runner
-            .run(
-                ProcessRequest::new("git")
-                    .args(["cat-file", "-t", &record.tree_oid])
-                    .cwd(&record.repository_root),
-            )
-            .map_err(|e| ArtifactError::Git(process_error(e)))?;
-        if output.output_truncated || String::from_utf8_lossy(&output.stdout).trim() != "tree" {
+        let output = match self.runner.run(
+            ProcessRequest::new(self.git_executable.clone())
+                .args(["cat-file", "-t", &record.tree_oid])
+                .cwd(&record.repository_root),
+        ) {
+            Ok(output) => output,
+            Err(ProcessError::NonZeroExit(output))
+                if is_missing_git_object_diagnostic(&output.stderr) =>
+            {
+                return Err(ArtifactError::Invalid("tree object missing".into()));
+            }
+            Err(error) => return Err(ArtifactError::Git(process_error(error))),
+        };
+        if output.stdout_truncated || output.stderr_truncated {
+            return Err(ArtifactError::Git("tree type output truncated".into()));
+        }
+        if String::from_utf8_lossy(&output.stdout).trim() != "tree" {
             return Err(ArtifactError::Invalid("tree object missing".into()));
         }
         Ok(())
@@ -371,7 +385,7 @@ impl<'a> ArtifactManager<'a> {
         args: &[&str],
         env: &[(&str, String)],
     ) -> Result<crate::ProcessOutput, ArtifactError> {
-        let mut request = ProcessRequest::new("git")
+        let mut request = ProcessRequest::new(self.git_executable.clone())
             .args(args.iter().copied())
             .cwd(cwd);
         for (key, value) in env {
@@ -427,9 +441,109 @@ fn now_ms() -> i64 {
 fn is_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
+fn is_missing_git_object_diagnostic(stderr: &[u8]) -> bool {
+    let diagnostic = String::from_utf8_lossy(stderr);
+    diagnostic.contains("Not a valid object name")
+        || diagnostic.contains("could not get object info")
+}
 fn process_error(error: ProcessError) -> String {
     match error {
         ProcessError::NonZeroExit(output) => format!("git exited with status {:?}", output.status),
         _ => "git command could not be completed".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ArtifactError, ArtifactManager, REF_PREFIX, is_missing_git_object_diagnostic, new_id,
+    };
+    use crate::{SqliteExecutionLedger, Task, TaskId, TaskRole, WorkspaceManager};
+    use std::{fs, process::Command};
+
+    #[test]
+    fn only_explicit_missing_object_diagnostics_confirm_absence() {
+        assert!(is_missing_git_object_diagnostic(
+            b"fatal: git cat-file: could not get object info"
+        ));
+        assert!(is_missing_git_object_diagnostic(
+            b"fatal: Not a valid object name deadbeef"
+        ));
+        assert!(!is_missing_git_object_diagnostic(
+            b"fatal: cannot open .git/objects: I/O error"
+        ));
+        assert!(!is_missing_git_object_diagnostic(b""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_git_failure_does_not_poison_available_artifact() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("artifact-read-{}", new_id()));
+        fs::create_dir_all(&root).unwrap();
+        let repository = root.join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let repository = fs::canonicalize(repository).unwrap();
+        let failing_git = root.join("git-failure");
+        fs::write(
+            &failing_git,
+            "#!/bin/sh\necho 'fatal: temporary object store I/O failure' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&failing_git, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task = TaskId::new("transient-artifact-task");
+        ledger
+            .save_task(&Task::new(
+                task.clone(),
+                "artifact recovery test",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let id = "artifact-transient";
+        let ref_name = format!("{REF_PREFIX}{id}");
+        ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO service_artifacts(id,task_id,base_commit,tree_oid,repository_root,ref_name,state,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,'available',0)",
+                rusqlite::params![
+                    id,
+                    task.as_str(),
+                    "0".repeat(40),
+                    "1".repeat(40),
+                    repository.to_string_lossy().as_ref(),
+                    ref_name
+                ],
+            )
+            .unwrap();
+        let workspaces = WorkspaceManager::new(&repository).unwrap();
+        let mut artifacts = ArtifactManager::new(&workspaces, &ledger);
+        artifacts.git_executable = failing_git.into_os_string();
+
+        let result = artifacts.verify_input(&task, id);
+        assert!(matches!(result, Err(ArtifactError::Git(_))), "{result:?}");
+        let state: String = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM service_artifacts WHERE task_id=?1 AND id=?2",
+                rusqlite::params![task.as_str(), id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "available");
+        let _ = fs::remove_dir_all(root);
     }
 }
