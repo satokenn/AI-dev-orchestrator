@@ -131,7 +131,7 @@ type PublicationTaskRow = (
     Option<String>,
 );
 
-const LATEST_SCHEMA_VERSION: u32 = 12;
+const LATEST_SCHEMA_VERSION: u32 = 13;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -272,6 +272,7 @@ impl SqliteExecutionLedger {
         create_artifact_service_schema(&transaction)?;
         create_artifact_evidence_schema(&transaction)?;
         create_artifact_publication_schema(&transaction)?;
+        create_task_creation_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -919,6 +920,7 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
             }
             11 => create_artifact_evidence_schema(connection)?,
             12 => create_artifact_publication_schema(connection)?,
+            13 => create_task_creation_schema(connection)?,
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
@@ -1077,6 +1079,26 @@ fn create_artifact_service_schema(connection: &Connection) -> Result<(), rusqlit
          CREATE INDEX IF NOT EXISTS service_artifacts_task_created ON service_artifacts(task_id, created_at);
          INSERT OR IGNORE INTO service_attempt_artifacts(task_id,attempt_id,input_artifact_id,output_artifact_id)
              SELECT task_id,attempt_id,NULL,NULL FROM service_operations;",
+    )
+}
+
+fn create_task_creation_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_request_snapshots (
+             task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             request_json TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS task_create_idempotency (
+             caller TEXT NOT NULL,
+             tool_name TEXT NOT NULL,
+             request_id TEXT NOT NULL,
+             request_json TEXT NOT NULL,
+             task_id TEXT NOT NULL REFERENCES tasks(id),
+             PRIMARY KEY(caller, tool_name, request_id)
+         );
+         CREATE TABLE IF NOT EXISTS service_task_id_sequence (
+             id INTEGER PRIMARY KEY AUTOINCREMENT
+        );",
     )
 }
 
@@ -1538,7 +1560,7 @@ mod tests {
         let version: u32 = migrated
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         let has_publication_table: bool = migrated
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifact_publication_operations')",
@@ -1547,6 +1569,14 @@ mod tests {
             )
             .unwrap();
         assert!(has_publication_table);
+        let has_task_snapshot_table: bool = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_request_snapshots')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_task_snapshot_table);
         let preserved_task: String = migrated
             .query_row(
                 "SELECT description FROM tasks WHERE id='task-v11'",
@@ -1561,11 +1591,11 @@ mod tests {
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 13;")
+            .execute_batch("PRAGMA user_version = 14;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(13))
+            Err(LedgerError::UnsupportedSchemaVersion(14))
         ));
     }
 }
