@@ -108,6 +108,7 @@ cargo test --workspace --all-features
 - [`README.md`](README.md): プロジェクト概要と開発者向けの入口
 - [初期アーキテクチャ](docs/architecture.md): 主要コンポーネントの高レベル構造、責務境界、未決定事項
 - [モデル選定の入力・出力仕様](docs/model-selection-spec.md): Provider / Model選定の入力、出力、観測事実とCodex判断の責務境界
+- [Providerの現在状態を観測する](docs/current-provider-observations.md): CLI起動観測と、未観測の認証・Model利用可否等を`unknown`で保持する現在の実装範囲
 - [実装・レビュー・修正を記録する設計](docs/implementation-review-model.md): 実装・レビュー・修正の履歴、レビュー結果、状態、Ledger保存単位
 - [作業・モデル実行・成果物のドメインモデル](docs/domain-model.md): Attempt、Validation、review verdict、監督Codex受入、成果物、旧データ互換の契約
 - [Rustコード品質・テスト方針](docs/rust-quality.md): 必須検証、テスト種別、warningとunsafeの扱い
