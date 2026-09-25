@@ -187,9 +187,21 @@ pub enum ArtifactError {
     Git(String),
     Io(String),
     NotFound,
+    TaskNotFound,
+    StaleRevision {
+        expected: u64,
+        actual: u64,
+    },
     Invalid(String),
     RecoveryRequired,
-    WorkspaceChanged { expected: String, actual: String },
+    WorkspaceChanged {
+        expected: String,
+        actual: String,
+    },
+    WorkspaceRetained {
+        path: std::path::PathBuf,
+        reason: String,
+    },
 }
 
 impl fmt::Display for ArtifactError {
@@ -200,11 +212,23 @@ impl fmt::Display for ArtifactError {
             Self::Git(e) => write!(f, "artifact Git error: {e}"),
             Self::Io(e) => write!(f, "artifact I/O error: {e}"),
             Self::NotFound => f.write_str("artifact was not found"),
+            Self::TaskNotFound => f.write_str("Task was not found"),
+            Self::StaleRevision { expected, actual } => {
+                write!(
+                    f,
+                    "stale Task revision: expected {expected}, actual {actual}"
+                )
+            }
             Self::Invalid(e) => write!(f, "invalid artifact: {e}"),
             Self::RecoveryRequired => f.write_str("artifact requires recovery"),
             Self::WorkspaceChanged { expected, actual } => {
                 write!(f, "workspace changed: expected {expected}, found {actual}")
             }
+            Self::WorkspaceRetained { path, reason } => write!(
+                f,
+                "validation workspace retained at '{}': {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -386,7 +410,13 @@ impl<'a> ArtifactManager<'a> {
             )
             .optional()?;
         if revision.and_then(|value| u64::try_from(value).ok()) != Some(expected_revision) {
-            return Err(ArtifactError::Invalid("stale Task revision".into()));
+            return Err(match revision.and_then(|value| u64::try_from(value).ok()) {
+                Some(actual) => ArtifactError::StaleRevision {
+                    expected: expected_revision,
+                    actual,
+                },
+                None => ArtifactError::TaskNotFound,
+            });
         }
         Ok(())
     }
@@ -414,9 +444,12 @@ impl<'a> ArtifactManager<'a> {
                 |row| row.get(0),
             )
             .optional()?;
-        let revision = revision.ok_or_else(|| ArtifactError::Invalid("Task not found".into()))?;
+        let revision = revision.ok_or(ArtifactError::TaskNotFound)?;
         if u64::try_from(revision).ok() != Some(expected_revision) {
-            return Err(ArtifactError::Invalid("stale Task revision".into()));
+            return Err(ArtifactError::StaleRevision {
+                expected: expected_revision,
+                actual: u64::try_from(revision).unwrap_or_default(),
+            });
         }
         let still_available: Option<String> = tx.query_row(
             "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
@@ -470,6 +503,7 @@ impl<'a> ArtifactManager<'a> {
                 "decision reason must not be empty".into(),
             ));
         }
+        self.check_revision(task, expected_revision)?;
         let artifact = self.read(task, artifact_id)?;
         let id = format!("decision-{}", new_id());
         let evidence_json = serde_json::to_string(evidence)
@@ -483,9 +517,12 @@ impl<'a> ArtifactManager<'a> {
                 |row| row.get(0),
             )
             .optional()?;
-        let revision = revision.ok_or_else(|| ArtifactError::Invalid("Task not found".into()))?;
+        let revision = revision.ok_or(ArtifactError::TaskNotFound)?;
         if u64::try_from(revision).ok() != Some(expected_revision) {
-            return Err(ArtifactError::Invalid("stale Task revision".into()));
+            return Err(ArtifactError::StaleRevision {
+                expected: expected_revision,
+                actual: u64::try_from(revision).unwrap_or_default(),
+            });
         }
         let still_available: Option<String> = tx.query_row(
             "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
@@ -545,6 +582,7 @@ impl<'a> ArtifactManager<'a> {
         decision_id: &str,
         expected_revision: u64,
     ) -> Result<ArtifactPublicationPermit, ArtifactError> {
+        self.check_revision(task, expected_revision)?;
         let artifact = self.read(task, artifact_id)?;
         let connection = self.ledger.lock_connection()?;
         let revision: Option<i64> = connection
@@ -555,19 +593,34 @@ impl<'a> ArtifactManager<'a> {
             )
             .optional()?;
         if revision.and_then(|value| u64::try_from(value).ok()) != Some(expected_revision) {
-            return Err(ArtifactError::Invalid("stale Task revision".into()));
+            return Err(match revision.and_then(|value| u64::try_from(value).ok()) {
+                Some(actual) => ArtifactError::StaleRevision {
+                    expected: expected_revision,
+                    actual,
+                },
+                None => ArtifactError::TaskNotFound,
+            });
         }
         let validation_matches: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM artifact_validations WHERE id=?1 AND task_id=?2 AND artifact_id=?3 AND tree_oid=?4 AND passed=1)",
             params![validation_id, task.as_str(), artifact_id, artifact.tree_oid()],
             |row| row.get(0),
         )?;
-        let decision_matches: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM artifact_codex_decisions WHERE id=?1 AND task_id=?2 AND artifact_id=?3 AND tree_oid=?4 AND decision='accepted' AND rowid=(SELECT MAX(rowid) FROM artifact_codex_decisions WHERE task_id=?2 AND artifact_id=?3))",
+        let decision_evidence: Option<String> = connection.query_row(
+            "SELECT evidence_json FROM artifact_codex_decisions WHERE id=?1 AND task_id=?2 AND artifact_id=?3 AND tree_oid=?4 AND decision='accepted' AND rowid=(SELECT MAX(rowid) FROM artifact_codex_decisions WHERE task_id=?2 AND artifact_id=?3)",
             params![decision_id, task.as_str(), artifact_id, artifact.tree_oid()],
             |row| row.get(0),
-        )?;
-        if !validation_matches || !decision_matches {
+        ).optional()?;
+        let decision_references_validation = decision_evidence
+            .map(|json| serde_json::from_str::<Vec<(String, String)>>(&json))
+            .transpose()
+            .map_err(|error| ArtifactError::Invalid(error.to_string()))?
+            .is_some_and(|evidence| {
+                evidence
+                    .iter()
+                    .any(|(kind, id)| kind == "validation" && id == validation_id)
+            });
+        if !validation_matches || !decision_references_validation {
             return Err(ArtifactError::Invalid(
                 "publication evidence is missing, unsuccessful, or belongs to another Artifact"
                     .into(),
@@ -580,6 +633,36 @@ impl<'a> ArtifactManager<'a> {
             validation_id: validation_id.to_owned(),
             decision_id: decision_id.to_owned(),
         })
+    }
+
+    pub(crate) fn cleanup_validation_workspace(
+        &self,
+        workspace: &Workspace,
+        expected_tree: &str,
+    ) -> Result<(), ArtifactError> {
+        if let Err(error) = self.verify_workspace_tree(workspace.path(), expected_tree) {
+            return Err(ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: error.to_string(),
+            });
+        }
+        self.workspaces
+            .cleanup(workspace)
+            .map_err(|error| ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: error.to_string(),
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn retained_workspace_error(
+        workspace: &Workspace,
+        reason: impl Into<String>,
+    ) -> ArtifactError {
+        ArtifactError::WorkspaceRetained {
+            path: workspace.path().to_owned(),
+            reason: reason.into(),
+        }
     }
 
     pub(crate) fn verify_workspace_tree(
@@ -595,6 +678,10 @@ impl<'a> ArtifactManager<'a> {
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn snapshot_workspace(&self, path: &Path) -> Result<String, ArtifactError> {
+        self.snapshot(path)
     }
 
     fn load(&self, task: &TaskId, id: &str) -> Result<Option<ArtifactRecord>, ArtifactError> {

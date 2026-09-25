@@ -392,7 +392,13 @@ impl From<WorkspaceError> for ServiceError {
 }
 impl From<ArtifactError> for ServiceError {
     fn from(error: ArtifactError) -> Self {
-        Self::Artifact(error)
+        match error {
+            ArtifactError::TaskNotFound => Self::TaskNotFound,
+            ArtifactError::StaleRevision { expected, actual } => {
+                Self::StaleRevision { expected, actual }
+            }
+            other => Self::Artifact(other),
+        }
     }
 }
 impl From<DomainError> for ServiceError {
@@ -970,13 +976,53 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let workspace =
             self.workspaces
                 .create_at_base(task_id, &attempt_id, artifact.base_commit())?;
-        artifacts.materialize(&workspace, task_id, &attempt_id, artifact_id)?;
-        artifacts.verify_workspace_tree(workspace.path(), artifact.tree_oid())?;
-        let result: ValidationResult = validator
-            .validate(workspace.path())
-            .map_err(|_| ServiceError::ValidationFailed)?;
-        artifacts.verify_workspace_tree(workspace.path(), artifact.tree_oid())?;
-        self.workspaces.cleanup(&workspace)?;
+        let initial_tree = match artifacts.snapshot_workspace(workspace.path()) {
+            Ok(tree) => tree,
+            Err(error) => {
+                return Err(ServiceError::Artifact(
+                    ArtifactManager::retained_workspace_error(&workspace, error.to_string()),
+                ));
+            }
+        };
+        if let Err(error) = artifacts.materialize(&workspace, task_id, &attempt_id, artifact_id) {
+            return match artifacts.cleanup_validation_workspace(&workspace, &initial_tree) {
+                Ok(()) => Err(ServiceError::from(error)),
+                Err(cleanup_error) => Err(ServiceError::Artifact(
+                    ArtifactManager::retained_workspace_error(
+                        &workspace,
+                        format!("materialization failed ({error}); {cleanup_error}"),
+                    ),
+                )),
+            };
+        }
+        if let Err(error) = artifacts.verify_workspace_tree(workspace.path(), artifact.tree_oid()) {
+            return Err(ServiceError::Artifact(
+                ArtifactManager::retained_workspace_error(&workspace, error.to_string()),
+            ));
+        }
+        let result: ValidationResult = match validator.validate(workspace.path()) {
+            Ok(result) => result,
+            Err(error) => {
+                return match artifacts.cleanup_validation_workspace(&workspace, artifact.tree_oid())
+                {
+                    Ok(()) => Err(ServiceError::ValidationFailed),
+                    Err(cleanup_error) => Err(ServiceError::Artifact(
+                        ArtifactManager::retained_workspace_error(
+                            &workspace,
+                            format!("validation failed ({error}); {cleanup_error}"),
+                        ),
+                    )),
+                };
+            }
+        };
+        if let Err(error) = artifacts.verify_workspace_tree(workspace.path(), artifact.tree_oid()) {
+            return Err(ServiceError::Artifact(
+                ArtifactManager::retained_workspace_error(&workspace, error.to_string()),
+            ));
+        }
+        artifacts
+            .cleanup_validation_workspace(&workspace, artifact.tree_oid())
+            .map_err(ServiceError::from)?;
         artifacts
             .record_validation(task_id, artifact_id, expected_revision, result)
             .map_err(ServiceError::from)
@@ -1472,6 +1518,21 @@ mod tests {
         fn check_availability(&self) -> Result<(), ProviderError> {
             self.availability_checks.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingValidator {
+        workspace: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    impl crate::Validator for FailingValidator {
+        fn validate(
+            &self,
+            workspace: &std::path::Path,
+        ) -> Result<ValidationResult, crate::ValidatorError> {
+            *self.workspace.lock().unwrap() = Some(workspace.to_owned());
+            Err(crate::ValidatorError::NoChecksConfigured)
         }
     }
 
@@ -2142,6 +2203,27 @@ mod tests {
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
+        assert!(matches!(
+            service.validate_artifact(
+                &TaskId::new("missing-task"),
+                "missing-artifact",
+                0,
+                &CommandValidator::new([ValidationCheck::new("passes", "true")]),
+            ),
+            Err(ServiceError::TaskNotFound)
+        ));
+        assert!(matches!(
+            service.validate_artifact(
+                &task_id,
+                "missing-artifact",
+                99,
+                &CommandValidator::new([ValidationCheck::new("passes", "true")]),
+            ),
+            Err(ServiceError::StaleRevision {
+                expected: 99,
+                actual: 0
+            })
+        ));
         let accepted = service
             .submit_attempt(&request(&repo, &task_id, 0, "artifact-evidence-run"))
             .unwrap();
@@ -2160,6 +2242,13 @@ mod tests {
                 )
                 .unwrap() as u64
         };
+        let failing_validator = FailingValidator::default();
+        assert!(matches!(
+            service.validate_artifact(&task_id, &artifact_id, revision(), &failing_validator,),
+            Err(ServiceError::ValidationFailed)
+        ));
+        let failed_workspace = failing_validator.workspace.lock().unwrap().clone().unwrap();
+        assert!(!failed_workspace.exists());
         let validation = service
             .validate_artifact(
                 &task_id,
@@ -2170,6 +2259,14 @@ mod tests {
             .unwrap();
         assert!(validation.passed());
         assert_eq!(validation.revision(), revision());
+        let other_validation = service
+            .validate_artifact(
+                &task_id,
+                &artifact_id,
+                revision(),
+                &CommandValidator::new([ValidationCheck::new("passes-again", "true")]),
+            )
+            .unwrap();
         let decision_id = service
             .record_artifact_decision(
                 &task_id,
@@ -2194,6 +2291,16 @@ mod tests {
             .unwrap();
         assert_eq!(permit.artifact_id(), artifact_id);
         assert_eq!(permit.tree_oid(), validation.tree_oid());
+        assert!(matches!(
+            service.require_artifact_publication_evidence(
+                &task_id,
+                &artifact_id,
+                other_validation.id(),
+                decision_id.id(),
+                revision(),
+            ),
+            Err(ServiceError::Artifact(ArtifactError::Invalid(_)))
+        ));
 
         let rejected_decision = service
             .record_artifact_decision(
@@ -2225,11 +2332,10 @@ mod tests {
                 ValidationCheck::new("mutates", "sh").args(["-c", "printf changed >> README.md"])
             ]),
         );
-        assert!(matches!(
-            rejected,
-            Err(ServiceError::Artifact(
-                ArtifactError::WorkspaceChanged { .. }
-            ))
-        ));
+        let retained_path = match rejected {
+            Err(ServiceError::Artifact(ArtifactError::WorkspaceRetained { path, .. })) => path,
+            other => panic!("mutated validation worktree should be retained: {other:?}"),
+        };
+        assert!(retained_path.exists());
     }
 }
