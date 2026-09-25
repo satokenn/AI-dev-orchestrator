@@ -327,7 +327,7 @@ fn result_from_error(check: &ValidationCheck, error: ProcessError) -> Validation
                 diagnostics(&stdout, &stderr)
             ),
         ),
-        ProcessError::Spawn(error) | ProcessError::Io(error) => {
+        ProcessError::Spawn(error) | ProcessError::Io(error) | ProcessError::Stdin(error) => {
             ValidationCheckResult::new(check.name(), false, None, error.to_string())
         }
     }

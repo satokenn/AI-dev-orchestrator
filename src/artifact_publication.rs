@@ -2,19 +2,13 @@
 
 use std::{
     fmt,
-    fs::{self, OpenOptions},
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use serde_json::{Value, json};
 
 use crate::process_runner::{ProcessRequest, ProcessRunner};
-
-static TEMP_PAYLOAD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The public information that will be sent to GitHub for a Pull Request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -264,10 +258,21 @@ impl GitHubArtifactPublicationGateway {
         args: &[&str],
         timeout: Duration,
     ) -> Result<String, PublicationGatewayError> {
+        self.gh_output_with_stdin(repository, args, timeout, None)
+    }
+
+    fn gh_output_with_stdin(
+        &self,
+        repository: &Path,
+        args: &[&str],
+        timeout: Duration,
+        stdin_bytes: Option<Vec<u8>>,
+    ) -> Result<String, PublicationGatewayError> {
         let mut request = ProcessRequest::new(self.gh_executable.clone())
             .cwd(repository)
             .timeout(timeout);
         request.args = args.iter().map(std::ffi::OsString::from).collect();
+        request.stdin_bytes = stdin_bytes;
         let output = ProcessRunner.run(request).map_err(map_process_error)?;
         if output.output_truncated {
             return Err(PublicationGatewayError::InvalidResponse);
@@ -368,26 +373,16 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
             "body": payload.body(),
             "draft": true,
         });
-        let input_file = TemporaryPayloadFile::create(&request_body)?;
+        let request_body = serde_json::to_vec(&request_body)
+            .map_err(|_| PublicationGatewayError::InvalidResponse)?;
         let endpoint = format!("repos/{repo}/pulls");
-        let created = self.gh_output(
+        let created = self.gh_output_with_stdin(
             repository,
-            &[
-                "api",
-                &endpoint,
-                "--method",
-                "POST",
-                "--input",
-                input_file
-                    .path()
-                    .to_str()
-                    .ok_or(PublicationGatewayError::InvalidResponse)?,
-            ],
+            &["api", &endpoint, "--method", "POST", "--input", "-"],
             timeout,
+            Some(request_body),
         );
-        let cleanup = input_file.remove();
         let created = created?;
-        cleanup?;
         let created_value: Value =
             serde_json::from_str(&created).map_err(|_| PublicationGatewayError::InvalidResponse)?;
         verify_pull_request_content(&created_value, payload)?;
@@ -414,55 +409,6 @@ fn valid_repository_component(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-struct TemporaryPayloadFile {
-    path: PathBuf,
-}
-
-impl TemporaryPayloadFile {
-    fn create(value: &Value) -> Result<Self, PublicationGatewayError> {
-        let bytes =
-            serde_json::to_vec(value).map_err(|_| PublicationGatewayError::InvalidResponse)?;
-        for _ in 0..8 {
-            let sequence = TEMP_PAYLOAD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "ai-dev-orchestrator-publication-{}-{sequence}.json",
-                std::process::id()
-            ));
-            let mut file = match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(_) => return Err(PublicationGatewayError::CommandFailed),
-            };
-            if file.write_all(&bytes).is_err() || file.sync_all().is_err() {
-                drop(file);
-                let _ = fs::remove_file(&path);
-                return Err(PublicationGatewayError::CommandFailed);
-            }
-            return Ok(Self { path });
-        }
-        Err(PublicationGatewayError::CommandFailed)
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn remove(self) -> Result<(), PublicationGatewayError> {
-        fs::remove_file(&self.path).map_err(|_| PublicationGatewayError::CommandFailed)
-    }
-}
-
-impl Drop for TemporaryPayloadFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
 }
 
 fn parse_api_pull_request(json: &str) -> Result<DraftPullRequest, PublicationGatewayError> {
@@ -559,9 +505,17 @@ fn verify_pull_request(
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     use super::*;
+
+    #[cfg(unix)]
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn api_pull_request_response_requires_exact_draft_identity() {
@@ -579,24 +533,50 @@ mod tests {
         assert_eq!(pull_request.base_branch(), "main");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn publication_payload_file_is_private_and_removed_explicitly() {
-        let file = TemporaryPayloadFile::create(&json!({
-            "title": "sensitive title",
-            "body": "sensitive body"
-        }))
-        .expect("private temporary file is created");
-        let path = file.path().to_owned();
-        let mode = fs::metadata(&path)
-            .expect("file metadata is available")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-        let contents = fs::read_to_string(&path).expect("payload was written");
-        assert!(contents.contains("sensitive title"));
-        assert!(contents.contains("sensitive body"));
-        file.remove().expect("temporary file is removed");
-        assert!(!path.exists());
+    fn gh_api_publication_payload_is_stdin_only() {
+        let directory = std::env::temp_dir().join(format!(
+            "gh-api-stdin-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).expect("isolated test directory is created");
+        let executable = directory.join("fake-gh");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\"\ncount=$(wc -c | tr -d ' ')\nprintf 'stdin-bytes=%s\\n' \"$count\"\n",
+        )
+        .expect("fake CLI is written");
+        let mut permissions = fs::metadata(&executable)
+            .expect("fake CLI metadata is available")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).expect("fake CLI is executable");
+
+        let gateway = GitHubArtifactPublicationGateway::with_executables("git", executable);
+        let body = b"private title and body".to_vec();
+        let result = gateway
+            .gh_output_with_stdin(
+                Path::new("."),
+                &[
+                    "api",
+                    "repos/example/project/pulls",
+                    "--method",
+                    "POST",
+                    "--input",
+                    "-",
+                ],
+                Duration::from_secs(2),
+                Some(body.clone()),
+            )
+            .expect("fake CLI consumes stdin");
+        assert!(result.contains("--input\n-\n"));
+        assert!(
+            result.contains(&format!("stdin-bytes={}", body.len())),
+            "unexpected fake CLI output: {result:?}"
+        );
+        assert!(!result.contains("private title and body"));
+        fs::remove_dir_all(directory).expect("test files are removed");
     }
 }

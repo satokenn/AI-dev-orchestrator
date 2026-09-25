@@ -1,7 +1,7 @@
 //! Run external commands with bounded, observable process lifecycles.
 
 use std::ffi::OsString;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -21,6 +21,8 @@ pub struct ProcessRequest {
     pub cwd: Option<PathBuf>,
     pub env: Vec<(OsString, OsString)>,
     pub timeout: Option<Duration>,
+    /// Optional stdin payload, written in full without being captured as output.
+    pub stdin_bytes: Option<Vec<u8>>,
 }
 
 impl ProcessRequest {
@@ -32,6 +34,7 @@ impl ProcessRequest {
             cwd: None,
             env: Vec::new(),
             timeout: None,
+            stdin_bytes: None,
         }
     }
     #[must_use]
@@ -57,6 +60,13 @@ impl ProcessRequest {
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+    #[must_use]
+    /// Writes the complete byte vector to stdin; partial writes are retried.
+    /// A closed pipe or a writer that does not stop after cancellation is returned as an error.
+    pub fn stdin_bytes(mut self, bytes: Vec<u8>) -> Self {
+        self.stdin_bytes = Some(bytes);
         self
     }
 }
@@ -115,6 +125,7 @@ pub enum ProcessError {
     TimedOut(ProcessOutput),
     Cancelled(ProcessOutput),
     CancelledBeforeStart,
+    Stdin(io::Error),
     /// Stop was requested, but the managed process group could not be
     /// confirmed stopped within the grace period.
     Interrupted {
@@ -146,10 +157,15 @@ impl ProcessRunner {
         token: CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
         let timeout = request.timeout;
+        let stdin_bytes = request.stdin_bytes;
         let mut command = Command::new(&request.command);
         command
             .args(&request.args)
-            .stdin(Stdio::null())
+            .stdin(if stdin_bytes.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(cwd) = request.cwd {
@@ -164,11 +180,15 @@ impl ProcessRunner {
             .spawn_if_not_cancelled(&mut command)
             .map_err(ProcessError::Spawn)?
             .ok_or(ProcessError::CancelledBeforeStart)?;
+        let started = Instant::now();
         let stdout = Arc::new(Mutex::new(CapturedBytes::default()));
         let stderr = Arc::new(Mutex::new(CapturedBytes::default()));
         let stdout_reader = take_pipe(&mut child, true, Arc::clone(&stdout))?;
         let stderr_reader = take_pipe(&mut child, false, Arc::clone(&stderr))?;
-        let started = Instant::now();
+        let stdin_writer = match stdin_bytes {
+            Some(bytes) => Some(write_stdin(&mut child, bytes)?),
+            None => None,
+        };
         let mut reason = loop {
             if token.is_cancelled() {
                 break Some(StopReason::Cancelled);
@@ -204,7 +224,9 @@ impl ProcessRunner {
         let drain_deadline = Instant::now() + PIPE_DRAIN_PERIOD;
         let stdout_done = join_pipe_until(stdout_reader, drain_deadline);
         let stderr_done = join_pipe_until(stderr_reader, drain_deadline);
-        if (stdout_done.is_err() || stderr_done.is_err()) && reason.is_none() {
+        let stdin_done = stdin_writer.map(|handle| join_stdin_until(handle, drain_deadline));
+        let stdin_writer_hung = matches!(stdin_done, Some(Err(())));
+        if (stdout_done.is_err() || stderr_done.is_err() || stdin_writer_hung) && reason.is_none() {
             reason = Some(StopReason::PipeHeld);
             let stopped = stop_process_group(&mut child, STOP_GRACE_PERIOD)?;
             if !stopped {
@@ -233,6 +255,23 @@ impl ProcessRunner {
             stdout_truncated: stdout_capture.truncated,
             stderr_truncated: stderr_capture.truncated,
         };
+        if stdin_writer_hung {
+            return Err(ProcessError::Interrupted {
+                reason: reason.unwrap_or(StopReason::PipeHeld),
+                stopped: false,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                output_truncated: output.output_truncated,
+                stdout_truncated: output.stdout_truncated,
+                stderr_truncated: output.stderr_truncated,
+                diagnostic: "stdin writer did not stop after the managed process stopped".into(),
+            });
+        }
+        if reason.is_none() {
+            if let Some(Ok(Err(error))) = stdin_done {
+                return Err(ProcessError::Stdin(error));
+            }
+        }
         match reason {
             Some(StopReason::Cancelled) => Err(ProcessError::Cancelled(output)),
             Some(StopReason::TimedOut) => Err(ProcessError::TimedOut(output)),
@@ -284,6 +323,24 @@ fn take_pipe(
         child.stderr.take().map(|pipe| spawn_reader(pipe, capture))
     };
     pipe.ok_or_else(|| ProcessError::Io(io::Error::other("missing output pipe")))
+}
+
+fn write_stdin(
+    child: &mut Child,
+    bytes: Vec<u8>,
+) -> Result<thread::JoinHandle<io::Result<()>>, ProcessError> {
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        ProcessError::Stdin(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "requested stdin pipe was unavailable",
+        ))
+    })?;
+    Ok(thread::spawn(move || {
+        // write_all handles partial writes and never captures or formats the payload.
+        let result = stdin.write_all(&bytes);
+        drop(stdin);
+        result
+    }))
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -341,6 +398,19 @@ fn join_pipe_until(
         return Err(());
     }
     handle.join().map_err(|_| ())?.map_err(|_| ())
+}
+
+fn join_stdin_until(
+    handle: thread::JoinHandle<io::Result<()>>,
+    deadline: Instant,
+) -> Result<io::Result<()>, ()> {
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
+    if !handle.is_finished() {
+        return Err(());
+    }
+    handle.join().map_err(|_| ())
 }
 
 #[cfg(unix)]
@@ -489,6 +559,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn writes_all_stdin_bytes_without_capturing_them() {
+        let input = vec![b'x'; 128 * 1024];
+        let request = ProcessRequest::new("wc")
+            .arg("-c")
+            .stdin_bytes(input.clone())
+            .timeout(Duration::from_secs(2));
+        let output = ProcessRunner.run(request).expect("stdin consumer succeeds");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            input.len().to_string()
+        );
+        assert!(
+            !output
+                .stdout
+                .windows(16)
+                .any(|window| window == b"xxxxxxxxxxxxxxxx")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_stops_a_blocked_stdin_writer() {
+        let request = ProcessRequest::new("sh")
+            .args(["-c", "sleep 10"])
+            .stdin_bytes(vec![b'x'; 1024 * 1024])
+            .timeout(Duration::from_millis(30));
+        assert!(matches!(
+            ProcessRunner.run(request),
+            Err(ProcessError::TimedOut(_))
+                | Err(ProcessError::Interrupted {
+                    reason: StopReason::TimedOut,
+                    ..
+                })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cancellation_stops_a_running_process() {
         let token = CancellationToken::new();
         let other = token.clone();
@@ -496,6 +604,31 @@ mod tests {
             ProcessRunner.run_with_cancellation(ProcessRequest::new("sleep").arg("10"), other)
         });
         std::thread::sleep(Duration::from_millis(20));
+        token.cancel();
+        assert!(matches!(
+            thread.join().expect("runner thread"),
+            Err(ProcessError::Cancelled(_))
+                | Err(ProcessError::Interrupted {
+                    reason: StopReason::Cancelled,
+                    ..
+                })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_stops_a_blocked_stdin_writer() {
+        let token = CancellationToken::new();
+        let other = token.clone();
+        let thread = std::thread::spawn(move || {
+            ProcessRunner.run_with_cancellation(
+                ProcessRequest::new("sh")
+                    .args(["-c", "sleep 10"])
+                    .stdin_bytes(vec![b'x'; 1024 * 1024]),
+                other,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(30));
         token.cancel();
         assert!(matches!(
             thread.join().expect("runner thread"),
