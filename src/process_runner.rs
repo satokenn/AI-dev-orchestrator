@@ -220,6 +220,7 @@ impl ProcessRunner {
                 diagnostic: "managed process group did not stop within the grace period".into(),
             });
         }
+        let mut process_group_stopped = stopped;
         let status = child.wait().map_err(ProcessError::Io)?;
         let drain_deadline = Instant::now() + PIPE_DRAIN_PERIOD;
         let stdout_done = join_pipe_until(stdout_reader, drain_deadline);
@@ -228,8 +229,8 @@ impl ProcessRunner {
         let stdin_writer_hung = matches!(stdin_done, Some(Err(())));
         if (stdout_done.is_err() || stderr_done.is_err() || stdin_writer_hung) && reason.is_none() {
             reason = Some(StopReason::PipeHeld);
-            let stopped = stop_process_group(&mut child, STOP_GRACE_PERIOD)?;
-            if !stopped {
+            process_group_stopped = stop_process_group(&mut child, STOP_GRACE_PERIOD)?;
+            if !process_group_stopped {
                 let stdout_capture = captured(&stdout);
                 let stderr_capture = captured(&stderr);
                 return Err(ProcessError::Interrupted {
@@ -240,8 +241,12 @@ impl ProcessRunner {
                     output_truncated: stdout_capture.truncated || stderr_capture.truncated,
                     stdout_truncated: stdout_capture.truncated,
                     stderr_truncated: stderr_capture.truncated,
-                    diagnostic: "a descendant kept an output pipe open after the command exited"
-                        .into(),
+                    diagnostic: if stdin_writer_hung {
+                        "stdin writer did not stop; managed process group stop was not confirmed"
+                    } else {
+                        "a descendant kept an output pipe open after the command exited"
+                    }
+                    .into(),
                 });
             }
         }
@@ -258,13 +263,18 @@ impl ProcessRunner {
         if stdin_writer_hung {
             return Err(ProcessError::Interrupted {
                 reason: reason.unwrap_or(StopReason::PipeHeld),
-                stopped: false,
+                stopped: process_group_stopped,
                 stdout: output.stdout,
                 stderr: output.stderr,
                 output_truncated: output.output_truncated,
                 stdout_truncated: output.stdout_truncated,
                 stderr_truncated: output.stderr_truncated,
-                diagnostic: "stdin writer did not stop after the managed process stopped".into(),
+                diagnostic: if process_group_stopped {
+                    "stdin writer did not stop after the managed process group stopped"
+                } else {
+                    "stdin writer did not stop; managed process group stop was not confirmed"
+                }
+                .into(),
             });
         }
         if reason.is_none() {
@@ -576,6 +586,26 @@ mod tests {
                 .windows(16)
                 .any(|window| window == b"xxxxxxxxxxxxxxxx")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_process_group_stop_when_stdin_writer_does_not_drain() {
+        let request = ProcessRequest::new("sh")
+            .args(["-c", "sleep 10 </dev/stdin >/dev/null 2>&1 & exit 0"])
+            .stdin_bytes(vec![b'x'; 1024 * 1024]);
+        match ProcessRunner.run(request) {
+            Err(ProcessError::Interrupted {
+                reason: StopReason::PipeHeld,
+                stopped,
+                diagnostic,
+                ..
+            }) => {
+                assert!(stopped, "managed process group was stopped");
+                assert!(diagnostic.contains("stdin writer"));
+            }
+            result => panic!("unexpected result: {result:?}"),
+        }
     }
 
     #[cfg(unix)]
