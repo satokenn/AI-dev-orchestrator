@@ -697,12 +697,6 @@ impl<'a> ArtifactManager<'a> {
                 path: workspace.path().to_owned(),
                 reason: error.to_string(),
             })?;
-        if let Err(error) = self.verify_workspace_tree(workspace.path(), artifact.tree_oid()) {
-            return Err(ArtifactError::WorkspaceRetained {
-                path: workspace.path().to_owned(),
-                reason: error.to_string(),
-            });
-        }
         let ignored = self
             .run_git(
                 workspace.path(),
@@ -756,6 +750,18 @@ impl<'a> ArtifactManager<'a> {
                 } else {
                     "Artifact contains a submodule whose working contents are not represented by its Git tree".into()
                 },
+            });
+        }
+        self.workspaces
+            .validate_artifact_workspace(workspace, task, attempt)
+            .map_err(|error| ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: error.to_string(),
+            })?;
+        if let Err(error) = self.verify_workspace_tree(workspace.path(), artifact.tree_oid()) {
+            return Err(ArtifactError::WorkspaceRetained {
+                path: workspace.path().to_owned(),
+                reason: error.to_string(),
             });
         }
         self.workspaces.cleanup_force(workspace).map_err(|error| {
@@ -1009,7 +1015,8 @@ mod tests {
         is_missing_git_object_diagnostic, new_id,
     };
     use crate::{
-        SqliteExecutionLedger, Task, TaskId, TaskRole, ValidationResult, WorkspaceManager,
+        AttemptId, SqliteExecutionLedger, Task, TaskId, TaskRole, ValidationResult,
+        WorkspaceManager,
     };
     use std::{fs, process::Command};
 
@@ -1052,6 +1059,14 @@ mod tests {
         fs::write(repository.join("tracked.txt"), "content\n").unwrap();
         git(&["add", "tracked.txt"]);
         git(&["commit", "-qm", "base"]);
+        let submodule_commit = git(&["rev-parse", "HEAD"]);
+        git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{submodule_commit},vendor"),
+        ]);
+        git(&["commit", "-qm", "base with submodule gitlink"]);
         let base = git(&["rev-parse", "HEAD"]);
         let tree = git(&["rev-parse", "HEAD^{tree}"]);
         let repository = fs::canonicalize(repository).unwrap();
@@ -1074,6 +1089,69 @@ mod tests {
         insert_artifact("artifact-b");
         let workspaces = WorkspaceManager::new(&repository).unwrap();
         let manager = ArtifactManager::new(&workspaces, &ledger);
+        let validation_attempt = AttemptId::new("validation-submodule-fixture");
+        let validation_workspace = workspaces
+            .create_at_base(&task, &validation_attempt, &base)
+            .unwrap();
+        manager
+            .materialize(
+                &validation_workspace,
+                &task,
+                &validation_attempt,
+                "artifact-a",
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.cleanup_unchanged_artifact_validation_workspace(
+                &task,
+                &validation_attempt,
+                "artifact-a",
+                &validation_workspace,
+            ),
+            Err(ArtifactError::WorkspaceRetained { path, reason })
+                if path == validation_workspace.path() && reason.contains("submodule")
+        ));
+        assert!(validation_workspace.path().exists());
+        workspaces.cleanup_force(&validation_workspace).unwrap();
+
+        let foreign = root.join("foreign-repo");
+        fs::create_dir_all(&foreign).unwrap();
+        let foreign_git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&foreign)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        foreign_git(&["init", "-q"]);
+        foreign_git(&["config", "user.name", "Test"]);
+        foreign_git(&["config", "user.email", "test@example.invalid"]);
+        fs::write(foreign.join("foreign.txt"), "foreign\n").unwrap();
+        foreign_git(&["add", "foreign.txt"]);
+        foreign_git(&["commit", "-qm", "foreign base"]);
+        let foreign_workspaces = WorkspaceManager::new(&foreign).unwrap();
+        let foreign_attempt = AttemptId::new("validation-foreign-owner");
+        let foreign_workspace = foreign_workspaces.create(&task, &foreign_attempt).unwrap();
+        assert!(matches!(
+            manager.cleanup_unchanged_artifact_validation_workspace(
+                &task,
+                &foreign_attempt,
+                "artifact-a",
+                &foreign_workspace,
+            ),
+            Err(ArtifactError::WorkspaceRetained { path, .. })
+                if path == foreign_workspace.path()
+        ));
+        assert!(foreign_workspace.path().exists());
+        foreign_workspaces
+            .cleanup_force(&foreign_workspace)
+            .unwrap();
         let validation = manager
             .record_validation(
                 &task,
