@@ -21,7 +21,10 @@ mod validator;
 mod workspace;
 
 pub use antigravity::AntigravityProvider;
-pub use artifact::{ArtifactRecord, ArtifactState};
+pub use artifact::{
+    ArtifactCodexDecisionRecord, ArtifactPublicationPermit, ArtifactRecord, ArtifactState,
+    ArtifactValidationRecord, CodexDecisionKind,
+};
 pub use codex_provider::CodexProvider;
 pub use copilot_provider::CopilotProvider;
 pub use domain::{

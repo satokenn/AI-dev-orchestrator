@@ -120,7 +120,13 @@ Codex自身が編集した場合はAttemptを作らない。管理済みArtifact
 
 監督Codexは目的の解釈、Provider / Model選択、実行・review・再試行の要否、成果物の採否、Task完了を判断する。Operation ServiceはTask ID、expected revision、request ID、workspace / Artifactの所属を検証し、操作受付・各事実・公開/CI参照を永続化する。Provider / Model、Validator、GitHub adapterを実行し、stale revision、busy、未知Provider / Model、policy違反、異なるArtifactへの証拠流用を外部副作用前に拒否する。これが #66 のOperation Service契約である。
 
-Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`か、同じTaskに属する既存`ArtifactInput { artifact_id }`のどちらかを受け取る。後者は保存tree/ref/baseをProvider起動前に照合し、検証済みbaseから新しい管理worktreeを作ってtreeを展開する。Providerが停止した後、ServiceはworkspaceをGit treeへsnapshotし、ignored扱いの新規ファイルを除外したArtifactを出力としてAttemptへ関連付ける。Task、Attempt、Operation、Artifactと入出力relationは同じSQLite Ledgerに保存する。Git refの作成はDB transactionと一括で原子化できないため、Artifact rowを`pending_ref`で先に記録し、tree/refを照合して復旧できない場合は`recovery_required`として使用を拒否する。この接続だけではValidation、review、CodexDecision、publicationの公開ゲートまでは実装されない。
+Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`か、同じTaskに属する既存`ArtifactInput { artifact_id }`のどちらかを受け取る。後者は保存tree/ref/baseをProvider起動前に照合し、検証済みbaseから新しい管理worktreeを作ってtreeを展開する。Providerが停止した後、ServiceはworkspaceをGit treeへsnapshotし、ignored扱いの新規ファイルを除外したArtifactを出力としてAttemptへ関連付ける。Task、Attempt、Operation、Artifactと入出力relationは同じSQLite Ledgerに保存する。Git refの作成はDB transactionと一括で原子化できないため、Artifact rowを`pending_ref`で先に記録し、tree/refを照合して復旧できない場合は`recovery_required`として使用を拒否する。
+
+### 同一Artifact証拠ゲートのMVP
+
+`validate_artifact`はArtifactを新しい管理worktreeへ展開し、検査の前後でGit treeが変わっていないことを確認してValidationの成功状態をArtifact ID・tree OIDへ結び付ける。検査後も保存済みArtifactとGit treeが完全一致し、Artifactに含まれないignoredファイルがなく、submoduleが含まれない場合は、validation専用Attempt ID、Task / Attemptから導いたworktree path / branch、manager ownershipを照合した後、その一時worktreeを強制削除する。Artifact treeとの照合、ignored-file / submodule走査、所属確認、削除のいずれかに失敗した場合はworktree path付きでエラーを返し、Validation成功recordを作らない。treeが変わった場合、ignoredファイルがある場合、submoduleがある場合はValidationを記録せず、worktreeを管理下に残す。組み込みの`CommandValidator`は`ProcessRunner`で管理プロセス群の終了を待つ。独自`Validator`を注入する呼出側は、戻る前にworktreeを書き換え得る子プロセスを終了させる必要がある。Serviceは最終tree照合からworktree削除までの間に、独立した外部プロセスが同じpathを書き換える競合を完全には排除しない。validation summary、check名、diagnostic本文にはsecretが含まれる可能性があるため、redaction設定がないMVPではLedgerに保存しない。`record_artifact_decision`は監督Codexの判断を別recordとして保存し、機械検証から採否を自動生成しない。現在のMVPで判断に添付できる`EvidenceRef`は同一Task・Artifactに属するValidationだけで、review・publication・CI証拠は未対応のため拒否する。
+
+`require_artifact_publication_evidence`は、指定IDのpassed Validationとaccepted CodexDecisionが同じTask、Artifact、tree OIDを指す場合だけ`ArtifactPublicationPermit`を返す。permitにはArtifact ID、tree OID、base commit、両証拠IDが含まれる。MVPではこのpermitをcommit / push / Pull Request作成へ接続していない。MCP tool、configured secret scan、公開用tree/SHA記録も未実装なので、permitだけでは公開を許可しない。
 
 ## 旧データとの互換性
 

@@ -131,7 +131,7 @@ type PublicationTaskRow = (
     Option<String>,
 );
 
-const LATEST_SCHEMA_VERSION: u32 = 10;
+const LATEST_SCHEMA_VERSION: u32 = 11;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -270,6 +270,7 @@ impl SqliteExecutionLedger {
         }
         create_service_schema(&transaction)?;
         create_artifact_service_schema(&transaction)?;
+        create_artifact_evidence_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -915,11 +916,54 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
             10 => {
                 create_artifact_service_schema(connection)?;
             }
+            11 => create_artifact_evidence_schema(connection)?,
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
     }
     Ok(())
+}
+
+fn create_artifact_evidence_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS artifact_validations (
+             id TEXT PRIMARY KEY NOT NULL,
+             task_id TEXT NOT NULL,
+             artifact_id TEXT NOT NULL,
+             tree_oid TEXT NOT NULL,
+             summary TEXT NOT NULL,
+             passed INTEGER NOT NULL CHECK(passed IN (0,1)),
+             created_at INTEGER NOT NULL,
+             FOREIGN KEY(task_id, artifact_id) REFERENCES service_artifacts(task_id, id)
+                 ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS artifact_validation_checks (
+             validation_id TEXT NOT NULL REFERENCES artifact_validations(id) ON DELETE CASCADE,
+             sequence INTEGER NOT NULL,
+             name TEXT NOT NULL,
+             passed INTEGER NOT NULL CHECK(passed IN (0,1)),
+             exit_status INTEGER,
+             diagnostics TEXT NOT NULL,
+             PRIMARY KEY(validation_id, sequence)
+         );
+         CREATE INDEX IF NOT EXISTS artifact_validations_by_artifact
+             ON artifact_validations(task_id, artifact_id, passed);
+         CREATE TABLE IF NOT EXISTS artifact_codex_decisions (
+             id TEXT PRIMARY KEY NOT NULL,
+             task_id TEXT NOT NULL,
+             artifact_id TEXT NOT NULL,
+             tree_oid TEXT NOT NULL,
+             decision TEXT NOT NULL CHECK(decision IN ('accepted','rejected','changes_requested')),
+             reason TEXT NOT NULL,
+             evidence_json TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             FOREIGN KEY(task_id, artifact_id) REFERENCES service_artifacts(task_id, id)
+                 ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS artifact_decisions_by_artifact
+             ON artifact_codex_decisions(task_id, artifact_id, decision);
+        ",
+    )
 }
 
 fn create_service_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -1425,17 +1469,21 @@ mod tests {
         assert!(artifact_table);
         let attempt_artifact_table: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_attempt_artifacts')", [], |row| row.get(0)).unwrap();
         assert!(attempt_artifact_table);
+        let artifact_validation_table: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_validations')", [], |row| row.get(0)).unwrap();
+        assert!(artifact_validation_table);
+        let artifact_decision_table: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_codex_decisions')", [], |row| row.get(0)).unwrap();
+        assert!(artifact_decision_table);
     }
 
     #[test]
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 11;")
+            .execute_batch("PRAGMA user_version = 12;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(11))
+            Err(LedgerError::UnsupportedSchemaVersion(12))
         ));
     }
 }
