@@ -39,7 +39,7 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 ## Providerの現在状態を観測する
 
-`CodexProvider`、`CopilotProvider`、`AntigravityProvider` の `observe_current()` は、3秒以内の `--version` probeでCLIの起動有無を観測し、情報源と時刻を付けて返します。CLIの起動成功だけでは認証済みやModel利用可能とは判断せず、それらは `unknown` のままです。この部分実装はquota、API利用量・料金、budgetの取得や `task.get_context` への接続を行いません。詳細は[Providerの現在状態を観測する](docs/current-provider-observations.md)を参照してください。
+`CodexProvider`、`CopilotProvider`、`AntigravityProvider` の `observe_current()` は、3秒のtimeoutを設定した `--version` probeでCLIの起動有無を観測し、情報源と時刻を付けて返します。CLIの起動成功だけでは認証済みやModel利用可能とは判断せず、それらは `unknown` のままです。この部分実装はquota、API利用量・料金、budgetの取得や `task.get_context` への接続を行いません。詳細は[Providerの現在状態を観測する](docs/current-provider-observations.md)を参照してください。
 
 ## Operation Ledger
 
