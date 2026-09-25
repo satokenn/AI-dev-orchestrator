@@ -2337,5 +2337,11 @@ mod tests {
             other => panic!("mutated validation worktree should be retained: {other:?}"),
         };
         assert!(retained_path.exists());
+        let retained_path_text = retained_path.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &["worktree", "remove", "--force", &retained_path_text],
+        );
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, completed.attempt_id());
     }
 }
