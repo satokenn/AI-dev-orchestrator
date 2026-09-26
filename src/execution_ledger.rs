@@ -979,12 +979,15 @@ impl SqliteExecutionLedger {
         operation_id: &str,
         token: CancellationToken,
     ) -> Result<(), LedgerError> {
-        self.ci_wait_cancellations
-            .lock()
-            .map_err(|_| {
-                LedgerError::InvalidStoredValue("CI cancellation registry was poisoned".into())
-            })?
-            .insert(operation_id.to_owned(), token);
+        let mut registry = self.ci_wait_cancellations.lock().map_err(|_| {
+            LedgerError::InvalidStoredValue("CI cancellation registry was poisoned".into())
+        })?;
+        if registry.contains_key(operation_id) {
+            return Err(LedgerError::InvalidStoredValue(
+                "CI wait already has an active worker registration".into(),
+            ));
+        }
+        registry.insert(operation_id.to_owned(), token);
         Ok(())
     }
 
@@ -1005,13 +1008,17 @@ impl SqliteExecutionLedger {
     pub(crate) fn remove_ci_wait_cancellation(
         &self,
         operation_id: &str,
+        token: &CancellationToken,
     ) -> Result<(), LedgerError> {
-        self.ci_wait_cancellations
-            .lock()
-            .map_err(|_| {
-                LedgerError::InvalidStoredValue("CI cancellation registry was poisoned".into())
-            })?
-            .remove(operation_id);
+        let mut registry = self.ci_wait_cancellations.lock().map_err(|_| {
+            LedgerError::InvalidStoredValue("CI cancellation registry was poisoned".into())
+        })?;
+        if registry
+            .get(operation_id)
+            .is_some_and(|registered| registered.is_same_signal(token))
+        {
+            registry.remove(operation_id);
+        }
         Ok(())
     }
 }

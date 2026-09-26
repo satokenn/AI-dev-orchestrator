@@ -419,6 +419,20 @@ pub enum CiWaitCancelTargetState {
     RecoveryRequired,
 }
 
+struct ActiveCiWaitGuard<'a> {
+    ledger: &'a SqliteExecutionLedger,
+    operation_id: String,
+    token: CancellationToken,
+}
+
+impl Drop for ActiveCiWaitGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .ledger
+            .remove_ci_wait_cancellation(&self.operation_id, &self.token);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArtifactPublicationPhase {
     Accepted,
@@ -2459,12 +2473,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         operation_id: &OperationId,
     ) -> Result<CiWaitOperationSnapshot, ServiceError> {
         let token = CancellationToken::new();
-        self.ledger
-            .register_ci_wait_cancellation(operation_id.as_str(), token.clone())?;
-        let result = self.run_ci_wait_operation_inner(operation_id, &token);
-        self.ledger
-            .remove_ci_wait_cancellation(operation_id.as_str())?;
-        result
+        self.run_ci_wait_operation_inner(operation_id, &token)
     }
 
     fn run_ci_wait_operation_inner(
@@ -2495,9 +2504,17 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 return self.get_ci_wait_operation(operation_id);
             }
             tx.execute("UPDATE service_ci_wait_operations SET status='running',started_at=?2 WHERE id=?1 AND status='accepted'",params![operation_id.as_str(),now_ms()])?;
+            self.ledger
+                .register_ci_wait_cancellation(operation_id.as_str(), cancellation.clone())?;
+            let registration_guard = ActiveCiWaitGuard {
+                ledger: self.ledger,
+                operation_id: operation_id.as_str().to_owned(),
+                token: cancellation.clone(),
+            };
             tx.commit()?;
-            row
+            (row, registration_guard)
         };
+        let (claim, _registration_guard) = claim;
         let prepared = (|| {
             let task_id = TaskId::new(claim.0);
             let target = parse_ci_target(&claim.2)?;
@@ -6833,6 +6850,10 @@ mod tests {
             let worker =
                 scope.spawn(move || worker_service.run_ci_wait_operation(&operation_id).unwrap());
             entered.wait();
+            let duplicate = cancel_service
+                .run_ci_wait_operation(accepted.operation_id())
+                .unwrap();
+            assert_eq!(duplicate.status(), ServiceOperationStatus::Running);
             assert_eq!(
                 cancel_service
                     .request_ci_wait_cancellation(accepted.operation_id())
