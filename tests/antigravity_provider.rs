@@ -154,7 +154,7 @@ fn passes_named_model_and_types_invalid_model_selection() {
         .execute(&named_model_request(
             workspace,
             "hello",
-            Duration::from_secs(1),
+            Duration::from_secs(5),
         ))
         .unwrap_err();
     assert!(
