@@ -10,8 +10,11 @@ agy -p <prompt> --output-format json
 
 実行の cwd には `ProviderRequest::workspace()` を使用します。CLI の JSON
 出力に含まれる `response` は `AgentResult` に、`usage` の各項目は
-`UsageMetric` に変換されます。元の stdout / stderr と exit status も
-`ProviderResult` から参照できます。
+`UsageMetric` に変換されます。stdout / stderr は
+`ProviderResult::expose_stdout_for_trusted_processing` /
+`expose_stderr_for_trusted_processing` で明示的に取得できます。これらはredaction前の
+本文を返すため、信頼された呼び出し側だけが使い、既知secretのredactionなしに保存・返却してはいけません。
+Providerの通常error本文にはraw診断を含めません。
 
 ## 可用性と診断
 
@@ -26,8 +29,8 @@ provider.check_availability()?;
 ```
 
 CLI が PATH にない場合は `ProviderError::Unavailable` になります。認証が
-必要な場合や認証情報が無効な場合も、headless 実行時の診断メッセージを
-`Unavailable` として返します。その他の非0終了は `ExecutionFailed` です。
+必要な場合や認証情報が無効な場合は `Unavailable` を返します。その他の非0終了は
+`ExecutionFailed` です。error本文にheadless実行のraw診断を含めません。
 
 ## 手動 Live Provider Test
 
