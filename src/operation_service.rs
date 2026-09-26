@@ -961,6 +961,21 @@ pub struct ModelCatalogEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelCatalogError;
 
+fn model_catalog_entry_is_fresh_at(
+    entry: &ModelCatalogEntry,
+    now_since_epoch: Duration,
+    max_age: Duration,
+) -> bool {
+    let Some(age) =
+        now_since_epoch.checked_sub(Duration::from_secs(entry.observed_at_unix_seconds))
+    else {
+        return false;
+    };
+    !entry.source.trim().is_empty()
+        && age <= max_age
+        && entry.status == ModelCapabilityStatus::Supported
+}
+
 /// Read-only source of Provider / Model capability facts. Errors fail closed.
 pub trait ModelCatalog: Send + Sync {
     fn lookup(
@@ -1228,13 +1243,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| ServiceError::NamedModelRequiresCatalog)?;
-            let age = now
-                .checked_sub(Duration::from_secs(entry.observed_at_unix_seconds))
-                .ok_or(ServiceError::NamedModelRequiresCatalog)?;
-            if entry.source.trim().is_empty()
-                || age > self.model_catalog_max_age
-                || entry.status != ModelCapabilityStatus::Supported
-            {
+            if !model_catalog_entry_is_fresh_at(&entry, now, self.model_catalog_max_age) {
                 return Err(ServiceError::NamedModelRequiresCatalog);
             }
         }
@@ -3642,6 +3651,26 @@ mod tests {
         ) -> Result<Option<ModelCatalogEntry>, ModelCatalogError> {
             Ok(Some(self.0.clone()))
         }
+    }
+
+    #[test]
+    fn model_catalog_freshness_accepts_exact_boundary_and_rejects_just_over() {
+        let entry = ModelCatalogEntry {
+            source: "test-catalog".into(),
+            observed_at_unix_seconds: 100,
+            status: ModelCapabilityStatus::Supported,
+        };
+        let max_age = Duration::from_secs(2);
+        assert!(model_catalog_entry_is_fresh_at(
+            &entry,
+            Duration::from_secs(102),
+            max_age
+        ));
+        assert!(!model_catalog_entry_is_fresh_at(
+            &entry,
+            Duration::from_secs(102) + Duration::from_nanos(1),
+            max_age
+        ));
     }
 
     #[test]
