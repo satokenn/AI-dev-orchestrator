@@ -93,7 +93,17 @@ impl CodexProvider {
                     "failed to start {}: {error}",
                     self.executable.to_string_lossy()
                 )),
-                other => ProviderError::Unavailable(format!("Codex CLI unavailable: {other:?}")),
+                ProcessError::Io(_) | ProcessError::Stdin(_) | ProcessError::NonZeroExit(_) => {
+                    ProviderError::Unavailable(
+                        "Codex CLI availability check failed; process output is withheld".into(),
+                    )
+                }
+                ProcessError::TimedOut(_)
+                | ProcessError::Cancelled(_)
+                | ProcessError::CancelledBeforeStart
+                | ProcessError::Interrupted { .. } => ProviderError::Unavailable(
+                    "Codex CLI availability check did not complete".into(),
+                ),
             })
     }
 
@@ -202,20 +212,11 @@ impl CodexProvider {
             }
             ProcessError::TimedOut(output) => {
                 let captured = CapturedOutput::from_process_output(&output);
-                ProviderError::TimedOutWithOutput {
-                    timeout,
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                }
-                .with_captured_output(captured)
+                ProviderError::TimedOutWithOutput { timeout }.with_captured_output(captured)
             }
             ProcessError::Cancelled(output) => {
                 let captured = CapturedOutput::from_process_output(&output);
-                ProviderError::CancelledWithOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                }
-                .with_captured_output(captured)
+                ProviderError::CancelledWithOutput.with_captured_output(captured)
             }
             ProcessError::CancelledBeforeStart => ProviderError::Cancelled,
             ProcessError::Interrupted {
@@ -226,13 +227,10 @@ impl CodexProvider {
                 output_truncated: _,
                 stdout_truncated,
                 stderr_truncated,
-                diagnostic,
+                diagnostic: _,
             } => ProviderError::Interrupted {
                 reason,
                 confirmed_stopped: stopped,
-                stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                diagnostic,
             }
             .with_captured_output(CapturedOutput::with_stream_truncation(
                 stdout,
@@ -242,23 +240,26 @@ impl CodexProvider {
                 stderr_truncated,
             )),
             ProcessError::NonZeroExit(output) => {
-                let diagnostic =
-                    output_diagnostic(&output.stdout, &output.stderr, output.exit_code());
+                let classification_text = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
                 let captured = CapturedOutput::from_process_output(&output);
-                if let Some(error) =
-                    crate::provider::unsupported_model_error(&self.reference, model, &diagnostic)
-                {
+                if let Some(error) = crate::provider::unsupported_model_error(
+                    &self.reference,
+                    model,
+                    &classification_text,
+                ) {
                     error.with_captured_output(captured)
-                } else if looks_like_authentication_failure(&diagnostic) {
-                    ProviderError::Unavailable(format!(
-                        "Codex CLI authentication failed; run `codex login`: {diagnostic}"
-                    ))
+                } else if looks_like_authentication_failure(&classification_text) {
+                    ProviderError::Unavailable(
+                        "Codex CLI authentication failed; run `codex login`".into(),
+                    )
                     .with_captured_output(captured)
                 } else {
-                    ProviderError::ExecutionFailed(format!(
-                        "Codex CLI exited unsuccessfully: {diagnostic}"
-                    ))
-                    .with_captured_output(captured)
+                    ProviderError::ExecutionFailed("Codex CLI exited unsuccessfully".into())
+                        .with_captured_output(captured)
                 }
             }
         }
@@ -315,8 +316,8 @@ fn parse_codex_jsonl(stdout: &str, truncated: bool) -> Result<ParsedCodexJsonl, 
                         final_message = Some(text.to_owned());
                     }
                     Some("error") => {
-                        if let Some(message) = item.get("message").and_then(Value::as_str) {
-                            diagnostics.push(message.to_owned());
+                        if item.get("message").and_then(Value::as_str).is_some() {
+                            diagnostics.push("Codex CLI emitted an item error event".into());
                         }
                     }
                     _ => {}
@@ -336,20 +337,10 @@ fn parse_codex_jsonl(stdout: &str, truncated: bool) -> Result<ParsedCodexJsonl, 
                 }
             }
             Some("turn.failed") => {
-                let message = event
-                    .get("error")
-                    .and_then(Value::as_object)
-                    .and_then(|error| error.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("Codex CLI reported a failed turn");
-                fatal_errors.push(message.to_owned());
+                fatal_errors.push("Codex CLI reported a failed turn".to_owned());
             }
             Some("error") => {
-                let message = event
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Codex CLI reported an unrecoverable stream error");
-                fatal_errors.push(message.to_owned());
+                fatal_errors.push("Codex CLI reported an unrecoverable stream error".to_owned());
             }
             _ => {}
         }
@@ -426,18 +417,6 @@ impl AgentProvider for CodexProvider {
     }
 }
 
-fn output_diagnostic(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> String {
-    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
-    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
-    let output = match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => String::from("no diagnostic output"),
-        (false, true) => format!("stdout: {stdout}"),
-        (true, false) => format!("stderr: {stderr}"),
-        (false, false) => format!("stdout: {stdout}; stderr: {stderr}"),
-    };
-    format!("exit status {exit_code:?}; {output}")
-}
-
 fn looks_like_authentication_failure(diagnostic: &str) -> bool {
     let diagnostic = diagnostic.to_ascii_lowercase();
     [
@@ -495,14 +474,17 @@ mod tests {
                 .summary()
                 .contains("do the task")
         );
-        assert_eq!(result.stderr(), "err");
+        assert_eq!(result.expose_stderr_for_trusted_processing(), "err");
         assert_eq!(result.exit_status(), Some(0));
         assert!(result.agent_result().unwrap().reported_success());
         assert_eq!(result.observed_provider().unwrap().as_str(), "codex");
         assert!(result.observed_model().is_none());
         assert_eq!(
-            result.captured_output().unwrap().stdout(),
-            result.stdout().as_bytes()
+            result
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stdout_bytes_for_trusted_processing(),
+            result.expose_stdout_for_trusted_processing().as_bytes()
         );
     }
 
@@ -516,7 +498,9 @@ mod tests {
         let result = provider.execute(&request(Duration::from_secs(5))).unwrap();
 
         assert_eq!(result.agent_result().unwrap().summary(), "complete");
-        let captured = result.captured_output().unwrap();
+        let captured = result
+            .expose_captured_output_for_trusted_processing()
+            .unwrap();
         assert!(!captured.stdout_truncated());
         assert!(captured.stderr_truncated());
         assert!(captured.truncated());
@@ -552,7 +536,13 @@ mod tests {
             error.kind(),
             ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gpt-test"
         ));
-        assert_eq!(error.captured_output().unwrap().stderr(), b"unknown model");
+        assert_eq!(
+            error
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stderr_bytes_for_trusted_processing(),
+            b"unknown model"
+        );
     }
 
     #[test]
@@ -588,7 +578,13 @@ mod tests {
         assert!(
             matches!(error.kind(), ProviderError::Unavailable(message) if message.contains("codex login"))
         );
-        assert_eq!(error.captured_output().unwrap().stderr(), b"Not logged in");
+        assert_eq!(
+            error
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stderr_bytes_for_trusted_processing(),
+            b"Not logged in"
+        );
     }
 
     #[cfg(unix)]
@@ -602,13 +598,20 @@ mod tests {
         assert!(matches!(
             error.kind(),
             ProviderError::ExecutionFailed(message)
-                if message.contains("exit status Some(7)")
-                    && message.contains("partial stdout")
-                    && message.contains("details")
+                if !message.contains("partial stdout")
+                    && !message.contains("details")
         ));
-        let output = error.captured_output().unwrap();
-        assert_eq!(output.stdout(), b"partial stdout");
-        assert_eq!(output.stderr(), b"details");
+        let output = error
+            .expose_captured_output_for_trusted_processing()
+            .unwrap();
+        assert_eq!(
+            output.expose_stdout_bytes_for_trusted_processing(),
+            b"partial stdout"
+        );
+        assert_eq!(
+            output.expose_stderr_bytes_for_trusted_processing(),
+            b"details"
+        );
         assert_eq!(output.exit_status(), Some(7));
         assert!(!output.truncated());
     }
@@ -621,9 +624,15 @@ mod tests {
             .execute(&request(Duration::from_secs(1)))
             .unwrap_err();
         assert!(
-            matches!(timeout.kind(), ProviderError::TimedOutWithOutput { stdout, .. } if stdout == "partial")
+            matches!(timeout.kind(), ProviderError::TimedOutWithOutput { timeout } if *timeout == Duration::from_secs(1))
         );
-        assert_eq!(timeout.captured_output().unwrap().stdout(), b"partial");
+        assert_eq!(
+            timeout
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stdout_bytes_for_trusted_processing(),
+            b"partial"
+        );
 
         let cancellation = CancellationToken::new();
         let other = cancellation.clone();
@@ -636,9 +645,15 @@ mod tests {
         let cancelled = thread.join().unwrap().unwrap_err();
         assert!(matches!(
             cancelled.kind(),
-            ProviderError::CancelledWithOutput { .. }
+            ProviderError::CancelledWithOutput
         ));
-        assert_eq!(cancelled.captured_output().unwrap().stdout(), b"partial");
+        assert_eq!(
+            cancelled
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stdout_bytes_for_trusted_processing(),
+            b"partial"
+        );
     }
 
     #[test]
@@ -697,7 +712,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn fatal_jsonl_events_fail_without_losing_the_raw_stream() {
+    fn fatal_jsonl_events_use_safe_error_text_and_preserve_trusted_capture() {
         let provider = shell_provider(
             "printf '%s\\n' '{\"type\":\"turn.failed\",\"error\":{\"message\":\"model failed\"}}'",
         );
@@ -705,11 +720,16 @@ mod tests {
             .execute(&request(Duration::from_secs(1)))
             .unwrap_err();
         assert!(
-            matches!(error.kind(), ProviderError::ExecutionFailed(message) if message == "model failed")
+            matches!(error.kind(), ProviderError::ExecutionFailed(message) if message == "Codex CLI reported a failed turn")
         );
         assert!(
-            String::from_utf8_lossy(error.captured_output().unwrap().stdout())
-                .contains("model failed")
+            String::from_utf8_lossy(
+                error
+                    .expose_captured_output_for_trusted_processing()
+                    .unwrap()
+                    .expose_stdout_bytes_for_trusted_processing()
+            )
+            .contains("model failed")
         );
     }
 

@@ -7,7 +7,7 @@ use crate::process_runner::ProcessOutput;
 use crate::{AgentResult, CancellationToken, ModelChoice, ModelRef, ProviderRef, UsageCost};
 
 /// Raw output captured from a provider process, before UTF-8 decoding.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CapturedOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -17,6 +17,12 @@ pub struct CapturedOutput {
 }
 
 impl CapturedOutput {
+    /// Explicitly exposes sensitive, unredacted process bytes to a trusted caller.
+    /// The caller must redact known secrets before persistence or returning the bytes.
+    #[must_use]
+    pub fn expose_raw_bytes_for_trusted_processing(&self) -> (&[u8], &[u8]) {
+        (&self.stdout, &self.stderr)
+    }
     #[must_use]
     pub fn new(
         stdout: Vec<u8>,
@@ -53,11 +59,11 @@ impl CapturedOutput {
         )
     }
     #[must_use]
-    pub fn stdout(&self) -> &[u8] {
+    pub fn expose_stdout_bytes_for_trusted_processing(&self) -> &[u8] {
         &self.stdout
     }
     #[must_use]
-    pub fn stderr(&self) -> &[u8] {
+    pub fn expose_stderr_bytes_for_trusted_processing(&self) -> &[u8] {
         &self.stderr
     }
     #[must_use]
@@ -75,6 +81,19 @@ impl CapturedOutput {
     #[must_use]
     pub const fn stderr_truncated(&self) -> bool {
         self.stderr_truncated
+    }
+}
+
+impl std::fmt::Debug for CapturedOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapturedOutput")
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .field("exit_status", &self.exit_status)
+            .field("stdout_truncated", &self.stdout_truncated)
+            .field("stderr_truncated", &self.stderr_truncated)
+            .finish()
     }
 }
 
@@ -129,7 +148,7 @@ impl ProviderRequest {
 }
 
 /// The minimum provider output needed by the orchestrator.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ProviderResult {
     stdout: String,
     stderr: String,
@@ -179,16 +198,21 @@ impl ProviderResult {
         self
     }
     #[must_use]
+    /// Adds safe, redacted diagnostic summaries; raw provider output must not be stored here.
     pub fn with_diagnostics(mut self, diagnostics: impl IntoIterator<Item = String>) -> Self {
         self.diagnostics = diagnostics.into_iter().collect();
         self
     }
     #[must_use]
-    pub fn stdout(&self) -> &str {
+    /// Explicitly exposes potentially sensitive provider output to a trusted caller.
+    /// Redact known secrets before persistence or returning the text.
+    pub fn expose_stdout_for_trusted_processing(&self) -> &str {
         &self.stdout
     }
     #[must_use]
-    pub fn stderr(&self) -> &str {
+    /// Explicitly exposes potentially sensitive provider output to a trusted caller.
+    /// Redact known secrets before persistence or returning the text.
+    pub fn expose_stderr_for_trusted_processing(&self) -> &str {
         &self.stderr
     }
     #[must_use]
@@ -212,16 +236,33 @@ impl ProviderResult {
         self.observed_model.as_ref()
     }
     #[must_use]
-    pub fn captured_output(&self) -> Option<&CapturedOutput> {
+    pub fn expose_captured_output_for_trusted_processing(&self) -> Option<&CapturedOutput> {
         self.captured_output.as_ref()
     }
     #[must_use]
-    pub fn diagnostics(&self) -> &[String] {
+    pub fn diagnostic_summaries(&self) -> &[String] {
         &self.diagnostics
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl std::fmt::Debug for ProviderResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderResult")
+            .field("stdout", &"<redacted>")
+            .field("stderr", &"<redacted>")
+            .field("exit_status", &self.exit_status)
+            .field("agent_result", &"<redacted>")
+            .field("usage", &self.usage)
+            .field("observed_provider", &self.observed_provider)
+            .field("observed_model", &self.observed_model)
+            .field("captured_output", &self.captured_output)
+            .field("diagnostic_count", &self.diagnostics.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub enum ProviderError {
     InvalidRequest(String),
     ExecutionFailed(String),
@@ -231,19 +272,11 @@ pub enum ProviderError {
     Cancelled,
     TimedOutWithOutput {
         timeout: Duration,
-        stdout: String,
-        stderr: String,
     },
-    CancelledWithOutput {
-        stdout: String,
-        stderr: String,
-    },
+    CancelledWithOutput,
     Interrupted {
         reason: crate::StopReason,
         confirmed_stopped: bool,
-        stdout: String,
-        stderr: String,
-        diagnostic: String,
     },
     Unavailable(String),
     UnsupportedModel {
@@ -266,7 +299,9 @@ impl ProviderError {
         }
     }
     #[must_use]
-    pub fn captured_output(&self) -> Option<&CapturedOutput> {
+    /// Explicitly exposes sensitive, unredacted process bytes to a trusted caller.
+    /// Redact known secrets before persistence or returning any exposed bytes.
+    pub fn expose_captured_output_for_trusted_processing(&self) -> Option<&CapturedOutput> {
         match self {
             Self::WithCapturedOutput { output, .. } => Some(output),
             _ => None,
@@ -278,6 +313,53 @@ impl ProviderError {
         match self {
             Self::WithCapturedOutput { error, .. } => error.kind(),
             _ => self,
+        }
+    }
+}
+
+impl std::fmt::Debug for ProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WithCapturedOutput { error, output } => formatter
+                .debug_struct("ProviderError::WithCapturedOutput")
+                .field("error", error)
+                .field("captured_output", output)
+                .finish(),
+            Self::InvalidRequest(_) => formatter
+                .debug_tuple("ProviderError::InvalidRequest")
+                .field(&"<redacted>")
+                .finish(),
+            Self::ExecutionFailed(_) => formatter
+                .debug_tuple("ProviderError::ExecutionFailed")
+                .field(&"<redacted>")
+                .finish(),
+            Self::Unavailable(_) => formatter
+                .debug_tuple("ProviderError::Unavailable")
+                .field(&"<redacted>")
+                .finish(),
+            Self::TimedOut { timeout } => formatter
+                .debug_struct("ProviderError::TimedOut")
+                .field("timeout", timeout)
+                .finish(),
+            Self::Cancelled => formatter.write_str("ProviderError::Cancelled"),
+            Self::TimedOutWithOutput { timeout } => formatter
+                .debug_struct("ProviderError::TimedOutWithOutput")
+                .field("timeout", timeout)
+                .finish(),
+            Self::CancelledWithOutput => formatter.write_str("ProviderError::CancelledWithOutput"),
+            Self::Interrupted {
+                reason,
+                confirmed_stopped,
+            } => formatter
+                .debug_struct("ProviderError::Interrupted")
+                .field("reason", reason)
+                .field("confirmed_stopped", confirmed_stopped)
+                .finish(),
+            Self::UnsupportedModel { provider, model } => formatter
+                .debug_struct("ProviderError::UnsupportedModel")
+                .field("provider", provider)
+                .field("model", model)
+                .finish(),
         }
     }
 }
@@ -325,17 +407,14 @@ impl std::fmt::Display for ProviderError {
             Self::TimedOutWithOutput { timeout, .. } => {
                 write!(formatter, "provider timed out after {timeout:?}")
             }
-            Self::CancelledWithOutput { .. } => {
-                formatter.write_str("provider execution was cancelled")
-            }
+            Self::CancelledWithOutput => formatter.write_str("provider execution was cancelled"),
             Self::Interrupted {
                 reason,
                 confirmed_stopped,
-                diagnostic,
                 ..
             } => write!(
                 formatter,
-                "provider execution interrupted ({reason:?}, stopped={confirmed_stopped}): {diagnostic}"
+                "provider execution interrupted ({reason:?}, stopped={confirmed_stopped})"
             ),
             Self::Unavailable(message) => write!(formatter, "provider unavailable: {message}"),
             Self::UnsupportedModel { provider, model } => write!(
@@ -388,6 +467,38 @@ mod tests {
         supported_model: Option<&'static str>,
     }
 
+    #[test]
+    fn debug_and_display_never_include_provider_output() {
+        let secret = "sentinel-provider-secret";
+        let captured = CapturedOutput::new(
+            secret.as_bytes().to_vec(),
+            b"stderr sentinel".to_vec(),
+            Some(7),
+            false,
+        );
+        let result = ProviderResult::new(
+            secret,
+            "stderr sentinel",
+            Some(7),
+            Some(AgentResult::new(secret, false)),
+            None,
+        )
+        .with_captured_output(captured.clone());
+        let rendered_result = format!("{result:?}");
+        assert!(!rendered_result.contains(secret));
+        assert!(!rendered_result.contains("stderr sentinel"));
+
+        let error = ProviderError::ExecutionFailed("provider process failed".into())
+            .with_captured_output(captured);
+        assert!(!format!("{error:?}").contains(secret));
+        assert!(!format!("{error:?}").contains("stderr sentinel"));
+        assert!(!format!("{error}").contains(secret));
+        assert!(!format!("{error}").contains("stderr sentinel"));
+
+        let caller_constructed = ProviderError::ExecutionFailed(secret.into());
+        assert!(!format!("{caller_constructed:?}").contains(secret));
+    }
+
     impl AgentProvider for FakeProvider {
         fn provider_ref(&self) -> &ProviderRef {
             &self.reference
@@ -436,8 +547,12 @@ mod tests {
         let result = provider.execute(&request).unwrap();
 
         assert_eq!(provider.provider_ref().as_str(), "codex");
-        assert!(result.stdout().contains("/tmp/worktree"));
-        assert_eq!(result.stderr(), "");
+        assert!(
+            result
+                .expose_stdout_for_trusted_processing()
+                .contains("/tmp/worktree")
+        );
+        assert_eq!(result.expose_stderr_for_trusted_processing(), "");
         assert_eq!(result.exit_status(), Some(0));
         assert_eq!(result.agent_result().unwrap().summary(), "do the task");
         assert!(result.usage().is_some());

@@ -138,9 +138,8 @@ impl AntigravityProvider {
             .and_then(|result| result.status.as_deref())
             .is_some_and(|status| !status.eq_ignore_ascii_case("SUCCESS"))
         {
-            let diagnostic = format_diagnostic(&stdout, &stderr);
             return Err(self
-                .map_diagnostic_error(&diagnostic, "", request.model())
+                .map_diagnostic_error(&stdout, &stderr, request.model())
                 .with_captured_output(captured_output.clone()));
         }
 
@@ -187,26 +186,17 @@ impl AntigravityProvider {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let detail = parse_json_result(&stdout)
                     .and_then(|result| result.error)
-                    .unwrap_or_else(|| format_diagnostic(&stdout, &stderr));
+                    .unwrap_or_else(|| format!("{stdout}\n{stderr}"));
                 self.map_diagnostic_error(&detail, &stderr, model)
                     .with_captured_output(captured)
             }
             ProcessError::TimedOut(output) => {
                 let captured = CapturedOutput::from_process_output(&output);
-                ProviderError::TimedOutWithOutput {
-                    timeout,
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                }
-                .with_captured_output(captured)
+                ProviderError::TimedOutWithOutput { timeout }.with_captured_output(captured)
             }
             ProcessError::Cancelled(output) => {
                 let captured = CapturedOutput::from_process_output(&output);
-                ProviderError::CancelledWithOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                }
-                .with_captured_output(captured)
+                ProviderError::CancelledWithOutput.with_captured_output(captured)
             }
             ProcessError::CancelledBeforeStart => ProviderError::Cancelled,
             ProcessError::Interrupted {
@@ -217,13 +207,10 @@ impl AntigravityProvider {
                 output_truncated: _,
                 stdout_truncated,
                 stderr_truncated,
-                diagnostic,
+                diagnostic: _,
             } => ProviderError::Interrupted {
                 reason,
                 confirmed_stopped: stopped,
-                stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                diagnostic,
             }
             .with_captured_output(CapturedOutput::with_stream_truncation(
                 stdout,
@@ -246,9 +233,9 @@ impl AntigravityProvider {
         {
             error
         } else if is_authentication_error(detail, stderr) {
-            ProviderError::Unavailable(detail.to_owned())
+            ProviderError::Unavailable("Antigravity CLI authentication failed".into())
         } else {
-            ProviderError::ExecutionFailed(detail.to_owned())
+            ProviderError::ExecutionFailed("Antigravity CLI execution failed".into())
         }
     }
 
@@ -371,23 +358,15 @@ fn process_error_message(error: ProcessError) -> String {
         ProcessError::Spawn(error) | ProcessError::Io(error) | ProcessError::Stdin(error) => {
             error.to_string()
         }
-        ProcessError::NonZeroExit(output)
-        | ProcessError::TimedOut(output)
-        | ProcessError::Cancelled(output) => format_diagnostic(
-            &String::from_utf8_lossy(&output.stdout),
-            &String::from_utf8_lossy(&output.stderr),
-        ),
+        ProcessError::NonZeroExit(_) => {
+            "process exited unsuccessfully; captured bytes are withheld".into()
+        }
+        ProcessError::TimedOut(_) => "process timed out; captured bytes are withheld".into(),
+        ProcessError::Cancelled(_) => "process was cancelled; captured bytes are withheld".into(),
         ProcessError::CancelledBeforeStart => "process was cancelled before start".to_owned(),
-        ProcessError::Interrupted { diagnostic, .. } => diagnostic,
-    }
-}
-
-fn format_diagnostic(stdout: &str, stderr: &str) -> String {
-    match (stdout.trim(), stderr.trim()) {
-        ("", "") => "Antigravity CLI exited without diagnostics".to_owned(),
-        (stdout, "") => stdout.to_owned(),
-        ("", stderr) => stderr.to_owned(),
-        (stdout, stderr) => format!("stdout: {stdout}; stderr: {stderr}"),
+        ProcessError::Interrupted { .. } => {
+            "process was interrupted; captured bytes are withheld".into()
+        }
     }
 }
 
