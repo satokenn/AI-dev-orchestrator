@@ -1227,12 +1227,12 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 .ok_or(ServiceError::NamedModelRequiresCatalog)?;
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|_| ServiceError::NamedModelRequiresCatalog)?
-                .as_secs();
-            let max_age = self.model_catalog_max_age.as_secs();
+                .map_err(|_| ServiceError::NamedModelRequiresCatalog)?;
+            let age = now
+                .checked_sub(Duration::from_secs(entry.observed_at_unix_seconds))
+                .ok_or(ServiceError::NamedModelRequiresCatalog)?;
             if entry.source.trim().is_empty()
-                || entry.observed_at_unix_seconds > now
-                || now - entry.observed_at_unix_seconds > max_age
+                || age > self.model_catalog_max_age
                 || entry.status != ModelCapabilityStatus::Supported
             {
                 return Err(ServiceError::NamedModelRequiresCatalog);
@@ -1479,7 +1479,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             workspace.path(),
             stored.instruction,
             timeout,
-            ModelChoice::ProviderDefault,
+            stored.requested_model,
         );
         let provider_result = provider.execute_with_cancellation(&provider_request, cancellation);
         match provider_result {
@@ -2600,7 +2600,14 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
 
     fn load_request(&self, operation_id: &OperationId) -> Result<StoredRequest, ServiceError> {
         let connection = self.ledger.lock_connection()?;
-        connection.query_row("SELECT operation.task_id,operation.attempt_id,operation.provider,operation.instruction,operation.base_commit,operation.timeout_ms,operation.status,relation.input_artifact_id FROM service_operations operation LEFT JOIN service_attempt_artifacts relation ON relation.task_id=operation.task_id AND relation.attempt_id=operation.attempt_id WHERE operation.id=?1",params![operation_id.as_str()],|row|Ok(StoredRequest{task_id:TaskId::new(row.get::<_,String>(0)?),attempt_id:AttemptId::new(row.get::<_,String>(1)?),provider:ProviderRef::new(row.get::<_,String>(2)?),instruction:row.get(3)?,base_commit:row.get(4)?,timeout_ms:row.get::<_,i64>(5)? as u64,status:ServiceOperationStatus::from_str(&row.get::<_,String>(6)?).map_err(|_|rusqlite::Error::InvalidQuery)?,input_artifact_id:row.get(7)?})).optional()?.ok_or(ServiceError::OperationNotFound)
+        connection.query_row("SELECT operation.task_id,operation.attempt_id,operation.provider,operation.instruction,operation.base_commit,operation.timeout_ms,operation.status,operation.model_kind,operation.model_name,relation.input_artifact_id FROM service_operations operation LEFT JOIN service_attempt_artifacts relation ON relation.task_id=operation.task_id AND relation.attempt_id=operation.attempt_id WHERE operation.id=?1",params![operation_id.as_str()],|row|{
+            let kind = row.get::<_, String>(7)?;
+            let name = row.get::<_, Option<String>>(8)?;
+            let requested_model = crate::execution_ledger::requested_model_from_storage(Some(&kind), name.as_deref())
+                .map_err(|_| rusqlite::Error::InvalidQuery)?
+                .ok_or(rusqlite::Error::InvalidQuery)?;
+            Ok(StoredRequest{task_id:TaskId::new(row.get::<_,String>(0)?),attempt_id:AttemptId::new(row.get::<_,String>(1)?),provider:ProviderRef::new(row.get::<_,String>(2)?),instruction:row.get(3)?,base_commit:row.get(4)?,timeout_ms:row.get::<_,i64>(5)? as u64,status:ServiceOperationStatus::from_str(&row.get::<_,String>(6)?).map_err(|_|rusqlite::Error::InvalidQuery)?,requested_model,input_artifact_id:row.get(9)?})
+        }).optional()?.ok_or(ServiceError::OperationNotFound)
     }
 
     /// Claims an accepted operation before availability checks or workspace side effects.
@@ -2772,6 +2779,7 @@ struct StoredRequest {
     instruction: String,
     base_commit: String,
     timeout_ms: u64,
+    requested_model: ModelChoice,
     status: ServiceOperationStatus,
     input_artifact_id: Option<String>,
 }
@@ -3155,7 +3163,14 @@ mod tests {
         fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             thread::sleep(self.execute_delay);
-            assert_eq!(request.model(), &ModelChoice::ProviderDefault);
+            if matches!(request.model(), ModelChoice::Named(_)) {
+                assert_eq!(
+                    request.model(),
+                    &ModelChoice::Named(ModelRef::new("gpt-test"))
+                );
+            } else {
+                assert_eq!(request.model(), &ModelChoice::ProviderDefault);
+            }
             if let Some((path, contents)) = &self.require_file {
                 assert_eq!(
                     fs::read_to_string(request.workspace().join(path)).unwrap(),
@@ -3686,6 +3701,43 @@ mod tests {
                     .unwrap()
                     .with_model_catalog(&catalog, Duration::from_secs(60));
             let mut req = request(&repo, &task_id, 0, "rejected-named-model");
+            req.model_id = ModelChoice::Named(ModelRef::new("gpt-test"));
+            assert!(matches!(
+                service.submit_attempt(&req),
+                Err(ServiceError::NamedModelRequiresCatalog)
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(checks.load(Ordering::SeqCst), 0);
+            assert!(
+                ledger
+                    .get_task(&task_id)
+                    .unwrap()
+                    .unwrap()
+                    .attempts()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn zero_and_subsecond_freshness_are_compared_at_duration_precision() {
+        for max_age in [Duration::ZERO, Duration::from_millis(500)] {
+            let (repo, ledger, workspace, providers, calls, checks, task_id) =
+                service_parts(false, Duration::ZERO, false);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let catalog = StaticCatalog(ModelCatalogEntry {
+                source: "test-catalog".into(),
+                observed_at_unix_seconds: now.saturating_sub(1),
+                status: ModelCapabilityStatus::Supported,
+            });
+            let service =
+                OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                    .unwrap()
+                    .with_model_catalog(&catalog, max_age);
+            let mut req = request(&repo, &task_id, 0, "subsecond-stale-model");
             req.model_id = ModelChoice::Named(ModelRef::new("gpt-test"));
             assert!(matches!(
                 service.submit_attempt(&req),
