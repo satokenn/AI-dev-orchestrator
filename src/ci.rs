@@ -651,9 +651,15 @@ impl<'a, P: CiProvider> CiRuntime<'a, P> {
                     });
                 }
                 Err(CiError::Provider(CiProviderError::Unavailable(reason))) => {
+                    let last_observation_id = last.map(|observation| observation.id);
+                    if Instant::now() >= deadline {
+                        return Err(CiError::Timeout {
+                            last_observation_id,
+                        });
+                    }
                     return Err(CiError::Unavailable {
                         reason,
-                        last_observation_id: last.map(|observation| observation.id),
+                        last_observation_id,
                     });
                 }
                 Err(error) => return Err(error),
@@ -1305,6 +1311,7 @@ mod tests {
         responses: Mutex<VecDeque<Result<CiProviderSnapshot, CiProviderError>>>,
         fallback: CiProviderSnapshot,
         queries: Mutex<Vec<CiQueryTarget>>,
+        unavailable_delay: Duration,
     }
 
     impl FakeProvider {
@@ -1315,14 +1322,24 @@ mod tests {
                 responses: Mutex::new(snapshots.into_iter().map(Ok).collect()),
                 fallback,
                 queries: Mutex::new(Vec::new()),
+                unavailable_delay: Duration::ZERO,
             }
         }
 
         fn unavailable_after(first: CiProviderSnapshot, error: CiProviderError) -> Self {
+            Self::unavailable_after_with_delay(first, error, Duration::ZERO)
+        }
+
+        fn unavailable_after_with_delay(
+            first: CiProviderSnapshot,
+            error: CiProviderError,
+            delay: Duration,
+        ) -> Self {
             Self {
                 responses: Mutex::new(VecDeque::from([Ok(first.clone()), Err(error)])),
                 fallback: first,
                 queries: Mutex::new(Vec::new()),
+                unavailable_delay: delay,
             }
         }
     }
@@ -1334,11 +1351,16 @@ mod tests {
             _: Duration,
         ) -> Result<CiProviderSnapshot, CiProviderError> {
             self.queries.lock().unwrap().push(target.clone());
-            self.responses
+            let response = self
+                .responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| Ok(self.fallback.clone()))
+                .unwrap_or_else(|| Ok(self.fallback.clone()));
+            if response.is_err() && !self.unavailable_delay.is_zero() {
+                thread::sleep(self.unavailable_delay);
+            }
+            response
         }
     }
 
@@ -1623,6 +1645,44 @@ mod tests {
                 expected_head_sha: Some(sha), ..
             }) if sha == &"a".repeat(40)
         ));
+    }
+
+    #[test]
+    fn wait_returns_timeout_when_unavailable_response_arrives_after_deadline() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = save_task(&ledger, "ci-timeout-unavailable-task");
+        let provider = FakeProvider::unavailable_after_with_delay(
+            snapshot(&"a".repeat(40), CiCheckDetailState::Pending),
+            CiProviderError::Unavailable("PR details request failed".into()),
+            Duration::from_millis(150),
+        );
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let error = runtime
+            .wait(
+                &task_id,
+                &CiQueryTarget::PullRequest {
+                    repository: "owner/repo".into(),
+                    number: 4,
+                    expected_head_sha: None,
+                },
+                Instant::now() + Duration::from_millis(100),
+            )
+            .unwrap_err();
+        let CiError::Timeout {
+            last_observation_id: Some(id),
+        } = error
+        else {
+            panic!("expected timeout with last observation: {error:?}");
+        };
+        let last = ledger.get_ci_observation(&id).unwrap().unwrap();
+        assert_eq!(last.target().head_sha(), "a".repeat(40));
+        assert_eq!(last.state(), CiAggregateState::Pending);
     }
 
     #[test]
