@@ -3,10 +3,11 @@
 //! The ledger stores timestamps as Unix milliseconds. Timestamps are optional so
 //! a queued attempt can be recorded before its provider starts.
 
-use std::{fmt, path::Path, sync::Mutex};
+use std::{collections::HashMap, fmt, path::Path, sync::Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::CancellationToken;
 use crate::ci::{
     CiAggregateState, CiCheck, CiCheckDetailState, CiCheckSource, CiCheckState, CiObservation,
     CiTarget, RequiredCheck, RequiredCheckSet, RequiredCheckSetSource, RequiredCheckSetState,
@@ -119,6 +120,7 @@ impl From<rusqlite::Error> for LedgerError {
 /// SQLite-backed local execution ledger.
 pub struct SqliteExecutionLedger {
     connection: Mutex<Connection>,
+    ci_wait_cancellations: Mutex<HashMap<String, CancellationToken>>,
 }
 
 type PublicationRow = (
@@ -147,7 +149,7 @@ type PublicationTaskRow = (
     Option<String>,
 );
 
-const LATEST_SCHEMA_VERSION: u32 = 15;
+const LATEST_SCHEMA_VERSION: u32 = 16;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -295,6 +297,7 @@ impl SqliteExecutionLedger {
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
+            ci_wait_cancellations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -970,18 +973,68 @@ impl SqliteExecutionLedger {
             LedgerError::InvalidStoredValue("execution ledger mutex was poisoned".into())
         })
     }
+
+    pub(crate) fn register_ci_wait_cancellation(
+        &self,
+        operation_id: &str,
+        token: CancellationToken,
+    ) -> Result<(), LedgerError> {
+        self.ci_wait_cancellations
+            .lock()
+            .map_err(|_| {
+                LedgerError::InvalidStoredValue("CI cancellation registry was poisoned".into())
+            })?
+            .insert(operation_id.to_owned(), token);
+        Ok(())
+    }
+
+    pub(crate) fn get_ci_wait_cancellation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<CancellationToken>, LedgerError> {
+        Ok(self
+            .ci_wait_cancellations
+            .lock()
+            .map_err(|_| {
+                LedgerError::InvalidStoredValue("CI cancellation registry was poisoned".into())
+            })?
+            .get(operation_id)
+            .cloned())
+    }
+
+    pub(crate) fn remove_ci_wait_cancellation(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), LedgerError> {
+        self.ci_wait_cancellations
+            .lock()
+            .map_err(|_| {
+                LedgerError::InvalidStoredValue("CI cancellation registry was poisoned".into())
+            })?
+            .remove(operation_id);
+        Ok(())
+    }
 }
 
 fn create_ci_wait_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS service_ci_wait_operations (
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_ci_wait_operations')",
+        [], |row| row.get(0),
+    )?;
+    if exists && !column_exists(connection, "service_ci_wait_operations", "caller")? {
+        connection.execute_batch(
+            "ALTER TABLE service_ci_wait_operations RENAME TO service_ci_wait_operations_legacy;
+             CREATE TABLE service_ci_wait_operations (
              id TEXT PRIMARY KEY NOT NULL,
-             request_id TEXT NOT NULL UNIQUE,
+             caller TEXT,
+             tool_name TEXT NOT NULL DEFAULT 'ci.wait',
+             request_id TEXT NOT NULL,
              task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
              expected_revision INTEGER NOT NULL,
              target_json TEXT NOT NULL,
-             deadline_ms INTEGER NOT NULL,
-             status TEXT NOT NULL CHECK(status IN ('accepted','running','completed','failed','recovery_required')),
+             deadline_seconds INTEGER NOT NULL,
+             deadline_nanos INTEGER NOT NULL,
+             status TEXT NOT NULL CHECK(status IN ('accepted','running','cancelling','completed','failed','cancelled','recovery_required')),
              observation_id TEXT REFERENCES ci_observations(id),
              details_ref TEXT,
              error_code TEXT,
@@ -989,9 +1042,42 @@ fn create_ci_wait_schema(connection: &Connection) -> Result<(), rusqlite::Error>
              started_at INTEGER,
              finished_at INTEGER
          );
+         INSERT INTO service_ci_wait_operations
+             (id,caller,tool_name,request_id,task_id,expected_revision,target_json,deadline_seconds,deadline_nanos,status,observation_id,details_ref,error_code,accepted_at,started_at,finished_at)
+         SELECT id,NULL,'ci.wait',request_id,task_id,expected_revision,target_json,
+             deadline_ms / 1000,(deadline_ms % 1000) * 1000000,status,observation_id,details_ref,error_code,accepted_at,started_at,finished_at
+         FROM service_ci_wait_operations_legacy;
+         DROP TABLE service_ci_wait_operations_legacy;",
+        )?;
+    } else {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS service_ci_wait_operations (
+             id TEXT PRIMARY KEY NOT NULL,
+             caller TEXT,
+             tool_name TEXT NOT NULL DEFAULT 'ci.wait',
+             request_id TEXT NOT NULL,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             expected_revision INTEGER NOT NULL,
+             target_json TEXT NOT NULL,
+             deadline_seconds INTEGER NOT NULL,
+             deadline_nanos INTEGER NOT NULL,
+             status TEXT NOT NULL CHECK(status IN ('accepted','running','cancelling','completed','failed','cancelled','recovery_required')),
+             observation_id TEXT REFERENCES ci_observations(id),
+             details_ref TEXT,
+             error_code TEXT,
+             accepted_at INTEGER NOT NULL,
+             started_at INTEGER,
+             finished_at INTEGER
+         );",
+        )?;
+    }
+    connection.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS service_ci_wait_idempotency
+             ON service_ci_wait_operations(caller,tool_name,request_id) WHERE caller IS NOT NULL;
          CREATE INDEX IF NOT EXISTS service_ci_wait_task_status
              ON service_ci_wait_operations(task_id,status);",
-    )
+    )?;
+    set_schema_version(connection, 16)
 }
 
 fn set_schema_version(connection: &Connection, version: u32) -> Result<(), rusqlite::Error> {
@@ -1096,6 +1182,7 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
             13 => create_task_creation_schema(connection)?,
             14 => create_ci_observation_schema(connection)?,
             15 => create_publication_identity_schema(connection)?,
+            16 => {}
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
@@ -1483,6 +1570,42 @@ fn failure_reason_from_str(value: &str) -> Result<AttemptFailureReason, LedgerEr
 mod tests {
     use super::*;
 
+    #[test]
+    fn ci_wait_schema_migration_preserves_legacy_rows_without_inventing_caller() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE tasks(id TEXT PRIMARY KEY,description TEXT NOT NULL,role TEXT NOT NULL,state TEXT NOT NULL);
+             CREATE TABLE ci_observations(id TEXT PRIMARY KEY);
+             CREATE TABLE service_ci_wait_operations (
+                id TEXT PRIMARY KEY NOT NULL, request_id TEXT NOT NULL UNIQUE,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                expected_revision INTEGER NOT NULL,target_json TEXT NOT NULL,deadline_ms INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('accepted','running','completed','failed','recovery_required')),
+                observation_id TEXT REFERENCES ci_observations(id),details_ref TEXT,error_code TEXT,
+                accepted_at INTEGER NOT NULL,started_at INTEGER,finished_at INTEGER
+             );
+             INSERT INTO tasks VALUES('legacy-task','legacy','unspecified','pending');
+             INSERT INTO service_ci_wait_operations(id,request_id,task_id,expected_revision,target_json,deadline_ms,status,accepted_at)
+             VALUES('legacy-operation','legacy-request','legacy-task',3,'{}',1234567,'failed',10);",
+        ).unwrap();
+        create_ci_wait_schema(&connection).unwrap();
+        let migrated: (Option<String>, String, i64, i64, String) = connection.query_row(
+            "SELECT caller,request_id,deadline_seconds,deadline_nanos,status FROM service_ci_wait_operations WHERE id='legacy-operation'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).unwrap();
+        assert_eq!(
+            migrated,
+            (
+                None,
+                "legacy-request".into(),
+                1234,
+                567_000_000,
+                "failed".into()
+            )
+        );
+    }
+
     fn task() -> Task {
         Task::new(
             TaskId::new("task-1"),
@@ -1797,7 +1920,7 @@ mod tests {
         let version: u32 = migrated
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         let has_publication_table: bool = migrated
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifact_publication_operations')",
@@ -1875,7 +1998,7 @@ mod tests {
             let version: u32 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 15);
+            assert_eq!(version, 16);
             let retained: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM service_artifact_publication_operations
@@ -1918,11 +2041,11 @@ mod tests {
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 16;")
+            .execute_batch("PRAGMA user_version = 17;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(16))
+            Err(LedgerError::UnsupportedSchemaVersion(17))
         ));
     }
 }
