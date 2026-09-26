@@ -37,6 +37,8 @@ Agent 実行先の違いは `AgentProvider` に閉じ込めます。`ProviderReq
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
+Operation Service は named Model の実行前に、信頼済みcomposition rootから明示注入された `ModelCatalog` で Provider / Model capability を照合します。source、観測時刻、statusがあり、設定したfreshnessを過ぎた情報、unknown / unsupported、照合失敗、catalog未設定は副作用前に拒否します。Model catalog自体はローカルのread-only情報源であり、受付検証のためにCLIやnetworkを起動しません。実providerごとのcatalog adapter / data sourceは後続Issue #60 / #91の対象です。ProviderDefaultはcatalogを必要としません。
+
 ## Operation Ledger
 
 `Orchestrator` は、設定された `SqliteOperationLedger` に外部 Provider の起動前の受理・開始を記録し、workspace 準備、Provider実行、validation の結果を終了状態として保存します。CLI は指定された実行Ledgerのサイドカーへ自動的にOperation Ledgerを保存します。`SqliteOperationLedger` は同じ request ID の再送を同じ operation として返し、異なる payload、古い Task revision、同一 Task の実行中操作を拒否します。終了事実、event、validation、review、汎用usage metric、budget、publication参照、上限付きraw log、再起動時の`recovery_required`診断を保存します。usage metricは名前・値・単位を個別に保持し、入力/出力の2値へ集約しません。

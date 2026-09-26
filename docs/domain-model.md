@@ -120,6 +120,8 @@ Codex自身が編集した場合はAttemptを作らない。管理済みArtifact
 
 監督Codexは目的の解釈、Provider / Model選択、実行・review・再試行の要否、成果物の採否、Task完了を判断する。Operation ServiceはTask ID、expected revision、request ID、workspace / Artifactの所属を検証し、操作受付・各事実・公開/CI参照を永続化する。Provider / Model、Validator、GitHub adapterを実行し、stale revision、busy、未知Provider / Model、policy違反、異なるArtifactへの証拠流用を外部副作用前に拒否する。これが #66 のOperation Service契約である。
 
+named Modelは、Service構築時にtrusted composition rootが明示注入するread-only `ModelCatalog` が、対象Provider / Modelを `Supported` とし、sourceと観測時刻がありfreshness内の場合だけ受付ける。catalog未設定、lookup error、欠落、unknown / unsupported、未来時刻、古い記録、source欠落はTask / Attempt / Operation記録やProvider起動より前にfail closedする。catalog lookupは外部CLIやnetworkを起動しない。ProviderDefaultはcatalogを使わない。provider-specific catalog adapter / data sourceは後続Issue #60 / #91の対象であり、既存の候補一覧を実行権限として扱わない。ProviderResultで実Modelを観測できない場合は、requested Modelから推定せずunknownのまま保持する。
+
 Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`か、同じTaskに属する既存`ArtifactInput { artifact_id }`のどちらかを受け取る。後者は保存tree/ref/baseをProvider起動前に照合し、検証済みbaseから新しい管理worktreeを作ってtreeを展開する。Providerが停止した後、ServiceはworkspaceをGit treeへsnapshotし、ignored扱いの新規ファイルを除外したArtifactを出力としてAttemptへ関連付ける。Task、Attempt、Operation、Artifactと入出力relationは同じSQLite Ledgerに保存する。Git refの作成はDB transactionと一括で原子化できないため、Artifact rowを`pending_ref`で先に記録し、tree/refを照合して復旧できない場合は`recovery_required`として使用を拒否する。
 
 ### 同一Artifact証拠ゲートのMVP

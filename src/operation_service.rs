@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -938,6 +938,36 @@ pub struct OperationService<'a, P> {
     default_timeout: Duration,
     secret_scanner: Option<&'a dyn SecretScanner>,
     publication_gateway: Option<&'a dyn ArtifactPublicationGateway>,
+    model_catalog: Option<&'a dyn ModelCatalog>,
+    model_catalog_max_age: Duration,
+}
+
+/// A point-in-time, source-attributed model capability record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelCapabilityStatus {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelCatalogEntry {
+    pub source: String,
+    /// Unix timestamp in seconds when this capability was observed.
+    pub observed_at_unix_seconds: u64,
+    pub status: ModelCapabilityStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelCatalogError;
+
+/// Read-only source of Provider / Model capability facts. Errors fail closed.
+pub trait ModelCatalog: Send + Sync {
+    fn lookup(
+        &self,
+        provider: &ProviderRef,
+        model: &ModelRef,
+    ) -> Result<Option<ModelCatalogEntry>, ModelCatalogError>;
 }
 
 impl<'a, P: ProviderResolver> OperationService<'a, P> {
@@ -964,7 +994,17 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             default_timeout,
             secret_scanner: None,
             publication_gateway: None,
+            model_catalog: None,
+            model_catalog_max_age: Duration::from_secs(24 * 60 * 60),
         })
+    }
+
+    /// Enables named models using an explicit, source-attributed capability catalog.
+    #[must_use]
+    pub fn with_model_catalog(mut self, catalog: &'a dyn ModelCatalog, max_age: Duration) -> Self {
+        self.model_catalog = Some(catalog);
+        self.model_catalog_max_age = max_age;
+        self
     }
 
     /// Injects the caller's secret scanning policy. Publication is denied when absent.
@@ -1177,8 +1217,26 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 "instruction must not be empty",
             ));
         }
-        if matches!(request.model_id, ModelChoice::Named(_)) {
-            return Err(ServiceError::NamedModelRequiresCatalog);
+        if let ModelChoice::Named(model) = &request.model_id {
+            let Some(catalog) = self.model_catalog else {
+                return Err(ServiceError::NamedModelRequiresCatalog);
+            };
+            let entry = catalog
+                .lookup(&request.provider_id, model)
+                .map_err(|_| ServiceError::NamedModelRequiresCatalog)?
+                .ok_or(ServiceError::NamedModelRequiresCatalog)?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ServiceError::NamedModelRequiresCatalog)?
+                .as_secs();
+            let max_age = self.model_catalog_max_age.as_secs();
+            if entry.source.trim().is_empty()
+                || entry.observed_at_unix_seconds > now
+                || now - entry.observed_at_unix_seconds > max_age
+                || entry.status != ModelCapabilityStatus::Supported
+            {
+                return Err(ServiceError::NamedModelRequiresCatalog);
+            }
         }
         let timeout = request.timeout.unwrap_or(self.default_timeout);
         if timeout.is_zero() {
@@ -3558,6 +3616,92 @@ mod tests {
                 .attempts()
                 .is_empty()
         );
+    }
+
+    struct StaticCatalog(ModelCatalogEntry);
+    impl ModelCatalog for StaticCatalog {
+        fn lookup(
+            &self,
+            _provider: &ProviderRef,
+            _model: &ModelRef,
+        ) -> Result<Option<ModelCatalogEntry>, ModelCatalogError> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    #[test]
+    fn catalog_supported_named_model_is_accepted_and_passed_through() {
+        let (repo, ledger, workspace, providers, calls, checks, task_id) =
+            service_parts(false, Duration::ZERO, false);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let catalog = StaticCatalog(ModelCatalogEntry {
+            source: "operator-verified-test-catalog".into(),
+            observed_at_unix_seconds: now,
+            status: ModelCapabilityStatus::Supported,
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_model_catalog(&catalog, Duration::from_secs(60));
+        let mut req = request(&repo, &task_id, 0, "known-named-model");
+        req.model_id = ModelChoice::Named(ModelRef::new("gpt-test"));
+        let accepted = service.submit_attempt(&req).unwrap();
+        let result = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(result.status(), ServiceOperationStatus::Completed);
+        assert_eq!(result.observed_model(), None);
+        let task = ledger.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(
+            task.attempt(result.attempt_id()).unwrap().requested_model(),
+            Some(&req.model_id)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stale_unsupported_or_unknown_catalog_entries_fail_before_side_effects() {
+        for (status, age) in [
+            (ModelCapabilityStatus::Unsupported, 0),
+            (ModelCapabilityStatus::Unknown, 0),
+            (ModelCapabilityStatus::Supported, 600),
+        ] {
+            let (repo, ledger, workspace, providers, calls, checks, task_id) =
+                service_parts(false, Duration::ZERO, false);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let catalog = StaticCatalog(ModelCatalogEntry {
+                source: "test-catalog".into(),
+                observed_at_unix_seconds: now.saturating_sub(age),
+                status,
+            });
+            let service =
+                OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                    .unwrap()
+                    .with_model_catalog(&catalog, Duration::from_secs(60));
+            let mut req = request(&repo, &task_id, 0, "rejected-named-model");
+            req.model_id = ModelChoice::Named(ModelRef::new("gpt-test"));
+            assert!(matches!(
+                service.submit_attempt(&req),
+                Err(ServiceError::NamedModelRequiresCatalog)
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(checks.load(Ordering::SeqCst), 0);
+            assert!(
+                ledger
+                    .get_task(&task_id)
+                    .unwrap()
+                    .unwrap()
+                    .attempts()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
