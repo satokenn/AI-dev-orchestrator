@@ -176,7 +176,7 @@ impl RetryPolicy {
             ProviderError::TimedOut { .. } | ProviderError::TimedOutWithOutput { .. } => {
                 self.retry_on_timeout
             }
-            ProviderError::Cancelled | ProviderError::CancelledWithOutput { .. } => {
+            ProviderError::Cancelled | ProviderError::CancelledWithOutput => {
                 self.retry_on_cancellation
             }
             ProviderError::Interrupted {
@@ -324,9 +324,6 @@ mod tests {
         let interrupted = ProviderError::Interrupted {
             reason: crate::StopReason::TimedOut,
             confirmed_stopped: false,
-            stdout: "partial output".into(),
-            stderr: String::new(),
-            diagnostic: "process group still exists".into(),
         };
         assert!(!RetryPolicy::new(3).allows(&interrupted));
     }
