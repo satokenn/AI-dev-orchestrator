@@ -1,7 +1,9 @@
 //! Run external commands with bounded, observable process lifecycles.
 
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -22,6 +24,7 @@ pub struct ProcessRequest {
     pub env: Vec<(OsString, OsString)>,
     pub timeout: Option<Duration>,
     /// Optional stdin payload, written in full without being captured as output.
+    /// Payloads are accepted only where the runner can cancel the writer synchronously.
     pub stdin_bytes: Option<Vec<u8>>,
 }
 
@@ -63,8 +66,8 @@ impl ProcessRequest {
         self
     }
     #[must_use]
-    /// Writes the complete byte vector to stdin; partial writes are retried.
-    /// A closed pipe or a writer that does not stop after cancellation is returned as an error.
+    /// Writes the complete byte vector to stdin with cancellable nonblocking writes.
+    /// Targets without that support return `ProcessError::Stdin(Unsupported)` before spawning.
     pub fn stdin_bytes(mut self, bytes: Vec<u8>) -> Self {
         self.stdin_bytes = Some(bytes);
         self
@@ -158,6 +161,7 @@ impl ProcessRunner {
     ) -> Result<ProcessOutput, ProcessError> {
         let timeout = request.timeout;
         let stdin_bytes = request.stdin_bytes;
+        validate_stdin_support(cfg!(unix), stdin_bytes.is_some())?;
         let mut command = Command::new(&request.command);
         command
             .args(&request.args)
@@ -170,11 +174,7 @@ impl ProcessRunner {
             .transpose()
             .map_err(ProcessError::Spawn)?;
         #[cfg(not(unix))]
-        command.stdin(if stdin_bytes.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        });
+        command.stdin(Stdio::null());
         if let Some(cwd) = request.cwd {
             command.current_dir(cwd);
         }
@@ -192,10 +192,7 @@ impl ProcessRunner {
         let stderr = Arc::new(Mutex::new(CapturedBytes::default()));
         let stdout_reader = take_pipe(&mut child, true, Arc::clone(&stdout))?;
         let stderr_reader = take_pipe(&mut child, false, Arc::clone(&stderr))?;
-        #[cfg(not(unix))]
-        let stdin_writer = stdin_bytes
-            .map(|bytes| write_stdin(&mut child, bytes))
-            .transpose()?;
+        #[cfg(unix)]
         let mut stdin_error = None;
         #[cfg(unix)]
         let mut stdin_incomplete = false;
@@ -260,12 +257,7 @@ impl ProcessRunner {
         let drain_deadline = Instant::now() + PIPE_DRAIN_PERIOD;
         let stdout_done = join_pipe_until(stdout_reader, drain_deadline);
         let stderr_done = join_pipe_until(stderr_reader, drain_deadline);
-        #[cfg(not(unix))]
-        let stdin_done = stdin_writer.map(|handle| join_stdin_until(handle, drain_deadline));
-        #[cfg(unix)]
-        let stdin_done: Option<Result<io::Result<()>, ()>> = None;
-        let stdin_writer_hung = matches!(stdin_done, Some(Err(())));
-        if (stdout_done.is_err() || stderr_done.is_err() || stdin_writer_hung) && reason.is_none() {
+        if (stdout_done.is_err() || stderr_done.is_err()) && reason.is_none() {
             reason = Some(StopReason::PipeHeld);
             process_group_stopped = stop_process_group(&mut child, STOP_GRACE_PERIOD)?;
             if !process_group_stopped {
@@ -279,12 +271,8 @@ impl ProcessRunner {
                     output_truncated: stdout_capture.truncated || stderr_capture.truncated,
                     stdout_truncated: stdout_capture.truncated,
                     stderr_truncated: stderr_capture.truncated,
-                    diagnostic: if stdin_writer_hung {
-                        "stdin writer did not stop; managed process group stop was not confirmed"
-                    } else {
-                        "a descendant kept an output pipe open after the command exited"
-                    }
-                    .into(),
+                    diagnostic: "a descendant kept an output pipe open after the command exited"
+                        .into(),
                 });
             }
         }
@@ -299,10 +287,7 @@ impl ProcessRunner {
             stderr_truncated: stderr_capture.truncated,
         };
         #[cfg(unix)]
-        let stdin_not_drained = stdin_incomplete;
-        #[cfg(not(unix))]
-        let stdin_not_drained = false;
-        if stdin_writer_hung || stdin_not_drained {
+        if stdin_incomplete {
             return Err(ProcessError::Interrupted {
                 reason: reason.unwrap_or(StopReason::PipeHeld),
                 stopped: process_group_stopped,
@@ -311,21 +296,14 @@ impl ProcessRunner {
                 output_truncated: output.output_truncated,
                 stdout_truncated: output.stdout_truncated,
                 stderr_truncated: output.stderr_truncated,
-                diagnostic: if stdin_not_drained {
+                diagnostic:
                     "stdin payload was not fully delivered before the managed process group stopped"
-                } else if process_group_stopped {
-                    "stdin writer did not stop after the managed process group stopped"
-                } else {
-                    "stdin writer did not stop; managed process group stop was not confirmed"
-                }
-                .into(),
+                        .into(),
             });
         }
+        #[cfg(unix)]
         if reason.is_none() {
             if let Some(error) = stdin_error {
-                return Err(ProcessError::Stdin(error));
-            }
-            if let Some(Ok(Err(error))) = stdin_done {
                 return Err(ProcessError::Stdin(error));
             }
         }
@@ -382,23 +360,17 @@ fn take_pipe(
     pipe.ok_or_else(|| ProcessError::Io(io::Error::other("missing output pipe")))
 }
 
-#[cfg(not(unix))]
-fn write_stdin(
-    child: &mut Child,
-    bytes: Vec<u8>,
-) -> Result<thread::JoinHandle<io::Result<()>>, ProcessError> {
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        ProcessError::Stdin(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "requested stdin pipe was unavailable",
-        ))
-    })?;
-    Ok(thread::spawn(move || {
-        // write_all handles partial writes and never captures or formats the payload.
-        let result = stdin.write_all(&bytes);
-        drop(stdin);
-        result
-    }))
+fn validate_stdin_support(
+    supports_cancellable_stdin: bool,
+    payload_requested: bool,
+) -> Result<(), ProcessError> {
+    if payload_requested && !supports_cancellable_stdin {
+        return Err(ProcessError::Stdin(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "stdin payload requires a platform with cancellable nonblocking writes",
+        )));
+    }
+    Ok(())
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -521,20 +493,6 @@ impl NonblockingStdin {
         self.stream = None;
         self.bytes.clear();
     }
-}
-
-#[cfg(not(unix))]
-fn join_stdin_until(
-    handle: thread::JoinHandle<io::Result<()>>,
-    deadline: Instant,
-) -> Result<io::Result<()>, ()> {
-    while !handle.is_finished() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(2));
-    }
-    if !handle.is_finished() {
-        return Err(());
-    }
-    handle.join().map_err(|_| ())
 }
 
 #[cfg(unix)]
@@ -663,6 +621,31 @@ mod tests {
             }
             result => panic!("unexpected result: {result:?}"),
         }
+    }
+
+    #[test]
+    fn stdin_payload_requires_cancellable_nonblocking_support() {
+        assert!(validate_stdin_support(false, false).is_ok());
+        assert!(matches!(
+            validate_stdin_support(false, true),
+            Err(ProcessError::Stdin(error))
+                if error.kind() == std::io::ErrorKind::Unsupported
+        ));
+        assert!(validate_stdin_support(true, true).is_ok());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_stdin_payload_is_rejected_before_process_spawn() {
+        let result = ProcessRunner.run(
+            ProcessRequest::new("this-command-must-not-be-spawned")
+                .stdin_bytes(b"private payload".to_vec()),
+        );
+        assert!(matches!(
+            result,
+            Err(ProcessError::Stdin(error))
+                if error.kind() == std::io::ErrorKind::Unsupported
+        ));
     }
 
     #[cfg(unix)]
