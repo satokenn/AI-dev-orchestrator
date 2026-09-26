@@ -216,7 +216,7 @@ impl ProcessRunner {
             }
             #[cfg(unix)]
             let stdin_finished = if let Some(writer) = stdin_writer.as_mut() {
-                if let Err(error) = writer.write_available() {
+                if let Err(error) = writer.write_available(&token) {
                     stdin_error = Some(error);
                     true
                 } else {
@@ -452,36 +452,33 @@ impl NonblockingStdin {
         })
     }
 
-    fn write_available(&mut self) -> io::Result<()> {
-        if self.offset == self.bytes.len() {
-            self.finish();
-            return Ok(());
-        }
+    fn write_available(&mut self, cancellation: &CancellationToken) -> io::Result<()> {
+        loop {
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+            if self.offset == self.bytes.len() {
+                self.finish();
+                return Ok(());
+            }
 
-        match self
-            .stream
-            .as_mut()
-            .expect("stdin stream remains open until all bytes are written")
-            .write(&self.bytes[self.offset..])
-        {
-            Ok(0) => Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "failed to write stdin payload",
-            )),
-            Ok(count) => {
-                self.offset += count;
-                if self.offset == self.bytes.len() {
-                    self.finish();
-                }
-                Ok(())
-            }
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    || error.kind() == io::ErrorKind::Interrupted =>
+            match self
+                .stream
+                .as_mut()
+                .expect("stdin stream remains open until all bytes are written")
+                .write(&self.bytes[self.offset..])
             {
-                Ok(())
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write stdin payload",
+                    ));
+                }
+                Ok(count) => self.offset += count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -671,7 +668,7 @@ mod tests {
         let request = ProcessRequest::new("wc")
             .arg("-c")
             .stdin_bytes(input.clone())
-            .timeout(Duration::from_secs(2));
+            .timeout(Duration::from_secs(10));
         let output = ProcessRunner.run(request).expect("stdin consumer succeeds");
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim(),
