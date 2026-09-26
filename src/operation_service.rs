@@ -2415,20 +2415,36 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             tx.commit()?;
             row
         };
-        let task_id = TaskId::new(claim.0);
-        let target = parse_ci_target(&claim.2)?;
-        let deadline = UNIX_EPOCH
-            .checked_add(Duration::from_millis(
-                u64::try_from(claim.3).map_err(|_| ServiceError::InvalidStoredState)?,
-            ))
-            .ok_or(ServiceError::InvalidStoredState)?;
-        let remaining = deadline
-            .duration_since(SystemTime::now())
-            .unwrap_or_default();
-        let resolved = self.resolve_ci_target(&target, Some(&task_id))?;
-        let run_deadline = Instant::now()
-            .checked_add(remaining)
-            .ok_or(ServiceError::InvalidStoredState)?;
+        let prepared = (|| {
+            let task_id = TaskId::new(claim.0);
+            let target = parse_ci_target(&claim.2)?;
+            let deadline = UNIX_EPOCH
+                .checked_add(Duration::from_millis(
+                    u64::try_from(claim.3).map_err(|_| ServiceError::InvalidStoredState)?,
+                ))
+                .ok_or(ServiceError::InvalidStoredState)?;
+            let remaining = deadline
+                .duration_since(SystemTime::now())
+                .unwrap_or_default();
+            let resolved = self.resolve_ci_target(&target, Some(&task_id))?;
+            let run_deadline = Instant::now()
+                .checked_add(remaining)
+                .ok_or(ServiceError::InvalidStoredState)?;
+            Ok::<_, ServiceError>((task_id, resolved, run_deadline))
+        })();
+        let (task_id, resolved, run_deadline) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let (status, code) = match error {
+                    ServiceError::Ledger(_) | ServiceError::Sqlite(_) => {
+                        ("recovery_required", "recovery_required")
+                    }
+                    _ => ("failed", "internal_error"),
+                };
+                self.finish_ci_wait(operation_id, status, None, Some(code), None)?;
+                return self.get_ci_wait_operation(operation_id);
+            }
+        };
         let result = match resolved.2 {
             Some(host) => runtime.wait_on_host(&task_id, &resolved.1, run_deadline, &host),
             None => runtime.wait(&task_id, &resolved.1, run_deadline),
@@ -6162,6 +6178,67 @@ mod tests {
             .details_ref()
             .expect("last persisted observation reference");
         assert!(fixture.ledger.get_ci_observation(detail).unwrap().is_some());
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn ci_wait_preparation_failure_finishes_claimed_operation() {
+        let fixture = artifact_publication_fixture();
+        let head_sha = "8".repeat(40);
+        let provider = FakeCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(8), &head_sha),
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+        let request = CiWaitRequest::new(
+            "ci-wait-bad-stored-target",
+            fixture.task_id.clone(),
+            task_revision(&fixture.ledger, &fixture.task_id),
+            CiServiceTarget::PullRequest {
+                repository: "owner/repo".into(),
+                number: 8,
+            },
+            SystemTime::now() + Duration::from_secs(5),
+        );
+        let accepted = service.accept_ci_wait(&request).unwrap();
+        fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "UPDATE service_ci_wait_operations SET target_json='not-json' WHERE id=?1",
+                params![accepted.operation_id().as_str()],
+            )
+            .unwrap();
+
+        let failed = service
+            .run_ci_wait_operation(accepted.operation_id())
+            .unwrap();
+        assert_eq!(failed.status(), ServiceOperationStatus::Failed);
+        assert_eq!(failed.error_code(), Some("internal_error"));
+        assert!(failed.observation().is_none());
+        assert_eq!(
+            service
+                .run_ci_wait_operation(accepted.operation_id())
+                .unwrap(),
+            failed
+        );
+        assert!(provider.queries.lock().unwrap().is_empty());
         cleanup_fixture_worktree(
             &fixture.repo,
             &fixture.workspace,
