@@ -2283,6 +2283,9 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         &self,
         request: &CiWaitRequest,
     ) -> Result<CiWaitAcceptance, ServiceError> {
+        if request.request_id.trim().is_empty() {
+            return Err(ServiceError::InvalidRequest("request_id must not be empty"));
+        }
         let deadline_ms: i64 = request
             .deadline
             .duration_since(UNIX_EPOCH)
@@ -2343,6 +2346,24 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 status: snapshot.status,
             });
         }
+        let direct_query = match &request.target {
+            CiServiceTarget::Publication(_) => None,
+            CiServiceTarget::PullRequest { repository, number } => {
+                Some(CiQueryTarget::PullRequest {
+                    repository: repository.clone(),
+                    number: *number,
+                    expected_head_sha: None,
+                })
+            }
+            CiServiceTarget::Commit { repository, sha } => Some(CiQueryTarget::Commit {
+                repository: repository.clone(),
+                sha: sha.clone(),
+            }),
+        };
+        if let Some(query) = direct_query {
+            crate::ci::validate_query_target(&query)
+                .map_err(|_| ServiceError::InvalidRequest("invalid CI target"))?;
+        }
         // Revision, Task state and Publication binding are read under the same
         // immediate transaction as the acceptance insert, closing stale-accept
         // races with Task mutations.
@@ -2375,6 +2396,13 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ));
         }
         resolve_ci_target_in_connection(&tx, &request.target, Some(&request.task_id))?;
+        // Check expiry only after both idempotency lookups. Replaying an
+        // accepted request remains valid after its original deadline.
+        if request.deadline <= SystemTime::now() {
+            return Err(ServiceError::InvalidRequest(
+                "CI deadline must be in the future",
+            ));
+        }
         let id = format!(
             "ci-wait-{}-{}",
             now_ms(),
@@ -6238,6 +6266,94 @@ mod tests {
                 .unwrap(),
             failed
         );
+        assert!(provider.queries.lock().unwrap().is_empty());
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn ci_wait_rejects_invalid_new_requests_but_replays_expired_acceptance() {
+        let fixture = artifact_publication_fixture();
+        let head_sha = "7".repeat(40);
+        let provider = FakeCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(8), &head_sha),
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+        let revision = task_revision(&fixture.ledger, &fixture.task_id);
+        let future = SystemTime::now() + Duration::from_secs(5);
+        let direct = CiServiceTarget::PullRequest {
+            repository: "owner/repo".into(),
+            number: 8,
+        };
+
+        for request in [
+            CiWaitRequest::new(
+                " ",
+                fixture.task_id.clone(),
+                revision,
+                direct.clone(),
+                future,
+            ),
+            CiWaitRequest::new(
+                "ci-wait-past",
+                fixture.task_id.clone(),
+                revision,
+                direct.clone(),
+                SystemTime::now() - Duration::from_secs(1),
+            ),
+            CiWaitRequest::new(
+                "ci-wait-bad-repository",
+                fixture.task_id.clone(),
+                revision,
+                CiServiceTarget::PullRequest {
+                    repository: "owner/repo/extra".into(),
+                    number: 8,
+                },
+                future,
+            ),
+            CiWaitRequest::new(
+                "ci-wait-bad-sha",
+                fixture.task_id.clone(),
+                revision,
+                CiServiceTarget::Commit {
+                    repository: "owner/repo".into(),
+                    sha: "short".into(),
+                },
+                future,
+            ),
+        ] {
+            assert!(matches!(
+                service.accept_ci_wait(&request),
+                Err(ServiceError::InvalidRequest(_))
+            ));
+        }
+
+        let replay_deadline = SystemTime::now() + Duration::from_millis(150);
+        let request = CiWaitRequest::new(
+            "ci-wait-expired-replay",
+            fixture.task_id.clone(),
+            revision,
+            direct,
+            replay_deadline,
+        );
+        let accepted = service.accept_ci_wait(&request).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(service.accept_ci_wait(&request).unwrap(), accepted);
         assert!(provider.queries.lock().unwrap().is_empty());
         cleanup_fixture_worktree(
             &fixture.repo,

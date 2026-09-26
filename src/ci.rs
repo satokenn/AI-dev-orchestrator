@@ -747,7 +747,7 @@ impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
     }
 }
 
-fn validate_query_target(query: &CiQueryTarget) -> Result<(), CiError> {
+pub(crate) fn validate_query_target(query: &CiQueryTarget) -> Result<(), CiError> {
     let (repository, sha) = match query {
         CiQueryTarget::PullRequest {
             repository,
