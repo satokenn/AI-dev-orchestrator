@@ -1513,14 +1513,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             .validate_named_model(&stored.provider, &stored.requested_model)
             .is_err()
         {
-            let cleanup = if let Some(input_id) = stored.input_artifact_id.as_deref() {
-                ArtifactManager::new(self.workspaces, self.ledger)
-                    .cleanup_unchanged_artifact_input_workspace(
-                        &stored.task_id,
-                        &stored.attempt_id,
-                        input_id,
-                        &workspace,
-                    )
+            let cleanup = if stored.input_artifact_id.is_some() {
+                Err(ArtifactManager::retained_workspace_error(
+                    &workspace,
+                    "ArtifactInput workspaces are retained after pre-start rejection",
+                ))
             } else {
                 self.workspaces.cleanup(&workspace).map_err(|error| {
                     ArtifactError::WorkspaceRetained {

@@ -707,34 +707,6 @@ impl<'a> ArtifactManager<'a> {
                 reason: "worktree is not identified as a validation workspace".into(),
             });
         }
-        self.cleanup_unchanged_artifact_workspace(task, attempt, artifact_id, workspace)
-    }
-
-    /// Removes an operation worktree before Provider start only when it still
-    /// exactly contains its input Artifact and has no ignored files.
-    pub(crate) fn cleanup_unchanged_artifact_input_workspace(
-        &self,
-        task: &TaskId,
-        attempt: &AttemptId,
-        artifact_id: &str,
-        workspace: &Workspace,
-    ) -> Result<(), ArtifactError> {
-        if is_validation_attempt(attempt) {
-            return Err(ArtifactError::WorkspaceRetained {
-                path: workspace.path().to_owned(),
-                reason: "worktree is not an attempt workspace".into(),
-            });
-        }
-        self.cleanup_unchanged_artifact_workspace(task, attempt, artifact_id, workspace)
-    }
-
-    fn cleanup_unchanged_artifact_workspace(
-        &self,
-        task: &TaskId,
-        attempt: &AttemptId,
-        artifact_id: &str,
-        workspace: &Workspace,
-    ) -> Result<(), ArtifactError> {
         let artifact =
             self.read(task, artifact_id)
                 .map_err(|error| ArtifactError::WorkspaceRetained {
