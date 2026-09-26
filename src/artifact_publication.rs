@@ -150,6 +150,13 @@ impl DraftPullRequest {
 
 /// Git and GitHub effects for an already-scanned Artifact.
 pub trait ArtifactPublicationGateway: Send + Sync {
+    /// Whether publication title/body bytes can be sent before side effects using a
+    /// cancellable stdin implementation. Implementations must opt in when their process path
+    /// can safely send the payload; the default fails closed.
+    fn supports_sensitive_stdin_payload(&self) -> bool {
+        false
+    }
+
     fn commit_tree(
         &self,
         repository: &Path,
@@ -295,6 +302,10 @@ impl GitHubArtifactPublicationGateway {
 }
 
 impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
+    fn supports_sensitive_stdin_payload(&self) -> bool {
+        cfg!(unix)
+    }
+
     fn commit_tree(
         &self,
         repository: &Path,

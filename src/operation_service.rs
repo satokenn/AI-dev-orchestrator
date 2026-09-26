@@ -1437,6 +1437,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let gateway = self.publication_gateway.ok_or(ServiceError::PolicyDenied(
             "Artifact publication gateway is not configured",
         ))?;
+        if !gateway.supports_sensitive_stdin_payload() {
+            return Err(ServiceError::PolicyDenied(
+                "publication gateway cannot safely send title/body on this platform",
+            ));
+        }
         let current_revision =
             u64::try_from(current_revision).map_err(|_| ServiceError::InvalidStoredState)?;
         if !self
@@ -2687,6 +2692,10 @@ mod tests {
     }
 
     impl ArtifactPublicationGateway for FakeArtifactPublicationGateway {
+        fn supports_sensitive_stdin_payload(&self) -> bool {
+            true
+        }
+
         fn commit_tree(
             &self,
             _repository: &Path,
@@ -2736,6 +2745,50 @@ mod tests {
                 payload.head_branch(),
                 payload.base_branch(),
             ))
+        }
+    }
+
+    struct UnsupportedStdinPublicationGateway {
+        calls: AtomicUsize,
+    }
+
+    impl ArtifactPublicationGateway for UnsupportedStdinPublicationGateway {
+        fn supports_sensitive_stdin_payload(&self) -> bool {
+            false
+        }
+
+        fn commit_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+            _base_commit: &str,
+            _message: &str,
+            _timeout: Duration,
+        ) -> Result<String, PublicationGatewayError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(PublicationGatewayError::CommandFailed)
+        }
+
+        fn push_commit(
+            &self,
+            _repository: &Path,
+            _commit_sha: &str,
+            _head_branch: &str,
+            _timeout: Duration,
+        ) -> Result<(), PublicationGatewayError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(PublicationGatewayError::CommandFailed)
+        }
+
+        fn create_or_find_draft_pull_request(
+            &self,
+            _repository: &Path,
+            _payload: &ArtifactPublicationPayload,
+            _commit_sha: &str,
+            _timeout: Duration,
+        ) -> Result<DraftPullRequest, PublicationGatewayError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(PublicationGatewayError::CommandFailed)
         }
     }
 
@@ -3807,6 +3860,45 @@ mod tests {
             &["worktree", "remove", "--force", &retained_path_text],
         );
         cleanup_fixture_worktree(&repo, &workspace, &task_id, completed.attempt_id());
+    }
+
+    #[test]
+    fn publication_rejects_unsupported_sensitive_stdin_before_claim_or_gateway_effects() {
+        let fixture = artifact_publication_fixture();
+        let scanner_events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: scanner_events,
+        };
+        let gateway = UnsupportedStdinPublicationGateway {
+            calls: AtomicUsize::new(0),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "unsupported-sensitive-stdin");
+        let acceptance = service.publish_artifact(&request).unwrap();
+
+        assert!(matches!(
+            service.run_artifact_publication(&acceptance, &request),
+            Err(ServiceError::PolicyDenied(
+                "publication gateway cannot safely send title/body on this platform"
+            ))
+        ));
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 0);
+        let operation = service
+            .get_artifact_publication_operation(acceptance.operation_id())
+            .unwrap();
+        assert_eq!(operation.state(), ServiceOperationStatus::Accepted);
+        assert_eq!(operation.phase(), ArtifactPublicationPhase::Scanned);
     }
 
     #[test]
