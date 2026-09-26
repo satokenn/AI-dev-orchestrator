@@ -152,7 +152,10 @@ impl DraftPullRequest {
 pub trait ArtifactPublicationGateway: Send + Sync {
     /// Whether publication title/body bytes can be sent before side effects using a
     /// cancellable stdin implementation. Implementations must opt in when their process path
-    /// can safely send the payload; the default fails closed.
+    /// can safely send the payload; the default fails closed. The returned capability must
+    /// remain stable for the lifetime of the service using this gateway. The service checks it
+    /// both before accepting a publication and before execution; changing it after acceptance
+    /// can leave the accepted publication unable to run until startup recovery records it.
     fn supports_sensitive_stdin_payload(&self) -> bool {
         false
     }
