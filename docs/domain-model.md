@@ -132,9 +132,13 @@ Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`�
 
 このMVPはMCP/CLIの`publication.publish`・`operation.get`にはまだ接続されておらず、Rust Serviceに専用の`publish_artifact` / `get_artifact_publication_operation` APIを提供する段階である。既存の`operation.get`はProvider Attempt操作用のまま。公開用cancel APIは未接続である。起動時に未claimの`accepted` publicationは外部効果が始まっていないため`failed`（`interrupted_before_start`）へ移し、実行claim後の`running` publicationは外部効果の有無を断定できないため`recovery_required`へ移す。どちらも外部操作を再実行しない。SQLite schema v12はPublication専用Ledger tableを追加し、schema v11を開くと既存recordを保持してmigrationする。したがって、MCP wire契約全体を実装済みとは扱わない。
 
-### CI観測runtimeの準備実装
+### CI観測Serviceの準備API
 
-Issue #79 の内部準備runtimeは、PR head SHA、check状態、Required Check集合をObservationとしてLedgerへ保存する。Publicationの保存SHAとの照合、Operation Serviceでの受付、MCP応答への接続は未実装であり、直接指定したCI観測をPublication証拠として扱わない。
+`OperationService::get_ci`は直接指定したPR / commit、または完了済みPublication operationを一度観測し、check状態とRequired Check集合を`CiObservation`としてLedgerへ保存する。同期`wait_ci`はTaskのexpected revisionを照合し、指定deadlineまで観測してTask ID付きで各Observationを保存する。呼出側は`CiProvider`を明示注入する。取得した事実から修正、merge、Task完了を自動判断しない。
+
+Publication由来の内部準備APIは、専用Publication recordに保存されたTask、PR番号、PR URL、commit / head SHAを使う。`CiServiceTarget::PublicationOperation(OperationId)`を渡し、完了済みpublished operationだけを受け付ける。PR URLのHTTPS host/pathが正確な`github.com/{owner}/{repo}/pull/{number}`で、numberがrecordと一致し、保存commit SHAとPR head SHAも一致する場合だけ照会する。GitHub Enterpriseを含む他hostは受け付けず、GitHub CLI APIも同じ`github.com`へ明示的に固定する。runtimeは現在のPR headを保存SHAと照合し、異なる場合はObservationを保存せずエラーにする。PR URLを解析できない場合もfail closedとする。
+
+これは内部の同期Rust APIであり、MCP wireの`publication_id`ではない。MCP契約にある独立したPublication IDへの対応付け、`ci.wait`の`request_id`を使った冪等受付、OperationAcceptanceと`operation.get`による非同期結果取得、中断時のoperation recovery、MCP応答への接続は未実装である。このAPIを#55の非同期`ci.wait`実装済みとは扱わない。
 
 Required Check集合をRuleset由来として確定するには、classic branch protection APIからHTTP 200を受け取り、classic側のRequired Checkが空だと確認したうえで、対象branchのRulesetを取得できなければならない。404、権限不足、取得失敗、応答形式不明、classic側にRequired Checkがある場合は集合とaggregateを`unknown`にする。GitHubは保護設定のないbranchにも404を返すため、この保守的な条件では通常の未保護branchやread権限が足りない環境で、Ruleset側のcheckが成功していても`unknown`が続くことがある。classic branch protectionとtrusted configurationのcheck集合は現在のwire sourceで表現できないため、Ruleset由来へ混ぜない。
 
