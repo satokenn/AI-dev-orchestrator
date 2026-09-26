@@ -121,10 +121,20 @@ pub enum AttemptFailureReason {
 }
 
 /// A report returned by an agent. It is not a success decision.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AgentResult {
     summary: String,
     reported_success: bool,
+}
+
+impl std::fmt::Debug for AgentResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentResult")
+            .field("summary", &"<redacted>")
+            .field("reported_success", &self.reported_success)
+            .finish()
+    }
 }
 
 impl AgentResult {
@@ -142,6 +152,19 @@ impl AgentResult {
     #[must_use]
     pub const fn reported_success(&self) -> bool {
         self.reported_success
+    }
+}
+
+#[cfg(test)]
+mod agent_result_redaction_tests {
+    use super::AgentResult;
+
+    #[test]
+    fn debug_redacts_model_summary() {
+        let result = AgentResult::new("sentinel-provider-secret", true);
+        let debug = format!("{result:?}");
+        assert!(!debug.contains("sentinel-provider-secret"));
+        assert!(debug.contains("<redacted>"));
     }
 }
 

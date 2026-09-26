@@ -17,5 +17,9 @@ fn codex_cli_provider_live_smoke_test() {
         .expect("Codex CLI provider should execute successfully");
 
     assert_eq!(result.exit_status(), Some(0));
-    assert!(result.stdout().contains("LIVE_PROVIDER_OK"));
+    assert!(
+        result
+            .expose_stdout_for_trusted_processing()
+            .contains("LIVE_PROVIDER_OK")
+    );
 }
