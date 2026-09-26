@@ -751,7 +751,6 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 return self.get_operation(operation_id);
             }
         };
-        self.record_workspace_reference(operation_id, &workspace)?;
         let prepared = if let Some(input_id) = stored.input_artifact_id.as_deref() {
             ArtifactManager::new(self.workspaces, self.ledger)
                 .materialize(&workspace, &stored.task_id, &stored.attempt_id, input_id)
