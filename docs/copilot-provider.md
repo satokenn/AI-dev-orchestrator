@@ -9,8 +9,11 @@ copilot -p <prompt> -s --no-ask-user --allow-tool=write,shell
 ```
 
 実行の cwd には `ProviderRequest::workspace()` を使用します。`-s` により
-Copilot の応答だけを stdout に出力させ、元の stdout / stderr と exit status を
-`ProviderResult` から参照できます。`ProviderRequest::timeout()` と
+Copilot の応答だけを stdout に出力させます。stdout / stderr は
+`ProviderResult::expose_stdout_for_trusted_processing` /
+`expose_stderr_for_trusted_processing` で明示的に取得できます。これらはredaction前の
+本文を返すため、信頼された呼び出し側だけが使い、既知secretのredactionなしに保存・返却してはいけません。
+Providerの通常error本文にはraw診断を含めません。`ProviderRequest::timeout()` と
 `CancellationToken` は `ProcessRunner` に渡されます。
 
 `ProviderRequest::model()` が `ModelChoice::Named` の場合は `--model <model>` を
