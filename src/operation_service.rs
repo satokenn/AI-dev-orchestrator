@@ -6,11 +6,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+
+static NEXT_PUBLICATION_ID: AtomicU64 = AtomicU64::new(0);
 
 use crate::{
     Attempt, AttemptFailureReason, AttemptId, AttemptSemantics, AttemptState, CancellationToken,
@@ -317,13 +319,28 @@ pub struct ArtifactPublicationRequest {
     payload: ArtifactPublicationPayload,
 }
 
+/// Stable identifier for one accepted Artifact Publication.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PublicationId(String);
+
+impl PublicationId {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Target for the synchronous CI Service preparation API.
 ///
-/// Publication lookup uses the internal Publication operation ID. This is not
-/// the separate `publication_id` defined by the MCP wire contract.
+/// A Publication target uses its stable `PublicationId`, never its operation ID.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CiServiceTarget {
-    PublicationOperation(OperationId),
+    Publication(PublicationId),
     PullRequest { repository: String, number: u64 },
     Commit { repository: String, sha: String },
 }
@@ -412,6 +429,7 @@ impl ArtifactPublicationPhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactPublicationAcceptance {
     operation_id: OperationId,
+    publication_id: PublicationId,
     request_id: String,
     task_id: TaskId,
     revision: u64,
@@ -422,6 +440,10 @@ impl ArtifactPublicationAcceptance {
     #[must_use]
     pub fn operation_id(&self) -> &OperationId {
         &self.operation_id
+    }
+    #[must_use]
+    pub fn publication_id(&self) -> &PublicationId {
+        &self.publication_id
     }
     #[must_use]
     pub fn request_id(&self) -> &str {
@@ -444,6 +466,7 @@ impl ArtifactPublicationAcceptance {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactPublicationSnapshot {
     operation_id: OperationId,
+    publication_id: PublicationId,
     request_id: String,
     task_id: TaskId,
     artifact_id: String,
@@ -464,6 +487,10 @@ impl ArtifactPublicationSnapshot {
     #[must_use]
     pub fn operation_id(&self) -> &OperationId {
         &self.operation_id
+    }
+    #[must_use]
+    pub fn publication_id(&self) -> &PublicationId {
+        &self.publication_id
     }
     #[must_use]
     pub fn request_id(&self) -> &str {
@@ -1869,7 +1896,10 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             return Err(ServiceError::IdempotencyConflict);
         }
         let snapshot = self.get_artifact_publication_operation(&acceptance.operation_id)?;
-        if snapshot.request_id != request.request_id || snapshot.task_id != request.task_id {
+        if snapshot.request_id != request.request_id
+            || snapshot.task_id != request.task_id
+            || snapshot.publication_id != acceptance.publication_id
+        {
             return Err(ServiceError::IdempotencyConflict);
         }
         let digest = publication_request_digest(request);
@@ -2030,8 +2060,10 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let row = connection.query_row(
             "SELECT request_id,task_id,artifact_id,tree_oid,validation_id,decision_id,commit_sha,
                     pull_request_number,pull_request_url,is_draft,status,phase,revision,error_code,
-                    accepted_at,finished_at,head_branch,base_branch
-             FROM service_artifact_publication_operations WHERE id=?1",
+                    accepted_at,finished_at,head_branch,base_branch,identity.publication_id
+             FROM service_artifact_publication_operations publication
+             JOIN service_publication_ids identity ON identity.operation_id=publication.id
+             WHERE publication.id=?1",
             params![operation_id.as_str()],
             |row| {
                 Ok((
@@ -2044,6 +2076,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                     row.get::<_, i64>(12)?, row.get::<_, Option<String>>(13)?,
                     row.get::<_, i64>(14)?, row.get::<_, Option<i64>>(15)?,
                     row.get::<_, String>(16)?, row.get::<_, String>(17)?,
+                    row.get::<_, String>(18)?,
                 ))
             },
         ).optional()?.ok_or(ServiceError::OperationNotFound)?;
@@ -2061,6 +2094,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         };
         Ok(ArtifactPublicationSnapshot {
             operation_id: operation_id.clone(),
+            publication_id: PublicationId::new(row.18),
             request_id: row.0,
             task_id: TaskId::new(row.1),
             artifact_id: row.2,
@@ -2078,9 +2112,29 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         })
     }
 
+    /// Reads an Artifact Publication through its independent Publication ID.
+    pub fn get_artifact_publication_by_id(
+        &self,
+        publication_id: &PublicationId,
+    ) -> Result<ArtifactPublicationSnapshot, ServiceError> {
+        let operation_id: Option<String> = {
+            let connection = self.ledger.lock_connection()?;
+            connection
+                .query_row(
+                    "SELECT operation_id FROM service_publication_ids WHERE publication_id=?1",
+                    params![publication_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        let operation_id =
+            operation_id.ok_or(ServiceError::InvalidRequest("publication_id was not found"))?;
+        self.get_artifact_publication_operation(&OperationId::new(operation_id))
+    }
+
     /// Observes CI for a direct PR / commit target or a completed internal
-    /// Publication operation. This synchronous API does not implement the MCP
-    /// `publication_id` mapping or asynchronous `ci.wait` operation contract.
+    /// Publication. This Rust API does not include an MCP response envelope or
+    /// transport integration.
     pub fn get_ci(&self, target: &CiServiceTarget) -> Result<CiObservation, ServiceError> {
         let (task_id, query, host) = self.resolve_ci_target(target, None)?;
         let runtime = self.ci_runtime()?;
@@ -2156,8 +2210,8 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 },
                 None,
             )),
-            CiServiceTarget::PublicationOperation(operation_id) => {
-                let publication = self.get_artifact_publication_operation(operation_id)?;
+            CiServiceTarget::Publication(publication_id) => {
+                let publication = self.get_artifact_publication_by_id(publication_id)?;
                 if publication.state() != ServiceOperationStatus::Completed
                     || publication.phase() != ArtifactPublicationPhase::Published
                 {
@@ -2216,10 +2270,13 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         digest: &str,
     ) -> Result<Option<ArtifactPublicationAcceptance>, ServiceError> {
         let connection = self.ledger.lock_connection()?;
-        let row: Option<(String, String, String, i64, String)> = connection
+        let row: Option<(String, String, String, String, i64, String)> = connection
             .query_row(
-                "SELECT id,task_id,request_digest,revision,status
-                 FROM service_artifact_publication_operations WHERE request_id=?1",
+                "SELECT publication.id,identity.publication_id,publication.task_id,
+                        publication.request_digest,publication.revision,publication.status
+                 FROM service_artifact_publication_operations publication
+                 JOIN service_publication_ids identity ON identity.operation_id=publication.id
+                 WHERE publication.request_id=?1",
                 params![request_id],
                 |row| {
                     Ok((
@@ -2228,22 +2285,27 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(id, task_id, stored_digest, revision, status)| {
-            if stored_digest != digest {
-                return Err(ServiceError::IdempotencyConflict);
-            }
-            Ok(ArtifactPublicationAcceptance {
-                operation_id: OperationId::new(id),
-                request_id: request_id.to_owned(),
-                task_id: TaskId::new(task_id),
-                revision: u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?,
-                status: ServiceOperationStatus::from_str(&status)?,
-            })
-        })
+        row.map(
+            |(id, publication_id, task_id, stored_digest, revision, status)| {
+                if stored_digest != digest {
+                    return Err(ServiceError::IdempotencyConflict);
+                }
+                Ok(ArtifactPublicationAcceptance {
+                    operation_id: OperationId::new(id),
+                    publication_id: PublicationId::new(publication_id),
+                    request_id: request_id.to_owned(),
+                    task_id: TaskId::new(task_id),
+                    revision: u64::try_from(revision)
+                        .map_err(|_| ServiceError::InvalidStoredState)?,
+                    status: ServiceOperationStatus::from_str(&status)?,
+                })
+            },
+        )
         .transpose()
     }
 
@@ -2255,18 +2317,22 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
     ) -> Result<(ArtifactPublicationAcceptance, bool), ServiceError> {
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some((id, task, stored_digest, revision, status)) = tx
+        if let Some((id, publication_id, task, stored_digest, revision, status)) = tx
             .query_row(
-                "SELECT id,task_id,request_digest,revision,status
-                 FROM service_artifact_publication_operations WHERE request_id=?1",
+                "SELECT publication.id,identity.publication_id,publication.task_id,
+                        publication.request_digest,publication.revision,publication.status
+                 FROM service_artifact_publication_operations publication
+                 JOIN service_publication_ids identity ON identity.operation_id=publication.id
+                 WHERE publication.request_id=?1",
                 params![request.request_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -2277,6 +2343,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             }
             let acceptance = ArtifactPublicationAcceptance {
                 operation_id: OperationId::new(id),
+                publication_id: PublicationId::new(publication_id),
                 request_id: request.request_id.clone(),
                 task_id: TaskId::new(task),
                 revision: u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?,
@@ -2347,6 +2414,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         )?;
         let accepted_at = now_ms();
         let operation_id = OperationId::new(format!("service-publication-{row_id}-{accepted_at}"));
+        let publication_id = new_publication_id();
         let request_digest = digest;
         tx.execute(
             "INSERT INTO service_artifact_publication_operations(
@@ -2371,10 +2439,15 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 accepted_at,
             ],
         )?;
+        tx.execute(
+            "INSERT INTO service_publication_ids(publication_id,operation_id) VALUES(?1,?2)",
+            params![publication_id.as_str(), operation_id.as_str()],
+        )?;
         tx.commit()?;
         Ok((
             ArtifactPublicationAcceptance {
                 operation_id,
+                publication_id,
                 request_id: request.request_id.clone(),
                 task_id: request.task_id.clone(),
                 revision: next_revision,
@@ -3041,6 +3114,18 @@ fn now_ms() -> i64 {
         })
 }
 
+fn new_publication_id() -> PublicationId {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_PUBLICATION_ID.fetch_add(1, Ordering::Relaxed);
+    PublicationId::new(format!(
+        "publication-v1-{time:x}-{:x}-{sequence:x}",
+        std::process::id()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -3576,6 +3661,16 @@ mod tests {
         .with_artifact_publication_gateway(&gateway);
         let request = publication_request(fixture, request_id);
         let acceptance = service.publish_artifact(&request).unwrap();
+        assert!(
+            acceptance
+                .publication_id()
+                .as_str()
+                .starts_with("publication-v1-")
+        );
+        assert_ne!(
+            acceptance.publication_id().as_str(),
+            acceptance.operation_id().as_str()
+        );
         service
             .run_artifact_publication(&acceptance, &request)
             .unwrap()
@@ -4793,9 +4888,16 @@ mod tests {
         let snapshot = service
             .run_artifact_publication(&acceptance, &request)
             .unwrap();
+        assert_eq!(acceptance.publication_id(), snapshot.publication_id());
         assert_eq!(snapshot.state(), ServiceOperationStatus::Completed);
         assert_eq!(snapshot.phase(), ArtifactPublicationPhase::Published);
         assert_eq!(snapshot.artifact_id(), fixture.artifact_id);
+        assert!(matches!(
+            service.get_artifact_publication_by_id(&PublicationId::new(
+                snapshot.operation_id().as_str()
+            )),
+            Err(ServiceError::InvalidRequest("publication_id was not found"))
+        ));
         assert!(valid_git_oid(snapshot.commit_sha().unwrap()));
         let pull_request = snapshot.pull_request().unwrap();
         assert_eq!(pull_request.number(), 17);
@@ -4830,7 +4932,14 @@ mod tests {
 
         let duplicate = service.publish_artifact(&request).unwrap();
         assert_eq!(duplicate.operation_id(), acceptance.operation_id());
+        assert_eq!(duplicate.publication_id(), acceptance.publication_id());
         assert_eq!(duplicate.status(), ServiceOperationStatus::Completed);
+        assert_eq!(
+            service
+                .get_artifact_publication_by_id(acceptance.publication_id())
+                .unwrap(),
+            snapshot
+        );
         assert_eq!(events.lock().unwrap().len(), 7);
         let mut changed = request.clone();
         changed.payload = ArtifactPublicationPayload::new(
@@ -5051,6 +5160,7 @@ mod tests {
             .run_artifact_publication(&acceptance, &request)
             .unwrap();
         assert_eq!(snapshot.state(), ServiceOperationStatus::Failed);
+        assert_eq!(snapshot.publication_id(), acceptance.publication_id());
         assert_eq!(snapshot.phase(), ArtifactPublicationPhase::Failed);
         assert_eq!(snapshot.error_code(), Some("interrupted_before_start"));
         assert_eq!(events.lock().unwrap().len(), 2);
@@ -5106,6 +5216,7 @@ mod tests {
         let snapshot = service
             .get_artifact_publication_operation(acceptance.operation_id())
             .unwrap();
+        assert_eq!(snapshot.publication_id(), acceptance.publication_id());
         assert_eq!(snapshot.state(), ServiceOperationStatus::RecoveryRequired);
         assert_eq!(snapshot.phase(), ArtifactPublicationPhase::RecoveryRequired);
         assert_eq!(snapshot.error_code(), Some("interrupted"));
@@ -5263,6 +5374,7 @@ mod tests {
         let events_before_retry = events.lock().unwrap().len();
         let retry = recovery_service.publish_artifact(&request).unwrap();
         assert_eq!(retry.operation_id(), &operation_id);
+        assert_eq!(retry.publication_id(), acceptance.publication_id());
         assert_eq!(retry.status(), ServiceOperationStatus::RecoveryRequired);
         assert_eq!(events.lock().unwrap().len(), events_before_retry);
         cleanup_fixture_worktree(
@@ -5274,7 +5386,7 @@ mod tests {
     }
 
     #[test]
-    fn ci_get_for_publication_operation_binds_task_pr_and_saved_head_sha() {
+    fn ci_get_by_publication_id_binds_task_pr_and_saved_head_sha() {
         let fixture = artifact_publication_fixture();
         let publication = publish_fixture(&fixture, "ci-publication-get");
         let head_sha = publication.commit_sha().unwrap().to_owned();
@@ -5295,8 +5407,8 @@ mod tests {
         .unwrap();
 
         let observation = service
-            .get_ci(&CiServiceTarget::PublicationOperation(
-                publication.operation_id().clone(),
+            .get_ci(&CiServiceTarget::Publication(
+                publication.publication_id().clone(),
             ))
             .unwrap();
 
@@ -5334,7 +5446,7 @@ mod tests {
             service.wait_ci(
                 &other_task_id,
                 0,
-                &CiServiceTarget::PublicationOperation(publication.operation_id().clone()),
+                &CiServiceTarget::Publication(publication.publication_id().clone()),
                 Instant::now() + Duration::from_secs(1),
             ),
             Err(ServiceError::PolicyDenied(_))
@@ -5375,8 +5487,8 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            service.get_ci(&CiServiceTarget::PublicationOperation(
-                publication.operation_id().clone(),
+            service.get_ci(&CiServiceTarget::Publication(
+                publication.publication_id().clone(),
             )),
             Err(ServiceError::Ci(CiError::HeadShaMismatch { expected, actual }))
                 if expected == saved_head_sha && actual == current_head_sha
