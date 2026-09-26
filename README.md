@@ -37,7 +37,9 @@ Agent 実行先の違いは `AgentProvider` に閉じ込めます。`ProviderReq
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
-Operation Service は named Model の受付時と実行時に、信頼済みcomposition rootから明示注入された `ModelCatalog` で Provider / Model capability を照合します。実行時はclaim・Provider準備より前と、workspace準備後・Attempt開始直前の二度確認します。source、観測時刻、statusがあり、設定したfreshnessを過ぎた情報、unknown / unsupported、照合失敗、catalog未設定は副作用前に拒否します。実行前の再確認に失敗した場合Operationを`failed`、Attemptを`queued`で終端し、同じrequest IDの再送でも再実行しません。失敗時のBaseInput workspaceはclean-only cleanupを試み、ArtifactInput workspaceは保存済み内容を守るため保持してlocatorを記録します。Model catalogはpoint-in-timeのread-only情報源で、照会直後の変更を防ぐleaseは提供せず、照会自体はCLIやnetworkを起動しません。実providerごとのcatalog adapter / data sourceは後続Issue #60 / #91の対象です。ProviderDefaultはcatalogを必要としません。
+Operation Service は named Model の受付時と実行時に、信頼済みcomposition rootから明示注入された `ModelCatalog` で Provider / Model capability を照合します。実行時はclaim・Provider準備より前と、workspace準備後・Attempt開始直前の二度確認します。source、観測時刻、statusがあり、設定したfreshnessを過ぎた情報、unknown / unsupported、照合失敗、catalog未設定は副作用前に拒否します。実行前の再確認に失敗した場合Operationを`failed`、Attemptを`queued`で終端し、同じrequest IDの再送でも再実行しません。失敗時のBaseInput workspaceはclean-only cleanupを試み、ArtifactInput workspaceは保存済み内容を守るため保持してlocatorを記録します。現行Serviceにこの残存workspaceを自動削除する処理やAPIはなく、運用者が記録されたpathを確認して手動で整理できます。これはArtifactInput materialization後にCatalog再確認が失敗した場合の安全措置であり、恒久保持の契約ではありません。Model catalogはpoint-in-timeのread-only情報源で、照会直後の変更を防ぐleaseは提供せず、照会自体はCLIやnetworkを起動しません。実providerごとのcatalog adapter / data sourceは後続Issue #60 / #91の対象です。ProviderDefaultはcatalogを必要としません。
+
+ArtifactInput失敗後に残るworkspaceの確認・安全な手動cleanup手順は[domain model](docs/domain-model.md#named-model-workspace-cleanup)にあります。dirty / ignored内容の確認ができない場合は削除せず、`git worktree remove`にも`--force`を付けません。
 
 ## Operation Ledger
 
