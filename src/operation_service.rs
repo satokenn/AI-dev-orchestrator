@@ -1351,11 +1351,16 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 "publication branch name is invalid",
             ));
         }
+        let gateway = self.publication_gateway.ok_or(ServiceError::PolicyDenied(
+            "Artifact publication gateway is not configured",
+        ))?;
+        if !gateway.supports_sensitive_stdin_payload() {
+            return Err(ServiceError::PolicyDenied(
+                "publication gateway cannot safely send title/body on this platform",
+            ));
+        }
         let scanner = self.secret_scanner.ok_or(ServiceError::PolicyDenied(
             "SecretScanner is not configured",
-        ))?;
-        self.publication_gateway.ok_or(ServiceError::PolicyDenied(
-            "Artifact publication gateway is not configured",
         ))?;
         let digest = publication_request_digest(request);
         if let Some(acceptance) = self.find_publication_acceptance(&request.request_id, &digest)? {
@@ -2469,7 +2474,7 @@ mod tests {
         process::Command,
         sync::{
             Arc, Barrier, Mutex,
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         thread,
     };
@@ -2750,11 +2755,12 @@ mod tests {
 
     struct UnsupportedStdinPublicationGateway {
         calls: AtomicUsize,
+        supports_stdin: AtomicBool,
     }
 
     impl ArtifactPublicationGateway for UnsupportedStdinPublicationGateway {
         fn supports_sensitive_stdin_payload(&self) -> bool {
-            false
+            self.supports_stdin.load(Ordering::SeqCst)
         }
 
         fn commit_tree(
@@ -3863,16 +3869,17 @@ mod tests {
     }
 
     #[test]
-    fn publication_rejects_unsupported_sensitive_stdin_before_claim_or_gateway_effects() {
+    fn publication_rejects_unsupported_sensitive_stdin_before_recording_or_scanning() {
         let fixture = artifact_publication_fixture();
         let scanner_events = Arc::new(Mutex::new(Vec::new()));
         let scanner = FakeSecretScanner {
             artifact_result: Ok(SecretScanResult::Clean),
             payload_result: Ok(SecretScanResult::Clean),
-            events: scanner_events,
+            events: scanner_events.clone(),
         };
         let gateway = UnsupportedStdinPublicationGateway {
             calls: AtomicUsize::new(0),
+            supports_stdin: AtomicBool::new(false),
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -3885,8 +3892,71 @@ mod tests {
         .with_secret_scanner(&scanner)
         .with_artifact_publication_gateway(&gateway);
         let request = publication_request(&fixture, "unsupported-sensitive-stdin");
-        let acceptance = service.publish_artifact(&request).unwrap();
+        assert!(matches!(
+            service.publish_artifact(&request),
+            Err(ServiceError::PolicyDenied(
+                "publication gateway cannot safely send title/body on this platform"
+            ))
+        ));
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 0);
+        assert!(scanner_events.lock().unwrap().is_empty());
+        let operation_count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_artifact_publication_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation_count, 0);
+        assert!(
+            service
+                .require_artifact_publication_evidence(
+                    &fixture.task_id,
+                    &fixture.artifact_id,
+                    &fixture.validation_id,
+                    &fixture.decision_id,
+                    fixture.revision,
+                )
+                .is_ok()
+        );
+    }
 
+    #[test]
+    fn publication_rechecks_stdin_capability_before_idempotent_return_and_run_claim() {
+        let fixture = artifact_publication_fixture();
+        let scanner_events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: scanner_events,
+        };
+        let gateway = UnsupportedStdinPublicationGateway {
+            calls: AtomicUsize::new(0),
+            supports_stdin: AtomicBool::new(true),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "capability-changed-after-acceptance");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        gateway.supports_stdin.store(false, Ordering::SeqCst);
+
+        assert!(matches!(
+            service.publish_artifact(&request),
+            Err(ServiceError::PolicyDenied(
+                "publication gateway cannot safely send title/body on this platform"
+            ))
+        ));
         assert!(matches!(
             service.run_artifact_publication(&acceptance, &request),
             Err(ServiceError::PolicyDenied(
