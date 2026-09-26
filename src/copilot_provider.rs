@@ -291,6 +291,10 @@ impl AgentProvider for CopilotProvider {
         &self.reference
     }
 
+    fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        CopilotProvider::observe_current_at(self, observed_at_ms)
+    }
+
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {
         self.execute_process(request, CancellationToken::new())
     }

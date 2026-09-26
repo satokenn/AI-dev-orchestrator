@@ -89,7 +89,7 @@ evidenceは結果を申告するfieldではなく、保存済みrecordへの参�
 | `id` | `string` | 必須 | 履歴record ID |
 | `kind` | `string` | 必須 | record種別 |
 | `state` | `string \| null` | 必須 | record種別に定義されたstate。stateを持たないrecordはnull |
-| `occurred_at` | `string (format: date-time)` | 必須 | record時刻（RFC 3339 UTC） |
+| `occurred_at` | `string (format: date-time) \| null` | 必須 | record時刻（RFC 3339 UTC）。記録されていない場合はnull |
 | `summary` | `string` | 必須 | 人が読める短い要約 |
 | `references` | `array<Reference>` | 必須 | 関連record |
 | `details` | `object` | 必須 | section固有の追加情報 |
@@ -99,10 +99,15 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 | Section | kind | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- | --- | --- |
 | `providers` | `provider` | `provider_id` | `string` | 必須 | Provider ID |
-|  |  | `model_ids` | `array<string>` | 必須 | 利用可能なModel ID |
+|  |  | `model_ids` | `array<string>` | 必須 | authoritativeなsourceで列挙できたModel ID |
 |  |  | `availability` | `enum(available, unavailable, unknown)` | 必須 | 観測した利用可否 |
 |  |  | `observed_at` | `string (format: date-time)` | 必須 | Provider状態の観測時刻 |
 |  |  | `diagnostic_ref` | `string \| null` | 必須 | 診断参照。なければnull |
+|  |  | `availability_evidence` | `AvailabilityEvidence` | 必須 | 状態、unknown理由、観測時刻、情報源 |
+|  |  | `authentication` | `AvailabilityEvidence` | 必須 | 認証状態。CLI確認だけではknownにならない |
+|  |  | `cli_present` | `Evidence<boolean>` | 必須 | 設定CLIの存在観測 |
+|  |  | `cli_version_check` | `Evidence<boolean>` | 必須 | `--version`確認。認証やModel利用権を示さない |
+|  |  | `models` | `array<ModelAvailabilityObservation>` | 必須 | Modelごとの利用可否と根拠。未取得はunknown |
 | `usage` | `usage` | `name` | `string` | 必須 | 使用量指標名 |
 |  |  | `value` | `number \| null` | 必須 | 観測値。不明ならnull |
 |  |  | `unit` | `string` | 必須 | 値の単位 |
@@ -112,11 +117,16 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 |  |  | `requested_model` | `ModelChoice \| null` | 必須 | 要求Model。旧記録等で確認できなければnull |
 |  |  | `observed_provider_id` | `string \| null` | 必須 | 実行されたと観測できたProvider。未知ならnull |
 |  |  | `observed_model_id` | `string \| null` | 必須 | 実際に使用したと観測できたModel。未知ならnull |
-|  |  | `role` | `enum(implementer, reviewer, explorer)` | 必須 | Attemptの役割 |
+|  |  | `role` | `enum(implementer, reviewer, explorer) \| null` | 必須 | Attemptの役割。旧記録等で取得できなければnull |
 |  |  | `input_artifact_id` | `string \| null` | 必須 | 入力Artifact。初期baseから開始した場合はnull |
 |  |  | `base_commit` | `string \| null` | 必須 | 開始時commit。なければnull |
 |  |  | `output_artifact_id` | `string \| null` | 必須 | 出力Artifact。未作成ならnull |
 |  |  | `diagnostic_ref` | `string \| null` | 必須 | 診断参照。なければnull |
+|  |  | `requested_provider_evidence` | `Evidence<string>` | 必須 | 要求Providerの値またはunknown理由、根拠、時刻 |
+|  |  | `requested_model_evidence` | `Evidence<ModelChoice>` | 必須 | 要求Modelの値またはunknown理由、根拠、時刻 |
+|  |  | `observed_provider_evidence` | `Evidence<string>` | 必須 | 観測Providerの値またはunknown理由、根拠、時刻 |
+|  |  | `observed_model_evidence` | `Evidence<string>` | 必須 | 観測Modelの値またはunknown理由、根拠、時刻 |
+|  |  | `timestamp_basis` | `enum(persisted, unknown)` | 必須 | occurred_atの元記録があるか |
 | `artifacts` | `artifact` | `artifact_id` | `string` | 必須 | Artifact ID |
 |  |  | `digest` | `string` | 必須 | Artifact内容のdigest |
 |  |  | `source_attempt_id` | `string \| null` | 必須 | 作成元Attempt。なければnull |
@@ -149,6 +159,10 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 |  |  | `checks` | `array<CiCheck>` | 必須 | 個別check結果 |
 
 `ContextItem.state`の値は次のとおり。sectionごとに別のenumであり、一覧にないstateを使わない。
+
+`Evidence<T>`は`status`で判別する。knownは`value`、`basis` (`measured`, `configured`, `computed`, `estimated`)、`assessed_at_ms`、`source`を持ち、unknownは`reason`、`assessed_at_ms`、`source`を持つ。`source`は`kind` (`provider_api`, `provider_cli`, `provider_adapter`, `execution_ledger`, `repository_config`) と`reference`を含む。`AvailabilityEvidence`は`status` object (`available`、`unavailable` + reason、または`unknown` + reason)、`observed_at_ms`、`source`を含む。`ModelAvailabilityObservation`は`model: ModelChoice`と`availability: AvailabilityEvidence`を持つ。Attempt itemで`occurred_at`を特定できない場合はnull、`timestamp_basis: unknown`を返す。旧roleを特定できない場合は`role: null`とする。
+
+`model_ids`には権威あるModel catalogで確認できたnamed Modelだけを含める。CLI起動状態からModel一覧・認証・利用権・quota・利用量・料金を推定しない。観測できない値はevidenceの`unknown`として理由・時刻・sourceを残す。Task Attemptのrequested値とobserved値は別々に保持し、unknown observed値をrequested値で埋めない。
 
 | Section | `state` type |
 | --- | --- |
@@ -286,6 +300,11 @@ Taskを作成する。`request_id`は冪等性keyに含まれる。
 
 Taskと選択したsectionのsnapshotを読む。読取専用。
 
+このService sliceは`providers`と`attempts`のContextPageを生成する。MCP transportは#45の対象であり、ここでは未実装。
+この2 sectionではprovider observationsを同一snapshot内で一括返し、page_size未満に収まらなければrequestを拒否する。
+Attempt historyは`occurred_at`降順、同時刻ならID降順でpage化し、cursorはTask、section、page size、Task revisionに束縛する。
+Provider観測sourceがProvider一覧を列挙できない場合は、空配列として成功したように見せずcontext取得を失敗させる。
+
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v2"` | 必須 | 契約version |
@@ -313,7 +332,22 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
   "occurred_at": "2026-09-23T01:02:03Z",
   "summary": "Provider call completed",
   "references": [{"kind": "artifact", "id": "artifact-01"}],
-  "details": {"requested_provider_id": "provider-a", "requested_model": {"kind": "named", "model": "model-a"}, "observed_provider_id": "provider-a", "observed_model_id": null, "role": "implementer", "input_artifact_id": null, "base_commit": "abc123", "output_artifact_id": "artifact-01", "diagnostic_ref": null}
+  "details": {
+    "requested_provider_id": "provider-a",
+    "requested_model": {"kind": "named", "model": "model-a"},
+    "observed_provider_id": "provider-a",
+    "observed_model_id": null,
+    "role": "implementer",
+    "input_artifact_id": null,
+    "base_commit": "abc123",
+    "output_artifact_id": "artifact-01",
+    "diagnostic_ref": null,
+    "requested_provider_evidence": {"status":"known","value":"provider-a","basis":"configured","assessed_at_ms":1790115723000,"source":{"kind":"execution_ledger","reference":"attempt:attempt-01"}},
+    "requested_model_evidence": {"status":"known","value":{"kind":"named","model":"model-a"},"basis":"configured","assessed_at_ms":1790115723000,"source":{"kind":"execution_ledger","reference":"attempt:attempt-01"}},
+    "observed_provider_evidence": {"status":"known","value":"provider-a","basis":"measured","assessed_at_ms":1790115783000,"source":{"kind":"execution_ledger","reference":"attempt:attempt-01"}},
+    "observed_model_evidence": {"status":"unknown","reason":"the Provider result did not record an observed Model","assessed_at_ms":1790115783000,"source":{"kind":"execution_ledger","reference":"attempt:attempt-01"}},
+    "timestamp_basis": "persisted"
+  }
 }
 ~~~
 

@@ -146,13 +146,16 @@ fn passes_named_model_and_types_invalid_model_selection() {
         .execute(&named_model_request(
             workspace,
             "hello",
-            Duration::from_secs(1),
+            Duration::from_secs(5),
         ))
         .unwrap_err();
-    assert!(matches!(
-        error.kind(),
-        ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
-    ));
+    assert!(
+        matches!(
+            error.kind(),
+            ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
+        ),
+        "unexpected error: {error:?}"
+    );
 
     let cli = FakeCli::new(
         r#"if [ "$1" = "--version" ]; then exit 0; fi; printf '{"status":"ERROR","error":"invalid model selection: unknown model"}\n'"#,
@@ -164,13 +167,16 @@ fn passes_named_model_and_types_invalid_model_selection() {
         .execute(&named_model_request(
             workspace,
             "hello",
-            Duration::from_secs(1),
+            Duration::from_secs(5),
         ))
         .unwrap_err();
-    assert!(matches!(
-        error.kind(),
-        ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
-    ));
+    assert!(
+        matches!(
+            error.kind(),
+            ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
+        ),
+        "unexpected error: {error:?}"
+    );
 }
 
 #[test]

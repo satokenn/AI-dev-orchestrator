@@ -274,6 +274,10 @@ impl AgentProvider for AntigravityProvider {
         &self.provider_ref
     }
 
+    fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        AntigravityProvider::observe_current_at(self, observed_at_ms)
+    }
+
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {
         self.execute_with_cancellation(request, CancellationToken::new())
     }

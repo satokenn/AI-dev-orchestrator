@@ -61,8 +61,8 @@ pub use operation_service::{
     ArtifactInput, ArtifactPublicationAcceptance, ArtifactPublicationPhase,
     ArtifactPublicationRequest, ArtifactPublicationSnapshot, AttemptInput, AttemptRunRequest,
     BaseInput, OperationAcceptance, OperationService, OperationSnapshot, ServiceError,
-    ServiceOperationStatus, TaskCreateRequest, TaskCreationResult, TaskIssueSnapshot,
-    TaskRequestSnapshot, TaskSource,
+    ServiceOperationStatus, TaskContextPage, TaskContextResult, TaskContextSection,
+    TaskCreateRequest, TaskCreationResult, TaskIssueSnapshot, TaskRequestSnapshot, TaskSource,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,
@@ -77,8 +77,8 @@ pub use process_runner::{
 };
 pub use provider::{AgentProvider, CapturedOutput, ProviderError, ProviderRequest, ProviderResult};
 pub use retry::{
-    ExecutionPolicy, PolicyError, ProviderRegistry, ProviderResolutionError, ProviderResolver,
-    RetryPolicy,
+    ExecutionPolicy, PolicyError, ProviderObservationUnavailable, ProviderRegistry,
+    ProviderResolutionError, ProviderResolver, RetryPolicy,
 };
 pub use validator::{
     CommandValidator, RustValidator, ValidationCheck, Validator, ValidatorError,

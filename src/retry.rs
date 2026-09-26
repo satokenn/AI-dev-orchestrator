@@ -216,7 +216,19 @@ pub trait ProviderResolver {
         &self,
         provider: &ProviderRef,
     ) -> Result<&dyn AgentProvider, ProviderResolutionError>;
+
+    /// Samples all configured adapters. Resolvers that cannot enumerate their
+    /// providers fail explicitly; they do not imply that no Providers exist.
+    fn observe_all_at(
+        &self,
+        _observed_at_ms: i64,
+    ) -> Result<Vec<crate::ProviderObservation>, ProviderObservationUnavailable> {
+        Err(ProviderObservationUnavailable)
+    }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderObservationUnavailable;
 
 /// In-memory provider registry for production wiring and tests.
 pub struct ProviderRegistry {
@@ -257,6 +269,17 @@ impl ProviderResolver for ProviderRegistry {
             .ok_or_else(|| ProviderResolutionError::UnknownProvider {
                 provider: provider.clone(),
             })
+    }
+
+    fn observe_all_at(
+        &self,
+        observed_at_ms: i64,
+    ) -> Result<Vec<crate::ProviderObservation>, ProviderObservationUnavailable> {
+        Ok(self
+            .providers
+            .iter()
+            .map(|provider| provider.observe_current_at(observed_at_ms))
+            .collect())
     }
 }
 
@@ -347,5 +370,26 @@ mod tests {
             registry.resolve(&ProviderRef::new("missing")),
             Err(ProviderResolutionError::UnknownProvider { .. })
         ));
+    }
+
+    #[test]
+    fn registered_provider_without_observation_adapter_stays_unknown() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Fake(ProviderRef::new("custom")));
+        let observations = registry.observe_all_at(123).unwrap();
+        assert_eq!(observations.len(), 1);
+        assert!(matches!(
+            observations[0].authentication.status,
+            crate::AvailabilityStatus::Unknown { .. }
+        ));
+        assert!(matches!(
+            observations[0].models[0].availability.status,
+            crate::AvailabilityStatus::Unknown { .. }
+        ));
+        assert_eq!(
+            observations[0].availability.source.kind,
+            crate::EvidenceSourceKind::ProviderAdapter
+        );
+        assert_eq!(observations[0].availability.observed_at_ms, 123);
     }
 }

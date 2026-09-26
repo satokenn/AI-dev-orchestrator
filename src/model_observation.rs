@@ -42,6 +42,7 @@ pub enum EvidenceBasis {
 pub enum EvidenceSourceKind {
     ProviderApi,
     ProviderCli,
+    ProviderAdapter,
     ExecutionLedger,
     RepositoryConfig,
 }
@@ -98,6 +99,15 @@ pub struct AttemptTargetObservation {
 impl AttemptTargetObservation {
     #[must_use]
     pub fn from_ledger_record(record: &AttemptRecord, assessed_at_ms: i64) -> Self {
+        Self::from_ledger_record_at_times(record, assessed_at_ms, assessed_at_ms)
+    }
+
+    #[must_use]
+    pub fn from_ledger_record_at_times(
+        record: &AttemptRecord,
+        requested_at_ms: i64,
+        observed_at_ms: i64,
+    ) -> Self {
         let source = EvidenceSource {
             kind: EvidenceSourceKind::ExecutionLedger,
             reference: format!("attempt:{}", record.attempt().id().as_str()),
@@ -107,28 +117,28 @@ impl AttemptTargetObservation {
             requested_provider: known_with_basis(
                 attempt.provider().clone(),
                 EvidenceBasis::Configured,
-                assessed_at_ms,
+                requested_at_ms,
                 source.clone(),
             ),
             requested_model: optional_known(
                 attempt.requested_model().cloned(),
                 EvidenceBasis::Configured,
                 "the Attempt does not record a requested model",
-                assessed_at_ms,
+                requested_at_ms,
                 source.clone(),
             ),
             observed_provider: optional_known(
                 attempt.observed_provider().cloned(),
                 EvidenceBasis::Measured,
                 "the Provider result did not record an observed Provider",
-                assessed_at_ms,
+                observed_at_ms,
                 source.clone(),
             ),
             observed_model: optional_known(
                 attempt.observed_model().cloned(),
                 EvidenceBasis::Measured,
                 "the Provider result did not record an observed Model",
-                assessed_at_ms,
+                observed_at_ms,
                 source,
             ),
         }
@@ -136,6 +146,46 @@ impl AttemptTargetObservation {
 }
 
 impl ProviderObservation {
+    /// Describes a registered Provider that has no authoritative observation
+    /// adapter. Unknown values are explicit and never inferred from execution.
+    #[must_use]
+    pub fn unsupported_adapter(provider: ProviderRef, observed_at_ms: i64) -> Self {
+        let source = EvidenceSource {
+            kind: EvidenceSourceKind::ProviderAdapter,
+            reference: provider.as_str().to_owned(),
+        };
+        let reason = "the Provider has no current observation adapter";
+        Self {
+            provider,
+            cli_present: unknown(reason, observed_at_ms, source.clone()),
+            cli_version_check: unknown(reason, observed_at_ms, source.clone()),
+            authentication: AvailabilityObservation {
+                status: AvailabilityStatus::Unknown {
+                    reason: reason.to_owned(),
+                },
+                observed_at_ms,
+                source: source.clone(),
+            },
+            availability: AvailabilityObservation {
+                status: AvailabilityStatus::Unknown {
+                    reason: reason.to_owned(),
+                },
+                observed_at_ms,
+                source: source.clone(),
+            },
+            models: vec![ModelAvailabilityObservation {
+                model: ModelChoice::ProviderDefault,
+                availability: AvailabilityObservation {
+                    status: AvailabilityStatus::Unknown {
+                        reason: reason.to_owned(),
+                    },
+                    observed_at_ms,
+                    source,
+                },
+            }],
+        }
+    }
+
     /// Probes an executable without retaining stdout/stderr, which may contain
     /// environment-specific or sensitive diagnostic text.
     #[must_use]
@@ -193,6 +243,14 @@ impl ProviderObservation {
                 ),
             ),
             Err(ProcessError::Io(_)) => (
+                known(true, observed_at_ms, source.clone()),
+                unknown(
+                    "the CLI version check did not complete",
+                    observed_at_ms,
+                    source.clone(),
+                ),
+            ),
+            Err(ProcessError::Stdin(_)) => (
                 known(true, observed_at_ms, source.clone()),
                 unknown(
                     "the CLI version check did not complete",

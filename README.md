@@ -29,6 +29,8 @@ install <target>/ai-dev-orchestrator "$HOME/.local/bin/ai-dev-orchestrator"
 
 外部 CLI は `ProcessRequest` に command、引数配列、作業ディレクトリ、環境変数、タイムアウトを指定し、`ProcessRunner` で実行できます。引数は shell 文字列へ連結されず、stdout / stderr と終了状態が `ProcessOutput` に集約されます。長時間実行を停止する場合は `CancellationToken` を渡して `cancel()` を呼び出してください。
 
+OperationServiceのread-only `get_context` APIはTaskの要求snapshotと、Provider観測・Attempt履歴のv2 ContextPageを返します。Provider観測の取得不能理由、source、時刻を含め、CLI起動成功から認証やModel利用権を推定しません。詳細は[Providerの現在状態を観測する](docs/current-provider-observations.md)を参照してください。
+
 timeout / cancel時のprocess group停止、停止確認結果、部分ログと出力上限は、[ProcessRunner の停止と出力回収](docs/process-runner.md)を参照してください。
 
 ## AgentProvider 契約
