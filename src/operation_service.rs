@@ -2092,9 +2092,10 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
     }
 
     /// Waits synchronously for a direct target or a completed internal
-    /// Publication operation after checking the Task revision. The full wire
-    /// contract returns an asynchronous OperationAcceptance and is not exposed
-    /// by this preparation API.
+    /// Publication operation after checking the Task revision. Direct targets
+    /// are attributed to the caller's Task; only Publication targets verify
+    /// ownership against the saved Publication record. The full wire contract
+    /// returns an asynchronous OperationAcceptance and is not exposed here.
     pub fn wait_ci(
         &self,
         task_id: &TaskId,
@@ -2109,16 +2110,12 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 actual: current_revision,
             });
         }
-        let (target_task_id, query, host) = self.resolve_ci_target(target, Some(task_id))?;
-        if target_task_id.as_ref() != Some(task_id) {
-            return Err(ServiceError::PolicyDenied(
-                "CI wait target does not belong to the requested Task",
-            ));
-        }
+        let (attributed_task_id, query, host) = self.resolve_ci_target(target, Some(task_id))?;
+        let attributed_task_id = attributed_task_id.ok_or(ServiceError::InvalidStoredState)?;
         let runtime = self.ci_runtime()?;
         match host {
-            Some(host) => runtime.wait_on_host(task_id, &query, deadline, &host),
-            None => runtime.wait(task_id, &query, deadline),
+            Some(host) => runtime.wait_on_host(&attributed_task_id, &query, deadline, &host),
+            None => runtime.wait(&attributed_task_id, &query, deadline),
         }
         .map_err(ServiceError::from)
     }
@@ -5424,7 +5421,7 @@ mod tests {
     }
 
     #[test]
-    fn ci_wait_service_checks_revision_and_persists_task_bound_observation() {
+    fn ci_wait_service_attributes_direct_target_to_caller_task_and_persists_observation() {
         let fixture = artifact_publication_fixture();
         let head_sha = "c".repeat(40);
         let provider = FakeCiProvider {
