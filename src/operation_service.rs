@@ -1827,6 +1827,10 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if request.request_id.trim().is_empty() {
             return Err(ServiceError::InvalidRequest("request_id must not be empty"));
         }
+        let digest = publication_request_digest(request);
+        if let Some(acceptance) = self.find_publication_acceptance(&request.request_id, &digest)? {
+            return Ok(acceptance);
+        }
         if request.payload.base_branch() == request.payload.head_branch() {
             return Err(ServiceError::InvalidRequest(
                 "publication base and head branches must differ",
@@ -1850,10 +1854,6 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let scanner = self.secret_scanner.ok_or(ServiceError::PolicyDenied(
             "SecretScanner is not configured",
         ))?;
-        let digest = publication_request_digest(request);
-        if let Some(acceptance) = self.find_publication_acceptance(&request.request_id, &digest)? {
-            return Ok(acceptance);
-        }
 
         let artifacts = ArtifactManager::new(self.workspaces, self.ledger);
         let permit = artifacts
@@ -4866,7 +4866,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_rechecks_stdin_capability_before_idempotent_return_and_run_claim() {
+    fn publication_replay_precedes_current_configuration_checks_but_run_rechecks_capability() {
         let fixture = artifact_publication_fixture();
         let scanner_events = Arc::new(Mutex::new(Vec::new()));
         let scanner = FakeSecretScanner {
@@ -4892,12 +4892,18 @@ mod tests {
         let acceptance = service.publish_artifact(&request).unwrap();
         gateway.supports_stdin.store(false, Ordering::SeqCst);
 
-        assert!(matches!(
-            service.publish_artifact(&request),
-            Err(ServiceError::PolicyDenied(
-                "publication gateway cannot safely send title/body on this platform"
-            ))
-        ));
+        let replay_service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let replayed = replay_service.publish_artifact(&request).unwrap();
+        assert_eq!(replayed.operation_id(), acceptance.operation_id());
+        assert_eq!(replayed.publication_id(), acceptance.publication_id());
+
         assert!(matches!(
             service.run_artifact_publication(&acceptance, &request),
             Err(ServiceError::PolicyDenied(
@@ -4910,6 +4916,14 @@ mod tests {
             .unwrap();
         assert_eq!(operation.state(), ServiceOperationStatus::Accepted);
         assert_eq!(operation.phase(), ArtifactPublicationPhase::Scanned);
+
+        let new_request = publication_request(&fixture, "new-request-after-capability-change");
+        assert!(matches!(
+            replay_service.publish_artifact(&new_request),
+            Err(ServiceError::PolicyDenied(
+                "Artifact publication gateway is not configured"
+            ))
+        ));
     }
 
     #[test]
