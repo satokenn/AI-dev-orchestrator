@@ -91,11 +91,19 @@ fn executes_headless_cli_in_workspace_and_maps_json_result() {
     assert_eq!(result.exit_status(), Some(0));
     assert_eq!(result.observed_provider().unwrap().as_str(), "antigravity");
     assert!(result.observed_model().is_none());
-    assert!(result.stdout().contains("\"status\":\"SUCCESS\""));
-    assert!(result.stderr().starts_with("fake diagnostic:"));
     assert!(
         result
-            .stderr()
+            .expose_stdout_for_trusted_processing()
+            .contains("\"status\":\"SUCCESS\"")
+    );
+    assert!(
+        result
+            .expose_stderr_for_trusted_processing()
+            .starts_with("fake diagnostic:")
+    );
+    assert!(
+        result
+            .expose_stderr_for_trusted_processing()
             .contains(workspace.to_string_lossy().as_ref())
     );
     assert_eq!(
@@ -149,10 +157,13 @@ fn passes_named_model_and_types_invalid_model_selection() {
             Duration::from_secs(1),
         ))
         .unwrap_err();
-    assert!(matches!(
-        error.kind(),
-        ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
-    ));
+    assert!(
+        matches!(
+            error.kind(),
+            ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
+        ),
+        "unexpected safe error: {error:?}"
+    );
 
     let cli = FakeCli::new(
         r#"if [ "$1" = "--version" ]; then exit 0; fi; printf '{"status":"ERROR","error":"invalid model selection: unknown model"}\n'"#,
@@ -209,7 +220,8 @@ fn reports_authentication_failure_as_unavailable() {
 
     let error = result.unwrap_err();
     assert!(
-        matches!(error.kind(), ProviderError::Unavailable(message) if message.contains("authentication required"))
+        matches!(error.kind(), ProviderError::Unavailable(message) if message.contains("authentication failed")),
+        "unexpected safe error: {error:?}"
     );
 }
 
@@ -224,9 +236,15 @@ fn maps_timeout_to_provider_error() {
 
     let error = result.unwrap_err();
     assert!(
-        matches!(error.kind(), ProviderError::TimedOutWithOutput { timeout, stdout, .. } if *timeout == Duration::from_secs(1) && stdout == "partial")
+        matches!(error.kind(), ProviderError::TimedOutWithOutput { timeout } if *timeout == Duration::from_secs(1))
     );
-    assert_eq!(error.captured_output().unwrap().stdout(), b"partial");
+    assert_eq!(
+        error
+            .expose_captured_output_for_trusted_processing()
+            .unwrap()
+            .expose_stdout_bytes_for_trusted_processing(),
+        b"partial"
+    );
 }
 
 #[test]
@@ -256,8 +274,8 @@ fn maps_cancellation_to_provider_error() {
     assert!(
         matches!(
             &result,
-            Err(error) if matches!(error.kind(), ProviderError::CancelledWithOutput { stdout, .. } if stdout == "partial")
-                && error.captured_output().is_some_and(|output| output.stdout() == b"partial")
+            Err(error) if matches!(error.kind(), ProviderError::CancelledWithOutput)
+                && error.expose_captured_output_for_trusted_processing().is_some_and(|output| output.expose_stdout_bytes_for_trusted_processing() == b"partial")
         ),
         "unexpected cancellation result: {result:?}"
     );
