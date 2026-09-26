@@ -976,7 +976,10 @@ fn model_catalog_entry_is_fresh_at(
         && entry.status == ModelCapabilityStatus::Supported
 }
 
-/// Read-only source of Provider / Model capability facts. Errors fail closed.
+/// Read-only source of point-in-time Provider / Model capability facts.
+/// The Service rechecks named targets at execution time, but this trait does
+/// not provide a lease or lock preventing a catalog change immediately after
+/// `lookup` returns. Implementations must keep lookups side-effect free.
 pub trait ModelCatalog: Send + Sync {
     fn lookup(
         &self,
@@ -1020,6 +1023,30 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         self.model_catalog = Some(catalog);
         self.model_catalog_max_age = max_age;
         self
+    }
+
+    fn validate_named_model(
+        &self,
+        provider: &ProviderRef,
+        choice: &ModelChoice,
+    ) -> Result<(), ServiceError> {
+        let ModelChoice::Named(model) = choice else {
+            return Ok(());
+        };
+        let Some(catalog) = self.model_catalog else {
+            return Err(ServiceError::NamedModelRequiresCatalog);
+        };
+        let entry = catalog
+            .lookup(provider, model)
+            .map_err(|_| ServiceError::NamedModelRequiresCatalog)?
+            .ok_or(ServiceError::NamedModelRequiresCatalog)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ServiceError::NamedModelRequiresCatalog)?;
+        if !model_catalog_entry_is_fresh_at(&entry, now, self.model_catalog_max_age) {
+            return Err(ServiceError::NamedModelRequiresCatalog);
+        }
+        Ok(())
     }
 
     /// Injects the caller's secret scanning policy. Publication is denied when absent.
@@ -1137,7 +1164,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let existing = connection
             .query_row(
                 "SELECT operation.id,operation.attempt_id,operation.expected_revision,operation.task_id,operation.provider,operation.model_kind,operation.model_name,
-                    operation.instruction,operation.role,operation.repository,operation.base_commit,operation.timeout_override_ms,relation.input_artifact_id
+                    operation.instruction,operation.role,operation.repository,operation.base_commit,operation.timeout_override_ms,relation.input_artifact_id,operation.status
              FROM service_operations operation LEFT JOIN service_attempt_artifacts relation
                ON relation.task_id=operation.task_id AND relation.attempt_id=operation.attempt_id
              WHERE operation.request_id=?1",
@@ -1157,6 +1184,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                         row.get::<_, String>(10)?,
                         row.get::<_, Option<i64>>(11)?,
                         row.get::<_, Option<String>>(12)?,
+                        row.get::<_, String>(13)?,
                     ))
                 },
             )
@@ -1175,6 +1203,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             commit,
             timeout_override,
             input_artifact_id,
+            status,
         )) = existing
         else {
             return Ok(None);
@@ -1212,7 +1241,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             operation_id: OperationId::new(id),
             attempt_id: AttemptId::new(attempt),
             revision: revision as u64 + 1,
-            status: ServiceOperationStatus::Accepted,
+            status: ServiceOperationStatus::from_str(&status)?,
         }))
     }
 
@@ -1232,21 +1261,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 "instruction must not be empty",
             ));
         }
-        if let ModelChoice::Named(model) = &request.model_id {
-            let Some(catalog) = self.model_catalog else {
-                return Err(ServiceError::NamedModelRequiresCatalog);
-            };
-            let entry = catalog
-                .lookup(&request.provider_id, model)
-                .map_err(|_| ServiceError::NamedModelRequiresCatalog)?
-                .ok_or(ServiceError::NamedModelRequiresCatalog)?;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| ServiceError::NamedModelRequiresCatalog)?;
-            if !model_catalog_entry_is_fresh_at(&entry, now, self.model_catalog_max_age) {
-                return Err(ServiceError::NamedModelRequiresCatalog);
-            }
-        }
+        self.validate_named_model(&request.provider_id, &request.model_id)?;
         let timeout = request.timeout.unwrap_or(self.default_timeout);
         if timeout.is_zero() {
             return Err(ServiceError::InvalidRequest("timeout must be positive"));
@@ -1422,6 +1437,13 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if stored.status != ServiceOperationStatus::Accepted {
             return self.get_operation(operation_id);
         }
+        if self
+            .validate_named_model(&stored.provider, &stored.requested_model)
+            .is_err()
+        {
+            self.reject_accepted_without_start(operation_id, "model_catalog_unavailable")?;
+            return self.get_operation(operation_id);
+        }
         if !self.claim_operation(operation_id)? {
             return self.get_operation(operation_id);
         }
@@ -1481,6 +1503,42 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                     "workspace_unavailable"
                 },
                 ServiceOperationStatus::Failed,
+            )?;
+            return self.get_operation(operation_id);
+        }
+        // Catalog facts may change while a worktree is being prepared. Recheck the
+        // named target at the last safe point before marking the Attempt started or
+        // invoking the Provider.
+        if self
+            .validate_named_model(&stored.provider, &stored.requested_model)
+            .is_err()
+        {
+            let cleanup = if let Some(input_id) = stored.input_artifact_id.as_deref() {
+                ArtifactManager::new(self.workspaces, self.ledger)
+                    .cleanup_unchanged_artifact_input_workspace(
+                        &stored.task_id,
+                        &stored.attempt_id,
+                        input_id,
+                        &workspace,
+                    )
+            } else {
+                self.workspaces.cleanup(&workspace).map_err(|error| {
+                    ArtifactError::WorkspaceRetained {
+                        path: workspace.path().to_owned(),
+                        reason: error.to_string(),
+                    }
+                })
+            };
+            let code = if cleanup.is_ok() {
+                "model_catalog_unavailable"
+            } else {
+                "model_catalog_unavailable_workspace_retained"
+            };
+            self.finish_without_start_with_locator_clear(
+                operation_id,
+                code,
+                ServiceOperationStatus::Failed,
+                cleanup.is_ok(),
             )?;
             return self.get_operation(operation_id);
         }
@@ -2700,6 +2758,16 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         code: &str,
         status: ServiceOperationStatus,
     ) -> Result<(), ServiceError> {
+        self.finish_without_start_with_locator_clear(operation_id, code, status, false)
+    }
+
+    fn finish_without_start_with_locator_clear(
+        &self,
+        operation_id: &OperationId,
+        code: &str,
+        status: ServiceOperationStatus,
+        clear_workspace_locator: bool,
+    ) -> Result<(), ServiceError> {
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (task_text, attempt_text, current): (String, String, String) = tx.query_row(
@@ -2718,13 +2786,52 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if attempt_state != "queued" {
             return Err(ServiceError::InvalidStoredState);
         }
-        let changed=tx.execute("UPDATE service_operations SET status=?2,finished_at=?3,diagnostic_code=?4 WHERE id=?1 AND status='running'",params![operation_id.as_str(),status.as_str(),now_ms(),code])?;
+        let changed = if clear_workspace_locator {
+            tx.execute("UPDATE service_operations SET status=?2,finished_at=?3,diagnostic_code=?4,workspace_path=NULL,workspace_branch=NULL WHERE id=?1 AND status='running'",params![operation_id.as_str(),status.as_str(),now_ms(),code])?
+        } else {
+            tx.execute("UPDATE service_operations SET status=?2,finished_at=?3,diagnostic_code=?4 WHERE id=?1 AND status='running'",params![operation_id.as_str(),status.as_str(),now_ms(),code])?
+        };
         if changed != 1 {
             return Err(ServiceError::InvalidStoredState);
         }
         bump_revision(&tx, &TaskId::new(task_text))?;
         tx.commit()?;
         Ok(())
+    }
+
+    fn reject_accepted_without_start(
+        &self,
+        operation_id: &OperationId,
+        code: &str,
+    ) -> Result<bool, ServiceError> {
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (task_text, attempt_text, current): (String, String, String) = tx.query_row(
+            "SELECT task_id,attempt_id,status FROM service_operations WHERE id=?1",
+            params![operation_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if current != "accepted" {
+            return Ok(false);
+        }
+        let attempt_state: String = tx.query_row(
+            "SELECT state FROM attempts WHERE task_id=?1 AND id=?2",
+            params![task_text, attempt_text],
+            |row| row.get(0),
+        )?;
+        if attempt_state != "queued" {
+            return Err(ServiceError::InvalidStoredState);
+        }
+        let changed = tx.execute(
+            "UPDATE service_operations SET status='failed',finished_at=?2,diagnostic_code=?3 WHERE id=?1 AND status='accepted'",
+            params![operation_id.as_str(), now_ms(), code],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        bump_revision(&tx, &TaskId::new(task_text))?;
+        tx.commit()?;
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2933,6 +3040,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         fs,
         process::Command,
         sync::{
@@ -3716,6 +3824,40 @@ mod tests {
         }
     }
 
+    struct CatalogSequence {
+        entries: Mutex<VecDeque<Result<Option<ModelCatalogEntry>, ModelCatalogError>>>,
+        lookups: AtomicUsize,
+    }
+
+    impl CatalogSequence {
+        fn new(entries: impl IntoIterator<Item = ModelCatalogEntry>) -> Self {
+            Self {
+                entries: Mutex::new(entries.into_iter().map(|entry| Ok(Some(entry))).collect()),
+                lookups: AtomicUsize::new(0),
+            }
+        }
+
+        fn outcomes(
+            entries: impl IntoIterator<Item = Result<Option<ModelCatalogEntry>, ModelCatalogError>>,
+        ) -> Self {
+            Self {
+                entries: Mutex::new(entries.into_iter().collect()),
+                lookups: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ModelCatalog for CatalogSequence {
+        fn lookup(
+            &self,
+            _provider: &ProviderRef,
+            _model: &ModelRef,
+        ) -> Result<Option<ModelCatalogEntry>, ModelCatalogError> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            self.entries.lock().unwrap().pop_front().unwrap_or(Ok(None))
+        }
+    }
+
     #[test]
     fn model_catalog_freshness_accepts_exact_boundary_and_rejects_just_over() {
         let entry = ModelCatalogEntry {
@@ -3768,6 +3910,213 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(checks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn named_model_is_revalidated_before_claim_and_terminalized_idempotently() {
+        let (repo, ledger, workspace, providers, calls, checks, task_id) =
+            service_parts(false, Duration::ZERO, false);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let catalog = CatalogSequence::new([
+            ModelCatalogEntry {
+                source: "test-catalog".into(),
+                observed_at_unix_seconds: now,
+                status: ModelCapabilityStatus::Supported,
+            },
+            ModelCatalogEntry {
+                source: "test-catalog".into(),
+                observed_at_unix_seconds: now.saturating_sub(120),
+                status: ModelCapabilityStatus::Supported,
+            },
+        ]);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_model_catalog(&catalog, Duration::from_secs(60));
+        let mut req = request(&repo, &task_id, 0, "catalog-stales-before-run");
+        req.model_id = ModelChoice::Named(ModelRef::new("gpt-test"));
+        let accepted = service.submit_attempt(&req).unwrap();
+
+        let failed = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(failed.status(), ServiceOperationStatus::Failed);
+        assert_eq!(failed.diagnostic_code(), Some("model_catalog_unavailable"));
+        assert_eq!(failed.started_at_ms(), None);
+        assert_eq!(failed.workspace_path(), None);
+        assert_eq!(failed.attempt_state(), AttemptState::Queued);
+        assert_eq!(catalog.lookups.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+
+        let replay = service.submit_attempt(&req).unwrap();
+        assert_eq!(replay.operation_id(), accepted.operation_id());
+        assert_eq!(replay.status(), ServiceOperationStatus::Failed);
+        let repeated_run = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(repeated_run.status(), ServiceOperationStatus::Failed);
+        assert_eq!(catalog.lookups.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn named_model_is_revalidated_immediately_before_provider_execution() {
+        let (repo, ledger, workspace, providers, calls, checks, task_id) =
+            service_parts(false, Duration::ZERO, false);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let catalog = CatalogSequence::new([
+            ModelCatalogEntry {
+                source: "test-catalog".into(),
+                observed_at_unix_seconds: now,
+                status: ModelCapabilityStatus::Supported,
+            },
+            ModelCatalogEntry {
+                source: "test-catalog".into(),
+                observed_at_unix_seconds: now,
+                status: ModelCapabilityStatus::Supported,
+            },
+            ModelCatalogEntry {
+                source: "test-catalog".into(),
+                observed_at_unix_seconds: now.saturating_sub(120),
+                status: ModelCapabilityStatus::Supported,
+            },
+        ]);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_model_catalog(&catalog, Duration::from_secs(60));
+        let mut req = request(&repo, &task_id, 0, "catalog-expires-before-provider");
+        req.model_id = ModelChoice::Named(ModelRef::new("gpt-test"));
+        let accepted = service.submit_attempt(&req).unwrap();
+
+        let failed = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(failed.status(), ServiceOperationStatus::Failed);
+        assert_eq!(failed.diagnostic_code(), Some("model_catalog_unavailable"));
+        assert!(failed.started_at_ms().is_some());
+        assert_eq!(failed.workspace_path(), None);
+        assert_eq!(failed.attempt_state(), AttemptState::Queued);
+        assert_eq!(catalog.lookups.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+
+        let replay = service.submit_attempt(&req).unwrap();
+        assert_eq!(replay.operation_id(), accepted.operation_id());
+        assert_eq!(replay.status(), ServiceOperationStatus::Failed);
+        let repeated_run = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(repeated_run.status(), ServiceOperationStatus::Failed);
+        assert_eq!(catalog.lookups.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn catalog_error_or_missing_entry_before_claim_terminalizes_without_provider_call() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let supported = || {
+            Ok(Some(ModelCatalogEntry {
+                source: "test-catalog".into(),
+                observed_at_unix_seconds: now,
+                status: ModelCapabilityStatus::Supported,
+            }))
+        };
+        for (suffix, outcome) in [
+            ("lookup-error", Err(ModelCatalogError)),
+            ("missing-entry", Ok(None)),
+        ] {
+            let (repo, ledger, workspace, providers, calls, checks, task_id) =
+                service_parts(false, Duration::ZERO, false);
+            let catalog = CatalogSequence::outcomes([supported(), outcome]);
+            let service =
+                OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                    .unwrap()
+                    .with_model_catalog(&catalog, Duration::from_secs(60));
+            let mut req = request(&repo, &task_id, 0, suffix);
+            req.model_id = ModelChoice::Named(ModelRef::new("gpt-test"));
+            let accepted = service.submit_attempt(&req).unwrap();
+            let failed = service
+                .run(accepted.operation_id(), CancellationToken::new())
+                .unwrap();
+            assert_eq!(failed.status(), ServiceOperationStatus::Failed);
+            assert_eq!(failed.diagnostic_code(), Some("model_catalog_unavailable"));
+            assert_eq!(failed.attempt_state(), AttemptState::Queued);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(checks.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                service.submit_attempt(&req).unwrap().status(),
+                ServiceOperationStatus::Failed
+            );
+        }
+    }
+
+    #[test]
+    fn final_catalog_recheck_rejects_changed_facts_and_cleans_unmodified_workspace() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (suffix, final_outcome) in [
+            (
+                "final-unsupported",
+                Ok(Some(ModelCatalogEntry {
+                    source: "test-catalog".into(),
+                    observed_at_unix_seconds: now,
+                    status: ModelCapabilityStatus::Unsupported,
+                })),
+            ),
+            ("final-missing", Ok(None)),
+            ("final-error", Err(ModelCatalogError)),
+        ] {
+            let (repo, ledger, workspace, providers, calls, checks, task_id) =
+                service_parts(false, Duration::ZERO, false);
+            let supported = || {
+                Ok(Some(ModelCatalogEntry {
+                    source: "test-catalog".into(),
+                    observed_at_unix_seconds: now,
+                    status: ModelCapabilityStatus::Supported,
+                }))
+            };
+            let catalog = CatalogSequence::outcomes([supported(), supported(), final_outcome]);
+            let service =
+                OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                    .unwrap()
+                    .with_model_catalog(&catalog, Duration::from_secs(60));
+            let mut req = request(&repo, &task_id, 0, suffix);
+            req.model_id = ModelChoice::Named(ModelRef::new("gpt-test"));
+            let accepted = service.submit_attempt(&req).unwrap();
+            let failed = service
+                .run(accepted.operation_id(), CancellationToken::new())
+                .unwrap();
+            assert_eq!(failed.status(), ServiceOperationStatus::Failed);
+            assert_eq!(failed.diagnostic_code(), Some("model_catalog_unavailable"));
+            assert!(failed.started_at_ms().is_some());
+            assert_eq!(failed.workspace_path(), None);
+            assert_eq!(failed.attempt_state(), AttemptState::Queued);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(checks.load(Ordering::SeqCst), 1);
+            assert_eq!(catalog.lookups.load(Ordering::SeqCst), 3);
+            assert_eq!(
+                service.submit_attempt(&req).unwrap().status(),
+                ServiceOperationStatus::Failed
+            );
+            assert!(
+                !workspace
+                    .worktree_path(&task_id, failed.attempt_id())
+                    .exists()
+            );
+        }
     }
 
     #[test]

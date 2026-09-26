@@ -37,7 +37,7 @@ Agent 実行先の違いは `AgentProvider` に閉じ込めます。`ProviderReq
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
-Operation Service は named Model の実行前に、信頼済みcomposition rootから明示注入された `ModelCatalog` で Provider / Model capability を照合します。source、観測時刻、statusがあり、設定したfreshnessを過ぎた情報、unknown / unsupported、照合失敗、catalog未設定は副作用前に拒否します。Model catalog自体はローカルのread-only情報源であり、受付検証のためにCLIやnetworkを起動しません。実providerごとのcatalog adapter / data sourceは後続Issue #60 / #91の対象です。ProviderDefaultはcatalogを必要としません。
+Operation Service は named Model の受付時と実行時に、信頼済みcomposition rootから明示注入された `ModelCatalog` で Provider / Model capability を照合します。実行時はclaim・Provider準備より前と、workspace準備後・Attempt開始直前の二度確認します。source、観測時刻、statusがあり、設定したfreshnessを過ぎた情報、unknown / unsupported、照合失敗、catalog未設定は副作用前に拒否します。実行前の再確認に失敗した場合Operationを`failed`、Attemptを`queued`で終端し、同じrequest IDの再送でも再実行しません。準備済みworkspaceは入力tree一致・ignored fileなし・submoduleなしを検証できれば削除し、証明できない場合はlocatorを保持して診断します。Model catalogはpoint-in-timeのread-only情報源で、照会直後の変更を防ぐleaseは提供せず、照会自体はCLIやnetworkを起動しません。実providerごとのcatalog adapter / data sourceは後続Issue #60 / #91の対象です。ProviderDefaultはcatalogを必要としません。
 
 ## Operation Ledger
 
