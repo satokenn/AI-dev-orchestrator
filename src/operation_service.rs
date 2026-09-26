@@ -956,7 +956,6 @@ fn provider_context_item(observation: &ProviderObservation) -> serde_json::Value
 fn attempt_context_item(
     record: &crate::AttemptRecord,
     operation: Option<&ContextAttemptMetadata>,
-    task_role: &str,
     captured_at_ms: i64,
 ) -> serde_json::Value {
     let attempt = record.attempt();
@@ -977,7 +976,7 @@ fn attempt_context_item(
         finished_at,
     );
     let (role, input_artifact, output_artifact, base_commit) =
-        operation.map_or((role_json(task_role), None, None, None), |details| {
+        operation.map_or((None, None, None, None), |details| {
             (
                 role_json(&details.role),
                 details.input_artifact_id.as_deref(),
@@ -1422,15 +1421,12 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 "cursor supplied for an unrequested section",
             ));
         }
+        if cursors.contains_key("providers") {
+            return Err(ServiceError::InvalidRequest(
+                "providers section does not support cursors",
+            ));
+        }
 
-        let probe_at_ms = now_ms();
-        let provider_observations = if sections.contains(&TaskContextSection::Providers) {
-            self.providers
-                .observe_all_at(probe_at_ms)
-                .map_err(|_| ServiceError::ProviderObservationUnavailable)?
-        } else {
-            Vec::new()
-        };
         let (task_snapshot, revision, attempts) = {
             let connection = self.ledger.lock_connection()?;
             let transaction = connection.unchecked_transaction()?;
@@ -1487,8 +1483,16 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             (
                 task_snapshot,
                 revision as u64,
-                (attempts, operation_details, task.role().as_str().to_owned()),
+                (attempts, operation_details),
             )
+        };
+        let probe_at_ms = now_ms();
+        let provider_observations = if sections.contains(&TaskContextSection::Providers) {
+            self.providers
+                .observe_all_at(probe_at_ms)
+                .map_err(|_| ServiceError::ProviderObservationUnavailable)?
+        } else {
+            Vec::new()
         };
         let observed_at_ms = now_ms();
         let mut page_map = BTreeMap::new();
@@ -1518,7 +1522,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                             .1
                             .get(record.attempt().id().as_str())
                             .and_then(Option::as_ref);
-                        attempt_context_item(record, details, &attempts.2, observed_at_ms)
+                        attempt_context_item(record, details, observed_at_ms)
                     })
                     .collect::<Vec<_>>(),
             };
@@ -3417,8 +3421,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AgentProvider, AgentResult, ProviderError, ProviderRegistry, ProviderResult,
-        PublicationGatewayError, SecretScanError, Task, UsageCost,
+        AgentProvider, AgentResult, ProviderError, ProviderRegistry, ProviderResolver,
+        ProviderResult, PublicationGatewayError, SecretScanError, Task, UsageCost,
     };
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
@@ -3667,6 +3671,123 @@ mod tests {
         assert!(matches!(
             service.get_context(task.task_id(), &sections, 2, &cursors),
             Err(ServiceError::InvalidRequest(_))
+        ));
+        let providers = [TaskContextSection::Providers];
+        let forged_provider_cursor = BTreeMap::from([("providers".to_owned(), cursor)]);
+        assert!(matches!(
+            service.get_context(task.task_id(), &providers, 1, &forged_provider_cursor),
+            Err(ServiceError::InvalidRequest(
+                "providers section does not support cursors"
+            ))
+        ));
+    }
+
+    #[test]
+    fn legacy_attempt_does_not_inherit_role_from_task() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let task = service
+            .create_task(
+                "caller",
+                &TaskCreateRequest::new(
+                    "create-legacy-role",
+                    TaskSource::Manual,
+                    "Legacy role",
+                    "Task has a concrete role",
+                    vec![],
+                    None,
+                ),
+            )
+            .unwrap();
+        ledger
+            .save_task(&Task::new(
+                task.task_id().clone(),
+                "Task has a concrete role",
+                TaskRole::new("reviewer"),
+            ))
+            .unwrap();
+        ledger
+            .save_attempt(
+                task.task_id(),
+                &Attempt::new(
+                    AttemptId::new("legacy-attempt-without-service-operation"),
+                    ProviderRef::new("codex"),
+                    ModelChoice::ProviderDefault,
+                ),
+                Some(10),
+                Some(20),
+            )
+            .unwrap();
+
+        let context = service
+            .get_context(
+                task.task_id(),
+                &[TaskContextSection::Attempts],
+                10,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            context.to_json_value()["sections"]["attempts"]["items"][0]["details"]["role"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn task_get_context_rejects_missing_task_snapshot_before_provider_probe() {
+        struct NeverProbeResolver;
+        impl ProviderResolver for NeverProbeResolver {
+            fn resolve(
+                &self,
+                provider: &ProviderRef,
+            ) -> Result<&dyn AgentProvider, crate::ProviderResolutionError> {
+                Err(crate::ProviderResolutionError::UnknownProvider {
+                    provider: provider.clone(),
+                })
+            }
+
+            fn observe_all_at(
+                &self,
+                _observed_at_ms: i64,
+            ) -> Result<Vec<crate::ProviderObservation>, crate::ProviderObservationUnavailable>
+            {
+                panic!("provider probing must happen after Task snapshot validation");
+            }
+        }
+
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = TaskId::new("task-without-create-snapshot");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "legacy task",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let providers = NeverProbeResolver;
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let sections = [TaskContextSection::Providers];
+        assert!(matches!(
+            service.get_context(&task_id, &sections, 10, &BTreeMap::new()),
+            Err(ServiceError::TaskSnapshotUnavailable)
+        ));
+        assert!(matches!(
+            service.get_context(
+                &TaskId::new("missing-task"),
+                &sections,
+                10,
+                &BTreeMap::new()
+            ),
+            Err(ServiceError::TaskNotFound)
         ));
     }
 
