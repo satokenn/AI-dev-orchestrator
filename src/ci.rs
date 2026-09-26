@@ -676,6 +676,14 @@ impl<'a, P: CiProvider> CiRuntime<'a, P> {
             } else {
                 pinned_sha = Some(observation.target.head_sha.clone());
             }
+            // `observe_until` persists before returning. A provider can finish
+            // its poll after our wait deadline, so do not report a late
+            // terminal result as if it arrived within the requested window.
+            if Instant::now() >= deadline {
+                return Err(CiError::Timeout {
+                    last_observation_id: Some(observation.id),
+                });
+            }
             let terminal = matches!(
                 observation.state,
                 CiAggregateState::Passed | CiAggregateState::Failed
@@ -1312,6 +1320,7 @@ mod tests {
         fallback: CiProviderSnapshot,
         queries: Mutex<Vec<CiQueryTarget>>,
         unavailable_delay: Duration,
+        success_delay: Duration,
     }
 
     impl FakeProvider {
@@ -1323,6 +1332,17 @@ mod tests {
                 fallback,
                 queries: Mutex::new(Vec::new()),
                 unavailable_delay: Duration::ZERO,
+                success_delay: Duration::ZERO,
+            }
+        }
+
+        fn success_after_with_delay(snapshot: CiProviderSnapshot, delay: Duration) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from([Ok(snapshot.clone())])),
+                fallback: snapshot,
+                queries: Mutex::new(Vec::new()),
+                unavailable_delay: Duration::ZERO,
+                success_delay: delay,
             }
         }
 
@@ -1340,6 +1360,7 @@ mod tests {
                 fallback: first,
                 queries: Mutex::new(Vec::new()),
                 unavailable_delay: delay,
+                success_delay: Duration::ZERO,
             }
         }
     }
@@ -1359,6 +1380,8 @@ mod tests {
                 .unwrap_or_else(|| Ok(self.fallback.clone()));
             if response.is_err() && !self.unavailable_delay.is_zero() {
                 thread::sleep(self.unavailable_delay);
+            } else if response.is_ok() && !self.success_delay.is_zero() {
+                thread::sleep(self.success_delay);
             }
             response
         }
@@ -1683,6 +1706,43 @@ mod tests {
         let last = ledger.get_ci_observation(&id).unwrap().unwrap();
         assert_eq!(last.target().head_sha(), "a".repeat(40));
         assert_eq!(last.state(), CiAggregateState::Pending);
+    }
+
+    #[test]
+    fn wait_returns_timeout_when_terminal_observation_is_persisted_after_deadline() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = save_task(&ledger, "ci-timeout-late-terminal-task");
+        let provider = FakeProvider::success_after_with_delay(
+            snapshot(&"a".repeat(40), CiCheckDetailState::Passed),
+            Duration::from_millis(150),
+        );
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let error = runtime
+            .wait(
+                &task_id,
+                &CiQueryTarget::PullRequest {
+                    repository: "owner/repo".into(),
+                    number: 4,
+                    expected_head_sha: None,
+                },
+                Instant::now() + Duration::from_millis(100),
+            )
+            .unwrap_err();
+        let CiError::Timeout {
+            last_observation_id: Some(id),
+        } = error
+        else {
+            panic!("expected timeout with late terminal observation: {error:?}");
+        };
+        let last = ledger.get_ci_observation(&id).unwrap().unwrap();
+        assert_eq!(last.task_id(), Some(&task_id));
+        assert_eq!(last.state(), CiAggregateState::Passed);
     }
 
     #[test]
