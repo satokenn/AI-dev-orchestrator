@@ -748,6 +748,9 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             return self.get_operation(operation_id);
         }
 
+        // Persist the deterministic locator before creating the worktree. A crash
+        // after `git worktree add` must not leave a retained workspace untracked.
+        self.record_workspace_locator(operation_id, &stored.task_id, &stored.attempt_id)?;
         let workspace = match self.workspaces.create_at_base(
             &stored.task_id,
             &stored.attempt_id,
@@ -763,7 +766,6 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 return self.get_operation(operation_id);
             }
         };
-        self.record_workspace_reference(operation_id, &workspace)?;
         let prepared = if let Some(input_id) = stored.input_artifact_id.as_deref() {
             ArtifactManager::new(self.workspaces, self.ledger)
                 .materialize(&workspace, &stored.task_id, &stored.attempt_id, input_id)
@@ -850,7 +852,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                         AttemptFailureReason::Timeout,
                         "timeout",
                     ),
-                    ProviderError::Cancelled | ProviderError::CancelledWithOutput { .. } => (
+                    ProviderError::Cancelled | ProviderError::CancelledWithOutput => (
                         ServiceOperationStatus::Cancelled,
                         AttemptFailureReason::Cancelled,
                         "cancelled",
@@ -1085,27 +1087,34 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             .map_err(ServiceError::from)
     }
 
-    fn record_workspace_reference(
+    fn record_workspace_locator(
         &self,
         operation_id: &OperationId,
-        workspace: &crate::Workspace,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
     ) -> Result<(), ServiceError> {
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let task_text: String = tx.query_row(
-            "SELECT task_id FROM service_operations WHERE id=?1 AND status='running'",
-            params![operation_id.as_str()],
-            |row| row.get(0),
+        let (stored_task, stored_attempt): (String, String) = tx.query_row(
+            "SELECT task_id,attempt_id FROM service_operations WHERE id=?1 AND attempt_id=?2 AND status='running'",
+            params![operation_id.as_str(), attempt_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if stored_task != task_id.as_str() || stored_attempt != attempt_id.as_str() {
+            return Err(ServiceError::InvalidStoredState);
+        }
         tx.execute(
             "UPDATE service_operations SET workspace_path=?2,workspace_branch=?3 WHERE id=?1",
             params![
                 operation_id.as_str(),
-                workspace.path().to_string_lossy().as_ref(),
-                workspace.branch()
+                self.workspaces
+                    .worktree_path(task_id, attempt_id)
+                    .to_string_lossy()
+                    .as_ref(),
+                self.workspaces.branch_name(task_id, attempt_id)
             ],
         )?;
-        bump_revision(&tx, &TaskId::new(task_text))?;
+        bump_revision(&tx, task_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -1504,16 +1513,11 @@ mod tests {
                 return Err(ProviderError::Interrupted {
                     reason: crate::StopReason::TimedOut,
                     confirmed_stopped: false,
-                    stdout: "RAW_STDOUT_SECRET".into(),
-                    stderr: "RAW_STDERR_SECRET".into(),
-                    diagnostic: "RAW_DIAGNOSTIC_SECRET".into(),
                 });
             }
             if self.fail {
                 return Err(ProviderError::TimedOutWithOutput {
                     timeout: request.timeout(),
-                    stdout: "RAW_STDOUT_SECRET".into(),
-                    stderr: "RAW_STDERR_SECRET".into(),
                 });
             }
             Ok(ProviderResult::new(
@@ -2228,32 +2232,34 @@ mod tests {
         let accepted = service
             .submit_attempt(&request(&repo, &task_id, 0, "crash-recovery"))
             .unwrap();
-        let connection = ledger.lock_connection().unwrap();
-        connection
-            .execute(
-                "UPDATE service_operations SET status='running',started_at=?2 WHERE id=?1",
-                params![accepted.operation_id().as_str(), now_ms()],
-            )
+        assert!(service.claim_operation(accepted.operation_id()).unwrap());
+        service
+            .record_workspace_locator(accepted.operation_id(), &task_id, accepted.attempt_id())
             .unwrap();
-        connection
-            .execute(
-                "UPDATE attempts SET state='running',started_at=?3 WHERE task_id=?1 AND id=?2",
-                params![task_id.as_str(), accepted.attempt_id().as_str(), now_ms()],
-            )
+        // Simulate a process crash immediately after the filesystem side effect,
+        // before validation or the Provider call can start.
+        let retained_workspace = workspace
+            .create_at_base(&task_id, accepted.attempt_id(), &repo.commit())
             .unwrap();
-        drop(connection);
 
         let recovered = service.recover_incomplete_operations().unwrap();
         assert_eq!(recovered, [accepted.operation_id().clone()]);
         let snapshot = service.get_operation(accepted.operation_id()).unwrap();
         assert_eq!(snapshot.status(), ServiceOperationStatus::RecoveryRequired);
-        assert_eq!(snapshot.attempt_state(), AttemptState::Running);
+        assert_eq!(snapshot.attempt_state(), AttemptState::Queued);
         assert_eq!(snapshot.diagnostic_code(), Some("interrupted"));
+        assert_eq!(snapshot.workspace_path(), Some(retained_workspace.path()));
+        assert_eq!(
+            snapshot.workspace_branch(),
+            Some(retained_workspace.branch())
+        );
+        assert!(snapshot.workspace_path().unwrap().exists());
         let repeated = service
             .run(accepted.operation_id(), CancellationToken::new())
             .unwrap();
         assert_eq!(repeated.status(), ServiceOperationStatus::RecoveryRequired);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, accepted.attempt_id());
     }
 
     #[test]
