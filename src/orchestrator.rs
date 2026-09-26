@@ -704,7 +704,7 @@ fn fail_attempt_with_provider_error(
         .expect("newly added attempt must be owned by its task");
     if matches!(
         error,
-        ProviderError::Cancelled | ProviderError::CancelledWithOutput { .. }
+        ProviderError::Cancelled | ProviderError::CancelledWithOutput
     ) {
         attempt
             .cancel_with_reason(crate::AttemptFailureReason::Cancelled)
@@ -725,9 +725,7 @@ fn fail_attempt_with_provider_error(
 
 fn provider_error_status(error: &ProviderError) -> OperationStatus {
     match error.kind() {
-        ProviderError::Cancelled | ProviderError::CancelledWithOutput { .. } => {
-            OperationStatus::Cancelled
-        }
+        ProviderError::Cancelled | ProviderError::CancelledWithOutput => OperationStatus::Cancelled,
         ProviderError::TimedOut { .. } | ProviderError::TimedOutWithOutput { .. } => {
             OperationStatus::TimedOut
         }
