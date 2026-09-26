@@ -291,6 +291,7 @@ impl SqliteExecutionLedger {
         create_task_creation_schema(&transaction)?;
         create_ci_observation_schema(&transaction)?;
         create_publication_identity_schema(&transaction)?;
+        create_ci_wait_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -969,6 +970,28 @@ impl SqliteExecutionLedger {
             LedgerError::InvalidStoredValue("execution ledger mutex was poisoned".into())
         })
     }
+}
+
+fn create_ci_wait_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_ci_wait_operations (
+             id TEXT PRIMARY KEY NOT NULL,
+             request_id TEXT NOT NULL UNIQUE,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             expected_revision INTEGER NOT NULL,
+             target_json TEXT NOT NULL,
+             deadline_ms INTEGER NOT NULL,
+             status TEXT NOT NULL CHECK(status IN ('accepted','running','completed','failed','recovery_required')),
+             observation_id TEXT REFERENCES ci_observations(id),
+             details_ref TEXT,
+             error_code TEXT,
+             accepted_at INTEGER NOT NULL,
+             started_at INTEGER,
+             finished_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS service_ci_wait_task_status
+             ON service_ci_wait_operations(task_id,status);",
+    )
 }
 
 fn set_schema_version(connection: &Connection, version: u32) -> Result<(), rusqlite::Error> {
