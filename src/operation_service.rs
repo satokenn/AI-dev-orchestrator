@@ -668,7 +668,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                         AttemptFailureReason::Timeout,
                         "timeout",
                     ),
-                    ProviderError::Cancelled | ProviderError::CancelledWithOutput { .. } => (
+                    ProviderError::Cancelled | ProviderError::CancelledWithOutput => (
                         ServiceOperationStatus::Cancelled,
                         AttemptFailureReason::Cancelled,
                         "cancelled",
@@ -1169,16 +1169,11 @@ mod tests {
                 return Err(ProviderError::Interrupted {
                     reason: crate::StopReason::TimedOut,
                     confirmed_stopped: false,
-                    stdout: "RAW_STDOUT_SECRET".into(),
-                    stderr: "RAW_STDERR_SECRET".into(),
-                    diagnostic: "RAW_DIAGNOSTIC_SECRET".into(),
                 });
             }
             if self.fail {
                 return Err(ProviderError::TimedOutWithOutput {
                     timeout: request.timeout(),
-                    stdout: "RAW_STDOUT_SECRET".into(),
-                    stderr: "RAW_STDERR_SECRET".into(),
                 });
             }
             Ok(ProviderResult::new(

@@ -17,5 +17,6 @@ fn codex_cli_provider_live_smoke_test() {
         .expect("Codex CLI provider should execute successfully");
 
     assert_eq!(result.exit_status(), Some(0));
-    assert!(result.stdout().contains("LIVE_PROVIDER_OK"));
+    let agent_result = result.agent_result().expect("Codex agent result");
+    assert!(agent_result.summary().contains("LIVE_PROVIDER_OK"));
 }
