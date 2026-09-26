@@ -422,6 +422,19 @@ pub trait CiProvider {
         target: &CiQueryTarget,
         timeout: Duration,
     ) -> Result<CiProviderSnapshot, CiProviderError>;
+
+    /// Observes against an explicit GitHub hostname. Providers that cannot pin
+    /// the host fail closed instead of silently using their default host.
+    fn observe_on_host(
+        &self,
+        _target: &CiQueryTarget,
+        _timeout: Duration,
+        _host: &str,
+    ) -> Result<CiProviderSnapshot, CiProviderError> {
+        Err(CiProviderError::Unavailable(
+            "CI Provider does not support explicit GitHub host selection".into(),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -507,13 +520,13 @@ impl From<LedgerError> for CiError {
     }
 }
 
-pub struct CiRuntime<'a, P> {
+pub struct CiRuntime<'a, P: ?Sized> {
     ledger: &'a SqliteExecutionLedger,
     provider: &'a P,
     poll_interval: Duration,
     api_timeout: Duration,
 }
-impl<'a, P: CiProvider> CiRuntime<'a, P> {
+impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
     pub fn new(
         ledger: &'a SqliteExecutionLedger,
         provider: &'a P,
@@ -537,19 +550,34 @@ impl<'a, P: CiProvider> CiRuntime<'a, P> {
         task_id: Option<&TaskId>,
         query: &CiQueryTarget,
     ) -> Result<CiObservation, CiError> {
-        self.observe_until(task_id, query, self.api_timeout)
+        self.observe_until(task_id, query, self.api_timeout, None)
+    }
+    pub(crate) fn observe_on_host(
+        &self,
+        task_id: Option<&TaskId>,
+        query: &CiQueryTarget,
+        host: &str,
+    ) -> Result<CiObservation, CiError> {
+        if !valid_gh_hostname(host) {
+            return Err(CiError::InvalidTarget(
+                "GitHub host must be a valid hostname".into(),
+            ));
+        }
+        self.observe_until(task_id, query, self.api_timeout, Some(host))
     }
     fn observe_until(
         &self,
         task_id: Option<&TaskId>,
         query: &CiQueryTarget,
         timeout: Duration,
+        host: Option<&str>,
     ) -> Result<CiObservation, CiError> {
         validate_query_target(query)?;
-        let snapshot = self
-            .provider
-            .observe(query, timeout)
-            .map_err(CiError::Provider)?;
+        let snapshot = match host {
+            Some(host) => self.provider.observe_on_host(query, timeout, host),
+            None => self.provider.observe(query, timeout),
+        }
+        .map_err(CiError::Provider)?;
         let target_matches = match query {
             CiQueryTarget::PullRequest {
                 repository, number, ..
@@ -605,6 +633,29 @@ impl<'a, P: CiProvider> CiRuntime<'a, P> {
         query: &CiQueryTarget,
         deadline: Instant,
     ) -> Result<CiObservation, CiError> {
+        self.wait_until(task_id, query, deadline, None)
+    }
+    pub(crate) fn wait_on_host(
+        &self,
+        task_id: &TaskId,
+        query: &CiQueryTarget,
+        deadline: Instant,
+        host: &str,
+    ) -> Result<CiObservation, CiError> {
+        if !valid_gh_hostname(host) {
+            return Err(CiError::InvalidTarget(
+                "GitHub host must be a valid hostname".into(),
+            ));
+        }
+        self.wait_until(task_id, query, deadline, Some(host))
+    }
+    fn wait_until(
+        &self,
+        task_id: &TaskId,
+        query: &CiQueryTarget,
+        deadline: Instant,
+        host: Option<&str>,
+    ) -> Result<CiObservation, CiError> {
         if deadline <= Instant::now() {
             return Err(CiError::Timeout {
                 last_observation_id: None,
@@ -637,7 +688,7 @@ impl<'a, P: CiProvider> CiRuntime<'a, P> {
                 },
                 CiQueryTarget::Commit { .. } => query.clone(),
             };
-            let observation = match self.observe_until(Some(task_id), &poll_query, timeout) {
+            let observation = match self.observe_until(Some(task_id), &poll_query, timeout, host) {
                 Ok(observation) => observation,
                 Err(CiError::HeadShaMismatch { expected, actual })
                     if pinned_sha.as_deref() == Some(expected.as_str()) && last.is_some() =>
@@ -858,6 +909,7 @@ fn aggregate(snapshot: &CiProviderSnapshot) -> (Vec<CiCheck>, CiAggregateState) 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GhCiProvider {
     executable: std::path::PathBuf,
+    hostname: Option<String>,
 }
 impl Default for GhCiProvider {
     fn default() -> Self {
@@ -868,11 +920,13 @@ impl GhCiProvider {
     pub fn new() -> Self {
         Self {
             executable: "gh".into(),
+            hostname: None,
         }
     }
     pub fn with_executable(executable: impl Into<std::path::PathBuf>) -> Self {
         Self {
             executable: executable.into(),
+            hostname: None,
         }
     }
 }
@@ -981,6 +1035,24 @@ impl CiProvider for GhCiProvider {
             observed_at_ms: now,
         })
     }
+
+    fn observe_on_host(
+        &self,
+        query: &CiQueryTarget,
+        timeout: Duration,
+        host: &str,
+    ) -> Result<CiProviderSnapshot, CiProviderError> {
+        if !valid_gh_hostname(host) {
+            return Err(CiProviderError::InvalidResponse(
+                "GitHub hostname is invalid".into(),
+            ));
+        }
+        Self {
+            executable: self.executable.clone(),
+            hostname: Some(host.to_owned()),
+        }
+        .observe(query, timeout)
+    }
 }
 
 impl GhCiProvider {
@@ -1010,11 +1082,7 @@ impl GhCiProvider {
         timeout: Duration,
     ) -> Result<Option<Value>, CiProviderError> {
         let output = crate::ProcessRunner
-            .run(
-                crate::ProcessRequest::new(self.executable.as_os_str().to_owned())
-                    .args(["api", "--include", endpoint])
-                    .timeout(timeout),
-            )
+            .run(self.api_request(endpoint, &["--include"], timeout))
             .map_err(|_| {
                 CiProviderError::Unavailable("GitHub API command did not complete".into())
             })?;
@@ -1097,11 +1165,7 @@ fn required_check_set_from_sources(
 impl GhCiProvider {
     fn api_json(&self, endpoint: &str, timeout: Duration) -> Result<Value, CiProviderError> {
         let output = crate::ProcessRunner
-            .run(
-                crate::ProcessRequest::new(self.executable.as_os_str().to_owned())
-                    .args(["api", "--paginate", "--slurp", endpoint])
-                    .timeout(timeout),
-            )
+            .run(self.api_request(endpoint, &["--paginate", "--slurp"], timeout))
             .map_err(|_| {
                 CiProviderError::Unavailable("GitHub API command did not complete".into())
             })?;
@@ -1113,6 +1177,37 @@ impl GhCiProvider {
         serde_json::from_slice(&output.stdout)
             .map_err(|error| CiProviderError::InvalidResponse(error.to_string()))
     }
+
+    fn api_request(
+        &self,
+        endpoint: &str,
+        flags: &[&str],
+        timeout: Duration,
+    ) -> crate::ProcessRequest {
+        let mut args = vec!["api".into()];
+        args.extend(flags.iter().map(|flag| (*flag).into()));
+        if let Some(hostname) = &self.hostname {
+            args.push("--hostname".into());
+            args.push(hostname.into());
+        }
+        args.push(endpoint.into());
+        let mut request =
+            crate::ProcessRequest::new(self.executable.as_os_str().to_owned()).timeout(timeout);
+        request.args = args;
+        request
+    }
+}
+
+fn valid_gh_hostname(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+        })
 }
 
 fn parse_rules(value: &Value) -> Result<Vec<RequiredCheck>, CiProviderError> {

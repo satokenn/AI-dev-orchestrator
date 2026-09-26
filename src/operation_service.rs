@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -14,9 +14,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     Attempt, AttemptFailureReason, AttemptId, AttemptSemantics, AttemptState, CancellationToken,
-    DomainError, LedgerError, ModelChoice, ModelRef, OperationId, ProviderError, ProviderRef,
-    ProviderRequest, ProviderResolver, SqliteExecutionLedger, TaskId, TaskRole, TaskState,
-    UsageCost, UsageMetric, ValidationResult, Validator, WorkspaceError, WorkspaceManager,
+    CiError, CiObservation, CiProvider, CiQueryTarget, CiRuntime, DomainError, LedgerError,
+    ModelChoice, ModelRef, OperationId, ProviderError, ProviderRef, ProviderRequest,
+    ProviderResolver, SqliteExecutionLedger, TaskId, TaskRole, TaskState, UsageCost, UsageMetric,
+    ValidationResult, Validator, WorkspaceError, WorkspaceManager,
     artifact::{
         ArtifactCodexDecisionRecord, ArtifactPublicationPermit, ArtifactValidationRecord,
         CodexDecisionKind,
@@ -314,6 +315,17 @@ pub struct ArtifactPublicationRequest {
     validation_id: String,
     decision_id: String,
     payload: ArtifactPublicationPayload,
+}
+
+/// Target for the synchronous CI Service preparation API.
+///
+/// Publication lookup uses the internal Publication operation ID. This is not
+/// the separate `publication_id` defined by the MCP wire contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CiServiceTarget {
+    PublicationOperation(OperationId),
+    PullRequest { repository: String, number: u64 },
+    Commit { repository: String, sha: String },
 }
 
 impl ArtifactPublicationRequest {
@@ -676,6 +688,8 @@ pub enum ServiceError {
     ValidationFailed,
     PublicationFailed,
     PublicationRecoveryRequired,
+    CiProviderUnavailable,
+    Ci(CiError),
     InvalidStateTransition(DomainError),
     Workspace(WorkspaceError),
     Artifact(ArtifactError),
@@ -720,6 +734,8 @@ impl std::fmt::Display for ServiceError {
             Self::PublicationRecoveryRequired => {
                 formatter.write_str("Artifact publication requires recovery; it was not replayed")
             }
+            Self::CiProviderUnavailable => formatter.write_str("CI Provider is not configured"),
+            Self::Ci(error) => error.fmt(formatter),
             Self::InvalidStateTransition(error) => error.fmt(formatter),
             Self::Workspace(_) => formatter.write_str("workspace preparation failed"),
             Self::Artifact(_) => formatter.write_str("artifact operation failed"),
@@ -730,6 +746,12 @@ impl std::fmt::Display for ServiceError {
 }
 
 impl std::error::Error for ServiceError {}
+
+impl From<CiError> for ServiceError {
+    fn from(error: CiError) -> Self {
+        Self::Ci(error)
+    }
+}
 
 fn validate_task_create(request: &TaskCreateRequest) -> Result<(), ServiceError> {
     match (request.source, request.issue.as_ref()) {
@@ -753,6 +775,31 @@ fn validate_task_create(request: &TaskCreateRequest) -> Result<(), ServiceError>
         }
     }
     Ok(())
+}
+
+fn repository_from_pull_request_url(url: &str, expected_number: u64) -> Option<String> {
+    let remainder = url.strip_prefix("https://")?;
+    let (host, path) = remainder.split_once('/')?;
+    if host != "github.com" {
+        return None;
+    }
+    let segments = path.split('/').collect::<Vec<_>>();
+    if segments.len() != 4
+        || segments[2] != "pull"
+        || segments[3] != expected_number.to_string()
+        || !valid_repository_component(segments[0])
+        || !valid_repository_component(segments[1])
+    {
+        return None;
+    }
+    Some(format!("{}/{}", segments[0], segments[1]))
+}
+
+fn valid_repository_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn is_absolute_uri(value: &str) -> bool {
@@ -938,6 +985,9 @@ pub struct OperationService<'a, P> {
     default_timeout: Duration,
     secret_scanner: Option<&'a dyn SecretScanner>,
     publication_gateway: Option<&'a dyn ArtifactPublicationGateway>,
+    ci_provider: Option<&'a (dyn CiProvider + Sync)>,
+    ci_poll_interval: Duration,
+    ci_api_timeout: Duration,
 }
 
 impl<'a, P: ProviderResolver> OperationService<'a, P> {
@@ -964,6 +1014,9 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             default_timeout,
             secret_scanner: None,
             publication_gateway: None,
+            ci_provider: None,
+            ci_poll_interval: Duration::from_millis(250),
+            ci_api_timeout: default_timeout,
         })
     }
 
@@ -982,6 +1035,26 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
     ) -> Self {
         self.publication_gateway = Some(gateway);
         self
+    }
+
+    /// Injects the read-only GitHub CI observer used by the synchronous
+    /// preparation Service API. Full asynchronous `ci.wait` acceptance is a
+    /// separate wire-contract integration.
+    pub fn with_ci_provider(
+        mut self,
+        provider: &'a (dyn CiProvider + Sync),
+        poll_interval: Duration,
+        api_timeout: Duration,
+    ) -> Result<Self, ServiceError> {
+        if poll_interval.is_zero() || api_timeout.is_zero() {
+            return Err(ServiceError::InvalidRequest(
+                "CI poll interval and API timeout must be positive",
+            ));
+        }
+        self.ci_provider = Some(provider);
+        self.ci_poll_interval = poll_interval;
+        self.ci_api_timeout = api_timeout;
+        Ok(self)
     }
 
     /// Creates a pending Task and its revision zero snapshot atomically. The
@@ -2005,6 +2078,138 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         })
     }
 
+    /// Observes CI for a direct PR / commit target or a completed internal
+    /// Publication operation. This synchronous API does not implement the MCP
+    /// `publication_id` mapping or asynchronous `ci.wait` operation contract.
+    pub fn get_ci(&self, target: &CiServiceTarget) -> Result<CiObservation, ServiceError> {
+        let (task_id, query, host) = self.resolve_ci_target(target, None)?;
+        let runtime = self.ci_runtime()?;
+        match host {
+            Some(host) => runtime.observe_on_host(task_id.as_ref(), &query, &host),
+            None => runtime.observe(task_id.as_ref(), &query),
+        }
+        .map_err(ServiceError::from)
+    }
+
+    /// Waits synchronously for a direct target or a completed internal
+    /// Publication operation after checking the Task revision. Direct targets
+    /// are attributed to the caller's Task; only Publication targets verify
+    /// ownership against the saved Publication record. The full wire contract
+    /// returns an asynchronous OperationAcceptance and is not exposed here.
+    pub fn wait_ci(
+        &self,
+        task_id: &TaskId,
+        expected_revision: u64,
+        target: &CiServiceTarget,
+        deadline: Instant,
+    ) -> Result<CiObservation, ServiceError> {
+        let current_revision = self.current_task_revision(task_id)?;
+        if current_revision != expected_revision {
+            return Err(ServiceError::StaleRevision {
+                expected: expected_revision,
+                actual: current_revision,
+            });
+        }
+        let (attributed_task_id, query, host) = self.resolve_ci_target(target, Some(task_id))?;
+        let attributed_task_id = attributed_task_id.ok_or(ServiceError::InvalidStoredState)?;
+        let runtime = self.ci_runtime()?;
+        match host {
+            Some(host) => runtime.wait_on_host(&attributed_task_id, &query, deadline, &host),
+            None => runtime.wait(&attributed_task_id, &query, deadline),
+        }
+        .map_err(ServiceError::from)
+    }
+
+    fn ci_runtime(&self) -> Result<CiRuntime<'a, dyn CiProvider + Sync + 'a>, ServiceError> {
+        let provider = self
+            .ci_provider
+            .ok_or(ServiceError::CiProviderUnavailable)?;
+        CiRuntime::new(
+            self.ledger,
+            provider,
+            self.ci_poll_interval,
+            self.ci_api_timeout,
+        )
+        .map_err(ServiceError::from)
+    }
+
+    fn resolve_ci_target(
+        &self,
+        target: &CiServiceTarget,
+        task_id: Option<&TaskId>,
+    ) -> Result<(Option<TaskId>, CiQueryTarget, Option<String>), ServiceError> {
+        match target {
+            CiServiceTarget::PullRequest { repository, number } => Ok((
+                task_id.cloned(),
+                CiQueryTarget::PullRequest {
+                    repository: repository.clone(),
+                    number: *number,
+                    expected_head_sha: None,
+                },
+                None,
+            )),
+            CiServiceTarget::Commit { repository, sha } => Ok((
+                task_id.cloned(),
+                CiQueryTarget::Commit {
+                    repository: repository.clone(),
+                    sha: sha.clone(),
+                },
+                None,
+            )),
+            CiServiceTarget::PublicationOperation(operation_id) => {
+                let publication = self.get_artifact_publication_operation(operation_id)?;
+                if publication.state() != ServiceOperationStatus::Completed
+                    || publication.phase() != ArtifactPublicationPhase::Published
+                {
+                    return Err(ServiceError::PolicyDenied(
+                        "CI requires a completed Publication operation",
+                    ));
+                }
+                if task_id.is_some_and(|task_id| task_id != publication.task_id()) {
+                    return Err(ServiceError::PolicyDenied(
+                        "Publication operation belongs to a different Task",
+                    ));
+                }
+                let commit_sha = publication
+                    .commit_sha()
+                    .ok_or(ServiceError::InvalidStoredState)?;
+                let pull_request = publication
+                    .pull_request()
+                    .ok_or(ServiceError::InvalidStoredState)?;
+                if commit_sha != pull_request.head_sha() {
+                    return Err(ServiceError::InvalidStoredState);
+                }
+                let repository =
+                    repository_from_pull_request_url(pull_request.url(), pull_request.number())
+                        .ok_or(ServiceError::InvalidStoredState)?;
+                Ok((
+                    Some(publication.task_id().clone()),
+                    CiQueryTarget::PullRequest {
+                        repository,
+                        number: pull_request.number(),
+                        expected_head_sha: Some(commit_sha.to_owned()),
+                    },
+                    Some("github.com".to_owned()),
+                ))
+            }
+        }
+    }
+
+    fn current_task_revision(&self, task_id: &TaskId) -> Result<u64, ServiceError> {
+        let connection = self.ledger.lock_connection()?;
+        let revision: Option<i64> = connection
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        revision
+            .ok_or(ServiceError::TaskNotFound)?
+            .try_into()
+            .map_err(|_| ServiceError::InvalidStoredState)
+    }
+
     fn find_publication_acceptance(
         &self,
         request_id: &str,
@@ -2850,8 +3055,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        AgentProvider, AgentResult, ProviderError, ProviderRegistry, ProviderResult,
-        PublicationGatewayError, SecretScanError, Task, UsageCost,
+        AgentProvider, AgentResult, CiAggregateState, CiCheckDetailState, CiCheckSource,
+        CiProviderError, CiProviderSnapshot, CiTarget, ProviderError, ProviderRegistry,
+        ProviderResult, PublicationGatewayError, RawCiCheck, RequiredCheck, RequiredCheckSet,
+        RequiredCheckSetSource, SecretScanError, Task, UsageCost,
     };
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
@@ -3279,13 +3486,99 @@ mod tests {
             }
             Ok(DraftPullRequest::new(
                 17,
-                "https://github.test/owner/repo/pull/17",
+                "https://github.com/owner/repo/pull/17",
                 true,
                 commit_sha,
                 payload.head_branch(),
                 payload.base_branch(),
             ))
         }
+    }
+
+    struct FakeCiProvider {
+        snapshot: crate::CiProviderSnapshot,
+        queries: Mutex<Vec<CiQueryTarget>>,
+        hosts: Mutex<Vec<String>>,
+    }
+
+    impl crate::CiProvider for FakeCiProvider {
+        fn observe(
+            &self,
+            target: &CiQueryTarget,
+            _timeout: Duration,
+        ) -> Result<crate::CiProviderSnapshot, CiProviderError> {
+            self.queries.lock().unwrap().push(target.clone());
+            Ok(self.snapshot.clone())
+        }
+
+        fn observe_on_host(
+            &self,
+            target: &CiQueryTarget,
+            timeout: Duration,
+            host: &str,
+        ) -> Result<crate::CiProviderSnapshot, CiProviderError> {
+            self.hosts.lock().unwrap().push(host.to_owned());
+            self.observe(target, timeout)
+        }
+    }
+
+    fn ci_provider_snapshot(
+        repository: &str,
+        pull_request_number: Option<u64>,
+        head_sha: &str,
+    ) -> crate::CiProviderSnapshot {
+        CiProviderSnapshot {
+            target: CiTarget::new(repository, pull_request_number, head_sha),
+            required_checks: RequiredCheckSet::known_from(
+                vec![RequiredCheck::new("build", Some(7))],
+                RequiredCheckSetSource::TrustedConfiguration,
+                123,
+            ),
+            checks: vec![RawCiCheck {
+                name: "build".into(),
+                detail_state: CiCheckDetailState::Passed,
+                url: Some("https://example.test/check".into()),
+                completed_at: Some("2026-01-01T00:00:00Z".into()),
+                app_id: Some(7),
+                source: CiCheckSource::GithubCheckRuns,
+            }],
+            check_runs_available: true,
+            commit_statuses_available: true,
+            observed_at_ms: 123,
+        }
+    }
+
+    fn publish_fixture(
+        fixture: &ArtifactPublicationFixture,
+        request_id: &str,
+    ) -> ArtifactPublicationSnapshot {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: Arc::clone(&events),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events,
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(fixture, request_id);
+        let acceptance = service.publish_artifact(&request).unwrap();
+        service
+            .run_artifact_publication(&acceptance, &request)
+            .unwrap()
     }
 
     struct ArtifactPublicationFixture {
@@ -4972,6 +5265,204 @@ mod tests {
         assert_eq!(retry.operation_id(), &operation_id);
         assert_eq!(retry.status(), ServiceOperationStatus::RecoveryRequired);
         assert_eq!(events.lock().unwrap().len(), events_before_retry);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn ci_get_for_publication_operation_binds_task_pr_and_saved_head_sha() {
+        let fixture = artifact_publication_fixture();
+        let publication = publish_fixture(&fixture, "ci-publication-get");
+        let head_sha = publication.commit_sha().unwrap().to_owned();
+        let provider = FakeCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(17), &head_sha),
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+
+        let observation = service
+            .get_ci(&CiServiceTarget::PublicationOperation(
+                publication.operation_id().clone(),
+            ))
+            .unwrap();
+
+        assert_eq!(observation.task_id(), Some(&fixture.task_id));
+        assert_eq!(observation.target().repository(), "owner/repo");
+        assert_eq!(observation.target().pull_request_number(), Some(17));
+        assert_eq!(observation.target().head_sha(), head_sha);
+        assert_eq!(observation.state(), CiAggregateState::Passed);
+        assert_eq!(*provider.hosts.lock().unwrap(), ["github.com"]);
+        assert!(matches!(
+            provider.queries.lock().unwrap().first(),
+            Some(CiQueryTarget::PullRequest {
+                repository,
+                number: 17,
+                expected_head_sha: Some(sha),
+            }) if repository == "owner/repo" && sha == &head_sha
+        ));
+        let persisted = fixture
+            .ledger
+            .get_ci_observation(observation.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted, observation);
+        let other_task_id = TaskId::new("different-ci-task");
+        fixture
+            .ledger
+            .save_task(&Task::new(
+                other_task_id.clone(),
+                "different task",
+                TaskRole::new("reviewer"),
+            ))
+            .unwrap();
+        let query_count = provider.queries.lock().unwrap().len();
+        assert!(matches!(
+            service.wait_ci(
+                &other_task_id,
+                0,
+                &CiServiceTarget::PublicationOperation(publication.operation_id().clone()),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(ServiceError::PolicyDenied(_))
+        ));
+        assert_eq!(provider.queries.lock().unwrap().len(), query_count);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn ci_get_does_not_persist_when_publication_head_sha_changed() {
+        let fixture = artifact_publication_fixture();
+        let publication = publish_fixture(&fixture, "ci-publication-head-mismatch");
+        let saved_head_sha = publication.commit_sha().unwrap().to_owned();
+        let current_head_sha = if saved_head_sha == "a".repeat(40) {
+            "b".repeat(40)
+        } else {
+            "a".repeat(40)
+        };
+        let provider = FakeCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(17), &current_head_sha),
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+
+        assert!(matches!(
+            service.get_ci(&CiServiceTarget::PublicationOperation(
+                publication.operation_id().clone(),
+            )),
+            Err(ServiceError::Ci(CiError::HeadShaMismatch { expected, actual }))
+                if expected == saved_head_sha && actual == current_head_sha
+        ));
+        let count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM ci_observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn ci_publication_url_must_have_an_exact_pr_path_and_number() {
+        assert_eq!(
+            repository_from_pull_request_url("https://github.com/owner/repo/pull/17", 17)
+                .as_deref(),
+            Some("owner/repo")
+        );
+        for invalid in [
+            "http://github.com/owner/repo/pull/17",
+            "https://github.com/owner/repo/pull/18",
+            "https://user@github.com/owner/repo/pull/17",
+            "https://github.com/owner/repo/pull/17?query=1",
+            "https://github.com/owner/repo/pull/17/files",
+            "https://github.com/owner%2Frepo/pull/17",
+            "https://github.test/owner/repo/pull/17",
+        ] {
+            assert_eq!(
+                repository_from_pull_request_url(invalid, 17),
+                None,
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_wait_service_attributes_direct_target_to_caller_task_and_persists_observation() {
+        let fixture = artifact_publication_fixture();
+        let head_sha = "c".repeat(40);
+        let provider = FakeCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(4), &head_sha),
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+        let revision = task_revision(&fixture.ledger, &fixture.task_id);
+
+        let observation = service
+            .wait_ci(
+                &fixture.task_id,
+                revision,
+                &CiServiceTarget::PullRequest {
+                    repository: "owner/repo".into(),
+                    number: 4,
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert_eq!(observation.task_id(), Some(&fixture.task_id));
+        assert_eq!(observation.state(), CiAggregateState::Passed);
+        assert_eq!(
+            fixture
+                .ledger
+                .get_ci_observation(observation.id())
+                .unwrap()
+                .unwrap(),
+            observation
+        );
         cleanup_fixture_worktree(
             &fixture.repo,
             &fixture.workspace,

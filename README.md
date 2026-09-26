@@ -73,6 +73,8 @@ Provider起動前にworkspaceのHEADが指定base commitと一致し、tracked�
 
 同一Artifact公開MVPはRust API `publish_artifact`（証拠/secret scanと原子的受付）、`run_artifact_publication`（受付済み操作の実行）、専用 `get_artifact_publication_operation`（最終結果取得）から利用できます。呼び出し側が`SecretScanner`とGitHub publication gatewayを明示注入しない場合、公開は拒否されます。Artifactの全treeとPR title/body等のpayloadを受付前と実行直前の両方でscanし、検出・失敗・利用不能なら拒否します。commit tree、親commit、Draft PRのhead SHA・base/head branch・title/body一致を確認し、tree・commit SHA・PR番号・Draft状態と検証/採否IDを専用Ledgerに記録します。raw title/bodyはLedgerに保存せず、digestで冪等性を照合します。Git/gh subprocessはProcessRunnerの有限timeoutと上限付き出力を使い、timeout後にpush/PRの成否が不明な場合は`recovery_required`へ進み再実行しません。title/bodyはProcessRunnerのstdinから`gh api --input -`へ直接渡し、argv、Ledger、OS一時ファイルへ書きません。SQLite schema v12はPublication専用operation tableを追加し、v11 Ledgerを開くと既存記録を保持してmigrationします。再起動時は未claimの`accepted` publicationを`failed`（`interrupted_before_start`）、実行claim後の`running` publicationを`recovery_required`として記録し、どちらも自動再実行しません。MCP `publication.publish` と既存`operation.get`への統合、publication用cancel APIは未接続であり、公開操作の取得には専用Rust APIを使います。
 
+CI観測の準備APIは、明示注入した`CiProvider`を使う`OperationService::get_ci`（一度観測）と同期`wait_ci`（期限まで待機）から利用できます。targetはPR、commit、または完了済みPublication operationです。Publication operationを使う場合は、記録されたTask・PR番号・保存head SHAを照合し、HTTPSのGitHub.com PR URLからrepositoryを厳密に導出してGitHub API接続先も`github.com`へ固定します。GitHub Enterpriseなど他hostはfail closedです。内部Rust APIの`PublicationOperation(OperationId)`は、MCP wire契約の`publication_id`ではありません。MCPでの`ci.wait`受付・冪等性・非同期Operation結果取得、および独立Publication IDへの対応付けは未実装です。
+
 Service利用側は明示したbase commitで受付し、返されたIDで同期実行または後から状態取得を行います。
 
 ```rust,ignore
