@@ -301,10 +301,9 @@ OperationServiceは`task.create`の前にtitle、description、各constraint、I
 
 Taskと選択したsectionのsnapshotを読む。読取専用。
 
-このService sliceは`providers`と`attempts`のContextPageを生成する。MCP transportは#45の対象であり、ここでは未実装。
+このService sliceは`providers`、`usage`、`attempts`のContextPageを生成する。`usage`はOperation Service Ledgerに保存されたProvider報告metricだけを返し、budgetやquotaは作らない。保存値をJSON numberとして保持できない場合は`value:null`、`basis:"unknown"`とし、元の文字列値は返さない。観測時刻にはOperationの完了時刻を使い、未保存ならnullとする。MCP transportは#45の対象であり、ここでは未実装。
 保存済みTask snapshotの要求textはcontext返却前にもSecretScannerでredactし、固定点であることを確認する。これにより既存の未redacted snapshotもraw textを返さない。SecretScannerが未設定、redactionが失敗、または固定点を作れない場合はProvider probeより前に`policy_denied`とし、raw snapshotを含む応答を返さない。
-この2 sectionではprovider observationsを同一snapshot内で一括返し、page_size未満に収まらなければrequestを拒否する。
-Attempt historyは`occurred_at`降順、同時刻ならID降順でpage化し、cursorはTask、section、page size、Task revisionに束縛する。
+`providers` sectionではprovider observationsを同一snapshot内で一括返し、page_size未満に収まらなければrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化し、cursorはTask、section、page size、Task revisionに束縛する。
 Provider観測sourceがProvider一覧を列挙できない場合は、空配列として成功したように見せずcontext取得を失敗させる。
 
 | Request field | JSON type | Required | 意味 |

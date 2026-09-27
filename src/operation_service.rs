@@ -39,6 +39,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TaskContextSection {
     Providers,
+    Usage,
     Attempts,
 }
 
@@ -46,6 +47,7 @@ impl TaskContextSection {
     fn as_str(self) -> &'static str {
         match self {
             Self::Providers => "providers",
+            Self::Usage => "usage",
             Self::Attempts => "attempts",
         }
     }
@@ -108,6 +110,15 @@ struct ContextAttemptMetadata {
     input_artifact_id: Option<String>,
     output_artifact_id: Option<String>,
     base_commit: String,
+}
+
+struct ContextUsageMetric {
+    id: String,
+    attempt_id: String,
+    finished_at_ms: Option<i64>,
+    name: String,
+    value: String,
+    unit: String,
 }
 
 impl TaskContextPage {
@@ -962,6 +973,74 @@ fn provider_context_item(observation: &ProviderObservation) -> serde_json::Value
     })
 }
 
+fn usage_context_item(metric: &ContextUsageMetric) -> serde_json::Value {
+    let parsed_value = parse_usage_number(&metric.value);
+    let basis = if parsed_value.is_some() {
+        "measured"
+    } else {
+        "unknown"
+    };
+    let observed_at = metric.finished_at_ms.map(epoch_ms_to_rfc3339);
+    serde_json::json!({
+        "id": metric.id,
+        "kind": "usage",
+        "state": null,
+        "occurred_at": observed_at,
+        "summary": format!("Provider-reported usage metric {}", metric.name),
+        "references": [{"kind":"attempt", "id":metric.attempt_id}],
+        "details": {
+            "name": metric.name,
+            "value": parsed_value,
+            "unit": metric.unit,
+            "basis": basis,
+            "observed_at": observed_at,
+        }
+    })
+}
+
+fn parse_usage_number(value: &str) -> Option<serde_json::Number> {
+    // First validate the stored text as one JSON number. Integer values are
+    // parsed through i64/u64 so valid large counters never round through f64.
+    let json_number = serde_json::from_str::<serde_json::Number>(value).ok()?;
+    if !value.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
+        return value
+            .parse::<i64>()
+            .map(serde_json::Number::from)
+            .or_else(|_| value.parse::<u64>().map(serde_json::Number::from))
+            .ok();
+    }
+    let parsed_float = json_number.as_f64()?;
+    if !parsed_float.is_finite() {
+        return None;
+    }
+    let represented = serde_json::Number::from_f64(parsed_float)?;
+    (normalized_decimal(value)? == normalized_decimal(&represented.to_string())?)
+        .then_some(represented)
+}
+
+fn normalized_decimal(value: &str) -> Option<(bool, String, i64)> {
+    let (mantissa, exponent) = match value.find(['e', 'E']) {
+        Some(index) => (&value[..index], value[index + 1..].parse::<i64>().ok()?),
+        None => (value, 0),
+    };
+    let (negative, mantissa) = mantissa
+        .strip_prefix('-')
+        .map_or((false, mantissa), |unsigned| (true, unsigned));
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut digits = format!("{whole}{fraction}");
+    let mut scale = exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
+    let first_nonzero = digits.bytes().position(|digit| digit != b'0');
+    let Some(first_nonzero) = first_nonzero else {
+        return Some((false, "0".into(), 0));
+    };
+    digits.drain(..first_nonzero);
+    while digits.ends_with('0') {
+        digits.pop();
+        scale = scale.checked_add(1)?;
+    }
+    Some((negative, digits, scale))
+}
+
 fn attempt_context_item(
     record: &crate::AttemptRecord,
     operation: Option<&ContextAttemptMetadata>,
@@ -1598,7 +1677,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         self
     }
 
-    /// Reads the Task snapshot and the v2 `providers` / `attempts` ContextPage
+    /// Reads the Task snapshot and the v2 `providers` / `usage` / `attempts` ContextPage
     /// sections without changing the Task, running an Attempt, or persisting a
     /// probe result. Only explicitly registered Provider adapters are sampled.
     pub fn get_context(
@@ -1634,7 +1713,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ));
         }
 
-        let (mut task_snapshot, revision, attempts) = {
+        let (mut task_snapshot, revision, attempts, usage) = {
             let connection = self.ledger.lock_connection()?;
             let transaction = connection.unchecked_transaction()?;
             if !transaction.query_row(
@@ -1666,6 +1745,30 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             task_snapshot.revision = revision as u64;
             task_snapshot.state = task.state();
             let attempts = self.ledger.load_attempts(&transaction, task_id)?;
+            let mut usage_statement = transaction.prepare(
+                "SELECT operation.id,operation.attempt_id,operation.finished_at,
+                        metric.sequence,metric.name,metric.value,metric.unit
+                 FROM service_operations operation
+                 JOIN service_operation_usage metric ON metric.operation_id=operation.id
+                 WHERE operation.task_id=?1
+                 ORDER BY operation.finished_at DESC,operation.id DESC,metric.sequence DESC",
+            )?;
+            let usage = usage_statement
+                .query_map(params![task_id.as_str()], |row| {
+                    let operation_id: String = row.get(0)?;
+                    let attempt_id: String = row.get(1)?;
+                    let sequence: i64 = row.get(3)?;
+                    Ok(ContextUsageMetric {
+                        id: format!("usage:{operation_id}:{sequence}"),
+                        attempt_id,
+                        finished_at_ms: row.get(2)?,
+                        name: row.get(4)?,
+                        value: row.get(5)?,
+                        unit: row.get(6)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(usage_statement);
             let operation_details = attempts.iter().map(|record| {
                 let detail = transaction.query_row(
                     "SELECT operation.role,operation.accepted_at,operation.finished_at,
@@ -1691,6 +1794,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 task_snapshot,
                 revision as u64,
                 (attempts, operation_details),
+                usage,
             )
         };
         redact_task_creation_result(&mut task_snapshot, self.secret_scanner)?;
@@ -1704,6 +1808,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 None => 0,
             };
             if *section == TaskContextSection::Attempts && offset > attempts.0.len() {
+                return Err(ServiceError::InvalidRequest(
+                    "cursor offset exceeds section length",
+                ));
+            }
+            if *section == TaskContextSection::Usage && offset > usage.len() {
                 return Err(ServiceError::InvalidRequest(
                     "cursor offset exceeds section length",
                 ));
@@ -1747,6 +1856,9 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                         attempt_context_item(record, details, observed_at_ms)
                     })
                     .collect::<Vec<_>>(),
+                TaskContextSection::Usage => {
+                    usage.iter().map(usage_context_item).collect::<Vec<_>>()
+                }
             };
             items.sort_by(|left, right| {
                 right["occurred_at"]
@@ -4016,6 +4128,159 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn task_get_context_returns_persisted_usage_with_safe_numeric_values_and_paging() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = TaskId::new("usage-context-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "Usage context task",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let checks = Arc::new(AtomicUsize::new(0));
+        let mut providers = ProviderRegistry::new();
+        providers.register(FakeProvider {
+            calls,
+            availability_checks: checks,
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            requested_models: None,
+            observed_target: None,
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
+        let task = service
+            .create_task(
+                "caller",
+                &TaskCreateRequest::new(
+                    "create-usage-context",
+                    TaskSource::Manual,
+                    "Usage",
+                    "Observe persisted provider usage",
+                    vec![],
+                    None,
+                ),
+            )
+            .unwrap();
+        let accepted = service
+            .submit_attempt(&AttemptRunRequest::new(
+                "run-usage-context",
+                task.task_id().clone(),
+                task.revision(),
+                ProviderRef::new("fake"),
+                ModelChoice::ProviderDefault,
+                "inspect usage",
+                TaskRole::new("implementer"),
+                BaseInput::new(&repo.0, repo.commit()),
+            ))
+            .unwrap();
+        service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        {
+            let connection = ledger.lock_connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE service_operation_usage SET value='9007199254740993' WHERE operation_id=?1 AND sequence=0",
+                    params![accepted.operation_id().as_str()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO service_operation_usage(operation_id,sequence,name,value,unit) VALUES(?1,1,'cost','0.25','USD')",
+                    params![accepted.operation_id().as_str()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO service_operation_usage(operation_id,sequence,name,value,unit) VALUES(?1,2,'malformed','not-a-number','count')",
+                    params![accepted.operation_id().as_str()],
+                )
+                .unwrap();
+        }
+
+        let sections = [TaskContextSection::Usage];
+        let first = service
+            .get_context(task.task_id(), &sections, 1, &BTreeMap::new())
+            .unwrap();
+        let first_item = &first.sections()["usage"].items()[0];
+        assert_eq!(first_item["kind"], "usage");
+        assert_eq!(first_item["details"]["name"], "malformed");
+        assert_eq!(first_item["details"]["value"], serde_json::Value::Null);
+        assert_eq!(first_item["details"]["basis"], "unknown");
+        assert!(first_item["details"]["observed_at"].as_str().is_some());
+        assert_eq!(
+            first_item["references"][0]["id"],
+            accepted.attempt_id().as_str()
+        );
+        let cursor = first.sections()["usage"].next_cursor().unwrap().to_owned();
+        let cursors = BTreeMap::from([("usage".to_owned(), cursor.clone())]);
+        let second = service
+            .get_context(task.task_id(), &sections, 1, &cursors)
+            .unwrap();
+        let second_item = &second.sections()["usage"].items()[0];
+        assert_eq!(second_item["details"]["name"], "cost");
+        assert_eq!(second_item["details"]["value"], 0.25);
+        assert_eq!(second_item["details"]["basis"], "measured");
+        assert_eq!(second_item["details"]["unit"], "USD");
+        assert!(second_item["details"]["observed_at"].as_str().is_some());
+        let second_cursor = second.sections()["usage"].next_cursor().unwrap().to_owned();
+        let third_cursor = BTreeMap::from([("usage".to_owned(), second_cursor)]);
+        let third = service
+            .get_context(task.task_id(), &sections, 1, &third_cursor)
+            .unwrap();
+        let third_item = &third.sections()["usage"].items()[0];
+        assert_eq!(third_item["details"]["name"], "input_tokens");
+        assert_eq!(
+            third_item["details"]["value"].as_u64(),
+            Some(9_007_199_254_740_993)
+        );
+        assert_eq!(third_item["details"]["basis"], "measured");
+        assert_eq!(third_item["details"]["unit"], "token");
+        assert!(third.sections()["usage"].next_cursor().is_none());
+        assert!(matches!(
+            service.get_context(task.task_id(), &sections, 2, &cursors),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+        let wrong_section = [TaskContextSection::Attempts];
+        let mismatched_cursor = BTreeMap::from([("attempts".to_owned(), cursor)]);
+        assert!(matches!(
+            service.get_context(task.task_id(), &wrong_section, 1, &mismatched_cursor),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn usage_number_parsing_preserves_integer_precision_and_rejects_out_of_range_values() {
+        assert_eq!(
+            parse_usage_number("9007199254740993").unwrap().to_string(),
+            "9007199254740993"
+        );
+        assert_eq!(
+            parse_usage_number("18446744073709551616"),
+            None,
+            "an integer outside the JSON number integer range must not round through f64"
+        );
+        assert_eq!(parse_usage_number("1e400"), None);
+        assert_eq!(parse_usage_number("9007199254740993.0"), None);
+        assert_eq!(parse_usage_number("1e-400"), None);
+        assert_eq!(parse_usage_number("0.25").unwrap().to_string(), "0.25");
+        assert_eq!(parse_usage_number("NaN"), None);
     }
 
     #[test]
