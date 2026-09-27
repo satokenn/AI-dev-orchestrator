@@ -773,13 +773,17 @@ impl SqliteExecutionLedger {
                 let temporary_identity = file.metadata()?;
                 if let Err(error) = file.write_all(log_content) {
                     drop(file);
-                    remove_created_log_if_unchanged(&temporary_path, &temporary_identity);
+                    remove_staging_log_if_unchanged(
+                        &temporary_path,
+                        &temporary_identity,
+                        log_content,
+                    );
                     return Err(error.into());
                 }
                 file.sync_all()?;
                 drop(file);
                 let publish_result = fs::hard_link(&temporary_path, &path);
-                remove_created_log_if_unchanged(&temporary_path, &temporary_identity);
+                remove_staging_log_if_unchanged(&temporary_path, &temporary_identity, log_content);
                 publish_result?;
                 (fs::symlink_metadata(&path)?, true)
             }
@@ -1102,6 +1106,22 @@ fn remove_created_log_if_unchanged(path: &Path, created: &fs::Metadata) {
 
 #[cfg(not(unix))]
 fn remove_created_log_if_unchanged(_path: &Path, _created: &fs::Metadata) {}
+
+#[cfg(unix)]
+fn remove_staging_log_if_unchanged(path: &Path, created: &fs::Metadata, _content: &[u8]) {
+    remove_created_log_if_unchanged(path, created);
+}
+
+#[cfg(not(unix))]
+fn remove_staging_log_if_unchanged(path: &Path, _created: &fs::Metadata, content: &[u8]) {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && !metadata.file_type().is_symlink()
+        && metadata.is_file()
+        && fs::read(path).is_ok_and(|staged| staged == content)
+    {
+        let _ = fs::remove_file(path);
+    }
+}
 
 impl ExecutionLedger for SqliteExecutionLedger {
     fn accept_operation(&self, request: &OperationRequest) -> Result<OperationRecord, LedgerError> {
