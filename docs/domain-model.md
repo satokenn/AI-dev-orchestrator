@@ -118,9 +118,26 @@ Codex自身が編集した場合はAttemptを作らない。管理済みArtifact
 
 ## Operation Serviceとの境界
 
-監督Codexは目的の解釈、Provider / Model選択、実行・review・再試行の要否、成果物の採否、Task完了を判断する。Operation ServiceはTask ID、expected revision、request ID、workspace / Artifactの所属を検証し、操作受付・各事実・公開/CI参照を永続化する。Provider / Model、Validator、GitHub adapterを実行し、stale revision、busy、未知Provider / Model、policy違反、異なるArtifactへの証拠流用を外部副作用前に拒否する。これが #66 のOperation Service契約である。
+監督Codexは目的の解釈、Provider / Model選択、実行・review・再試行の要否、成果物の採否、Task完了を判断する。Operation ServiceはTask ID、expected revision、request ID、workspace / Artifactの所属を検証し、操作受付・各事実・公開/CI参照を永続化する。Provider / Model、Validator、GitHub adapterを実行し、stale revision、busy、未知Provider / Model、policy違反、異なるArtifactへの証拠流用を外部副作用前に拒否する。永続LedgerではServiceがベースLedgerとOperation sidecarのcanonical identityに結び付いたプロセス排他ロックを保持し、同じLedgerへの別プロセス実行を拒否する。Service構築時はそのロックを得た後、残存する実行中Operationを `recovery_required` にしてからServiceを返す。復旧をProvider実行中に再呼出しする公開操作は設けない。in-memory LedgerはService構築時の自動復旧を行わない。これが #66 のOperation Service契約である。
 
-Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`か、同じTaskに属する既存`ArtifactInput { artifact_id }`のどちらかを受け取る。後者は保存tree/ref/baseをProvider起動前に照合し、検証済みbaseから新しい管理worktreeを作ってtreeを展開する。Providerが停止した後、ServiceはworkspaceをGit treeへsnapshotし、ignored扱いの新規ファイルを除外したArtifactを出力としてAttemptへ関連付ける。Task、Attempt、Operation、Artifactと入出力relationは同じSQLite Ledgerに保存する。Git refの作成はDB transactionと一括で原子化できないため、Artifact rowを`pending_ref`で先に記録し、tree/refを照合して復旧できない場合は`recovery_required`として使用を拒否する。
+named Modelは、Service構築時にtrusted composition rootが明示注入するread-only `ModelCatalog` が、対象Provider / Modelを `Supported` とし、sourceと観測時刻がありfreshness内の場合だけ受付ける。catalog未設定、lookup error、欠落、unknown / unsupported、未来時刻、古い記録、source欠落はTask / Attempt / Operation記録やProvider起動より前にfail closedする。受付後もOperation実行時にcatalogを再照会し、まずOperation claimやProvider準備処理より前に確認し、続いてworkspace準備後・Attempt開始直前にもう一度確認する。実行前の照会で失敗した要求はOperationを`failed`で終端し、Providerを開始していないことを示すためAttemptは`queued`のままにする。同じrequest IDの再送はこの終端結果を返し、再実行しない。最後の照会で失敗した場合、BaseInput workspaceはclean-only cleanupを試みる。ArtifactInput workspaceは保存済み内容を失わないよう保持し、pathをLedgerに残す。現在のServiceはこのworkspaceを自動削除せず、手動cleanup APIも提供しないため、運用者が記録されたpathを確認して整理する。これはArtifactInput展開後のCatalog再確認失敗に限る例外であり、workspaceを恒久保持する契約ではない。削除を証明できないworkspaceもlocatorを保持して`model_catalog_unavailable_workspace_retained`を記録する。catalog lookupは外部CLIやnetworkを起動しない。ProviderDefaultはcatalogを使わない。ModelCatalogはpoint-in-time照会であり、照会後のcatalog変更をロックするleaseは提供しない。Provider-specific catalog adapter / data sourceは後続Issue #60 / #91の対象であり、既存の候補一覧を実行権限として扱わない。ProviderResultで実Modelを観測できない場合は、requested Modelから推定せずunknownのまま保持する。
+
+Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`か、同じTaskに属する既存`ArtifactInput { artifact_id }`のどちらかを受け取る。後者は保存tree/ref/baseをProvider起動前に照合し、検証済みbaseから新しい管理worktreeを作ってtreeを展開する。Provider停止後のArtifact snapshotはtracked変更とignoredでない新規ファイルを含み、ignoredファイルは意図的に除外する。Provider実行中にignoredファイルが作られた場合、Serviceはそれを黙って落として成功Artifactを作ることはせず、Operationを`recovery_required`にし、調査用workspaceを保持する。Task、Attempt、Operation、Artifactと入出力relationは同じSQLite Ledgerに保存する。Git refの作成はDB transactionと一括で原子化できないため、Artifact rowを`pending_ref`で先に記録する。プロセス再起動時はService構築中にLedger lockを保持したままpending ArtifactのGit tree/refを照合し、treeが存在してrefが未作成ならrefを再作成して利用可能にする。tree欠落やref不一致は`recovery_required`として使用を拒否する。この接続だけではValidation、review、CodexDecision、publicationの公開ゲートまでは実装されない。
+
+<a id="named-model-workspace-cleanup"></a>
+
+### named Modelの実行前再確認に失敗して残るworkspace
+
+workspace準備後・Attempt開始直前のCatalog再確認に失敗したOperationはProviderを起動せず、`failed`で終端する。ArtifactInputの場合、保存済み成果物を独立writerとの競合で失わないようworkspaceを削除せず、`OperationSnapshot.workspace_path()` と `workspace_branch()` にlocatorを残す。BaseInputの場合は通常のnon-force cleanupを試す。cleanupに成功したときはworkspace locatorを消し、cleanupに失敗したときはworkspaceを保持して `model_catalog_unavailable_workspace_retained` を記録する。現行Serviceに残存workspaceを自動削除する処理やcleanup APIはない。これらは失敗時の安全措置であり、workspaceを恒久保持する契約ではない。
+
+ArtifactInputまたはcleanup失敗後にlocatorが残る場合、運用者が手動整理するには`OperationService::get_operation`のsnapshotから`workspace_path()`と`workspace_branch()`を記録する。pathがある場合は、`git -C <workspace-path> rev-parse --path-format=absolute --git-common-dir`で共有Git directoryを確認し、その親directoryを元repository rootとして次を行う。
+
+1. `git -C <repository-root> worktree list --porcelain`で対象pathとbranchが記録値に一致することを確認する。
+2. workspace内の変更、未追跡file、ignored fileとその内容を確認する。例えば`git -C <workspace-path> status --short --ignored=matching`を使う。状態がdirty、unknown、または内容を安全に確認できない場合は削除せず、必要な内容を退避して調査する。
+3. cleanでignored内容も存在しないと確認できた場合だけ、`git -C <repository-root> worktree remove <workspace-path>`を実行する。`--force`は使わない。削除に失敗した場合はworkspaceを保持する。
+4. Worktree削除後もbranchは自動削除されない。branch名はOperation snapshotの`workspace_branch()`で確認でき、`git -C <repository-root> branch --list <workspace-branch>`で存在を照合できる。branch自体の削除は、内容と他の参照を別途確認した後に運用者が判断する。
+
+worktree managerの`cleanup`はdirty workspaceを保持するnon-force操作である。この手動手順は、ArtifactInputを保護する場合とBaseInputのcleanupが失敗した場合の両方に適用する。
 
 ### 同一Artifact証拠ゲートのMVP
 

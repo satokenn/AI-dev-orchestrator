@@ -646,7 +646,7 @@ Planner 結果を Task / Attempt へ適用する前に、Rust は少なくとも
 5. Provider と Model の availability がともに `available` である。
 6. Model が role の required capability をすべて持つ。
 7. Rust が所有する予算、利用枠、retry 上限、安全 policy に反しない。
-8. 実行直前に availability と `hard` constraint を再取得し、snapshot 後に変化した事実に反しない。
+8. 実行直前に availability と `hard` constraint を再取得し、snapshot 後に変化した事実に反しない。named Modelでは、Operation受付後にも信頼済みModelCatalogを照会し、Provider準備前とAttempt開始直前に対象Provider / Modelがfreshかつsupportedであることを確認する。照会不能・欠落・unknown・unsupported・staleならProviderを開始せず、Operationを失敗で終端する。
 
 1〜6は選定結果の構造と snapshot に対する検証、7〜8は現在事実に対する実行許可である。
 `ValidatedPlannerDecision` 相当の値は両方を通過して初めて Provider 実行へ渡せる。検証失敗は

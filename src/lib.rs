@@ -53,16 +53,17 @@ pub use model_observation::{
 };
 pub use operation_ledger::{
     EventKind, ExecutionLedger as OperationLedger, LedgerError as OperationLedgerError,
-    LogReference, OperationEvent, OperationId, OperationRecord, OperationRequest, OperationStatus,
-    PublicationReference, RecoveryRecord, ReviewRecord,
+    LedgerRunLock, LogReference, OperationEvent, OperationId, OperationRecord, OperationRequest,
+    OperationStatus, PublicationReference, RecoveryRecord, ReviewRecord,
     SqliteExecutionLedger as SqliteOperationLedger, UsageRecord, ValidationRecord,
 };
 pub use operation_service::{
     ArtifactInput, ArtifactPublicationAcceptance, ArtifactPublicationPhase,
     ArtifactPublicationRequest, ArtifactPublicationSnapshot, AttemptInput, AttemptRunRequest,
-    BaseInput, OperationAcceptance, OperationService, OperationSnapshot, ServiceError,
-    ServiceOperationStatus, TaskContextPage, TaskContextResult, TaskContextSection,
-    TaskCreateRequest, TaskCreationResult, TaskIssueSnapshot, TaskRequestSnapshot, TaskSource,
+    BaseInput, ModelCapabilityStatus, ModelCatalog, ModelCatalogEntry, ModelCatalogError,
+    OperationAcceptance, OperationService, OperationSnapshot, ServiceError, ServiceOperationStatus,
+    TaskContextPage, TaskContextResult, TaskContextSection, TaskCreateRequest, TaskCreationResult,
+    TaskIssueSnapshot, TaskRequestSnapshot, TaskSource,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,
