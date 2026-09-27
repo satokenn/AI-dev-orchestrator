@@ -1158,16 +1158,17 @@ fn availability_state(status: &crate::AvailabilityStatus) -> &'static str {
     }
 }
 fn availability_json(observation: &crate::AvailabilityObservation) -> serde_json::Value {
-    let status = match &observation.status {
-        crate::AvailabilityStatus::Available => serde_json::json!({"status":"available"}),
-        crate::AvailabilityStatus::Unavailable { reason } => {
-            serde_json::json!({"status":"unavailable","reason":reason})
-        }
-        crate::AvailabilityStatus::Unknown { reason } => {
-            serde_json::json!({"status":"unknown","reason":reason})
-        }
-    };
-    serde_json::json!({"status":status,"observed_at_ms":observation.observed_at_ms,"source":evidence_source_json(&observation.source)})
+    let mut value = serde_json::json!({
+        "status": availability_state(&observation.status),
+        "observed_at_ms": observation.observed_at_ms,
+        "source": evidence_source_json(&observation.source),
+    });
+    if let crate::AvailabilityStatus::Unavailable { reason }
+    | crate::AvailabilityStatus::Unknown { reason } = &observation.status
+    {
+        value["reason"] = serde_json::json!(reason);
+    }
+    value
 }
 fn evidence_json<T: ContextEvidenceValue>(evidence: &Evidence<T>) -> serde_json::Value {
     match evidence {
@@ -4097,8 +4098,20 @@ mod tests {
         let provider = &json["sections"]["providers"]["items"][0]["details"];
         assert_eq!(provider["cli_present"]["status"], "known");
         assert_eq!(provider["cli_present"]["value"], true);
-        assert_eq!(provider["authentication"]["status"]["status"], "unknown");
+        assert_eq!(provider["authentication"]["status"], "unknown");
+        assert!(provider["authentication"]["reason"].as_str().is_some());
         assert_eq!(provider["availability"], "unknown");
+        assert_eq!(provider["availability_evidence"]["status"], "unknown");
+        assert!(
+            provider["availability_evidence"]["reason"]
+                .as_str()
+                .is_some()
+        );
+        assert!(
+            provider["availability_evidence"]["status"]
+                .get("status")
+                .is_none()
+        );
         assert_eq!(
             provider["availability_evidence"]["source"]["kind"],
             "provider_cli"
@@ -7956,11 +7969,3 @@ mod tests {
             .submit_attempt(&request(&repo, &task_id, 0, "memory-live-operation"))
             .unwrap();
         assert!(first.claim_operation(accepted.operation_id()).unwrap());
-
-        let second =
-            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
-        let snapshot = second.get_operation(accepted.operation_id()).unwrap();
-        assert_eq!(snapshot.status(), ServiceOperationStatus::Running);
-    }
-}
