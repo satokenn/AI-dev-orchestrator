@@ -7969,6 +7969,5 @@ mod tests {
             .submit_attempt(&request(&repo, &task_id, 0, "memory-live-operation"))
             .unwrap();
         assert!(first.claim_operation(accepted.operation_id()).unwrap());
-
     }
 }
