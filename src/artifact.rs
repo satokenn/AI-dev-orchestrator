@@ -194,6 +194,7 @@ pub enum ArtifactError {
     },
     Invalid(String),
     RecoveryRequired,
+    IgnoredFiles,
     WorkspaceChanged {
         expected: String,
         actual: String,
@@ -221,6 +222,9 @@ impl fmt::Display for ArtifactError {
             }
             Self::Invalid(e) => write!(f, "invalid artifact: {e}"),
             Self::RecoveryRequired => f.write_str("artifact requires recovery"),
+            Self::IgnoredFiles => {
+                f.write_str("ignored workspace files cannot be captured as an artifact")
+            }
             Self::WorkspaceChanged { expected, actual } => {
                 write!(f, "workspace changed: expected {expected}, found {actual}")
             }
@@ -369,6 +373,21 @@ impl<'a> ArtifactManager<'a> {
             ref_name,
             state: ArtifactState::PendingRef,
         };
+        self.persist_pending(task, attempt, input_id, &record)?;
+        self.install_ref(&record)?;
+        self.set_state(task, &record.id, ArtifactState::Available)?;
+        let mut available = record;
+        available.state = ArtifactState::Available;
+        Ok(available)
+    }
+
+    fn persist_pending(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+        input_id: Option<&str>,
+        record: &ArtifactRecord,
+    ) -> Result<(), ArtifactError> {
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(parent) = input_id {
@@ -377,15 +396,10 @@ impl<'a> ArtifactManager<'a> {
                 return Err(ArtifactError::NotFound);
             }
         }
-        tx.execute("INSERT INTO service_artifacts(id,task_id,source_attempt_id,input_artifact_id,base_commit,tree_oid,repository_root,ref_name,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending_ref',?9)", params![record.id, task.as_str(), attempt.as_str(), input_id, record.base_commit, record.tree_oid, root.to_string_lossy().as_ref(), record.ref_name, now_ms()])?;
+        tx.execute("INSERT INTO service_artifacts(id,task_id,source_attempt_id,input_artifact_id,base_commit,tree_oid,repository_root,ref_name,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending_ref',?9)", params![record.id, task.as_str(), record.source_attempt_id.as_deref(), input_id, record.base_commit, record.tree_oid, record.repository_root.to_string_lossy().as_ref(), record.ref_name, now_ms()])?;
         tx.execute("UPDATE service_attempt_artifacts SET output_artifact_id=?3 WHERE task_id=?1 AND attempt_id=?2", params![task.as_str(), attempt.as_str(), record.id])?;
         tx.commit()?;
-        drop(connection);
-        self.install_ref(&record)?;
-        self.set_state(task, &record.id, ArtifactState::Available)?;
-        let mut available = record;
-        available.state = ArtifactState::Available;
-        Ok(available)
+        Ok(())
     }
 
     pub(crate) fn verify_input(
@@ -802,6 +816,39 @@ impl<'a> ArtifactManager<'a> {
         self.snapshot(path)
     }
 
+    /// Completes ref installation for durable pending records while the Service owns
+    /// the persistent Ledger process lock. Missing objects become RecoveryRequired;
+    /// transient Git failures abort startup without changing the pending record.
+    pub(crate) fn recover_pending(&self) -> Result<(), ArtifactError> {
+        let repository = self
+            .workspaces
+            .repository_root()
+            .to_string_lossy()
+            .into_owned();
+        let connection = self.ledger.lock_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT task_id,id FROM service_artifacts
+             WHERE state='pending_ref' AND repository_root=?1 ORDER BY created_at,id",
+        )?;
+        let pending = statement
+            .query_map(params![repository], |row| {
+                Ok((
+                    TaskId::new(row.get::<_, String>(0)?),
+                    row.get::<_, String>(1)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+        for (task, id) in pending {
+            match self.read(&task, &id) {
+                Ok(_) | Err(ArtifactError::RecoveryRequired) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     fn load(&self, task: &TaskId, id: &str) -> Result<Option<ArtifactRecord>, ArtifactError> {
         let connection = self.ledger.lock_connection()?;
         connection.query_row("SELECT id,source_attempt_id,input_artifact_id,base_commit,tree_oid,repository_root,ref_name,state FROM service_artifacts WHERE task_id=?1 AND id=?2", params![task.as_str(), id], |row| {
@@ -831,6 +878,7 @@ impl<'a> ArtifactManager<'a> {
     }
 
     fn snapshot(&self, path: &Path) -> Result<String, ArtifactError> {
+        self.reject_ignored_files(path)?;
         let temp = TempIndex::create()?;
         let index = temp.path().join("index").to_string_lossy().into_owned();
         let index_env = [("GIT_INDEX_FILE", index)];
@@ -846,6 +894,32 @@ impl<'a> ArtifactManager<'a> {
             return Err(ArtifactError::Invalid("invalid Git tree id".into()));
         }
         Ok(tree)
+    }
+
+    fn reject_ignored_files(&self, path: &Path) -> Result<(), ArtifactError> {
+        let output = self.run_git(
+            path,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+            &[],
+        )?;
+        if output.output_truncated {
+            return Err(ArtifactError::Git(
+                "workspace status output truncated".into(),
+            ));
+        }
+        if output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.starts_with(b"!! "))
+        {
+            return Err(ArtifactError::IgnoredFiles);
+        }
+        Ok(())
     }
 
     fn normalize_commit(&self, cwd: &Path, oid: &str) -> Result<String, ArtifactError> {
@@ -1011,14 +1085,206 @@ fn process_error(error: ProcessError) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactError, ArtifactManager, CodexDecisionKind, REF_PREFIX,
-        is_missing_git_object_diagnostic, new_id,
+        ArtifactError, ArtifactManager, ArtifactRecord, ArtifactState, CodexDecisionKind,
+        REF_PREFIX, is_missing_git_object_diagnostic, new_id,
     };
     use crate::{
-        AttemptId, SqliteExecutionLedger, Task, TaskId, TaskRole, ValidationResult,
-        WorkspaceManager,
+        AgentProvider, AttemptId, AttemptRunRequest, BaseInput, ModelChoice, OperationService,
+        ProviderError, ProviderRef, ProviderRegistry, ProviderRequest, ProviderResult,
+        SqliteExecutionLedger, Task, TaskId, TaskRole, ValidationResult, WorkspaceManager,
     };
-    use std::{fs, process::Command};
+    use std::{
+        fs,
+        path::PathBuf,
+        process::{Command, Stdio},
+    };
+
+    const CRASH_LEDGER: &str = "AI_DEV_ORCHESTRATOR_ARTIFACT_CRASH_LEDGER";
+    const CRASH_REPOSITORY: &str = "AI_DEV_ORCHESTRATOR_ARTIFACT_CRASH_REPOSITORY";
+    const CRASH_TASK: &str = "AI_DEV_ORCHESTRATOR_ARTIFACT_CRASH_TASK";
+    const CRASH_ATTEMPT: &str = "AI_DEV_ORCHESTRATOR_ARTIFACT_CRASH_ATTEMPT";
+    const CRASH_BASE: &str = "AI_DEV_ORCHESTRATOR_ARTIFACT_CRASH_BASE";
+    const CRASH_TREE: &str = "AI_DEV_ORCHESTRATOR_ARTIFACT_CRASH_TREE";
+
+    struct NoopProvider(ProviderRef);
+
+    impl AgentProvider for NoopProvider {
+        fn provider_ref(&self) -> &ProviderRef {
+            &self.0
+        }
+        fn execute(&self, _request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {
+            unreachable!("crash recovery test does not execute a provider")
+        }
+        fn check_availability(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    fn git(path: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn pending_ref_crash_child_exits_after_persist() {
+        let Some(ledger_path) = std::env::var_os(CRASH_LEDGER) else {
+            return;
+        };
+        let repository = PathBuf::from(std::env::var_os(CRASH_REPOSITORY).unwrap());
+        let ledger = SqliteExecutionLedger::open(ledger_path).unwrap();
+        let workspaces = WorkspaceManager::new(&repository).unwrap();
+        let task = TaskId::new(std::env::var(CRASH_TASK).unwrap());
+        let attempt = AttemptId::new(std::env::var(CRASH_ATTEMPT).unwrap());
+        let id = "crash-window-artifact".to_owned();
+        let record = ArtifactRecord {
+            id: id.clone(),
+            task_id: task.clone(),
+            source_attempt_id: Some(attempt.as_str().to_owned()),
+            input_artifact_id: None,
+            base_commit: std::env::var(CRASH_BASE).unwrap(),
+            tree_oid: std::env::var(CRASH_TREE).unwrap(),
+            repository_root: fs::canonicalize(repository).unwrap(),
+            ref_name: format!("{REF_PREFIX}{id}"),
+            state: ArtifactState::PendingRef,
+        };
+        ArtifactManager::new(&workspaces, &ledger)
+            .persist_pending(&task, &attempt, None, &record)
+            .unwrap();
+        std::process::exit(77);
+    }
+
+    #[test]
+    fn restart_recovers_artifact_persisted_before_ref_installation() {
+        let root = std::env::temp_dir().join(format!("artifact-crash-window-{}", new_id()));
+        let repository = root.join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        git(
+            &repository,
+            &["config", "user.email", "artifact-test@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Artifact Test"]);
+        fs::write(repository.join("tracked.txt"), "tracked\n").unwrap();
+        git(&repository, &["add", "tracked.txt"]);
+        git(&repository, &["commit", "-m", "artifact base"]);
+        let repository = fs::canonicalize(repository).unwrap();
+        let base = git(&repository, &["rev-parse", "HEAD"]);
+        let tree = git(&repository, &["rev-parse", "HEAD^{tree}"]);
+        let ledger_path = root.join("execution.sqlite3");
+        let ledger = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let task = TaskId::new("artifact-crash-task");
+        ledger
+            .save_task(&Task::new(
+                task.clone(),
+                "crash recovery",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspaces = WorkspaceManager::new(&repository).unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(NoopProvider(ProviderRef::new("crash-test")));
+        let service = OperationService::new(
+            &ledger,
+            &workspaces,
+            &providers,
+            1,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let accepted = service
+            .submit_attempt(&AttemptRunRequest::new(
+                "crash-window-request",
+                task.clone(),
+                0,
+                ProviderRef::new("crash-test"),
+                ModelChoice::ProviderDefault,
+                "produce an artifact",
+                TaskRole::new("implementer"),
+                BaseInput::new(&repository, base.clone()),
+            ))
+            .unwrap();
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE service_operations SET status='running' WHERE id=?1",
+                rusqlite::params![accepted.operation_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE attempts SET state='running',started_at=1 WHERE task_id=?1 AND id=?2",
+                rusqlite::params![task.as_str(), accepted.attempt_id().as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        let attempt_id = accepted.attempt_id().as_str().to_owned();
+        let operation_id = accepted.operation_id().clone();
+        drop(service);
+        drop(ledger);
+
+        let executable = std::env::current_exe().unwrap();
+        let status = Command::new(executable)
+            .args([
+                "--exact",
+                "artifact::tests::pending_ref_crash_child_exits_after_persist",
+            ])
+            .env(CRASH_LEDGER, &ledger_path)
+            .env(CRASH_REPOSITORY, &repository)
+            .env(CRASH_TASK, task.as_str())
+            .env(CRASH_ATTEMPT, &attempt_id)
+            .env(CRASH_BASE, &base)
+            .env(CRASH_TREE, &tree)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(77));
+
+        let ledger = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let workspaces = WorkspaceManager::new(&repository).unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(NoopProvider(ProviderRef::new("crash-test")));
+        let service = OperationService::new(
+            &ledger,
+            &workspaces,
+            &providers,
+            1,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let snapshot = service.get_operation(&operation_id).unwrap();
+        assert_eq!(
+            snapshot.status(),
+            crate::ServiceOperationStatus::RecoveryRequired
+        );
+        assert_eq!(snapshot.output_artifact_id(), Some("crash-window-artifact"));
+        let manager = ArtifactManager::new(&workspaces, &ledger);
+        let artifact = manager
+            .verify_input(&task, "crash-window-artifact")
+            .unwrap();
+        assert_eq!(artifact.state(), ArtifactState::Available);
+        assert_eq!(git(&repository, &["rev-parse", &artifact.ref_name]), tree);
+        drop(service);
+        drop(manager);
+        drop(ledger);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn only_explicit_missing_object_diagnostics_confirm_absence() {

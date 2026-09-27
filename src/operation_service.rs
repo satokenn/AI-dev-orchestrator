@@ -330,6 +330,9 @@ pub enum ServiceError {
     Workspace(WorkspaceError),
     Artifact(ArtifactError),
     Ledger(LedgerError),
+    OperationLedger(crate::operation_ledger::LedgerError),
+    RecoveryLockRequired,
+    RecoveryLockMismatch,
     Sqlite(rusqlite::Error),
 }
 
@@ -368,6 +371,12 @@ impl std::fmt::Display for ServiceError {
             Self::Workspace(_) => formatter.write_str("workspace preparation failed"),
             Self::Artifact(_) => formatter.write_str("artifact operation failed"),
             Self::Ledger(error) => error.fmt(formatter),
+            Self::OperationLedger(error) => error.fmt(formatter),
+            Self::RecoveryLockRequired => formatter
+                .write_str("persistent Operation Service requires a process-wide ledger lock"),
+            Self::RecoveryLockMismatch => {
+                formatter.write_str("process-wide ledger lock belongs to a different ledger")
+            }
             Self::Sqlite(error) => write!(formatter, "operation service database error: {error}"),
         }
     }
@@ -378,6 +387,11 @@ impl std::error::Error for ServiceError {}
 impl From<LedgerError> for ServiceError {
     fn from(error: LedgerError) -> Self {
         Self::Ledger(error)
+    }
+}
+impl From<crate::operation_ledger::LedgerError> for ServiceError {
+    fn from(error: crate::operation_ledger::LedgerError) -> Self {
+        Self::OperationLedger(error)
     }
 }
 impl From<rusqlite::Error> for ServiceError {
@@ -413,15 +427,43 @@ pub struct OperationService<'a, P> {
     providers: &'a P,
     max_attempts: usize,
     default_timeout: Duration,
+    run_lock: Option<crate::operation_ledger::LedgerRunLock>,
 }
 
 impl<'a, P: ProviderResolver> OperationService<'a, P> {
+    /// Creates a service and, for a persistent ledger, acquires an exclusive process lock.
+    /// The service holds the lock until it is dropped, so recovery cannot race a live run.
     pub fn new(
         ledger: &'a SqliteExecutionLedger,
         workspaces: &'a WorkspaceManager,
         providers: &'a P,
         max_attempts: usize,
         default_timeout: Duration,
+    ) -> Result<Self, ServiceError> {
+        let run_lock = match ledger.ledger_path() {
+            Some(path) => Some(crate::operation_ledger::LedgerRunLock::acquire(path)?),
+            None => None,
+        };
+        Self::new_with_run_lock(
+            ledger,
+            workspaces,
+            providers,
+            max_attempts,
+            default_timeout,
+            run_lock,
+        )
+    }
+
+    /// Builds a service with a process lock already held by the caller.
+    /// Persistent ledgers require a matching lock; incomplete operations are recovered
+    /// before the service is returned.
+    pub fn new_with_run_lock(
+        ledger: &'a SqliteExecutionLedger,
+        workspaces: &'a WorkspaceManager,
+        providers: &'a P,
+        max_attempts: usize,
+        default_timeout: Duration,
+        run_lock: Option<crate::operation_ledger::LedgerRunLock>,
     ) -> Result<Self, ServiceError> {
         if max_attempts == 0 {
             return Err(ServiceError::PolicyDenied("max_attempts must be positive"));
@@ -431,13 +473,27 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 "default timeout must be positive",
             ));
         }
-        Ok(Self {
+        match (ledger.ledger_path(), run_lock.as_ref()) {
+            (Some(_), None) => return Err(ServiceError::RecoveryLockRequired),
+            (Some(_), Some(lock)) if !ledger.matches_run_lock(lock) => {
+                return Err(ServiceError::RecoveryLockMismatch);
+            }
+            (None, Some(_)) => return Err(ServiceError::RecoveryLockMismatch),
+            _ => {}
+        }
+        let service = Self {
             ledger,
             workspaces,
             providers,
             max_attempts,
             default_timeout,
-        })
+            run_lock,
+        };
+        service.recover_incomplete_operations()?;
+        if ledger.ledger_path().is_some() {
+            ArtifactManager::new(workspaces, ledger).recover_pending()?;
+        }
+        Ok(service)
     }
 
     fn idempotent_acceptance(
@@ -932,7 +988,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let (input_artifact_id, output_artifact_id): (Option<String>, Option<String>) = connection.query_row(
-            "SELECT relation.input_artifact_id,CASE WHEN artifact.state='available' THEN relation.output_artifact_id ELSE NULL END FROM service_attempt_artifacts relation LEFT JOIN service_artifacts artifact ON artifact.task_id=relation.task_id AND artifact.id=relation.output_artifact_id WHERE relation.task_id=?1 AND relation.attempt_id=?2",
+            "SELECT relation.input_artifact_id,relation.output_artifact_id FROM service_attempt_artifacts relation WHERE relation.task_id=?1 AND relation.attempt_id=?2",
             params![task, attempt], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?.unwrap_or((None, None));
         Ok(OperationSnapshot {
@@ -1140,9 +1196,20 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         Ok(())
     }
 
-    /// Call once during startup, before accepting requests, to close interrupted executions.
+    /// Closes operations left running by a prior process while the matching run lock is held.
+    /// Called only by service construction, before the service is exposed to callers.
     /// It never replays an operation whose running claim was persisted before a crash.
-    pub fn recover_incomplete_operations(&self) -> Result<Vec<OperationId>, ServiceError> {
+    fn recover_incomplete_operations(&self) -> Result<Vec<OperationId>, ServiceError> {
+        if self.ledger.ledger_path().is_none() {
+            return Ok(Vec::new());
+        }
+        match (self.ledger.ledger_path(), self.run_lock.as_ref()) {
+            (Some(_), None) => return Err(ServiceError::RecoveryLockRequired),
+            (Some(_), Some(lock)) if !self.ledger.matches_run_lock(lock) => {
+                return Err(ServiceError::RecoveryLockMismatch);
+            }
+            _ => {}
+        }
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pending = {
@@ -1404,12 +1471,13 @@ fn now_ms() -> i64 {
 mod tests {
     use std::{
         fs,
-        process::Command,
+        process::{Child, Command},
         sync::{
-            Arc, Barrier,
+            Arc, Barrier, Condvar, Mutex,
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         thread,
+        time::Instant,
     };
 
     use super::*;
@@ -1419,6 +1487,21 @@ mod tests {
     };
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
+    const CHILD_LEDGER_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_LEDGER";
+    const CHILD_REPOSITORY_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_REPOSITORY";
+    const CHILD_OPERATION_ID: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_OPERATION";
+    const CHILD_MARKER_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_MARKER";
+
+    fn sqlite_open_is_busy(error: &crate::LedgerError) -> bool {
+        matches!(
+            error,
+            crate::LedgerError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
 
     struct Repo(PathBuf);
 
@@ -1602,6 +1685,60 @@ mod tests {
         }
     }
 
+    struct BlockingProvider {
+        reference: ProviderRef,
+        calls: Arc<AtomicUsize>,
+        state: Arc<(Mutex<BlockingProviderState>, Condvar)>,
+    }
+
+    #[derive(Default)]
+    struct BlockingProviderState {
+        started: bool,
+        released: bool,
+    }
+
+    impl AgentProvider for BlockingProvider {
+        fn provider_ref(&self) -> &ProviderRef {
+            &self.reference
+        }
+
+        fn execute(&self, _request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().unwrap();
+            state.started = true;
+            changed.notify_all();
+            while !state.released {
+                state = changed.wait(state).unwrap();
+            }
+            Ok(
+                ProviderResult::new("", "", Some(0), Some(AgentResult::new("done", true)), None)
+                    .with_observed_target(Some(self.reference.clone()), None),
+            )
+        }
+
+        fn check_availability(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    struct BlockingResolver(BlockingProvider);
+
+    impl crate::ProviderResolver for BlockingResolver {
+        fn resolve(
+            &self,
+            provider: &ProviderRef,
+        ) -> Result<&dyn AgentProvider, crate::ProviderResolutionError> {
+            if provider == &self.0.reference {
+                Ok(&self.0)
+            } else {
+                Err(crate::ProviderResolutionError::UnknownProvider {
+                    provider: provider.clone(),
+                })
+            }
+        }
+    }
+
     struct FakeResolver(FakeProvider);
 
     impl crate::ProviderResolver for FakeResolver {
@@ -1617,6 +1754,27 @@ mod tests {
                 })
             }
         }
+    }
+
+    fn spawn_test_child(test_name: &str, variables: &[(&str, &str)]) -> Child {
+        let executable = std::env::current_exe().unwrap();
+        let mut command = Command::new(executable);
+        command.arg("--exact").arg(test_name).arg("--nocapture");
+        for (name, value) in variables {
+            command.env(name, value);
+        }
+        command.spawn().unwrap()
+    }
+
+    fn wait_for_file(path: &std::path::Path, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(value) = fs::read_to_string(path) {
+                return value;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for child marker {}", path.display());
     }
 
     fn request(repo: &Repo, task: &TaskId, revision: u64, id: &str) -> AttemptRunRequest {
@@ -1671,6 +1829,258 @@ mod tests {
             require_file: None,
         });
         (repo, ledger, workspace, providers, calls, checks, task_id)
+    }
+
+    #[test]
+    fn child_service_crashes_after_claim_and_parent_recovers() {
+        let Some(ledger_path) = std::env::var_os(CHILD_LEDGER_PATH) else {
+            return;
+        };
+        let ledger = SqliteExecutionLedger::open(ledger_path).unwrap();
+        let repository = PathBuf::from(std::env::var_os(CHILD_REPOSITORY_PATH).unwrap());
+        let workspace = WorkspaceManager::new(&repository).unwrap();
+        let resolver = FakeResolver(FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            require_file: None,
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
+                .unwrap();
+        let operation_id = OperationId::new(std::env::var(CHILD_OPERATION_ID).unwrap());
+        assert!(service.claim_operation(&operation_id).unwrap());
+        fs::write(std::env::var_os(CHILD_MARKER_PATH).unwrap(), "claimed").unwrap();
+        thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    fn child_reports_lock_acquisition_during_active_service() {
+        let Some(ledger_path) = std::env::var_os(CHILD_LEDGER_PATH) else {
+            return;
+        };
+        let result = (|| -> Result<&'static str, String> {
+            let ledger = match SqliteExecutionLedger::open(ledger_path) {
+                Ok(ledger) => ledger,
+                Err(error) if sqlite_open_is_busy(&error) => return Ok("busy"),
+                Err(error) => return Err(error.to_string()),
+            };
+            let repository = PathBuf::from(std::env::var_os(CHILD_REPOSITORY_PATH).unwrap());
+            let workspace =
+                WorkspaceManager::new(&repository).map_err(|error| error.to_string())?;
+            let resolver = FakeResolver(FakeProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+                availability_checks: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+                unknown_interrupt: false,
+                execute_delay: Duration::ZERO,
+                reference: ProviderRef::new("fake"),
+                write_output: None,
+                write_ignored: None,
+                require_file: None,
+            });
+            match OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
+            {
+                Err(ServiceError::OperationLedger(crate::OperationLedgerError::LockBusy)) => {
+                    Ok("busy")
+                }
+                Err(error) => Err(error.to_string()),
+                Ok(_service) => Ok("constructed"),
+            }
+        })();
+        let marker_value = result
+            .map(str::to_owned)
+            .unwrap_or_else(|error| format!("error:{error}"));
+        fs::write(std::env::var_os(CHILD_MARKER_PATH).unwrap(), marker_value).unwrap();
+    }
+
+    #[test]
+    fn persistent_service_lock_blocks_another_process_during_provider_execution() {
+        let repo = Repo::new();
+        let ledger_path = repo.0.join("execution.sqlite3");
+        let ledger = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let task_id = TaskId::new("locked-service-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "task",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new((Mutex::new(BlockingProviderState::default()), Condvar::new()));
+        let providers = BlockingResolver(BlockingProvider {
+            reference: ProviderRef::new("fake"),
+            calls: calls.clone(),
+            state: state.clone(),
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let accepted = service
+            .submit_attempt(&request(&repo, &task_id, 0, "process-lock"))
+            .unwrap();
+        let marker = repo.0.join("child-lock-result");
+        let ledger_path_text = ledger_path.to_string_lossy().into_owned();
+        let marker_text = marker.to_string_lossy().into_owned();
+        thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                service
+                    .run(accepted.operation_id(), CancellationToken::new())
+                    .unwrap()
+            });
+            let (provider_state, changed) = &*state;
+            let provider_state = provider_state.lock().unwrap();
+            let (mut provider_state, _) = changed
+                .wait_timeout_while(provider_state, Duration::from_secs(10), |state| {
+                    !state.started
+                })
+                .unwrap();
+            let provider_started = provider_state.started;
+            if !provider_started {
+                provider_state.released = true;
+                changed.notify_all();
+                drop(provider_state);
+                let _ = run.join();
+                panic!("provider did not start before the deadline");
+            }
+            drop(provider_state);
+            let mut child = spawn_test_child(
+                "operation_service::tests::child_reports_lock_acquisition_during_active_service",
+                &[
+                    (CHILD_LEDGER_PATH, &ledger_path_text),
+                    (CHILD_REPOSITORY_PATH, repo.0.to_str().unwrap()),
+                    (CHILD_MARKER_PATH, &marker_text),
+                ],
+            );
+            let marker_deadline = Instant::now() + Duration::from_secs(30);
+            let mut marker_value = None;
+            while Instant::now() < marker_deadline {
+                if let Ok(value) = fs::read_to_string(&marker) {
+                    marker_value = Some(value);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let Some(marker_value) = marker_value else {
+                let _ = child.kill();
+                let _ = child.wait();
+                let (provider_state, changed) = &*state;
+                provider_state.lock().unwrap().released = true;
+                changed.notify_all();
+                let _ = run.join();
+                panic!("competing service did not report its lock result");
+            };
+            let child_success = child.wait().unwrap().success();
+            let (provider_state, changed) = &*state;
+            provider_state.lock().unwrap().released = true;
+            changed.notify_all();
+            let result = run.join().unwrap();
+            assert_eq!(marker_value, "busy");
+            assert!(child_success);
+            assert_eq!(result.status(), ServiceOperationStatus::Completed);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn service_rejects_a_lock_for_a_different_ledger_identity() {
+        let repo = Repo::new();
+        let ledger_path = repo.0.join("execution.sqlite3");
+        let other_path = repo.0.join("other.sqlite3");
+        let ledger = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let other_lock = crate::LedgerRunLock::acquire(&other_path).unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let resolver = FakeResolver(FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            require_file: None,
+        });
+        assert!(matches!(
+            OperationService::new_with_run_lock(
+                &ledger,
+                &workspace,
+                &resolver,
+                3,
+                Duration::from_secs(30),
+                Some(other_lock),
+            ),
+            Err(ServiceError::RecoveryLockMismatch)
+        ));
+    }
+
+    #[test]
+    fn process_crash_releases_lock_and_allows_service_recovery() {
+        let repo = Repo::new();
+        let ledger_path = repo.0.join("execution.sqlite3");
+        let ledger = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let task_id = TaskId::new("crashed-service-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "task",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let resolver = FakeResolver(FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            require_file: None,
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
+                .unwrap();
+        let accepted = service
+            .submit_attempt(&request(&repo, &task_id, 0, "process-crash-recovery"))
+            .unwrap();
+        drop(service);
+        drop(ledger);
+
+        let marker = repo.0.join("child-claimed");
+        let ledger_path_text = ledger_path.to_string_lossy().into_owned();
+        let repository_path = repo.0.to_string_lossy().into_owned();
+        let operation_id = accepted.operation_id().as_str().to_owned();
+        let marker_text = marker.to_string_lossy().into_owned();
+        let mut child = spawn_test_child(
+            "operation_service::tests::child_service_crashes_after_claim_and_parent_recovers",
+            &[
+                (CHILD_LEDGER_PATH, &ledger_path_text),
+                (CHILD_REPOSITORY_PATH, &repository_path),
+                (CHILD_OPERATION_ID, &operation_id),
+                (CHILD_MARKER_PATH, &marker_text),
+            ],
+        );
+        assert_eq!(wait_for_file(&marker, Duration::from_secs(30)), "claimed");
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+
+        let ledger = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
+                .unwrap();
+        let operation = service.get_operation(accepted.operation_id()).unwrap();
+        assert_eq!(operation.status(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(operation.diagnostic_code(), Some("interrupted"));
     }
 
     #[test]
@@ -1769,6 +2179,64 @@ mod tests {
     }
 
     #[test]
+    fn ignored_provider_output_blocks_artifact_success_and_preserves_workspace() {
+        let repo = Repo::new();
+        fs::write(repo.0.join(".gitignore"), "*.excluded\n").unwrap();
+        git(&repo.0, &["add", ".gitignore"]);
+        git(&repo.0, &["commit", "-m", "ignore generated output"]);
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = TaskId::new("ignored-output-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "task with ignored output",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let providers = FakeResolver(FakeProvider {
+            calls: calls.clone(),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: Some(("secret.excluded".into(), "not in artifact".into())),
+            require_file: None,
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let accepted = service
+            .submit_attempt(&request(&repo, &task_id, 0, "ignored-output"))
+            .unwrap();
+        let result = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.status(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(result.diagnostic_code(), Some("artifact_capture_failed"));
+        assert_eq!(result.output_artifact_id(), None);
+        let workspace_path = result.workspace_path().unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace_path.join("secret.excluded")).unwrap(),
+            "not in artifact"
+        );
+        let artifact_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM service_artifacts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(artifact_count, 0);
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+    }
+
+    #[test]
     fn artifact_input_rework_is_task_scoped_and_captures_output() {
         let repo = Repo::new();
         fs::write(repo.0.join(".gitignore"), "*.excluded\n").unwrap();
@@ -1792,10 +2260,7 @@ mod tests {
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
             write_output: Some(("persisted-result-6f32.txt".into(), "saved result".into())),
-            write_ignored: Some((
-                "secret-output-6f32.excluded".into(),
-                "should not persist".into(),
-            )),
+            write_ignored: None,
             require_file: None,
         };
         let mut first_registry = ProviderRegistry::new();
@@ -1833,10 +2298,6 @@ mod tests {
         assert!(
             git(&repo.0, &["ls-tree", "-r", "--name-only", &tree])
                 .contains("persisted-result-6f32.txt")
-        );
-        assert!(
-            !git(&repo.0, &["ls-tree", "-r", "--name-only", &tree])
-                .contains("secret-output-6f32.excluded")
         );
         let persisted_state: String = ledger
             .lock_connection()
@@ -2224,8 +2685,31 @@ mod tests {
 
     #[test]
     fn startup_recovery_closes_running_operation_without_replay() {
-        let (repo, ledger, workspace, providers, calls, _, task_id) =
-            service_parts(false, Duration::ZERO, false);
+        let repo = Repo::new();
+        let ledger_path = repo.0.join("execution.sqlite3");
+        let ledger = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let task_id = TaskId::new("service-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "task description",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut providers = ProviderRegistry::new();
+        providers.register(FakeProvider {
+            calls: calls.clone(),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            require_file: None,
+        });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
@@ -2241,18 +2725,23 @@ mod tests {
         let retained_workspace = workspace
             .create_at_base(&task_id, accepted.attempt_id(), &repo.commit())
             .unwrap();
+        let retained_path = retained_workspace.path().to_path_buf();
+        let retained_branch = retained_workspace.branch().to_owned();
+        drop(service);
+        drop(ledger);
+        drop(workspace);
 
-        let recovered = service.recover_incomplete_operations().unwrap();
-        assert_eq!(recovered, [accepted.operation_id().clone()]);
+        let ledger = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
         let snapshot = service.get_operation(accepted.operation_id()).unwrap();
         assert_eq!(snapshot.status(), ServiceOperationStatus::RecoveryRequired);
         assert_eq!(snapshot.attempt_state(), AttemptState::Queued);
         assert_eq!(snapshot.diagnostic_code(), Some("interrupted"));
-        assert_eq!(snapshot.workspace_path(), Some(retained_workspace.path()));
-        assert_eq!(
-            snapshot.workspace_branch(),
-            Some(retained_workspace.branch())
-        );
+        assert_eq!(snapshot.workspace_path(), Some(retained_path.as_path()));
+        assert_eq!(snapshot.workspace_branch(), Some(retained_branch.as_str()));
         assert!(snapshot.workspace_path().unwrap().exists());
         let repeated = service
             .run(accepted.operation_id(), CancellationToken::new())
@@ -2494,5 +2983,24 @@ mod tests {
             &["worktree", "remove", "--force", &retained_path_text],
         );
         cleanup_fixture_worktree(&repo, &workspace, &task_id, completed.attempt_id());
+    }
+
+    #[test]
+    fn second_in_memory_service_does_not_recover_another_service_live_operation() {
+        let (repo, ledger, workspace, providers, _, _, task_id) =
+            service_parts(false, Duration::ZERO, false);
+        let first =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let accepted = first
+            .submit_attempt(&request(&repo, &task_id, 0, "memory-live-operation"))
+            .unwrap();
+        assert!(first.claim_operation(accepted.operation_id()).unwrap());
+
+        let second =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let snapshot = second.get_operation(accepted.operation_id()).unwrap();
+        assert_eq!(snapshot.status(), ServiceOperationStatus::Running);
     }
 }
