@@ -475,6 +475,9 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             run_lock,
         };
         service.recover_incomplete_operations()?;
+        if ledger.ledger_path().is_some() {
+            ArtifactManager::new(workspaces, ledger).recover_pending()?;
+        }
         Ok(service)
     }
 
@@ -970,7 +973,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let (input_artifact_id, output_artifact_id): (Option<String>, Option<String>) = connection.query_row(
-            "SELECT relation.input_artifact_id,CASE WHEN artifact.state='available' THEN relation.output_artifact_id ELSE NULL END FROM service_attempt_artifacts relation LEFT JOIN service_artifacts artifact ON artifact.task_id=relation.task_id AND artifact.id=relation.output_artifact_id WHERE relation.task_id=?1 AND relation.attempt_id=?2",
+            "SELECT relation.input_artifact_id,relation.output_artifact_id FROM service_attempt_artifacts relation WHERE relation.task_id=?1 AND relation.attempt_id=?2",
             params![task, attempt], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?.unwrap_or((None, None));
         Ok(OperationSnapshot {
@@ -1867,6 +1870,64 @@ mod tests {
     }
 
     #[test]
+    fn ignored_provider_output_blocks_artifact_success_and_preserves_workspace() {
+        let repo = Repo::new();
+        fs::write(repo.0.join(".gitignore"), "*.excluded\n").unwrap();
+        git(&repo.0, &["add", ".gitignore"]);
+        git(&repo.0, &["commit", "-m", "ignore generated output"]);
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = TaskId::new("ignored-output-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "task with ignored output",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let providers = FakeResolver(FakeProvider {
+            calls: calls.clone(),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: Some(("secret.excluded".into(), "not in artifact".into())),
+            require_file: None,
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let accepted = service
+            .submit_attempt(&request(&repo, &task_id, 0, "ignored-output"))
+            .unwrap();
+        let result = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.status(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(result.diagnostic_code(), Some("artifact_capture_failed"));
+        assert_eq!(result.output_artifact_id(), None);
+        let workspace_path = result.workspace_path().unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace_path.join("secret.excluded")).unwrap(),
+            "not in artifact"
+        );
+        let artifact_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM service_artifacts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(artifact_count, 0);
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+    }
+
+    #[test]
     fn artifact_input_rework_is_task_scoped_and_captures_output() {
         let repo = Repo::new();
         fs::write(repo.0.join(".gitignore"), "*.excluded\n").unwrap();
@@ -1890,10 +1951,7 @@ mod tests {
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
             write_output: Some(("persisted-result-6f32.txt".into(), "saved result".into())),
-            write_ignored: Some((
-                "secret-output-6f32.excluded".into(),
-                "should not persist".into(),
-            )),
+            write_ignored: None,
             require_file: None,
         };
         let mut first_registry = ProviderRegistry::new();
@@ -1931,10 +1989,6 @@ mod tests {
         assert!(
             git(&repo.0, &["ls-tree", "-r", "--name-only", &tree])
                 .contains("persisted-result-6f32.txt")
-        );
-        assert!(
-            !git(&repo.0, &["ls-tree", "-r", "--name-only", &tree])
-                .contains("secret-output-6f32.excluded")
         );
         let persisted_state: String = ledger
             .lock_connection()
