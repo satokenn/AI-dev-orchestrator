@@ -1328,7 +1328,7 @@ mod tests {
         fs,
         process::{Child, Command},
         sync::{
-            Arc, Barrier,
+            Arc, Barrier, Condvar, Mutex,
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         thread,
@@ -1346,6 +1346,17 @@ mod tests {
     const CHILD_REPOSITORY_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_REPOSITORY";
     const CHILD_OPERATION_ID: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_OPERATION";
     const CHILD_MARKER_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_MARKER";
+
+    fn sqlite_open_is_busy(error: &crate::LedgerError) -> bool {
+        matches!(
+            error,
+            crate::LedgerError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
 
     struct Repo(PathBuf);
 
@@ -1463,6 +1474,60 @@ mod tests {
         fn check_availability(&self) -> Result<(), ProviderError> {
             self.availability_checks.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    struct BlockingProvider {
+        reference: ProviderRef,
+        calls: Arc<AtomicUsize>,
+        state: Arc<(Mutex<BlockingProviderState>, Condvar)>,
+    }
+
+    #[derive(Default)]
+    struct BlockingProviderState {
+        started: bool,
+        released: bool,
+    }
+
+    impl AgentProvider for BlockingProvider {
+        fn provider_ref(&self) -> &ProviderRef {
+            &self.reference
+        }
+
+        fn execute(&self, _request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().unwrap();
+            state.started = true;
+            changed.notify_all();
+            while !state.released {
+                state = changed.wait(state).unwrap();
+            }
+            Ok(
+                ProviderResult::new("", "", Some(0), Some(AgentResult::new("done", true)), None)
+                    .with_observed_target(Some(self.reference.clone()), None),
+            )
+        }
+
+        fn check_availability(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    struct BlockingResolver(BlockingProvider);
+
+    impl crate::ProviderResolver for BlockingResolver {
+        fn resolve(
+            &self,
+            provider: &ProviderRef,
+        ) -> Result<&dyn AgentProvider, crate::ProviderResolutionError> {
+            if provider == &self.0.reference {
+                Ok(&self.0)
+            } else {
+                Err(crate::ProviderResolutionError::UnknownProvider {
+                    provider: provider.clone(),
+                })
+            }
         }
     }
 
@@ -1592,8 +1657,11 @@ mod tests {
             return;
         };
         let result = (|| -> Result<&'static str, String> {
-            let ledger =
-                SqliteExecutionLedger::open(ledger_path).map_err(|error| error.to_string())?;
+            let ledger = match SqliteExecutionLedger::open(ledger_path) {
+                Ok(ledger) => ledger,
+                Err(error) if sqlite_open_is_busy(&error) => return Ok("busy"),
+                Err(error) => return Err(error.to_string()),
+            };
             let repository = PathBuf::from(std::env::var_os(CHILD_REPOSITORY_PATH).unwrap());
             let workspace =
                 WorkspaceManager::new(&repository).map_err(|error| error.to_string())?;
@@ -1638,19 +1706,14 @@ mod tests {
             .unwrap();
         let workspace = WorkspaceManager::new(&repo.0).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let resolver = FakeResolver(FakeProvider {
-            calls: calls.clone(),
-            availability_checks: Arc::new(AtomicUsize::new(0)),
-            fail: false,
-            unknown_interrupt: false,
-            execute_delay: Duration::from_millis(800),
+        let state = Arc::new((Mutex::new(BlockingProviderState::default()), Condvar::new()));
+        let providers = BlockingResolver(BlockingProvider {
             reference: ProviderRef::new("fake"),
-            write_output: None,
-            write_ignored: None,
-            require_file: None,
+            calls: calls.clone(),
+            state: state.clone(),
         });
         let service =
-            OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
         let accepted = service
             .submit_attempt(&request(&repo, &task_id, 0, "process-lock"))
@@ -1664,6 +1727,22 @@ mod tests {
                     .run(accepted.operation_id(), CancellationToken::new())
                     .unwrap()
             });
+            let (provider_state, changed) = &*state;
+            let provider_state = provider_state.lock().unwrap();
+            let (mut provider_state, _) = changed
+                .wait_timeout_while(provider_state, Duration::from_secs(10), |state| {
+                    !state.started
+                })
+                .unwrap();
+            let provider_started = provider_state.started;
+            if !provider_started {
+                provider_state.released = true;
+                changed.notify_all();
+                drop(provider_state);
+                let _ = run.join();
+                panic!("provider did not start before the deadline");
+            }
+            drop(provider_state);
             let mut child = spawn_test_child(
                 "operation_service::tests::child_reports_lock_acquisition_during_active_service",
                 &[
@@ -1672,9 +1751,31 @@ mod tests {
                     (CHILD_MARKER_PATH, &marker_text),
                 ],
             );
-            assert_eq!(wait_for_file(&marker, Duration::from_secs(30)), "busy");
-            assert!(child.wait().unwrap().success());
+            let marker_deadline = Instant::now() + Duration::from_secs(30);
+            let mut marker_value = None;
+            while Instant::now() < marker_deadline {
+                if let Ok(value) = fs::read_to_string(&marker) {
+                    marker_value = Some(value);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let Some(marker_value) = marker_value else {
+                let _ = child.kill();
+                let _ = child.wait();
+                let (provider_state, changed) = &*state;
+                provider_state.lock().unwrap().released = true;
+                changed.notify_all();
+                let _ = run.join();
+                panic!("competing service did not report its lock result");
+            };
+            let child_success = child.wait().unwrap().success();
+            let (provider_state, changed) = &*state;
+            provider_state.lock().unwrap().released = true;
+            changed.notify_all();
             let result = run.join().unwrap();
+            assert_eq!(marker_value, "busy");
+            assert!(child_success);
             assert_eq!(result.status(), ServiceOperationStatus::Completed);
         });
         assert_eq!(calls.load(Ordering::SeqCst), 1);
