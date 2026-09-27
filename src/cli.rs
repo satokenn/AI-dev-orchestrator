@@ -1,24 +1,19 @@
 //! Command-line interface.
 use std::{
     env, fs,
-    fs::File,
-    fs::OpenOptions,
-    io,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use fs2::FileExt;
-
 use crate::{
     AgentResult, AntigravityProvider, Attempt, AttemptId, CodexPlanner, CodexProvider,
     CopilotProvider, ExecutionPolicy, GhIssueSource, GhPullRequestGateway, GhRepositoryEffects,
-    GitHubWorkflow, IssueExecutor, IssueRef, IssueSnapshot, IssueSource, Orchestrator,
-    PlannerRequest, PlannerService, ProviderAvailability, ProviderRef, ProviderRegistry,
-    ProviderResolver, PublicationRecord, PublishResult, RustValidator, SqliteExecutionLedger,
-    SqliteOperationLedger, Task, TaskId, TaskRole, ValidationResult, WorkflowError,
-    WorkspaceManager, prepare_issue_publication,
+    GitHubWorkflow, IssueExecutor, IssueRef, IssueSnapshot, IssueSource, LedgerRunLock,
+    Orchestrator, PlannerRequest, PlannerService, ProviderAvailability, ProviderRef,
+    ProviderRegistry, ProviderResolver, PublicationRecord, PublishResult, RustValidator,
+    SqliteExecutionLedger, SqliteOperationLedger, Task, TaskId, TaskRole, ValidationResult,
+    WorkflowError, WorkspaceManager, prepare_issue_publication,
 };
 
 pub const SUCCESS: i32 = 0;
@@ -26,101 +21,6 @@ pub const OPERATION_ERROR: i32 = 1;
 pub const USAGE_ERROR: i32 = 2;
 pub const UNAVAILABLE: i32 = 3;
 const DEFAULT_LEDGER: &str = ".ai-dev-orchestrator/ledger.sqlite3";
-
-struct LedgerRunLock {
-    _file: File,
-    ledger_path: PathBuf,
-}
-
-impl LedgerRunLock {
-    fn acquire(ledger_path: &Path) -> Result<Self, String> {
-        let canonical_ledger = canonical_ledger_path(ledger_path)?;
-        let mut lock_name = canonical_ledger
-            .file_name()
-            .ok_or_else(|| "ledger path has no file name".to_owned())?
-            .to_os_string();
-        lock_name.push(".operations.lock");
-        let lock_path = canonical_ledger.with_file_name(lock_name);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|error| format!("cannot open ledger lock {}: {error}", lock_path.display()))?;
-        file.try_lock_exclusive().map_err(|error| {
-            if error.kind() == io::ErrorKind::WouldBlock {
-                "ledger is busy: another process is running it".to_owned()
-            } else {
-                format!(
-                    "cannot acquire ledger lock {}: {error}",
-                    lock_path.display()
-                )
-            }
-        })?;
-        Ok(Self {
-            _file: file,
-            ledger_path: canonical_ledger,
-        })
-    }
-}
-
-fn canonical_ledger_path(path: &Path) -> Result<PathBuf, String> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|error| {
-        format!(
-            "cannot create ledger directory {}: {error}",
-            parent.display()
-        )
-    })?;
-    let canonical_parent = parent.canonicalize().map_err(|error| {
-        format!(
-            "cannot resolve ledger directory {}: {error}",
-            parent.display()
-        )
-    })?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| "ledger path has no file name".to_owned())?;
-    let unresolved = canonical_parent.join(file_name);
-    let canonical = match fs::symlink_metadata(&unresolved) {
-        Ok(_) => fs::canonicalize(&unresolved)
-            .map_err(|error| format!("cannot resolve ledger file {}: {error}", path.display()))?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => unresolved,
-        Err(error) => {
-            return Err(format!(
-                "cannot inspect ledger file {}: {error}",
-                path.display()
-            ));
-        }
-    };
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match fs::metadata(&canonical) {
-            Ok(metadata) if metadata.nlink() > 1 => {
-                return Err(format!(
-                    "hard-linked ledger files are not supported: {}",
-                    canonical.display()
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot inspect ledger file {}: {error}",
-                    canonical.display()
-                ));
-            }
-        }
-    }
-
-    Ok(canonical)
-}
 
 fn open_ledger_for_run(path: &Path) -> Result<SqliteExecutionLedger, String> {
     if let Some(parent) = path
@@ -145,7 +45,7 @@ fn open_operation_ledger_for_run(
     let ledger = SqliteOperationLedger::open(path)
         .map_err(|error| format!("cannot open operation ledger: {error}"))?;
     let recovered = ledger
-        .recover()
+        .recover(_run_lock)
         .map_err(|error| format!("cannot recover operation ledger: {error}"))?;
     for record in recovered {
         eprintln!(
@@ -302,7 +202,7 @@ impl CliRuntime for ProductionRuntime {
                 return OPERATION_ERROR;
             }
         };
-        let ledger_path = &_run_lock.ledger_path;
+        let ledger_path = _run_lock.ledger_path();
         let ledger = match open_ledger_for_run(ledger_path) {
             Ok(ledger) => ledger,
             Err(error) => {
@@ -637,8 +537,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliRuntime, LedgerRunLock, ProductionRuntime, RunRequest, canonical_ledger_path,
-        open_operation_ledger_for_run,
+        CliRuntime, LedgerRunLock, ProductionRuntime, RunRequest, open_operation_ledger_for_run,
     };
     use crate::{
         EventKind, OperationLedger, OperationRequest, OperationStatus, ProviderRef,
@@ -742,7 +641,7 @@ mod tests {
         let marker = std::path::PathBuf::from(std::env::var(CHILD_MARKER).unwrap());
         match mode.as_str() {
             "lock" => match LedgerRunLock::acquire(&ledger_path) {
-                Err(error) if error.contains("ledger is busy") => {
+                Err(error) if error.to_string().contains("ledger is busy") => {
                     write_marker(&marker, "busy").unwrap();
                 }
                 Err(error) => write_marker(&marker, &format!("error: {error}")).unwrap(),
@@ -811,15 +710,14 @@ mod tests {
         let alias = root.join("ledger-alias.sqlite3");
         symlink(&path, &alias).unwrap();
 
-        let canonical = canonical_ledger_path(&path).unwrap();
-        assert_eq!(canonical_ledger_path(&alias).unwrap(), canonical);
         let lock = LedgerRunLock::acquire(&path).unwrap();
+        assert!(LedgerRunLock::acquire(&alias).is_err());
         let marker = root.join("child-result");
         let mut child = spawn_lock_child("lock", &alias, &marker);
         assert_eq!(wait_for_marker(&mut child, &marker), "busy");
         assert!(child.wait().unwrap().success());
 
-        let ledger = open_operation_ledger_for_run(&canonical, &lock).unwrap();
+        let ledger = open_operation_ledger_for_run(lock.ledger_path(), &lock).unwrap();
         assert!(ledger.get_operation(&id).unwrap().is_some());
         drop(ledger);
         drop(lock);
@@ -836,8 +734,6 @@ mod tests {
         SqliteExecutionLedger::open(&path).unwrap();
         fs::hard_link(&path, &alias).unwrap();
 
-        let error = canonical_ledger_path(&alias).unwrap_err();
-        assert!(error.contains("hard-linked ledger files are not supported"));
         assert!(LedgerRunLock::acquire(&alias).is_err());
         fs::remove_dir_all(root).unwrap();
     }
@@ -919,7 +815,7 @@ mod tests {
                 operation.diagnostic().unwrap()
             );
         }
-        assert!(recovered.recover().unwrap().is_empty());
+        assert!(recovered.recover(&lock).unwrap().is_empty());
         assert_eq!(recovered.events(&accepted_id).unwrap().len(), 2);
         assert_eq!(recovered.events(&running_id).unwrap().len(), 3);
         drop(recovered);
