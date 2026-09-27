@@ -17,39 +17,60 @@ const DEFAULT_LOG_LIMIT: usize = 1024 * 1024;
 /// Exclusive process lock for one canonical operation ledger.
 pub struct LedgerRunLock {
     _file: std::fs::File,
+    _operation_file: std::fs::File,
     ledger_path: PathBuf,
+    operation_path: PathBuf,
 }
 
 impl LedgerRunLock {
     pub fn acquire(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let canonical = canonical_ledger_path(path.as_ref())?;
-        let mut name = canonical
-            .file_name()
-            .ok_or_else(|| LedgerError::InvalidValue("ledger path has no file name".into()))?
-            .to_os_string();
-        name.push(".operations.lock");
-        let lock_path = canonical.with_file_name(name);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
-        file.try_lock_exclusive().map_err(|error| {
-            if error.kind() == io::ErrorKind::WouldBlock {
-                LedgerError::LockBusy
-            } else {
-                LedgerError::Io(error)
-            }
-        })?;
+        let operation_path = operation_database_path(&canonical)?;
+        let (lock_path, operation_lock_path) = ledger_run_lock_paths(&canonical, &operation_path)?;
+        let file = open_exclusive_lock(&lock_path)?;
+        let operation_file = open_exclusive_lock(&operation_lock_path)?;
         Ok(Self {
             _file: file,
+            _operation_file: operation_file,
             ledger_path: canonical,
+            operation_path,
         })
     }
     pub fn ledger_path(&self) -> &Path {
         &self.ledger_path
     }
+}
+
+fn ledger_run_lock_paths(
+    ledger_path: &Path,
+    operation_path: &Path,
+) -> Result<(PathBuf, PathBuf), LedgerError> {
+    let mut name = ledger_path
+        .file_name()
+        .ok_or_else(|| LedgerError::InvalidValue("ledger path has no file name".into()))?
+        .to_os_string();
+    name.push(".operations.lock");
+    let lock_path = ledger_path.with_file_name(name);
+    let mut operation_lock = operation_path.as_os_str().to_os_string();
+    operation_lock.push(".recovery.lock");
+    Ok((lock_path, PathBuf::from(operation_lock)))
+}
+
+fn open_exclusive_lock(path: &Path) -> Result<std::fs::File, LedgerError> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    file.try_lock_exclusive().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            LedgerError::LockBusy
+        } else {
+            LedgerError::Io(error)
+        }
+    })?;
+    Ok(file)
 }
 
 fn canonical_ledger_path(path: &Path) -> Result<PathBuf, LedgerError> {
@@ -80,6 +101,32 @@ fn canonical_ledger_path(path: &Path) -> Result<PathBuf, LedgerError> {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(canonical)
+}
+
+fn operation_database_path(ledger_path: &Path) -> Result<PathBuf, LedgerError> {
+    let mut name = ledger_path.as_os_str().to_os_string();
+    name.push(".operations.sqlite3");
+    let candidate = PathBuf::from(name);
+    let canonical = match fs::symlink_metadata(&candidate) {
+        Ok(_) => fs::canonicalize(&candidate)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => candidate,
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match fs::metadata(&canonical) {
+            Ok(metadata) if metadata.nlink() > 1 => {
+                return Err(LedgerError::InvalidValue(
+                    "hard-linked operation ledger files are not supported".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(canonical)
@@ -435,14 +482,16 @@ pub struct SqliteExecutionLedger {
     connection: Mutex<Connection>,
     log_limit: usize,
     ledger_path: Option<PathBuf>,
+    operation_path: Option<PathBuf>,
 }
 
 impl SqliteExecutionLedger {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let ledger_path = canonical_ledger_path(path.as_ref())?;
-        let sidecar = PathBuf::from(format!("{}.operations.sqlite3", ledger_path.display()));
-        let mut ledger = Self::from_connection(Connection::open(sidecar)?)?;
+        let operation_path = operation_database_path(&ledger_path)?;
+        let mut ledger = Self::from_connection(Connection::open(&operation_path)?)?;
         ledger.ledger_path = Some(ledger_path);
+        ledger.operation_path = Some(operation_path);
         Ok(ledger)
     }
     pub fn open_in_memory() -> Result<Self, LedgerError> {
@@ -459,6 +508,7 @@ impl SqliteExecutionLedger {
             connection: Mutex::new(connection),
             log_limit: DEFAULT_LOG_LIMIT,
             ledger_path: None,
+            operation_path: None,
         })
     }
     pub fn set_log_limit(&mut self, bytes: usize) {
@@ -669,6 +719,9 @@ impl SqliteExecutionLedger {
             .as_ref()
             .ok_or(LedgerError::RecoveryLockRequired)?;
         if expected != &lock.ledger_path {
+            return Err(LedgerError::RecoveryLockMismatch);
+        }
+        if self.operation_path.as_ref() != Some(&lock.operation_path) {
             return Err(LedgerError::RecoveryLockMismatch);
         }
         let mut connection = self.connection.lock().expect("ledger mutex poisoned");
@@ -1102,6 +1155,94 @@ mod tests {
             let _ = fs::remove_file(format!("{}.operations.sqlite3", path.display()));
             let _ = fs::remove_file(format!("{}.operations.lock", path.display()));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_ledger_names_keep_sidecars_and_locks_distinct() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = std::env::temp_dir().join(format!("operation-non-utf8-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let first_path = root.join(std::ffi::OsString::from_vec(b"ledger-\xff".to_vec()));
+        let second_path = root.join(std::ffi::OsString::from_vec(b"ledger-\xfe".to_vec()));
+
+        let first_canonical = canonical_ledger_path(&first_path).unwrap();
+        let second_canonical = canonical_ledger_path(&second_path).unwrap();
+        let first_sidecar = operation_database_path(&first_canonical).unwrap();
+        let second_sidecar = operation_database_path(&second_canonical).unwrap();
+        let (first_lock, first_operation_lock) =
+            ledger_run_lock_paths(&first_canonical, &first_sidecar).unwrap();
+        let (second_lock, second_operation_lock) =
+            ledger_run_lock_paths(&second_canonical, &second_sidecar).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        assert_ne!(
+            first_sidecar.as_os_str().as_bytes(),
+            second_sidecar.as_os_str().as_bytes()
+        );
+        assert_ne!(
+            first_lock.as_os_str().as_bytes(),
+            second_lock.as_os_str().as_bytes()
+        );
+        assert_ne!(
+            first_operation_lock.as_os_str().as_bytes(),
+            second_operation_lock.as_os_str().as_bytes()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_operation_sidecar_is_rejected() {
+        let root =
+            std::env::temp_dir().join(format!("operation-sidecar-hardlink-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let first_path = root.join("first.sqlite3");
+        let second_path = root.join("second.sqlite3");
+        drop(SqliteExecutionLedger::open(&first_path).unwrap());
+        let mut first_sidecar = first_path.as_os_str().to_os_string();
+        first_sidecar.push(".operations.sqlite3");
+        let mut second_sidecar = second_path.as_os_str().to_os_string();
+        second_sidecar.push(".operations.sqlite3");
+        fs::hard_link(PathBuf::from(first_sidecar), PathBuf::from(second_sidecar)).unwrap();
+
+        assert!(matches!(
+            LedgerRunLock::acquire(&first_path),
+            Err(LedgerError::InvalidValue(message)) if message.contains("hard-linked operation ledger")
+        ));
+        assert!(matches!(
+            SqliteExecutionLedger::open(&second_path),
+            Err(LedgerError::InvalidValue(message)) if message.contains("hard-linked operation ledger")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_operation_sidecar_uses_the_target_lock() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("operation-sidecar-symlink-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let first_path = root.join("first.sqlite3");
+        let second_path = root.join("second.sqlite3");
+        drop(SqliteExecutionLedger::open(&first_path).unwrap());
+        let mut first_sidecar = first_path.as_os_str().to_os_string();
+        first_sidecar.push(".operations.sqlite3");
+        let mut second_sidecar = second_path.as_os_str().to_os_string();
+        second_sidecar.push(".operations.sqlite3");
+        let first_sidecar = PathBuf::from(first_sidecar);
+        symlink(&first_sidecar, PathBuf::from(second_sidecar)).unwrap();
+
+        let first_lock = LedgerRunLock::acquire(&first_path).unwrap();
+        assert!(matches!(
+            LedgerRunLock::acquire(&second_path),
+            Err(LedgerError::LockBusy)
+        ));
+        drop(first_lock);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
