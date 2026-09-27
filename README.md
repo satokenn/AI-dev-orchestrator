@@ -120,7 +120,7 @@ Task を `save_task` で保存した後、各 Attempt を `save_attempt` で保�
 retry は別の Attempt ID として追加されます。
 
 本番CLIの`run`は、指定Ledger単位で実行全体を排他します。同じLedgerを使う別プロセスの実行中は、後続の`run`をbusyとして中止します。シンボリックリンクで指定した場合もリンク先のLedgerを使います。macOS/Linuxではhard linkされたLedgerを安全に排他できないため、実行を拒否します。
-Ledgerの隣に作られる`<Ledger file name>.operations.lock`（例: `ledger.sqlite3.operations.lock`）はプロセス終了後も残りますが、排他状態はOSがファイルを開いている間だけ保持します。実行中にこのファイルを削除しないでください。
+Ledgerの隣に作られる`<Ledger file name>.operations.lock`（例: `ledger.sqlite3.operations.lock`）と、canonicalなOperation Ledger sidecarの隣に作られる`<Operation Ledger sidecar>.recovery.lock`（例: `ledger.sqlite3.operations.sqlite3.recovery.lock`）は、どちらもプロセス終了後も残ります。排他状態はOSが各lockファイルを開いている間だけ保持されるため、実行中にどちらのファイルも削除しないでください。
 
 ## GitHub Workflow
 
