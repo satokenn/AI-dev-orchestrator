@@ -23,7 +23,7 @@ MCP toolsでは`inputSchema`が入力schemaを定め、任意の`outputSchema`�
 
 副作用を伴うrequestは`request_id: string`を必須とする。既存Taskを変更する場合はさらに`task_id: string`と`expected_revision: integer`を必須とする。読取requestは`request_id`と`expected_revision`を持たない。
 
-冪等性keyの範囲は`caller + tool name + request_id`。`task.create`を含む全副作用requestに適用する。同じkey・同じnormalized payloadの再送は保存済みresponseを返し、副作用を繰り返さない。同じkeyでpayloadが異なる場合は`idempotency_conflict`。
+冪等性keyの範囲は`caller + tool name + request_id`。`task.create`を含む全副作用requestに適用する。同じkey・同じnormalized payloadの再送は保存済みresponseを返し、副作用を繰り返さない。同じkeyでpayloadが異なる場合は`idempotency_conflict`。Task作成のnormalized payloadは、設定済みSecretScannerが全ての要求テキストfieldをredactした後の値である。redaction結果は再適用で変化しない固定点でなければならず、Serviceはこれを確認し、固定点でない場合は保存・返却を拒否する。
 
 IDはすべて不透明なstringとし、呼出側はIDの形式・連番・内部構造を解釈しない。RFC 3339日時は`string`として送受信し、UTC (`Z`) を使う。fieldがoptionalなら省略し、nullを使うのは型に`| null`と明記された場合だけ。
 
@@ -269,6 +269,7 @@ Taskを作成する。`request_id`は冪等性keyに含まれる。
 | `issue` | `IssueSnapshot` | 条件付き | sourceが`issue`なら必須、`manual`なら省略 |
 
 `issue`は前述の`IssueSnapshot`型を使う。title/bodyは作成時点のsnapshot。
+OperationServiceは`task.create`の前にtitle、description、各constraint、IssueのURL/title/bodyをSecretScannerでredactし、再適用で変化しない固定点であることを確認してからredacted canonical payloadだけを冪等性記録とTask snapshotに保存する。同じ入力の再送も同じredacted payloadで照合する。SecretScannerが未設定、失敗、または固定点を作れない場合は`policy_denied`で拒否し、raw textを保存・返却しない。
 
 成功output:
 
@@ -301,6 +302,7 @@ Taskを作成する。`request_id`は冪等性keyに含まれる。
 Taskと選択したsectionのsnapshotを読む。読取専用。
 
 このService sliceは`providers`と`attempts`のContextPageを生成する。MCP transportは#45の対象であり、ここでは未実装。
+保存済みTask snapshotの要求textはcontext返却前にもSecretScannerでredactし、固定点であることを確認する。これにより既存の未redacted snapshotもraw textを返さない。SecretScannerが未設定、redactionが失敗、または固定点を作れない場合はProvider probeより前に`policy_denied`とし、raw snapshotを含む応答を返さない。
 この2 sectionではprovider observationsを同一snapshot内で一括返し、page_size未満に収まらなければrequestを拒否する。
 Attempt historyは`occurred_at`降順、同時刻ならID降順でpage化し、cursorはTask、section、page size、Task revisionに束縛する。
 Provider観測sourceがProvider一覧を列挙できない場合は、空配列として成功したように見せずcontext取得を失敗させる。

@@ -1236,6 +1236,75 @@ fn task_request_json(request: &TaskCreateRequest) -> String {
     .to_string()
 }
 
+fn redact_task_create_request(
+    request: &TaskCreateRequest,
+    scanner: Option<&dyn SecretScanner>,
+) -> Result<TaskCreateRequest, ServiceError> {
+    let scanner = scanner.ok_or(ServiceError::PolicyDenied(
+        "task text redaction is unavailable",
+    ))?;
+    let redact = |text: &str| {
+        let redacted = scanner
+            .redact_text(text)
+            .map_err(|_| ServiceError::PolicyDenied("task text redaction is unavailable"))?;
+        let verified = scanner
+            .redact_text(&redacted)
+            .map_err(|_| ServiceError::PolicyDenied("task text redaction is unavailable"))?;
+        if verified != redacted {
+            return Err(ServiceError::PolicyDenied(
+                "task text redaction is unavailable",
+            ));
+        }
+        Ok(redacted)
+    };
+    let issue = request
+        .issue
+        .as_ref()
+        .map(|issue| -> Result<TaskIssueSnapshot, ServiceError> {
+            Ok(TaskIssueSnapshot {
+                url: redact(&issue.url)?,
+                number: issue.number,
+                title: redact(&issue.title)?,
+                body: redact(&issue.body)?,
+            })
+        })
+        .transpose()?;
+    Ok(TaskCreateRequest {
+        request_id: request.request_id.clone(),
+        source: request.source,
+        title: redact(&request.title)?,
+        description: redact(&request.description)?,
+        constraints: request
+            .constraints
+            .iter()
+            .map(|text| redact(text))
+            .collect::<Result<Vec<_>, _>>()?,
+        issue,
+    })
+}
+
+fn redact_task_creation_result(
+    result: &mut TaskCreationResult,
+    scanner: Option<&dyn SecretScanner>,
+) -> Result<(), ServiceError> {
+    let sanitized = redact_task_create_request(
+        &TaskCreateRequest {
+            request_id: result.request_id.clone(),
+            source: result.request.source,
+            title: result.request.title.clone(),
+            description: result.request.description.clone(),
+            constraints: result.request.constraints.clone(),
+            issue: result.request.issue.clone(),
+        },
+        scanner,
+    )?;
+    result.request.title = sanitized.title;
+    result.request.description = sanitized.description;
+    result.request.constraints = sanitized.constraints;
+    result.request.issue = sanitized.issue;
+    Ok(())
+}
+
 fn load_task_creation_result(
     connection: &rusqlite::Connection,
     request_id: &str,
@@ -1427,7 +1496,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ));
         }
 
-        let (task_snapshot, revision, attempts) = {
+        let (mut task_snapshot, revision, attempts) = {
             let connection = self.ledger.lock_connection()?;
             let transaction = connection.unchecked_transaction()?;
             if !transaction.query_row(
@@ -1486,6 +1555,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 (attempts, operation_details),
             )
         };
+        redact_task_creation_result(&mut task_snapshot, self.secret_scanner)?;
         // Validate all supplied cursors against the snapshot before any Provider
         // observation can spawn a CLI probe.
         let mut validated_offsets = BTreeMap::new();
@@ -1582,7 +1652,9 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ));
         }
         validate_task_create(request)?;
-        let payload = task_request_json(request);
+        let sanitized_request = redact_task_create_request(request, self.secret_scanner)?;
+        validate_task_create(&sanitized_request)?;
+        let payload = task_request_json(&sanitized_request);
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx
@@ -1597,7 +1669,8 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             if stored != payload {
                 return Err(ServiceError::IdempotencyConflict);
             }
-            let result = load_task_creation_result(&tx, &request.request_id, &task_id)?;
+            let mut result = load_task_creation_result(&tx, &request.request_id, &task_id)?;
+            redact_task_creation_result(&mut result, self.secret_scanner)?;
             tx.commit()?;
             return Ok(result);
         }
@@ -1615,7 +1688,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         }
         tx.execute(
             "INSERT INTO tasks(id,description,role,state) VALUES(?1,?2,'unspecified','pending')",
-            params![task_id.as_str(), request.description],
+            params![task_id.as_str(), sanitized_request.description],
         )?;
         tx.execute(
             "INSERT INTO service_task_revisions(task_id,revision) VALUES(?1,0)",
@@ -1636,11 +1709,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             revision: 0,
             state: TaskState::Pending,
             request: TaskRequestSnapshot {
-                source: request.source,
-                title: request.title.clone(),
-                description: request.description.clone(),
-                constraints: request.constraints.clone(),
-                issue: request.issue.clone(),
+                source: sanitized_request.source,
+                title: sanitized_request.title,
+                description: sanitized_request.description,
+                constraints: sanitized_request.constraints,
+                issue: sanitized_request.issue,
             },
         };
         tx.commit()?;
@@ -3460,6 +3533,28 @@ mod tests {
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
 
+    struct TestRedactingScanner;
+    static TEST_SECRET_SCANNER: TestRedactingScanner = TestRedactingScanner;
+
+    impl SecretScanner for TestRedactingScanner {
+        fn redact_text(&self, text: &str) -> Result<String, SecretScanError> {
+            Ok(text.replace("sentinel-secret", "[REDACTED]"))
+        }
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+        fn scan_publication_payload(
+            &self,
+            _payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+    }
+
     struct Repo(PathBuf);
 
     impl Repo {
@@ -3524,7 +3619,8 @@ mod tests {
         let workspace = WorkspaceManager::new(&repo.0).unwrap();
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
         let request = TaskCreateRequest::new(
             "create-1",
             TaskSource::Manual,
@@ -3575,7 +3671,8 @@ mod tests {
         let workspace = WorkspaceManager::new(&repo.0).unwrap();
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
         let task = service
             .create_task(
                 "caller",
@@ -3653,7 +3750,8 @@ mod tests {
         let workspace = WorkspaceManager::new(&repo.0).unwrap();
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
         let task = service
             .create_task(
                 "caller",
@@ -3743,7 +3841,8 @@ mod tests {
         let workspace = WorkspaceManager::new(&repo.0).unwrap();
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
         let task = service
             .create_task(
                 "caller",
@@ -3762,6 +3861,7 @@ mod tests {
         for cursor in [
             "not-hex".to_owned(),
             encode_context_cursor(task.task_id(), "attempts", 1, task.revision() + 1, 0),
+            encode_context_cursor(task.task_id(), "attempts", 1, task.revision(), 1),
         ] {
             let cursors = BTreeMap::from([("attempts".to_owned(), cursor)]);
             assert!(matches!(
@@ -3780,7 +3880,8 @@ mod tests {
         let workspace = WorkspaceManager::new(&repo.0).unwrap();
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
         let task = service
             .create_task(
                 "caller",
@@ -3864,7 +3965,8 @@ mod tests {
         let workspace = WorkspaceManager::new(&repo.0).unwrap();
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
         let sections = [TaskContextSection::Providers];
         assert!(matches!(
             service.get_context(&task_id, &sections, 10, &BTreeMap::new()),
@@ -3889,7 +3991,8 @@ mod tests {
         let workspace = WorkspaceManager::new(&repo.0).unwrap();
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
         let missing_issue = TaskCreateRequest::new(
             "bad-1",
             TaskSource::Issue,
@@ -3978,7 +4081,8 @@ mod tests {
             let workspace = WorkspaceManager::new(&repo.0).unwrap();
             let service =
                 OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                    .unwrap();
+                    .unwrap()
+                    .with_secret_scanner(&TEST_SECRET_SCANNER);
             service.create_task("durable-caller", &request).unwrap()
         };
         let reopened = SqliteExecutionLedger::open(&database).unwrap();
@@ -3990,7 +4094,8 @@ mod tests {
             3,
             Duration::from_secs(30),
         )
-        .unwrap();
+        .unwrap()
+        .with_secret_scanner(&TEST_SECRET_SCANNER);
         let replay = service.create_task("durable-caller", &request).unwrap();
         assert_eq!(replay, first);
         assert_eq!(replay.issue(), request.issue.as_ref());
@@ -4066,6 +4171,9 @@ mod tests {
     }
 
     impl SecretScanner for FakeSecretScanner {
+        fn redact_text(&self, text: &str) -> Result<String, SecretScanError> {
+            Ok(text.to_owned())
+        }
         fn scan_artifact_tree(
             &self,
             _repository: &Path,
@@ -4092,6 +4200,9 @@ mod tests {
     }
 
     impl SecretScanner for BlockingSecretScanner {
+        fn redact_text(&self, text: &str) -> Result<String, SecretScanError> {
+            Ok(text.to_owned())
+        }
         fn scan_artifact_tree(
             &self,
             _repository: &Path,
@@ -4120,6 +4231,9 @@ mod tests {
     }
 
     impl SecretScanner for CleanThenFindingScanner {
+        fn redact_text(&self, text: &str) -> Result<String, SecretScanError> {
+            Ok(text.to_owned())
+        }
         fn scan_artifact_tree(
             &self,
             _repository: &Path,
@@ -4140,6 +4254,251 @@ mod tests {
                 Ok(SecretScanResult::Findings)
             }
         }
+    }
+
+    struct FailingRedactionScanner;
+
+    impl SecretScanner for FailingRedactionScanner {
+        fn redact_text(&self, _text: &str) -> Result<String, SecretScanError> {
+            Err(SecretScanError::Failed)
+        }
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+        fn scan_publication_payload(
+            &self,
+            _payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+    }
+
+    struct NonIdempotentRedactionScanner;
+
+    impl SecretScanner for NonIdempotentRedactionScanner {
+        fn redact_text(&self, text: &str) -> Result<String, SecretScanError> {
+            Ok(format!("{text}#"))
+        }
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+        fn scan_publication_payload(
+            &self,
+            _payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+    }
+
+    #[test]
+    fn task_create_redacts_all_text_before_persistence_and_replay() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
+        let request = TaskCreateRequest::new(
+            "redaction-1",
+            TaskSource::Issue,
+            "title sentinel-secret",
+            "description sentinel-secret",
+            vec!["constraint sentinel-secret".into()],
+            Some(TaskIssueSnapshot {
+                url: "https://example.test/sentinel-secret".into(),
+                number: 7,
+                title: "issue title sentinel-secret".into(),
+                body: "issue body sentinel-secret".into(),
+            }),
+        );
+        let first = service.create_task("redaction-caller", &request).unwrap();
+        let serialized = serde_json::to_string(&task_creation_json(&first)).unwrap();
+        assert!(!serialized.contains("sentinel-secret"));
+        assert!(serialized.contains("[REDACTED]"));
+        {
+            let connection = ledger.lock_connection().unwrap();
+            for query in [
+                "SELECT request_json FROM task_request_snapshots",
+                "SELECT request_json FROM task_create_idempotency",
+                "SELECT description FROM tasks",
+            ] {
+                let stored: String = connection.query_row(query, [], |row| row.get(0)).unwrap();
+                assert!(!stored.contains("sentinel-secret"), "{query}");
+                assert!(stored.contains("[REDACTED]"), "{query}");
+            }
+        }
+        let replay = service.create_task("redaction-caller", &request).unwrap();
+        assert_eq!(replay, first);
+        assert!(
+            !serde_json::to_string(&task_creation_json(&replay))
+                .unwrap()
+                .contains("sentinel-secret")
+        );
+    }
+
+    #[test]
+    fn task_create_and_context_fail_closed_when_redaction_is_unavailable() {
+        struct CountingResolver(AtomicUsize);
+        impl ProviderResolver for CountingResolver {
+            fn resolve(
+                &self,
+                provider: &ProviderRef,
+            ) -> Result<&dyn AgentProvider, crate::ProviderResolutionError> {
+                Err(crate::ProviderResolutionError::UnknownProvider {
+                    provider: provider.clone(),
+                })
+            }
+            fn observe_all_at(
+                &self,
+                _observed_at_ms: i64,
+            ) -> Result<Vec<crate::ProviderObservation>, crate::ProviderObservationUnavailable>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        }
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = CountingResolver(AtomicUsize::new(0));
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let no_scanner =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let request = TaskCreateRequest::new(
+            "redaction-missing",
+            TaskSource::Manual,
+            "secret sentinel-secret",
+            "description",
+            vec![],
+            None,
+        );
+        assert!(matches!(
+            no_scanner.create_task("caller", &request),
+            Err(ServiceError::PolicyDenied(
+                "task text redaction is unavailable"
+            ))
+        ));
+        assert_eq!(
+            ledger
+                .lock_connection()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        let failing =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&FailingRedactionScanner);
+        assert!(matches!(
+            failing.create_task("caller", &request),
+            Err(ServiceError::PolicyDenied(
+                "task text redaction is unavailable"
+            ))
+        ));
+        let non_idempotent_scanner = NonIdempotentRedactionScanner;
+        let non_idempotent =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&non_idempotent_scanner);
+        assert!(matches!(
+            non_idempotent.create_task("caller", &request),
+            Err(ServiceError::PolicyDenied(
+                "task text redaction is unavailable"
+            ))
+        ));
+        assert_eq!(
+            ledger
+                .lock_connection()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        let safe_service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
+        let safe = safe_service
+            .create_task(
+                "caller",
+                &TaskCreateRequest::new(
+                    "legacy-redaction",
+                    TaskSource::Manual,
+                    "legacy title",
+                    "legacy description",
+                    vec![],
+                    None,
+                ),
+            )
+            .unwrap();
+        ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "UPDATE task_request_snapshots SET request_json=?2 WHERE task_id=?1",
+                params![safe.task_id().as_str(), r#"{"source":"manual","title":"legacy sentinel-secret","description":"legacy sentinel-secret","constraints":["sentinel-secret"],"issue":null}"#],
+            )
+            .unwrap();
+        let context = safe_service
+            .get_context(
+                safe.task_id(),
+                &[TaskContextSection::Attempts],
+                10,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let context_json = serde_json::to_string(&context.to_json_value()).unwrap();
+        assert!(!context_json.contains("sentinel-secret"));
+        assert!(context_json.contains("[REDACTED]"));
+        assert!(matches!(
+            no_scanner.get_context(
+                safe.task_id(),
+                &[TaskContextSection::Attempts, TaskContextSection::Providers],
+                10,
+                &BTreeMap::new(),
+            ),
+            Err(ServiceError::PolicyDenied(
+                "task text redaction is unavailable"
+            ))
+        ));
+        assert_eq!(providers.0.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            failing.get_context(
+                safe.task_id(),
+                &[TaskContextSection::Attempts, TaskContextSection::Providers],
+                10,
+                &BTreeMap::new(),
+            ),
+            Err(ServiceError::PolicyDenied(
+                "task text redaction is unavailable"
+            ))
+        ));
+        assert_eq!(providers.0.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            non_idempotent.get_context(
+                safe.task_id(),
+                &[TaskContextSection::Attempts, TaskContextSection::Providers],
+                10,
+                &BTreeMap::new(),
+            ),
+            Err(ServiceError::PolicyDenied(
+                "task text redaction is unavailable"
+            ))
+        ));
+        assert_eq!(providers.0.load(Ordering::SeqCst), 0);
     }
 
     struct FakeArtifactPublicationGateway {

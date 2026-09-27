@@ -63,6 +63,15 @@ pub enum SecretScanResult {
 /// A scanner must inspect every file in the supplied Git tree and every field in the payload.
 /// Implementations should return only a typed failure; diagnostics may contain secret material.
 pub trait SecretScanner: Send + Sync {
+    /// Returns `text` with every known secret replaced. Implementations must be
+    /// deterministic and idempotent (`redact_text(redact_text(text))` equals
+    /// `redact_text(text)`) and fail if complete redaction cannot be guaranteed.
+    /// The default is fail-closed for callers that expose text; callers verify
+    /// the returned value is a fixed point before persisting or returning it.
+    fn redact_text(&self, _text: &str) -> Result<String, SecretScanError> {
+        Err(SecretScanError::Unavailable)
+    }
+
     fn scan_artifact_tree(
         &self,
         repository: &Path,
