@@ -3,7 +3,11 @@
 //! The ledger stores timestamps as Unix milliseconds. Timestamps are optional so
 //! a queued attempt can be recorded before its provider starts.
 
-use std::{fmt, path::Path, sync::Mutex};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -103,6 +107,7 @@ impl From<rusqlite::Error> for LedgerError {
 /// SQLite-backed local execution ledger.
 pub struct SqliteExecutionLedger {
     connection: Mutex<Connection>,
+    ledger_path: Option<PathBuf>,
 }
 
 type PublicationRow = (
@@ -155,8 +160,12 @@ pub trait ExecutionLedger {
 impl SqliteExecutionLedger {
     /// Opens (and initializes) a ledger at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
-        let connection = Connection::open(path)?;
-        Self::from_connection(connection)
+        let path = crate::operation_ledger::canonical_ledger_path(path.as_ref())
+            .map_err(|error| LedgerError::InvalidStoredValue(error.to_string()))?;
+        let connection = Connection::open(&path)?;
+        let mut ledger = Self::from_connection(connection)?;
+        ledger.ledger_path = Some(path);
+        Ok(ledger)
     }
 
     /// Opens an isolated in-memory ledger, useful for deterministic tests.
@@ -167,6 +176,18 @@ impl SqliteExecutionLedger {
     /// Alias for [`Self::open_in_memory`].
     pub fn in_memory() -> Result<Self, LedgerError> {
         Self::open_in_memory()
+    }
+
+    pub(crate) fn ledger_path(&self) -> Option<&Path> {
+        self.ledger_path.as_deref()
+    }
+
+    pub(crate) fn matches_run_lock(&self, lock: &crate::operation_ledger::LedgerRunLock) -> bool {
+        let Some(ledger_path) = &self.ledger_path else {
+            return false;
+        };
+        crate::operation_ledger::operation_database_path(ledger_path)
+            .is_ok_and(|operation_path| lock.matches_identity(ledger_path, &operation_path))
     }
 
     fn from_connection(connection: Connection) -> Result<Self, LedgerError> {
@@ -275,6 +296,7 @@ impl SqliteExecutionLedger {
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
+            ledger_path: None,
         })
     }
 
