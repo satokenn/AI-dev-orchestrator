@@ -136,7 +136,7 @@ type PublicationTaskRow = (
     Option<String>,
 );
 
-const LATEST_SCHEMA_VERSION: u32 = 9;
+const LATEST_SCHEMA_VERSION: u32 = 10;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -933,6 +933,30 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
                     "TEXT",
                 )?;
             }
+            10 => {
+                connection.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS service_attempt_history (
+                         task_id TEXT NOT NULL,
+                         attempt_id TEXT NOT NULL,
+                         sequence INTEGER NOT NULL,
+                         role TEXT,
+                         relation_kind TEXT NOT NULL CHECK(relation_kind IN ('initial','retry_of','escalation_of','review_of','rework_from','legacy_unspecified')),
+                         related_attempt_id TEXT,
+                         PRIMARY KEY(task_id,attempt_id),
+                         UNIQUE(task_id,sequence),
+                         FOREIGN KEY(task_id,attempt_id) REFERENCES attempts(task_id,id) ON DELETE CASCADE,
+                         FOREIGN KEY(task_id,related_attempt_id) REFERENCES attempts(task_id,id)
+                     );
+                     INSERT OR IGNORE INTO service_attempt_history(task_id,attempt_id,sequence,role,relation_kind,related_attempt_id)
+                     SELECT a.task_id,a.id,
+                         (SELECT COUNT(*) FROM attempts prior WHERE prior.task_id=a.task_id AND prior.rowid<=a.rowid),
+                         (SELECT CASE WHEN t.role='unspecified' THEN NULL ELSE t.role END FROM tasks t WHERE t.id=a.task_id),
+                         CASE WHEN (SELECT COUNT(*) FROM attempts prior WHERE prior.task_id=a.task_id AND prior.rowid<=a.rowid)=1
+                                   AND (SELECT t.role FROM tasks t WHERE t.id=a.task_id)='implementer'
+                              THEN 'initial' ELSE 'legacy_unspecified' END,
+                         NULL FROM attempts a;",
+                )?;
+            }
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
@@ -942,7 +966,19 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
 
 fn create_service_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
     connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS service_task_revisions (
+        "CREATE TABLE IF NOT EXISTS service_attempt_history (
+             task_id TEXT NOT NULL,
+             attempt_id TEXT NOT NULL,
+             sequence INTEGER NOT NULL,
+             role TEXT,
+             relation_kind TEXT NOT NULL CHECK(relation_kind IN ('initial','retry_of','escalation_of','review_of','rework_from','legacy_unspecified')),
+             related_attempt_id TEXT,
+             PRIMARY KEY(task_id, attempt_id),
+             UNIQUE(task_id, sequence),
+             FOREIGN KEY(task_id, attempt_id) REFERENCES attempts(task_id, id) ON DELETE CASCADE,
+             FOREIGN KEY(task_id, related_attempt_id) REFERENCES attempts(task_id, id)
+         );
+         CREATE TABLE IF NOT EXISTS service_task_revisions (
              task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
              revision INTEGER NOT NULL CHECK(revision >= 0)
          );
@@ -1373,7 +1409,12 @@ mod tests {
                  CREATE TABLE publications (idempotency_key TEXT PRIMARY KEY NOT NULL, repository TEXT NOT NULL,
                      branch TEXT NOT NULL, commit_sha TEXT, pull_request TEXT, phase TEXT NOT NULL);
                  INSERT INTO tasks VALUES ('task-1', 'legacy', 'developer', 'failed');
+                 INSERT INTO tasks VALUES ('task-2', 'known role', 'implementer', 'active');
+                 INSERT INTO tasks VALUES ('task-3', 'unknown role', 'unspecified', 'active');
                  INSERT INTO attempts VALUES ('task-1', 'attempt-1', 'codex', 'failed', 10, 20, 'timeout');
+                 INSERT INTO attempts VALUES ('task-2', 'attempt-2', 'codex', 'failed', 10, 20, 'timeout');
+                 INSERT INTO attempts VALUES ('task-2', 'attempt-3', 'codex', 'failed', 30, 40, 'timeout');
+                 INSERT INTO attempts VALUES ('task-3', 'attempt-4', 'codex', 'failed', 50, 60, 'timeout');
                  INSERT INTO publications VALUES ('key-1', 'owner/repo', 'main', 'abc', '42', 'published');
                  PRAGMA user_version = 1;",
             )
@@ -1401,17 +1442,76 @@ mod tests {
         assert_eq!(publication.base(), None);
         assert_eq!(publication.title(), None);
         assert_eq!(publication.body(), None);
+        let connection = ledger.lock_connection().unwrap();
+        type MigratedAttemptRow = (String, i64, Option<String>, String, Option<String>);
+        let migrated: Vec<MigratedAttemptRow> = {
+            let mut statement = connection.prepare(
+                "SELECT attempt_id, sequence, role, relation_kind, related_attempt_id FROM service_attempt_history
+                 WHERE task_id='task-2' ORDER BY sequence",
+            ).unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            migrated,
+            vec![
+                (
+                    "attempt-2".into(),
+                    1,
+                    Some("implementer".into()),
+                    "initial".into(),
+                    None
+                ),
+                (
+                    "attempt-3".into(),
+                    2,
+                    Some("implementer".into()),
+                    "legacy_unspecified".into(),
+                    None
+                ),
+            ]
+        );
+        let unknown_role: (Option<String>, String) = connection
+            .query_row(
+                "SELECT role, relation_kind FROM service_attempt_history WHERE task_id='task-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            unknown_role,
+            (Some("developer".into()), "legacy_unspecified".into())
+        );
+        let unspecified_role: (Option<String>, String) = connection
+            .query_row(
+                "SELECT role, relation_kind FROM service_attempt_history WHERE task_id='task-3'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unspecified_role, (None, "legacy_unspecified".into()));
     }
 
     #[test]
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 10;")
+            .execute_batch("PRAGMA user_version = 11;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(10))
+            Err(LedgerError::UnsupportedSchemaVersion(11))
         ));
     }
 }

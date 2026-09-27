@@ -563,12 +563,22 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if task.attempts().len() >= self.max_attempts {
             return Err(ServiceError::PolicyDenied("maximum attempts reached"));
         }
+        if request.role.as_str() != "implementer" {
+            return Err(ServiceError::PolicyDenied(
+                "only an initial implementer Attempt is currently representable",
+            ));
+        }
         let busy: Option<String> = transaction.query_row(
             "SELECT id FROM service_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
             params![request.task_id.as_str()], |row| row.get(0),
         ).optional()?;
         if let Some(id) = busy {
             return Err(ServiceError::Busy(OperationId::new(id)));
+        }
+        if !task.attempts().is_empty() {
+            return Err(ServiceError::PolicyDenied(
+                "follow-up Attempt relation requires explicit supporting evidence",
+            ));
         }
 
         if task.state() == TaskState::Pending {
@@ -592,7 +602,14 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             "UPDATE tasks SET state=?2 WHERE id=?1",
             params![request.task_id.as_str(), task_state_to_str(task.state())],
         )?;
-        insert_queued_attempt(&transaction, &request.task_id, &attempt)?;
+        insert_queued_attempt(
+            &transaction,
+            &request.task_id,
+            &attempt,
+            1,
+            &request.role,
+            "initial",
+        )?;
         let new_revision = actual_revision
             .checked_add(1)
             .ok_or(ServiceError::InvalidStoredState)?;
@@ -1099,8 +1116,16 @@ fn insert_queued_attempt(
     tx: &rusqlite::Transaction<'_>,
     task_id: &TaskId,
     attempt: &Attempt,
+    sequence: usize,
+    role: &TaskRole,
+    relation_kind: &str,
 ) -> Result<(), ServiceError> {
     tx.execute("INSERT INTO attempts(task_id,id,provider,state,started_at,finished_at,failure_reason,requested_model_kind,requested_model,observed_provider,observed_model,semantics_version) VALUES(?1,?2,?3,'queued',NULL,NULL,NULL,?4,?5,NULL,NULL,'provider_call_v2')",params![task_id.as_str(),attempt.id().as_str(),attempt.provider().as_str(),attempt.requested_model().map(model_choice_kind),attempt.requested_model().and_then(model_choice_name)])?;
+    tx.execute(
+        "INSERT INTO service_attempt_history(task_id,attempt_id,sequence,role,relation_kind,related_attempt_id)
+         VALUES(?1,?2,?3,?4,?5,NULL)",
+        params![task_id.as_str(), attempt.id().as_str(), sequence as i64, role.as_str(), relation_kind],
+    )?;
     Ok(())
 }
 
@@ -1629,6 +1654,40 @@ mod tests {
     }
 
     #[test]
+    fn non_implementer_role_is_rejected_before_persistence() {
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let mut req = request(&repo, &task_id, 0, "unsupported-role");
+        req.role = TaskRole::new("reviewer");
+        assert!(matches!(
+            service.submit_attempt(&req),
+            Err(ServiceError::PolicyDenied(
+                "only an initial implementer Attempt is currently representable"
+            ))
+        ));
+        let connection = ledger.lock_connection().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM attempts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM service_attempt_history", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn base_input_acceptance_is_atomic_idempotent_and_records_safe_success() {
         let (repo, ledger, workspace, providers, calls, checks, task_id) =
             service_parts(false, Duration::ZERO, false, None);
@@ -1679,6 +1738,49 @@ mod tests {
         assert_eq!(agent_rows, 0);
         let unsafe_text:i64=connection.query_row("SELECT COUNT(*) FROM service_operations WHERE id=?1 AND (instruction LIKE '%RAW_STDOUT_SECRET%' OR instruction LIKE '%RAW_STDERR_SECRET%' OR diagnostic_code LIKE '%SECRET%')",params![result.operation_id().as_str()],|row|row.get(0)).unwrap();
         assert_eq!(unsafe_text, 0);
+        let initial_relation: (i64, String, String, Option<String>) = connection.query_row(
+            "SELECT sequence, role, relation_kind, related_attempt_id FROM service_attempt_history
+             WHERE task_id=?1 AND attempt_id=?2",
+            params![task_id.as_str(), result.attempt_id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            initial_relation,
+            (1, "implementer".into(), "initial".into(), None)
+        );
+        let revision: u64 = connection
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64;
+        drop(connection);
+        assert!(matches!(
+            service.submit_attempt(&request(&repo, &task_id, revision, "unsupported-follow-up")),
+            Err(ServiceError::PolicyDenied(
+                "follow-up Attempt relation requires explicit supporting evidence"
+            ))
+        ));
+        let connection = ledger.lock_connection().unwrap();
+        let history_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM service_attempt_history WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history_rows, 1);
+        assert_eq!(
+            connection
+                .query_row::<i64, _, _>(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get(0)
+                )
+                .unwrap() as u64,
+            revision
+        );
         drop(connection);
         assert!(
             workspace
@@ -1927,6 +2029,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(operation_count, 0);
+        let history_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM service_attempt_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(history_count, 0);
         let revision: i64 = connection
             .query_row(
                 "SELECT revision FROM service_task_revisions WHERE task_id=?1",
