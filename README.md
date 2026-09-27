@@ -67,9 +67,9 @@ Provider APIでは成功・失敗結果にUTF-8変換前のstdout/stderr byte列
 
 ### MCP Operation Service（中核実装）
 
-`OperationService` は監督側が明示した `attempt.run` を単一のExecution Ledger DBで受け付け、request ID・Task revision・busy状態を検査してOperationとQueued Attemptを原子的に保存します。現在実行できる入力は同じrepositoryの完全なbase commitを指定する `BaseInput` と `ProviderDefault` です。named Modelは信頼できるcatalogが用意されるまで実行前に拒否します。成功・timeout・cancel・中断状態と汎用usageを保存し、Providerのstdout/stderr、AgentResult、秘密を含む診断本文は保存・返却しません。
+`OperationService` は監督側が明示した `attempt.run` を単一のExecution Ledger DBで受け付け、request ID・Task revision・busy状態を検査してOperationとQueued Attemptを原子的に保存します。永続LedgerではService生成時にベースLedgerとOperation sidecarのプロセス排他ロックを取得し、未完了Operationの復旧を完了してからServiceを返します。ロックはService破棄まで保持されるため、別プロセスのService生成と復旧はロック競合で拒否されます。復旧はService構築時だけに行い、Provider実行中に再度呼び出す公開APIはありません。`SqliteOperationLedger::recover` も同じ `LedgerRunLock` を要求します。既存ロックを共有する呼出元は `new_with_run_lock` に同じcanonical Ledger identityのguardを渡します。in-memory Ledgerはプロセス間で生存する中断状態を持たないため、Service構築時の自動復旧を行いません。現在実行できる入力は同じrepositoryの完全なbase commitを指定する `BaseInput` と `ProviderDefault` です。named Modelは信頼できるcatalogが用意されるまで実行前に拒否します。成功・timeout・cancel・中断状態と汎用usageを保存し、Providerのstdout/stderr、AgentResult、秘密を含む診断本文は保存・返却しません。
 
-Provider起動前にworkspaceのHEADが指定commitと一致し、tracked・untracked・ignored fileが空であることも確認します。hook等が内容を作った場合はProviderを起動せず、workspaceと内容を保持します。実行中のOperationはworkspace pathとbranchを参照として記録し、結果確認・Artifact連携までは自動削除しません。プロセス再起動時は `recover_incomplete_operations()` を新しい依頼を受け付ける前に呼び、running Operationを `recovery_required` として閉じます。中断結果を推測せず、同じOperationを再実行しません。これはRust Service APIの中核実装であり、MCP transport、ArtifactInput、redacted log保存、named Model catalog、CLIへの配線は別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
+Provider起動前にworkspaceのHEADが指定commitと一致し、tracked・untracked・ignored fileが空であることも確認します。hook等が内容を作った場合はProviderを起動せず、workspaceと内容を保持します。実行中のOperationはworkspace pathとbranchを参照として記録し、結果確認・Artifact連携までは自動削除しません。永続LedgerのService構築時は、取得したロックの下で残存するrunning Operationを `recovery_required` として閉じてから依頼受付を始めます。中断結果を推測せず、同じOperationを再実行しません。これはRust Service APIの中核実装であり、MCP transport、ArtifactInput、redacted log保存、named Model catalog、CLIへの配線は別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
 
 Service利用側は明示したbase commitで受付し、返されたIDで同期実行または後から状態取得を行います。
 
