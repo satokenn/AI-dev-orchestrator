@@ -3830,12 +3830,18 @@ mod tests {
 
     impl Repo {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "operation-service-{}-{}",
-                std::process::id(),
-                NEXT_DIR.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&path).unwrap();
+            let path = loop {
+                let path = std::env::temp_dir().join(format!(
+                    "operation-service-{}-{}",
+                    std::process::id(),
+                    NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => break path,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create test repository {}: {error}", path.display()),
+                }
+            };
             git(&path, &["init", "-b", "main"]);
             git(&path, &["config", "user.email", "service@example.invalid"]);
             git(&path, &["config", "user.name", "Service Test"]);
