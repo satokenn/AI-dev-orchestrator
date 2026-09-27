@@ -2,7 +2,10 @@ use std::{
     fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,6 +17,7 @@ use crate::{ProviderRef, TaskId};
 
 const SCHEMA_VERSION: u32 = 2;
 const DEFAULT_LOG_LIMIT: usize = 1024 * 1024;
+static LOG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn initialize_schema(connection: &mut Connection) -> Result<(), LedgerError> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -744,17 +748,43 @@ impl SqliteExecutionLedger {
                 "log reference already exists with different content".into(),
             ));
         }
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        let created_identity = file.metadata()?;
-        if let Err(error) = file.write_all(log_content) {
-            drop(file);
-            remove_created_log_if_unchanged(&path, &created_identity);
-            return Err(error.into());
-        }
-        drop(file);
+        let (created_identity, created_in_this_call) = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(LedgerError::InvalidValue(
+                        "log path already exists and is not a regular file".into(),
+                    ));
+                }
+                if fs::read(&path)? != log_content {
+                    return Err(LedgerError::InvalidValue(
+                        "log path already exists with different content".into(),
+                    ));
+                }
+                // A previous call may have completed the file write but failed before
+                // registering its reference. Adopt only the exact requested bytes.
+                (metadata, false)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let (temporary_path, mut file) = create_log_staging_file(
+                    &canonical_directory,
+                    operation_component,
+                    stream_component,
+                )?;
+                let temporary_identity = file.metadata()?;
+                if let Err(error) = file.write_all(log_content) {
+                    drop(file);
+                    remove_created_log_if_unchanged(&temporary_path, &temporary_identity);
+                    return Err(error.into());
+                }
+                file.sync_all()?;
+                drop(file);
+                let publish_result = fs::hard_link(&temporary_path, &path);
+                remove_created_log_if_unchanged(&temporary_path, &temporary_identity);
+                publish_result?;
+                (fs::symlink_metadata(&path)?, true)
+            }
+            Err(error) => return Err(error.into()),
+        };
         let reference = LogReference {
             path,
             byte_count: limit as u64,
@@ -771,7 +801,9 @@ impl SqliteExecutionLedger {
             ],
         );
         if let Err(error) = insert_result {
-            remove_created_log_if_unchanged(reference.path(), &created_identity);
+            if created_in_this_call {
+                remove_created_log_if_unchanged(reference.path(), &created_identity);
+            }
             return Err(error.into());
         }
         Ok(reference)
@@ -831,7 +863,10 @@ impl SqliteExecutionLedger {
             )
             .optional()?;
         if let Some((existing_amount, state, settled)) = existing {
-            if existing_amount == amount && state == "reserved" && settled.is_none() {
+            if existing_amount == amount
+                && ((state == "reserved" && settled.is_none())
+                    || (state == "settled" && settled.is_some()))
+            {
                 transaction.commit()?;
                 return Ok(());
             }
@@ -1025,6 +1060,32 @@ fn safe_log_component(value: &str) -> Result<&str, LedgerError> {
         )));
     }
     Ok(value)
+}
+
+fn create_log_staging_file(
+    directory: &Path,
+    operation: &str,
+    stream: &str,
+) -> Result<(PathBuf, fs::File), LedgerError> {
+    for _ in 0..32 {
+        let sequence = LOG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            ".{operation}-{stream}-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(LedgerError::InvalidValue(
+        "could not allocate a unique log staging file".into(),
+    ))
 }
 
 #[cfg(unix)]
@@ -1522,6 +1583,30 @@ mod tests {
         assert!(!directory.exists());
     }
 
+    #[test]
+    fn save_log_recovers_an_exact_unreferenced_file() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let operation = ledger
+            .accept_operation(&request("r-log-orphan", "a"))
+            .unwrap();
+        let directory = std::env::temp_dir().join(format!("ledger-log-orphan-{}", now()));
+        fs::create_dir_all(&directory).unwrap();
+        let orphan = directory.join(format!("{}-stdout.log", operation.id().as_str()));
+        fs::write(&orphan, b"complete log").unwrap();
+
+        let reference = ledger
+            .save_log(operation.id(), "stdout", &directory, b"complete log")
+            .unwrap();
+        assert_eq!(reference.path(), orphan.canonicalize().unwrap());
+        assert_eq!(fs::read(reference.path()).unwrap(), b"complete log");
+        assert!(
+            ledger
+                .save_log(operation.id(), "stdout", &directory, b"different log")
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
     #[cfg(unix)]
     #[test]
     fn save_log_does_not_follow_a_preexisting_symlink() {
@@ -1571,11 +1656,20 @@ mod tests {
                 .save_log(operation.id(), "stdout", &directory, b"partial")
                 .is_err()
         );
-        assert!(
-            !directory
-                .join(format!("{}-stdout.log", operation.id().as_str()))
-                .exists()
-        );
+        let orphan = directory.join(format!("{}-stdout.log", operation.id().as_str()));
+        if orphan.exists() {
+            assert_eq!(fs::read(&orphan).unwrap(), b"partial");
+        }
+        ledger
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_log_insert;")
+            .unwrap();
+        let reference = ledger
+            .save_log(operation.id(), "stdout", &directory, b"partial")
+            .unwrap();
+        assert_eq!(fs::read(reference.path()).unwrap(), b"partial");
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -1591,6 +1685,9 @@ mod tests {
         ));
         ledger.settle_budget(operation.id(), "7").unwrap();
         ledger.settle_budget(operation.id(), "7").unwrap();
+        // A retry of the original reservation can arrive after the settlement
+        // committed if the reservation response was lost.
+        ledger.reserve_budget(operation.id(), "10").unwrap();
         assert!(matches!(
             ledger.settle_budget(operation.id(), "8"),
             Err(LedgerError::BudgetSettlementConflict(_))
