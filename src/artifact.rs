@@ -878,11 +878,11 @@ impl<'a> ArtifactManager<'a> {
     }
 
     fn snapshot(&self, path: &Path) -> Result<String, ArtifactError> {
-        self.reject_ignored_files(path)?;
         let temp = TempIndex::create()?;
         let index = temp.path().join("index").to_string_lossy().into_owned();
         let index_env = [("GIT_INDEX_FILE", index)];
         self.run_git(path, &["read-tree", "HEAD"], &index_env)?;
+        self.reject_ignored_files(path, &index_env)?;
         // Ignored files are deliberately excluded; the temporary index preserves the user's index.
         self.run_git(path, &["add", "-A", "--", "."], &index_env)?;
         let output = self.run_git(path, &["write-tree"], &index_env)?;
@@ -896,7 +896,11 @@ impl<'a> ArtifactManager<'a> {
         Ok(tree)
     }
 
-    fn reject_ignored_files(&self, path: &Path) -> Result<(), ArtifactError> {
+    fn reject_ignored_files(
+        &self,
+        path: &Path,
+        index_env: &[(&str, String)],
+    ) -> Result<(), ArtifactError> {
         let output = self.run_git(
             path,
             &[
@@ -905,7 +909,7 @@ impl<'a> ArtifactManager<'a> {
                 "--untracked-files=all",
                 "--ignored=matching",
             ],
-            &[],
+            index_env,
         )?;
         if output.output_truncated {
             return Err(ArtifactError::Git(

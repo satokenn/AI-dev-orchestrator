@@ -1569,6 +1569,7 @@ mod tests {
         reference: ProviderRef,
         write_output: Option<(String, String)>,
         write_ignored: Option<(String, String)>,
+        write_gitignore: Option<String>,
         require_file: Option<(String, String)>,
     }
 
@@ -1591,6 +1592,9 @@ mod tests {
             }
             if let Some((path, contents)) = &self.write_ignored {
                 fs::write(request.workspace().join(path), contents).unwrap();
+            }
+            if let Some(contents) = &self.write_gitignore {
+                fs::write(request.workspace().join(".gitignore"), contents).unwrap();
             }
             if self.unknown_interrupt {
                 return Err(ProviderError::Interrupted {
@@ -1826,6 +1830,7 @@ mod tests {
             reference: ProviderRef::new("fake"),
             write_output: None,
             write_ignored: None,
+            write_gitignore: None,
             require_file: None,
         });
         (repo, ledger, workspace, providers, calls, checks, task_id)
@@ -1848,6 +1853,7 @@ mod tests {
             reference: ProviderRef::new("fake"),
             write_output: None,
             write_ignored: None,
+            write_gitignore: None,
             require_file: None,
         });
         let service =
@@ -1882,6 +1888,7 @@ mod tests {
                 reference: ProviderRef::new("fake"),
                 write_output: None,
                 write_ignored: None,
+                write_gitignore: None,
                 require_file: None,
             });
             match OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
@@ -2006,6 +2013,7 @@ mod tests {
             reference: ProviderRef::new("fake"),
             write_output: None,
             write_ignored: None,
+            write_gitignore: None,
             require_file: None,
         });
         assert!(matches!(
@@ -2044,6 +2052,7 @@ mod tests {
             reference: ProviderRef::new("fake"),
             write_output: None,
             write_ignored: None,
+            write_gitignore: None,
             require_file: None,
         });
         let service =
@@ -2204,6 +2213,7 @@ mod tests {
             reference: ProviderRef::new("fake"),
             write_output: None,
             write_ignored: Some(("secret.excluded".into(), "not in artifact".into())),
+            write_gitignore: None,
             require_file: None,
         });
         let service =
@@ -2261,6 +2271,7 @@ mod tests {
             reference: ProviderRef::new("fake"),
             write_output: Some(("persisted-result-6f32.txt".into(), "saved result".into())),
             write_ignored: None,
+            write_gitignore: None,
             require_file: None,
         };
         let mut first_registry = ProviderRegistry::new();
@@ -2343,6 +2354,7 @@ mod tests {
             reference: ProviderRef::new("fake"),
             write_output: Some(("revision.txt".into(), "second".into())),
             write_ignored: None,
+            write_gitignore: None,
             require_file: Some(("persisted-result-6f32.txt".into(), "saved result".into())),
         };
         let mut second_registry = ProviderRegistry::new();
@@ -2447,6 +2459,111 @@ mod tests {
             )
             .unwrap();
         assert_eq!(artifact_state, "recovery_required");
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, first_result.attempt_id());
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+    }
+
+    #[test]
+    fn artifact_rework_rejects_input_file_ignored_by_provider_gitignore() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = TaskId::new("artifact-ignore-rework-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "task description",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let first_provider = FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: Some(("carried-input.txt".into(), "saved input".into())),
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
+        };
+        let mut first_registry = ProviderRegistry::new();
+        first_registry.register(first_provider);
+        let first_service = OperationService::new(
+            &ledger,
+            &workspace,
+            &first_registry,
+            4,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let first = first_service
+            .submit_attempt(&request(&repo, &task_id, 0, "ignore-first"))
+            .unwrap();
+        let first_result = first_service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(first_result.status(), ServiceOperationStatus::Completed);
+        let artifact_id = first_result.output_artifact_id().unwrap().to_owned();
+        let revision: u64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second_provider = FakeProvider {
+            calls: calls.clone(),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: Some("/carried-input.txt\n".into()),
+            require_file: Some(("carried-input.txt".into(), "saved input".into())),
+        };
+        let mut second_registry = ProviderRegistry::new();
+        second_registry.register(second_provider);
+        let second_service = OperationService::new(
+            &ledger,
+            &workspace,
+            &second_registry,
+            4,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let second_request = AttemptRunRequest::with_artifact(
+            "ignore-second",
+            task_id.clone(),
+            revision,
+            ProviderRef::new("fake"),
+            ModelChoice::ProviderDefault,
+            "continue from saved input",
+            TaskRole::new("implementer"),
+            ArtifactInput::new(&artifact_id),
+        );
+        let accepted = second_service.submit_attempt(&second_request).unwrap();
+        let result = second_service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.status(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(result.diagnostic_code(), Some("artifact_capture_failed"));
+        assert_eq!(result.output_artifact_id(), None);
+        let retained_path = result.workspace_path().unwrap();
+        assert_eq!(
+            fs::read_to_string(retained_path.join("carried-input.txt")).unwrap(),
+            "saved input"
+        );
+        assert!(retained_path.join(".gitignore").exists());
         cleanup_fixture_worktree(&repo, &workspace, &task_id, first_result.attempt_id());
         cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
     }
@@ -2639,6 +2756,7 @@ mod tests {
             reference: ProviderRef::new("fake"),
             write_output: None,
             write_ignored: None,
+            write_gitignore: None,
             require_file: None,
         });
         let service =
@@ -2708,6 +2826,7 @@ mod tests {
             reference: ProviderRef::new("fake"),
             write_output: None,
             write_ignored: None,
+            write_gitignore: None,
             require_file: None,
         });
         let service =
@@ -2782,6 +2901,7 @@ mod tests {
             reference: ProviderRef::new("fake"),
             write_output: Some(("artifact-new-file.txt".into(), "artifact content".into())),
             write_ignored: None,
+            write_gitignore: None,
             require_file: None,
         });
         let service =
