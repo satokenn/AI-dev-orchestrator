@@ -1486,6 +1486,23 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 (attempts, operation_details),
             )
         };
+        // Validate all supplied cursors against the snapshot before any Provider
+        // observation can spawn a CLI probe.
+        let mut validated_offsets = BTreeMap::new();
+        for section in sections {
+            let name = section.as_str();
+            let offset = match cursors.get(name) {
+                Some(cursor) => decode_context_cursor(cursor, task_id, name, page_size, revision)?,
+                None => 0,
+            };
+            if *section == TaskContextSection::Attempts && offset > attempts.0.len() {
+                return Err(ServiceError::InvalidRequest(
+                    "cursor offset exceeds section length",
+                ));
+            }
+            validated_offsets.insert(name, offset);
+        }
+
         let probe_at_ms = now_ms();
         let provider_observations = if sections.contains(&TaskContextSection::Providers) {
             self.providers
@@ -1498,10 +1515,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let mut page_map = BTreeMap::new();
         for section in sections {
             let name = section.as_str();
-            let offset = match cursors.get(name) {
-                Some(cursor) => decode_context_cursor(cursor, task_id, name, page_size, revision)?,
-                None => 0,
-            };
+            let offset = validated_offsets[name];
             let mut items = match section {
                 TaskContextSection::Providers => {
                     if provider_observations.len() > page_size {
@@ -3699,6 +3713,63 @@ mod tests {
                 "providers section does not support cursors"
             ))
         ));
+    }
+
+    #[test]
+    fn task_get_context_validates_attempt_cursor_before_provider_probe() {
+        struct CountingResolver(std::sync::atomic::AtomicUsize);
+        impl ProviderResolver for CountingResolver {
+            fn resolve(
+                &self,
+                provider: &ProviderRef,
+            ) -> Result<&dyn crate::AgentProvider, crate::ProviderResolutionError> {
+                Err(crate::ProviderResolutionError::UnknownProvider {
+                    provider: provider.clone(),
+                })
+            }
+            fn observe_all_at(
+                &self,
+                _observed_at_ms: i64,
+            ) -> Result<Vec<crate::ProviderObservation>, crate::ProviderObservationUnavailable>
+            {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        }
+
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = CountingResolver(std::sync::atomic::AtomicUsize::new(0));
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let task = service
+            .create_task(
+                "caller",
+                &TaskCreateRequest::new(
+                    "create-cursor-probe-check",
+                    TaskSource::Manual,
+                    "Cursor",
+                    "Cursor validation",
+                    vec![],
+                    None,
+                ),
+            )
+            .unwrap();
+        let sections = [TaskContextSection::Attempts, TaskContextSection::Providers];
+
+        for cursor in [
+            "not-hex".to_owned(),
+            encode_context_cursor(task.task_id(), "attempts", 1, task.revision() + 1, 0),
+        ] {
+            let cursors = BTreeMap::from([("attempts".to_owned(), cursor)]);
+            assert!(matches!(
+                service.get_context(task.task_id(), &sections, 1, &cursors),
+                Err(ServiceError::InvalidRequest(_))
+            ));
+            assert_eq!(providers.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
