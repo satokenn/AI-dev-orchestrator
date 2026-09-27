@@ -5,12 +5,132 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use fs2::FileExt;
+
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{ProviderRef, TaskId};
 
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_LOG_LIMIT: usize = 1024 * 1024;
+
+/// Exclusive process lock for one canonical operation ledger.
+pub struct LedgerRunLock {
+    _file: std::fs::File,
+    _operation_file: std::fs::File,
+    ledger_path: PathBuf,
+    operation_path: PathBuf,
+}
+
+impl LedgerRunLock {
+    pub fn acquire(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
+        let canonical = canonical_ledger_path(path.as_ref())?;
+        let operation_path = operation_database_path(&canonical)?;
+        let (lock_path, operation_lock_path) = ledger_run_lock_paths(&canonical, &operation_path)?;
+        let file = open_exclusive_lock(&lock_path)?;
+        let operation_file = open_exclusive_lock(&operation_lock_path)?;
+        Ok(Self {
+            _file: file,
+            _operation_file: operation_file,
+            ledger_path: canonical,
+            operation_path,
+        })
+    }
+    pub fn ledger_path(&self) -> &Path {
+        &self.ledger_path
+    }
+}
+
+fn ledger_run_lock_paths(
+    ledger_path: &Path,
+    operation_path: &Path,
+) -> Result<(PathBuf, PathBuf), LedgerError> {
+    let mut name = ledger_path
+        .file_name()
+        .ok_or_else(|| LedgerError::InvalidValue("ledger path has no file name".into()))?
+        .to_os_string();
+    name.push(".operations.lock");
+    let lock_path = ledger_path.with_file_name(name);
+    let mut operation_lock = operation_path.as_os_str().to_os_string();
+    operation_lock.push(".recovery.lock");
+    Ok((lock_path, PathBuf::from(operation_lock)))
+}
+
+fn open_exclusive_lock(path: &Path) -> Result<std::fs::File, LedgerError> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    file.try_lock_exclusive().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            LedgerError::LockBusy
+        } else {
+            LedgerError::Io(error)
+        }
+    })?;
+    Ok(file)
+}
+
+fn canonical_ledger_path(path: &Path) -> Result<PathBuf, LedgerError> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let parent = parent.canonicalize()?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| LedgerError::InvalidValue("ledger path has no file name".into()))?;
+    let candidate = parent.join(name);
+    let canonical = match fs::symlink_metadata(&candidate) {
+        Ok(_) => fs::canonicalize(candidate)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => candidate,
+        Err(e) => return Err(e.into()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match fs::metadata(&canonical) {
+            Ok(metadata) if metadata.nlink() > 1 => {
+                return Err(LedgerError::InvalidValue(
+                    "hard-linked ledger files are not supported".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(canonical)
+}
+
+fn operation_database_path(ledger_path: &Path) -> Result<PathBuf, LedgerError> {
+    let mut name = ledger_path.as_os_str().to_os_string();
+    name.push(".operations.sqlite3");
+    let candidate = PathBuf::from(name);
+    let canonical = match fs::symlink_metadata(&candidate) {
+        Ok(_) => fs::canonicalize(&candidate)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => candidate,
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match fs::metadata(&canonical) {
+            Ok(metadata) if metadata.nlink() > 1 => {
+                return Err(LedgerError::InvalidValue(
+                    "hard-linked operation ledger files are not supported".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(canonical)
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OperationId(String);
@@ -295,6 +415,9 @@ pub enum LedgerError {
     ActiveOperation(OperationId),
     TerminalConflict(OperationId),
     UnsupportedSchema(u32),
+    RecoveryLockRequired,
+    RecoveryLockMismatch,
+    LockBusy,
 }
 impl fmt::Display for LedgerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -318,6 +441,9 @@ impl fmt::Display for LedgerError {
                 id.as_str()
             ),
             Self::UnsupportedSchema(v) => write!(f, "unsupported ledger schema: {v}"),
+            Self::RecoveryLockRequired => write!(f, "recovery requires an exclusive ledger lock"),
+            Self::RecoveryLockMismatch => write!(f, "recovery lock belongs to a different ledger"),
+            Self::LockBusy => write!(f, "ledger is busy: another process is running it"),
         }
     }
 }
@@ -348,17 +474,25 @@ pub trait ExecutionLedger {
         status: OperationStatus,
         diagnostic: Option<&str>,
     ) -> Result<(), LedgerError>;
+    fn mark_recovery_required(&self, id: &OperationId, diagnostic: &str)
+    -> Result<(), LedgerError>;
 }
 
 pub struct SqliteExecutionLedger {
     connection: Mutex<Connection>,
     log_limit: usize,
+    ledger_path: Option<PathBuf>,
+    operation_path: Option<PathBuf>,
 }
 
 impl SqliteExecutionLedger {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
-        let sidecar = PathBuf::from(format!("{}.operations.sqlite3", path.as_ref().display()));
-        Self::from_connection(Connection::open(sidecar)?)
+        let ledger_path = canonical_ledger_path(path.as_ref())?;
+        let operation_path = operation_database_path(&ledger_path)?;
+        let mut ledger = Self::from_connection(Connection::open(&operation_path)?)?;
+        ledger.ledger_path = Some(ledger_path);
+        ledger.operation_path = Some(operation_path);
+        Ok(ledger)
     }
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         Self::from_connection(Connection::open_in_memory()?)
@@ -373,6 +507,8 @@ impl SqliteExecutionLedger {
         Ok(Self {
             connection: Mutex::new(connection),
             log_limit: DEFAULT_LOG_LIMIT,
+            ledger_path: None,
+            operation_path: None,
         })
     }
     pub fn set_log_limit(&mut self, bytes: usize) {
@@ -577,7 +713,17 @@ impl SqliteExecutionLedger {
         )?;
         Ok(())
     }
-    pub fn recover(&self) -> Result<Vec<RecoveryRecord>, LedgerError> {
+    pub fn recover(&self, lock: &LedgerRunLock) -> Result<Vec<RecoveryRecord>, LedgerError> {
+        let expected = self
+            .ledger_path
+            .as_ref()
+            .ok_or(LedgerError::RecoveryLockRequired)?;
+        if expected != &lock.ledger_path {
+            return Err(LedgerError::RecoveryLockMismatch);
+        }
+        if self.operation_path.as_ref() != Some(&lock.operation_path) {
+            return Err(LedgerError::RecoveryLockMismatch);
+        }
         let mut connection = self.connection.lock().expect("ledger mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut statement = transaction.prepare("SELECT id, status FROM operations WHERE status IN ('accepted','running','interrupted')")?;
@@ -588,19 +734,100 @@ impl SqliteExecutionLedger {
         for item in ids {
             let (id, status) = item?;
             let status = OperationStatus::from_str(&status)?;
-            transaction.execute("UPDATE operations SET status='recovery_required' WHERE id=?1 AND status NOT IN ('succeeded','failed','invalid_output','timed_out','cancelled')", params![id])?;
+            let reason = format!(
+                "operation was not terminal at restart (previously {})",
+                status.as_str()
+            );
+            let recovered_at = now();
+            let changed = transaction.execute(
+                "UPDATE operations SET status='recovery_required', diagnostic=?2 \
+                 WHERE id=?1 AND status IN ('accepted','running','interrupted')",
+                params![id, reason],
+            )?;
+            if changed != 1 {
+                return Err(LedgerError::InvalidValue(format!(
+                    "operation changed during recovery: {id}"
+                )));
+            }
+            let sequence: i64 = transaction.query_row(
+                "SELECT COALESCE(MAX(sequence), -1) + 1 FROM operation_events WHERE operation_id=?1",
+                params![id],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO operation_events VALUES(?1, ?2, 'recovery', ?3, ?4)",
+                params![id, sequence, recovered_at, reason],
+            )?;
             records.push(RecoveryRecord {
                 operation: OperationId::new(id),
                 status: OperationStatus::RecoveryRequired,
-                reason: format!(
-                    "operation was not terminal at restart (previously {})",
-                    status.as_str()
-                ),
+                reason,
             });
         }
         drop(statement);
         transaction.commit()?;
         Ok(records)
+    }
+    pub fn mark_recovery_required(
+        &self,
+        id: &OperationId,
+        diagnostic: &str,
+    ) -> Result<(), LedgerError> {
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM operations WHERE id=?1",
+                params![id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Err(LedgerError::InvalidValue(format!(
+                "unknown operation {}",
+                id.as_str()
+            )));
+        };
+        let current = OperationStatus::from_str(&current)?;
+        if current == OperationStatus::RecoveryRequired {
+            let saved_diagnostic: Option<String> = transaction.query_row(
+                "SELECT diagnostic FROM operations WHERE id=?1",
+                params![id.as_str()],
+                |row| row.get(0),
+            )?;
+            return if saved_diagnostic.as_deref() == Some(diagnostic) {
+                Ok(())
+            } else {
+                Err(LedgerError::TerminalConflict(id.clone()))
+            };
+        }
+        if !matches!(
+            current,
+            OperationStatus::Accepted | OperationStatus::Running | OperationStatus::Interrupted
+        ) {
+            return Err(LedgerError::TerminalConflict(id.clone()));
+        }
+
+        let occurred_at = now();
+        let changed = transaction.execute(
+            "UPDATE operations SET status='recovery_required', diagnostic=?2 \
+             WHERE id=?1 AND status IN ('accepted','running','interrupted')",
+            params![id.as_str(), diagnostic],
+        )?;
+        if changed != 1 {
+            return Err(LedgerError::TerminalConflict(id.clone()));
+        }
+        let sequence: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM operation_events WHERE operation_id=?1",
+            params![id.as_str()],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO operation_events VALUES(?1, ?2, 'recovery', ?3, ?4)",
+            params![id.as_str(), sequence, occurred_at, diagnostic],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
     fn load(&self, id: &OperationId) -> Result<Option<OperationRecord>, LedgerError> {
         let connection = self.connection.lock().expect("ledger mutex poisoned");
@@ -717,6 +944,12 @@ impl ExecutionLedger for SqliteExecutionLedger {
             )));
         };
         let current = OperationStatus::from_str(&current)?;
+        if matches!(
+            current,
+            OperationStatus::Interrupted | OperationStatus::RecoveryRequired
+        ) {
+            return Err(LedgerError::TerminalConflict(id.clone()));
+        }
         if current.terminal() {
             if current != status {
                 return Err(LedgerError::TerminalConflict(id.clone()));
@@ -724,7 +957,7 @@ impl ExecutionLedger for SqliteExecutionLedger {
             return Ok(());
         }
         let finished = now();
-        let changed = transaction.execute("UPDATE operations SET status=?2, finished_at=?3, diagnostic=COALESCE(?4, diagnostic) WHERE id=?1 AND status NOT IN ('succeeded','failed','invalid_output','timed_out','cancelled')", params![id.as_str(), status.as_str(), finished, diagnostic])?;
+        let changed = transaction.execute("UPDATE operations SET status=?2, finished_at=?3, diagnostic=COALESCE(?4, diagnostic) WHERE id=?1 AND status IN ('accepted','running')", params![id.as_str(), status.as_str(), finished, diagnostic])?;
         if changed != 1 {
             return Err(LedgerError::TerminalConflict(id.clone()));
         }
@@ -745,6 +978,13 @@ impl ExecutionLedger for SqliteExecutionLedger {
         transaction.commit()?;
         Ok(())
     }
+    fn mark_recovery_required(
+        &self,
+        id: &OperationId,
+        diagnostic: &str,
+    ) -> Result<(), LedgerError> {
+        SqliteExecutionLedger::mark_recovery_required(self, id, diagnostic)
+    }
 }
 
 fn now() -> i64 {
@@ -757,6 +997,15 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery_test_path(label: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "operation-recovery-{label}-{}-{}.sqlite3",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
     fn request(id: &str, payload: &str) -> OperationRequest {
         OperationRequest::new(
             id,
@@ -838,10 +1087,16 @@ mod tests {
     }
     #[test]
     fn recovery_marks_unknown_state_without_claiming_success() {
-        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let path = recovery_test_path("state");
+        let ledger = SqliteExecutionLedger::open(&path).unwrap();
         let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
-        let recovered = ledger.recover().unwrap();
+        let lock = LedgerRunLock::acquire(&path).unwrap();
+        let recovered = ledger.recover(&lock).unwrap();
         assert_eq!(recovered[0].operation, *operation.id());
+        assert_eq!(
+            recovered[0].reason,
+            "operation was not terminal at restart (previously accepted)"
+        );
         assert_eq!(
             ledger
                 .get_operation(operation.id())
@@ -850,6 +1105,176 @@ mod tests {
                 .status(),
             OperationStatus::RecoveryRequired
         );
+        assert_eq!(
+            ledger
+                .get_operation(operation.id())
+                .unwrap()
+                .unwrap()
+                .diagnostic(),
+            Some(recovered[0].reason.as_str())
+        );
+        let events = ledger.events(operation.id()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, EventKind::Recovery);
+        assert_eq!(events[1].detail, recovered[0].reason);
+        assert!(ledger.recover(&lock).unwrap().is_empty());
+        assert_eq!(ledger.events(operation.id()).unwrap().len(), 2);
+        drop(lock);
+        drop(ledger);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}.operations.sqlite3", path.display()));
+        let _ = fs::remove_file(format!("{}.operations.lock", path.display()));
+    }
+
+    #[test]
+    fn recovery_requires_a_lock_for_the_same_canonical_ledger() {
+        let first_path = recovery_test_path("first");
+        let second_path = recovery_test_path("second");
+        let ledger = SqliteExecutionLedger::open(&first_path).unwrap();
+        let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
+        let wrong_lock = LedgerRunLock::acquire(&second_path).unwrap();
+        assert!(matches!(
+            ledger.recover(&wrong_lock),
+            Err(LedgerError::RecoveryLockMismatch)
+        ));
+        assert_eq!(
+            ledger
+                .get_operation(operation.id())
+                .unwrap()
+                .unwrap()
+                .status(),
+            OperationStatus::Accepted
+        );
+        drop(wrong_lock);
+        let lock = LedgerRunLock::acquire(&first_path).unwrap();
+        assert_eq!(ledger.recover(&lock).unwrap().len(), 1);
+        drop(lock);
+        drop(ledger);
+        for path in [&first_path, &second_path] {
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(format!("{}.operations.sqlite3", path.display()));
+            let _ = fs::remove_file(format!("{}.operations.lock", path.display()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_ledger_names_keep_sidecars_and_locks_distinct() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = std::env::temp_dir().join(format!("operation-non-utf8-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let first_path = root.join(std::ffi::OsString::from_vec(b"ledger-\xff".to_vec()));
+        let second_path = root.join(std::ffi::OsString::from_vec(b"ledger-\xfe".to_vec()));
+
+        let first_canonical = canonical_ledger_path(&first_path).unwrap();
+        let second_canonical = canonical_ledger_path(&second_path).unwrap();
+        let first_sidecar = operation_database_path(&first_canonical).unwrap();
+        let second_sidecar = operation_database_path(&second_canonical).unwrap();
+        let (first_lock, first_operation_lock) =
+            ledger_run_lock_paths(&first_canonical, &first_sidecar).unwrap();
+        let (second_lock, second_operation_lock) =
+            ledger_run_lock_paths(&second_canonical, &second_sidecar).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        assert_ne!(
+            first_sidecar.as_os_str().as_bytes(),
+            second_sidecar.as_os_str().as_bytes()
+        );
+        assert_ne!(
+            first_lock.as_os_str().as_bytes(),
+            second_lock.as_os_str().as_bytes()
+        );
+        assert_ne!(
+            first_operation_lock.as_os_str().as_bytes(),
+            second_operation_lock.as_os_str().as_bytes()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_operation_sidecar_is_rejected() {
+        let root =
+            std::env::temp_dir().join(format!("operation-sidecar-hardlink-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let first_path = root.join("first.sqlite3");
+        let second_path = root.join("second.sqlite3");
+        drop(SqliteExecutionLedger::open(&first_path).unwrap());
+        let mut first_sidecar = first_path.as_os_str().to_os_string();
+        first_sidecar.push(".operations.sqlite3");
+        let mut second_sidecar = second_path.as_os_str().to_os_string();
+        second_sidecar.push(".operations.sqlite3");
+        fs::hard_link(PathBuf::from(first_sidecar), PathBuf::from(second_sidecar)).unwrap();
+
+        assert!(matches!(
+            LedgerRunLock::acquire(&first_path),
+            Err(LedgerError::InvalidValue(message)) if message.contains("hard-linked operation ledger")
+        ));
+        assert!(matches!(
+            SqliteExecutionLedger::open(&second_path),
+            Err(LedgerError::InvalidValue(message)) if message.contains("hard-linked operation ledger")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_operation_sidecar_uses_the_target_lock() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("operation-sidecar-symlink-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let first_path = root.join("first.sqlite3");
+        let second_path = root.join("second.sqlite3");
+        drop(SqliteExecutionLedger::open(&first_path).unwrap());
+        let mut first_sidecar = first_path.as_os_str().to_os_string();
+        first_sidecar.push(".operations.sqlite3");
+        let mut second_sidecar = second_path.as_os_str().to_os_string();
+        second_sidecar.push(".operations.sqlite3");
+        let first_sidecar = PathBuf::from(first_sidecar);
+        symlink(&first_sidecar, PathBuf::from(second_sidecar)).unwrap();
+
+        let first_lock = LedgerRunLock::acquire(&first_path).unwrap();
+        assert!(matches!(
+            LedgerRunLock::acquire(&second_path),
+            Err(LedgerError::LockBusy)
+        ));
+        drop(first_lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_required_operation_cannot_be_finished_or_overwritten() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
+        ledger
+            .start_operation(operation.id(), &ProviderRef::new("codex"), Some("gpt"))
+            .unwrap();
+        ledger
+            .mark_recovery_required(operation.id(), "process outcome is unknown")
+            .unwrap();
+        ledger
+            .mark_recovery_required(operation.id(), "process outcome is unknown")
+            .unwrap();
+
+        assert!(matches!(
+            ledger.finish_operation(operation.id(), OperationStatus::Succeeded, None),
+            Err(LedgerError::TerminalConflict(_))
+        ));
+        assert!(matches!(
+            ledger.mark_recovery_required(operation.id(), "different diagnosis"),
+            Err(LedgerError::TerminalConflict(_))
+        ));
+        let stored = ledger.get_operation(operation.id()).unwrap().unwrap();
+        assert_eq!(stored.status(), OperationStatus::RecoveryRequired);
+        assert_eq!(stored.finished_at(), None);
+        assert_eq!(stored.diagnostic(), Some("process outcome is unknown"));
+        let events = ledger.events(operation.id()).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].kind, EventKind::Recovery);
+        assert_eq!(events[2].detail, "process outcome is unknown");
     }
     #[test]
     fn raw_logs_are_bounded_and_referenced() {

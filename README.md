@@ -39,7 +39,7 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 ## Operation Ledger
 
-`Orchestrator` は、設定された `SqliteOperationLedger` に外部 Provider の起動前の受理・開始を記録し、workspace 準備、Provider実行、validation の結果を終了状態として保存します。CLI は指定された実行Ledgerのサイドカーへ自動的にOperation Ledgerを保存します。`SqliteOperationLedger` は同じ request ID の再送を同じ operation として返し、異なる payload、古い Task revision、同一 Task の実行中操作を拒否します。終了事実、event、validation、review、usage / budget、publication 参照、上限付き raw log、再起動時の `recovery_required` 診断を保存します。
+`Orchestrator` は、設定された `SqliteOperationLedger` に外部 Provider の起動前の受理・開始を記録し、workspace 準備、Provider実行、validation の結果を終了状態として保存します。CLI は指定された実行Ledgerのサイドカーへ自動的にOperation Ledgerを保存します。`SqliteOperationLedger` は同じ request ID の再送を同じ operation として返し、異なる payload、古い Task revision、同一 Task の実行中操作を拒否します。終了事実、event、validation、review、usage / budget、publication 参照、上限付き raw log、再起動時の `recovery_required` 診断を保存します。`recover`には対象ledger pathに対する`LedgerRunLock::acquire`で得たlockが必要で、別ledgerのlockは拒否されます。CLIも同じlockを保持して起動時復旧を行います。
 
 ## WorkspaceManager
 
@@ -118,6 +118,9 @@ Rustコードに適用する必須検証、テスト種別、unsafeの扱いは�
 ファイルを開いて schema を初期化し、`open_in_memory()` は隔離された ledger を作成します。
 Task を `save_task` で保存した後、各 Attempt を `save_attempt` で保存してください。
 retry は別の Attempt ID として追加されます。
+
+本番CLIの`run`は、指定Ledger単位で実行全体を排他します。同じLedgerを使う別プロセスの実行中は、後続の`run`をbusyとして中止します。シンボリックリンクで指定した場合もリンク先のLedgerを使います。macOS/Linuxではhard linkされたLedgerを安全に排他できないため、実行を拒否します。
+Ledgerの隣に作られる`<Ledger file name>.operations.lock`（例: `ledger.sqlite3.operations.lock`）と、canonicalなOperation Ledger sidecarの隣に作られる`<Operation Ledger sidecar>.recovery.lock`（例: `ledger.sqlite3.operations.sqlite3.recovery.lock`）は、どちらもプロセス終了後も残ります。排他状態はOSが各lockファイルを開いている間だけ保持されるため、実行中にどちらのファイルも削除しないでください。
 
 ## GitHub Workflow
 

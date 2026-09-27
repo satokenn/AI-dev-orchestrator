@@ -1,4 +1,4 @@
-//! Small, dependency-free command line interface.
+//! Command-line interface.
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -9,11 +9,11 @@ use std::{
 use crate::{
     AgentResult, AntigravityProvider, Attempt, AttemptId, CodexPlanner, CodexProvider,
     CopilotProvider, ExecutionPolicy, GhIssueSource, GhPullRequestGateway, GhRepositoryEffects,
-    GitHubWorkflow, IssueExecutor, IssueRef, IssueSnapshot, IssueSource, Orchestrator,
-    PlannerRequest, PlannerService, ProviderAvailability, ProviderRef, ProviderRegistry,
-    ProviderResolver, PublicationRecord, PublishResult, RustValidator, SqliteExecutionLedger,
-    SqliteOperationLedger, Task, TaskId, TaskRole, ValidationResult, WorkflowError,
-    WorkspaceManager, prepare_issue_publication,
+    GitHubWorkflow, IssueExecutor, IssueRef, IssueSnapshot, IssueSource, LedgerRunLock,
+    Orchestrator, PlannerRequest, PlannerService, ProviderAvailability, ProviderRef,
+    ProviderRegistry, ProviderResolver, PublicationRecord, PublishResult, RustValidator,
+    SqliteExecutionLedger, SqliteOperationLedger, Task, TaskId, TaskRole, ValidationResult,
+    WorkflowError, WorkspaceManager, prepare_issue_publication,
 };
 
 pub const SUCCESS: i32 = 0;
@@ -36,6 +36,25 @@ fn open_ledger_for_run(path: &Path) -> Result<SqliteExecutionLedger, String> {
     }
     SqliteExecutionLedger::open(path)
         .map_err(|error| format!("cannot open ledger {}: {error}", path.display()))
+}
+
+fn open_operation_ledger_for_run(
+    path: &Path,
+    _run_lock: &LedgerRunLock,
+) -> Result<Arc<SqliteOperationLedger>, String> {
+    let ledger = SqliteOperationLedger::open(path)
+        .map_err(|error| format!("cannot open operation ledger: {error}"))?;
+    let recovered = ledger
+        .recover(_run_lock)
+        .map_err(|error| format!("cannot recover operation ledger: {error}"))?;
+    for record in recovered {
+        eprintln!(
+            "operation {} requires recovery: {}",
+            record.operation.as_str(),
+            record.reason
+        );
+    }
+    Ok(Arc::new(ledger))
 }
 
 fn help() -> String {
@@ -176,7 +195,22 @@ impl CliRuntime for ProductionRuntime {
         doctor(json)
     }
     fn run_issue(&self, request: &RunRequest) -> i32 {
-        let ledger = match open_ledger_for_run(&request.ledger) {
+        let _run_lock = match LedgerRunLock::acquire(&request.ledger) {
+            Ok(lock) => lock,
+            Err(error) => {
+                eprintln!("{error}");
+                return OPERATION_ERROR;
+            }
+        };
+        let ledger_path = _run_lock.ledger_path();
+        let ledger = match open_ledger_for_run(ledger_path) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                eprintln!("{error}");
+                return OPERATION_ERROR;
+            }
+        };
+        let operation_ledger = match open_operation_ledger_for_run(ledger_path, &_run_lock) {
             Ok(ledger) => ledger,
             Err(error) => {
                 eprintln!("{error}");
@@ -233,13 +267,6 @@ impl CliRuntime for ProductionRuntime {
                 };
             }
         }
-        let operation_ledger = match SqliteOperationLedger::open(&request.ledger) {
-            Ok(ledger) => Arc::new(ledger),
-            Err(error) => {
-                eprintln!("cannot open operation ledger: {error}");
-                return OPERATION_ERROR;
-            }
-        };
         let executor = ProductionIssueExecutor {
             root: request.repository_root.clone(),
             ledger,
@@ -505,4 +532,354 @@ pub fn run_with_runtime<I: IntoIterator<Item = String>>(args: I, runtime: &dyn C
 
 pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     run_with_runtime(args, &ProductionRuntime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CliRuntime, LedgerRunLock, ProductionRuntime, RunRequest, open_operation_ledger_for_run,
+    };
+    use crate::{
+        EventKind, OperationLedger, OperationRequest, OperationStatus, ProviderRef,
+        SqliteExecutionLedger, SqliteOperationLedger, TaskId,
+    };
+    use std::{
+        fs,
+        process::{Child, Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const CHILD_MODE: &str = "AI_DEV_ORCHESTRATOR_LOCK_TEST_MODE";
+    const CHILD_LEDGER: &str = "AI_DEV_ORCHESTRATOR_LOCK_TEST_LEDGER";
+    const CHILD_MARKER: &str = "AI_DEV_ORCHESTRATOR_LOCK_TEST_MARKER";
+
+    fn temporary_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ai-dev-orchestrator-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn seed_operation(path: &std::path::Path, running: bool) -> crate::OperationId {
+        let ledger = SqliteOperationLedger::open(path).unwrap();
+        ledger.set_task_revision(&TaskId::new("task-1"), 1).unwrap();
+        let operation = ledger
+            .accept_operation(&OperationRequest::new(
+                "request-1",
+                TaskId::new("task-1"),
+                1,
+                "payload",
+                "instruction",
+                ProviderRef::new("codex"),
+                None,
+            ))
+            .unwrap();
+        if running {
+            ledger
+                .start_operation(operation.id(), &ProviderRef::new("codex"), None)
+                .unwrap();
+        }
+        operation.id().clone()
+    }
+
+    fn spawn_lock_child(mode: &str, ledger: &std::path::Path, marker: &std::path::Path) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::tests::ledger_lock_child_helper",
+                "--nocapture",
+            ])
+            .env(CHILD_MODE, mode)
+            .env(CHILD_LEDGER, ledger)
+            .env(CHILD_MARKER, marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn write_marker(marker: &std::path::Path, contents: &str) -> std::io::Result<()> {
+        let mut temporary_name = marker
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("marker path has no file name"))?
+            .to_os_string();
+        temporary_name.push(".tmp");
+        let temporary_path = marker.with_file_name(temporary_name);
+        fs::write(&temporary_path, contents)?;
+        fs::rename(temporary_path, marker)
+    }
+
+    fn wait_for_marker(child: &mut Child, marker: &std::path::Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if marker.exists() {
+                return fs::read_to_string(marker).unwrap();
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("lock helper exited before signaling readiness: {status}");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("timed out waiting for lock helper");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn ledger_lock_child_helper() {
+        let Ok(mode) = std::env::var(CHILD_MODE) else {
+            return;
+        };
+        let ledger_path = std::path::PathBuf::from(std::env::var(CHILD_LEDGER).unwrap());
+        let marker = std::path::PathBuf::from(std::env::var(CHILD_MARKER).unwrap());
+        match mode.as_str() {
+            "lock" => match LedgerRunLock::acquire(&ledger_path) {
+                Err(error) if error.to_string().contains("ledger is busy") => {
+                    write_marker(&marker, "busy").unwrap();
+                }
+                Err(error) => write_marker(&marker, &format!("error: {error}")).unwrap(),
+                Ok(_lock) => write_marker(&marker, "acquired").unwrap(),
+            },
+            "run" => {
+                let result = ProductionRuntime.run_issue(&RunRequest {
+                    repository: "owner/repo".to_owned(),
+                    issue: 1,
+                    repository_root: std::path::PathBuf::from("."),
+                    ledger: ledger_path,
+                });
+                write_marker(&marker, &result.to_string()).unwrap();
+            }
+            "hold" => {
+                let _lock = LedgerRunLock::acquire(&ledger_path).unwrap();
+                write_marker(&marker, "locked").unwrap();
+                thread::sleep(Duration::from_secs(60));
+            }
+            _ => panic!("unknown lock test mode"),
+        }
+    }
+
+    #[test]
+    fn concurrent_process_cannot_recover_an_active_ledger() {
+        let root = temporary_path("ledger-lock-concurrent");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        let id = seed_operation(&path, false);
+        let marker = root.join("child-result");
+        let lock = LedgerRunLock::acquire(&path).unwrap();
+        let mut child = spawn_lock_child("run", &path, &marker);
+
+        assert_eq!(
+            wait_for_marker(&mut child, &marker),
+            super::OPERATION_ERROR.to_string()
+        );
+        assert!(child.wait().unwrap().success());
+        let ledger = SqliteOperationLedger::open(&path).unwrap();
+        let operation = ledger.get_operation(&id).unwrap().unwrap();
+        assert_eq!(operation.status(), OperationStatus::Accepted);
+        assert_eq!(ledger.events(&id).unwrap().len(), 1);
+        drop(ledger);
+        drop(lock);
+
+        let lock = LedgerRunLock::acquire(&path).unwrap();
+        let recovered = open_operation_ledger_for_run(&path, &lock).unwrap();
+        assert_eq!(
+            recovered.get_operation(&id).unwrap().unwrap().status(),
+            OperationStatus::RecoveryRequired
+        );
+        drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_uses_same_lock_and_operation_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_path("ledger-lock-symlink");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        SqliteExecutionLedger::open(&path).unwrap();
+        let id = seed_operation(&path, false);
+        let alias = root.join("ledger-alias.sqlite3");
+        symlink(&path, &alias).unwrap();
+
+        let lock = LedgerRunLock::acquire(&path).unwrap();
+        assert!(LedgerRunLock::acquire(&alias).is_err());
+        let marker = root.join("child-result");
+        let mut child = spawn_lock_child("lock", &alias, &marker);
+        assert_eq!(wait_for_marker(&mut child, &marker), "busy");
+        assert!(child.wait().unwrap().success());
+
+        let ledger = open_operation_ledger_for_run(lock.ledger_path(), &lock).unwrap();
+        assert!(ledger.get_operation(&id).unwrap().is_some());
+        drop(ledger);
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_ledger_is_rejected_before_lock_or_recovery() {
+        let root = temporary_path("ledger-hard-link");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        let alias = root.join("ledger-alias.sqlite3");
+        SqliteExecutionLedger::open(&path).unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+
+        assert!(LedgerRunLock::acquire(&alias).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_crash_releases_ledger_lock_and_allows_startup_recovery() {
+        let root = temporary_path("ledger-lock-crash");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        let id = seed_operation(&path, true);
+        let marker = root.join("child-locked");
+        let mut child = spawn_lock_child("hold", &path, &marker);
+
+        assert_eq!(wait_for_marker(&mut child, &marker), "locked");
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+
+        let lock = LedgerRunLock::acquire(&path).unwrap();
+        let recovered = open_operation_ledger_for_run(&path, &lock).unwrap();
+        let operation = recovered.get_operation(&id).unwrap().unwrap();
+        assert_eq!(operation.status(), OperationStatus::RecoveryRequired);
+        assert!(operation.diagnostic().is_some());
+        assert_eq!(
+            recovered.events(&id).unwrap().last().unwrap().kind,
+            EventKind::Recovery
+        );
+        drop(recovered);
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_operation_ledger_recovers_unfinished_operations() {
+        let root = temporary_path("startup-recovery");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        let (accepted_id, running_id) = {
+            let ledger = SqliteOperationLedger::open(&path).unwrap();
+            ledger.set_task_revision(&TaskId::new("task-1"), 1).unwrap();
+            ledger.set_task_revision(&TaskId::new("task-2"), 1).unwrap();
+            let accepted = ledger
+                .accept_operation(&OperationRequest::new(
+                    "request-1",
+                    TaskId::new("task-1"),
+                    1,
+                    "payload",
+                    "instruction",
+                    ProviderRef::new("codex"),
+                    None,
+                ))
+                .unwrap();
+            let running = ledger
+                .accept_operation(&OperationRequest::new(
+                    "request-2",
+                    TaskId::new("task-2"),
+                    1,
+                    "payload",
+                    "instruction",
+                    ProviderRef::new("codex"),
+                    None,
+                ))
+                .unwrap();
+            ledger
+                .start_operation(running.id(), &ProviderRef::new("codex"), None)
+                .unwrap();
+            (accepted.id().clone(), running.id().clone())
+        };
+
+        let lock = LedgerRunLock::acquire(&path).unwrap();
+        let recovered = open_operation_ledger_for_run(&path, &lock).unwrap();
+        for id in [&accepted_id, &running_id] {
+            let operation = recovered.get_operation(id).unwrap().unwrap();
+            assert_eq!(operation.status(), OperationStatus::RecoveryRequired);
+            assert!(operation.diagnostic().is_some());
+            let events = recovered.events(id).unwrap();
+            assert_eq!(events.last().unwrap().kind, EventKind::Recovery);
+            assert_eq!(
+                events.last().unwrap().detail,
+                operation.diagnostic().unwrap()
+            );
+        }
+        assert!(recovered.recover(&lock).unwrap().is_empty());
+        assert_eq!(recovered.events(&accepted_id).unwrap().len(), 2);
+        assert_eq!(recovered.events(&running_id).unwrap().len(), 3);
+        drop(recovered);
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operation_ledger_open_failure_is_reported_without_continuing() {
+        let root = temporary_path("startup-recovery-failure");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        let sidecar = std::path::PathBuf::from(format!("{}.operations.sqlite3", path.display()));
+        fs::write(&sidecar, b"not a sqlite database").unwrap();
+
+        let lock = LedgerRunLock::acquire(&path).unwrap();
+        let error = open_operation_ledger_for_run(&path, &lock).err().unwrap();
+        assert!(error.contains("cannot open operation ledger"));
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operation_ledger_recovery_failure_is_reported_without_partial_update() {
+        let root = temporary_path("startup-recovery-transaction");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.sqlite3");
+        let id = {
+            let ledger = SqliteOperationLedger::open(&path).unwrap();
+            ledger.set_task_revision(&TaskId::new("task-1"), 1).unwrap();
+            ledger
+                .accept_operation(&OperationRequest::new(
+                    "request-1",
+                    TaskId::new("task-1"),
+                    1,
+                    "payload",
+                    "instruction",
+                    ProviderRef::new("codex"),
+                    None,
+                ))
+                .unwrap()
+                .id()
+                .clone()
+        };
+        let sidecar = std::path::PathBuf::from(format!("{}.operations.sqlite3", path.display()));
+        let connection = rusqlite::Connection::open(&sidecar).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_recovery BEFORE INSERT ON operation_events
+                 WHEN NEW.kind = 'recovery' BEGIN SELECT RAISE(ABORT, 'injected recovery failure'); END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let lock = LedgerRunLock::acquire(&path).unwrap();
+        let error = open_operation_ledger_for_run(&path, &lock).err().unwrap();
+        assert!(error.contains("cannot recover operation ledger"));
+        let ledger = SqliteOperationLedger::open(&path).unwrap();
+        let operation = ledger.get_operation(&id).unwrap().unwrap();
+        assert_eq!(operation.status(), OperationStatus::Accepted);
+        assert_eq!(operation.diagnostic(), None);
+        assert_eq!(ledger.events(&id).unwrap().len(), 1);
+        drop(ledger);
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
