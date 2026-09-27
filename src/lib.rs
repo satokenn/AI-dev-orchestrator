@@ -39,8 +39,8 @@ pub use github_workflow::{
 };
 pub use operation_ledger::{
     EventKind, ExecutionLedger as OperationLedger, LedgerError as OperationLedgerError,
-    LogReference, OperationEvent, OperationId, OperationRecord, OperationRequest, OperationStatus,
-    PublicationReference, RecoveryRecord, ReviewRecord,
+    LedgerRunLock, LogReference, OperationEvent, OperationId, OperationRecord, OperationRequest,
+    OperationStatus, PublicationReference, RecoveryRecord, ReviewRecord,
     SqliteExecutionLedger as SqliteOperationLedger, UsageRecord, ValidationRecord,
 };
 pub use operation_service::{
