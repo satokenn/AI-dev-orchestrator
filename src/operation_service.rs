@@ -1222,8 +1222,16 @@ mod tests {
         availability_checks: Arc<AtomicUsize>,
         fail: bool,
         unknown_interrupt: bool,
+        provider_failure: Option<FakeProviderFailure>,
         execute_delay: Duration,
         reference: ProviderRef,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeProviderFailure {
+        ExecutionFailed,
+        Cancelled,
+        CancelledWithOutput,
     }
 
     impl AgentProvider for FakeProvider {
@@ -1234,6 +1242,25 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             thread::sleep(self.execute_delay);
             assert_eq!(request.model(), &ModelChoice::ProviderDefault);
+            match self.provider_failure {
+                Some(FakeProviderFailure::ExecutionFailed) => {
+                    return Err(ProviderError::ExecutionFailed(
+                        "RAW_EXECUTION_DIAGNOSTIC_SECRET".into(),
+                    ));
+                }
+                Some(FakeProviderFailure::Cancelled) => return Err(ProviderError::Cancelled),
+                Some(FakeProviderFailure::CancelledWithOutput) => {
+                    return Err(ProviderError::CancelledWithOutput.with_captured_output(
+                        crate::CapturedOutput::new(
+                            b"RAW_STDOUT_SECRET".to_vec(),
+                            b"RAW_STDERR_SECRET".to_vec(),
+                            None,
+                            false,
+                        ),
+                    ));
+                }
+                None => {}
+            }
             if self.unknown_interrupt {
                 return Err(ProviderError::Interrupted {
                     reason: crate::StopReason::TimedOut,
@@ -1257,6 +1284,21 @@ mod tests {
                 )])),
             )
             .with_observed_target(Some(self.reference.clone()), None))
+        }
+        fn execute_with_cancellation(
+            &self,
+            request: &ProviderRequest,
+            cancellation: CancellationToken,
+        ) -> Result<ProviderResult, ProviderError> {
+            if !matches!(self.provider_failure, Some(FakeProviderFailure::Cancelled)) {
+                return self.execute(request);
+            }
+
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            while !cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(ProviderError::Cancelled)
         }
         fn check_availability(&self) -> Result<(), ProviderError> {
             self.availability_checks.fetch_add(1, Ordering::SeqCst);
@@ -1319,6 +1361,7 @@ mod tests {
         fail: bool,
         execute_delay: Duration,
         unknown_interrupt: bool,
+        provider_failure: Option<FakeProviderFailure>,
     ) -> (
         Repo,
         SqliteExecutionLedger,
@@ -1347,6 +1390,7 @@ mod tests {
             availability_checks: checks.clone(),
             fail,
             unknown_interrupt,
+            provider_failure,
             execute_delay,
             reference: ProviderRef::new("fake"),
         });
@@ -1366,6 +1410,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
         });
@@ -1394,6 +1439,7 @@ mod tests {
                 availability_checks: Arc::new(AtomicUsize::new(0)),
                 fail: false,
                 unknown_interrupt: false,
+                provider_failure: None,
                 execute_delay: Duration::ZERO,
                 reference: ProviderRef::new("fake"),
             });
@@ -1432,6 +1478,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::from_millis(800),
             reference: ProviderRef::new("fake"),
         });
@@ -1479,6 +1526,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
         });
@@ -1514,6 +1562,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
         });
@@ -1557,7 +1606,7 @@ mod tests {
     #[test]
     fn named_model_is_fail_closed_before_provider_side_effects() {
         let (repo, ledger, workspace, providers, calls, checks, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
@@ -1582,7 +1631,7 @@ mod tests {
     #[test]
     fn base_input_acceptance_is_atomic_idempotent_and_records_safe_success() {
         let (repo, ledger, workspace, providers, calls, checks, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
@@ -1651,7 +1700,7 @@ mod tests {
     #[test]
     fn provider_timeout_is_recorded_without_raw_streams() {
         let (repo, ledger, workspace, providers, calls, _, task_id) =
-            service_parts(true, Duration::ZERO, false);
+            service_parts(true, Duration::ZERO, false, None);
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
@@ -1673,9 +1722,85 @@ mod tests {
     }
 
     #[test]
+    fn provider_failures_and_cancelled_output_are_persisted_without_raw_diagnostics() {
+        for (request_id, failure, status, attempt_state, diagnostic) in [
+            (
+                "provider-execution-failure",
+                FakeProviderFailure::ExecutionFailed,
+                ServiceOperationStatus::Failed,
+                AttemptState::Failed,
+                "provider_failed",
+            ),
+            (
+                "provider-cancelled",
+                FakeProviderFailure::Cancelled,
+                ServiceOperationStatus::Cancelled,
+                AttemptState::Cancelled,
+                "cancelled",
+            ),
+            (
+                "provider-cancelled-output",
+                FakeProviderFailure::CancelledWithOutput,
+                ServiceOperationStatus::Cancelled,
+                AttemptState::Cancelled,
+                "cancelled",
+            ),
+        ] {
+            let (repo, ledger, workspace, providers, calls, _, task_id) =
+                service_parts(false, Duration::ZERO, false, Some(failure));
+            let service =
+                OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                    .unwrap();
+            let accepted = service
+                .submit_attempt(&request(&repo, &task_id, 0, request_id))
+                .unwrap();
+            let cancellation = CancellationToken::new();
+            let cancellation_driver = if matches!(failure, FakeProviderFailure::Cancelled) {
+                let driver_token = cancellation.clone();
+                Some(thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(10));
+                    driver_token.cancel();
+                }))
+            } else {
+                None
+            };
+            let result = service.run(accepted.operation_id(), cancellation).unwrap();
+            if let Some(driver) = cancellation_driver {
+                driver.join().unwrap();
+            }
+
+            assert_eq!(result.status(), status);
+            assert_eq!(result.attempt_state(), attempt_state);
+            assert_eq!(result.diagnostic_code(), Some(diagnostic));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let snapshot_text = format!("{result:?}");
+            assert!(!snapshot_text.contains("RAW_STDOUT_SECRET"));
+            assert!(!snapshot_text.contains("RAW_STDERR_SECRET"));
+            assert_eq!(
+                service
+                    .run(accepted.operation_id(), CancellationToken::new())
+                    .unwrap(),
+                result
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let connection = ledger.lock_connection().unwrap();
+            let raw_output_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM service_operations WHERE id=?1 AND (instruction LIKE '%RAW_STDOUT_SECRET%' OR instruction LIKE '%RAW_STDERR_SECRET%' OR diagnostic_code LIKE '%RAW_%')",
+                    params![result.operation_id().as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(raw_output_count, 0);
+            drop(connection);
+            cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+        }
+    }
+
+    #[test]
     fn unconfirmed_provider_stop_preserves_running_attempt_as_unknown() {
         let (repo, ledger, workspace, providers, calls, _, task_id) =
-            service_parts(false, Duration::ZERO, true);
+            service_parts(false, Duration::ZERO, true, None);
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
@@ -1721,7 +1846,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (repo, ledger, workspace, providers, calls, _, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         fs::write(repo.0.join(".gitignore"), "hook-secret.txt\n").unwrap();
         git(&repo.0, &["add", ".gitignore"]);
         git(&repo.0, &["commit", "-m", "ignore hook fixture"]);
@@ -1771,7 +1896,7 @@ mod tests {
     #[test]
     fn failed_acceptance_rolls_back_operation_task_and_attempt_together() {
         let (repo, ledger, workspace, providers, calls, _, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         let connection = ledger.lock_connection().unwrap();
         connection.execute_batch("CREATE TRIGGER reject_service_attempt BEFORE INSERT ON attempts WHEN NEW.semantics_version='provider_call_v2' BEGIN SELECT RAISE(ABORT, 'test transaction rollback'); END;").unwrap();
         drop(connection);
@@ -1832,6 +1957,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::from_millis(250),
             reference: ProviderRef::new("fake"),
         });
@@ -1898,6 +2024,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
         });
@@ -1945,7 +2072,7 @@ mod tests {
     #[test]
     fn second_in_memory_service_does_not_recover_another_service_live_operation() {
         let (repo, ledger, workspace, providers, _, _, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         let first =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
