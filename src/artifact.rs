@@ -91,6 +91,8 @@ pub struct ArtifactValidationRecord {
     passed: bool,
     check_count: usize,
     revision: u64,
+    config_id: Option<String>,
+    config_version: Option<String>,
 }
 
 impl ArtifactValidationRecord {
@@ -114,6 +116,12 @@ impl ArtifactValidationRecord {
     }
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+    pub fn config_id(&self) -> Option<&str> {
+        self.config_id.as_deref()
+    }
+    pub fn config_version(&self) -> Option<&str> {
+        self.config_version.as_deref()
     }
 }
 
@@ -478,8 +486,8 @@ impl<'a> ArtifactManager<'a> {
             return Err(ArtifactError::RecoveryRequired);
         }
         tx.execute(
-            "INSERT INTO artifact_validations(id,task_id,artifact_id,tree_oid,summary,passed,created_at) VALUES(?1,?2,?3,?4,'validation outcome recorded; raw diagnostics withheld',?5,?6)",
-            params![id, task.as_str(), artifact_id, artifact.tree_oid(), i64::from(result.passed()), now_ms()],
+            "INSERT INTO artifact_validations(id,task_id,artifact_id,tree_oid,summary,passed,created_at,config_id,config_version) VALUES(?1,?2,?3,?4,'validation outcome recorded; raw diagnostics withheld',?5,?6,?7,?8)",
+            params![id, task.as_str(), artifact_id, artifact.tree_oid(), i64::from(result.passed()), now_ms(), result.config_id(), result.config_version()],
         )?;
         for (sequence, check) in result.checks().iter().enumerate() {
             tx.execute(
@@ -504,6 +512,8 @@ impl<'a> ArtifactManager<'a> {
             passed: result.passed(),
             check_count: result.checks().len(),
             revision: next_revision,
+            config_id: result.config_id().map(str::to_owned),
+            config_version: result.config_version().map(str::to_owned),
         })
     }
 

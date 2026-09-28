@@ -88,7 +88,9 @@ reviewerが修正を求めても、reviewの呼び出し自体が正常ならrev
 
 ## 成果物に結び付ける事実
 
-`ValidationResult`はAttemptの状態ではない。対象Artifact、check定義、各checkの終了結果、診断、実行時刻を持つ。passは監督Codexの受入やTask完了を自動発生させず、failはAttemptを失敗へ書き換えない。成果物が変われば、古いValidationを新しい成果物のpublish gateに使えない。
+`ValidationResult`はAttemptの状態ではない。対象Artifact、check定義、各checkの終了結果、固定診断、実行時刻を持つ。組み込みCommandValidatorはstdout/stderr本文をValidationResultへ返さず、check名・exit status・固定診断だけを保持する。Repository設定から作ったValidatorの結果は、設定IDと設定本文のSHA-256 versionも記録する。passは監督Codexの受入やTask完了を自動発生させず、failはAttemptを失敗へ書き換えない。成果物が変われば、古いValidationを新しい成果物のpublish gateに使えない。
+
+ValidatorのcancelはValidation failureや`invalid_output`ではない。Providerがすでに正常終了している場合、OrchestratorはAttemptを`Succeeded`として記録し、ValidationResultを追加せず、cancelをOrchestrator errorとoperation状態に表す。Artifact ServiceのValidation APIは`ValidationCancelled`を返し、Validation recordを作らない。停止を確認できない場合は結果を推測せず、Orchestratorはoperationを`recovery_required`として記録し、Artifact Serviceはvalidation worktreeを保持する。
 
 reviewはreviewer roleの通常のAttemptとして実行し、正常なreviewer Attemptは対象ArtifactへのReviewVerdictを1件持てる。`approved` はreviewerの見解であり、`changes_requested` はreview処理の失敗ではない。
 
@@ -147,7 +149,7 @@ worktree managerの`cleanup`はdirty workspaceを保持するnon-force操作で�
 
 公開操作はProvider Attemptを偽装せず、専用の受付・phase・結果Ledgerへ保存する。呼び出し側は`publish_artifact`で受付を行い、返されたoperationと同じrequest/payloadで`run_artifact_publication`を起動し、`get_artifact_publication_operation`で結果を読む。LedgerにはArtifact tree、validation/decision ID、作成commit SHA、Draft PR番号・URL・状態を保存し、title/body等のraw payloadは保存しない。冪等照合には長さ付きfield列から計算したSHA-256 digestを使う。Artifact treeと完全なpublication payloadは受付前と外部効果直前の両方でscanする。後段で検出・失敗した場合は副作用前に`failed`で閉じる。GitHub CLIにはtitle/bodyをargvや一時ファイルに渡さず、ProcessRunnerが提供するstdin bytesで`gh api --input -`へ直接渡す。stdinは`write_all`相当で全byteを送り、stdout/stderr captureへ混ぜない。Unix系では非blocking socketをProcessRunnerの監視loopから書き込むため、timeout/cancel時にwriter threadやpayloadを残さずsenderを閉じる。入力を送り切る前に子が終了してreaderが残った場合はprocess groupを停止し、固定diagnostic付き`Interrupted`を返す。
 
-このMVPはMCP/CLIの`publication.publish`・`operation.get`にはまだ接続されておらず、Rust Serviceに専用の`publish_artifact` / `get_artifact_publication_operation` APIを提供する段階である。既存の`operation.get`はProvider Attempt操作用のまま。公開用cancel APIは未接続である。起動時に未claimの`accepted` publicationは外部効果が始まっていないため`failed`（`interrupted_before_start`）へ移し、実行claim後の`running` publicationは外部効果の有無を断定できないため`recovery_required`へ移す。どちらも外部操作を再実行しない。SQLite schema v13はPublication専用Ledger tableを追加し、v14ではTask要求snapshotとcaller単位の冪等記録を追加する。schema v11ではArtifactとAttempt historyの分岐を統合し、v12でArtifact Validation / CodexDecision tablesを追加する。schema v12 Ledgerからv14へのmigrationも既存recordを保持する。したがって、MCP wire契約全体を実装済みとは扱わない。
+このMVPはMCP/CLIの`publication.publish`・`operation.get`にはまだ接続されておらず、Rust Serviceに専用の`publish_artifact` / `get_artifact_publication_operation` APIを提供する段階である。既存の`operation.get`はProvider Attempt操作用のまま。公開用cancel APIは未接続である。起動時に未claimの`accepted` publicationは外部効果が始まっていないため`failed`（`interrupted_before_start`）へ移し、実行claim後の`running` publicationは外部効果の有無を断定できないため`recovery_required`へ移す。どちらも外部操作を再実行しない。SQLite schema v13はPublication専用Ledger tableを追加し、v14ではTask要求snapshotとcaller単位の冪等記録を追加する。schema v11ではArtifactとAttempt historyの分岐を統合し、v12でArtifact Validation / CodexDecision tablesを追加する。v15/v16はValidationResultにRepository設定IDとSHA-256 versionを保存する列を追加し、schema v12 Ledgerからv16へのmigrationも既存recordを保持する。したがって、MCP wire契約全体を実装済みとは扱わない。
 
 ## 旧データとの互換性
 

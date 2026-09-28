@@ -138,7 +138,7 @@ type PublicationTaskRow = (
 
 // Version 10 was independently used by the parent Attempt-history migration and
 // the Artifact migration. Version 11 reconciles both layouts and is idempotent.
-const LATEST_SCHEMA_VERSION: u32 = 14;
+const LATEST_SCHEMA_VERSION: u32 = 16;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -519,13 +519,16 @@ impl SqliteExecutionLedger {
             })?;
             transaction.execute(
                 "INSERT INTO validation_results
-                 (task_id, attempt_id, sequence, summary, passed) VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (task_id, attempt_id, sequence, summary, passed, config_id, config_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     record.task_id().as_str(),
                     record.attempt().id().as_str(),
                     sequence,
                     result.summary(),
                     bool_to_int(result.passed()),
+                    result.config_id(),
+                    result.config_version(),
                 ],
             )?;
             for (check_sequence, check) in result.checks().iter().enumerate() {
@@ -760,7 +763,7 @@ impl SqliteExecutionLedger {
             .transpose()?;
         let aggregate_rows = {
             let mut statement = connection.prepare(
-                "SELECT sequence, summary, passed FROM validation_results
+                "SELECT sequence, summary, passed, config_id, config_version FROM validation_results
                  WHERE task_id = ?1 AND attempt_id = ?2 ORDER BY sequence",
             )?;
             let rows =
@@ -769,12 +772,14 @@ impl SqliteExecutionLedger {
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut validations = Vec::with_capacity(aggregate_rows.len());
-        for (sequence, summary, passed) in aggregate_rows {
+        for (sequence, summary, passed, config_id, config_version) in aggregate_rows {
             let mut statement = connection.prepare(
                 "SELECT name, passed, exit_status, diagnostics
                  FROM validation_checks
@@ -806,6 +811,8 @@ impl SqliteExecutionLedger {
                 summary,
                 int_to_bool(passed)?,
                 checks,
+                config_id,
+                config_version,
             ));
         }
         let mut metrics = Vec::new();
@@ -862,7 +869,8 @@ fn create_latest_schema(connection: &Connection) -> Result<(), rusqlite::Error> 
              reported_success INTEGER NOT NULL, PRIMARY KEY (task_id, attempt_id),
              FOREIGN KEY (task_id, attempt_id) REFERENCES attempts(task_id, id) ON DELETE CASCADE);
          CREATE TABLE validation_results (task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, sequence INTEGER NOT NULL,
-             summary TEXT NOT NULL, passed INTEGER NOT NULL, PRIMARY KEY (task_id, attempt_id, sequence),
+             summary TEXT NOT NULL, passed INTEGER NOT NULL, config_id TEXT, config_version TEXT,
+             PRIMARY KEY (task_id, attempt_id, sequence),
              FOREIGN KEY (task_id, attempt_id) REFERENCES attempts(task_id, id) ON DELETE CASCADE);
          CREATE TABLE validation_checks (task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, validation_sequence INTEGER NOT NULL,
              sequence INTEGER NOT NULL, name TEXT NOT NULL, passed INTEGER NOT NULL, exit_status INTEGER, diagnostics TEXT NOT NULL,
@@ -954,6 +962,19 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
             12 => create_artifact_evidence_schema(connection)?,
             13 => create_artifact_publication_schema(connection)?,
             14 => create_task_creation_schema(connection)?,
+            15 => {
+                add_column_if_missing(connection, "validation_results", "config_id", "TEXT")?;
+                add_column_if_missing(connection, "validation_results", "config_version", "TEXT")?;
+            }
+            16 => {
+                add_column_if_missing(connection, "artifact_validations", "config_id", "TEXT")?;
+                add_column_if_missing(
+                    connection,
+                    "artifact_validations",
+                    "config_version",
+                    "TEXT",
+                )?;
+            }
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
@@ -999,6 +1020,8 @@ fn create_artifact_evidence_schema(connection: &Connection) -> Result<(), rusqli
              summary TEXT NOT NULL,
              passed INTEGER NOT NULL CHECK(passed IN (0,1)),
              created_at INTEGER NOT NULL,
+             config_id TEXT,
+             config_version TEXT,
              FOREIGN KEY(task_id, artifact_id) REFERENCES service_artifacts(task_id, id)
                  ON DELETE CASCADE
          );
@@ -1696,7 +1719,11 @@ mod tests {
         let version: u32 = migrated
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 16);
+        assert!(column_exists(&migrated, "validation_results", "config_id").unwrap());
+        assert!(column_exists(&migrated, "validation_results", "config_version").unwrap());
+        assert!(column_exists(&migrated, "artifact_validations", "config_id").unwrap());
+        assert!(column_exists(&migrated, "artifact_validations", "config_version").unwrap());
         let has_publication_table: bool = migrated
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifact_publication_operations')",
@@ -1727,11 +1754,11 @@ mod tests {
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 15;")
+            .execute_batch("PRAGMA user_version = 17;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(15))
+            Err(LedgerError::UnsupportedSchemaVersion(17))
         ));
     }
 
@@ -1777,7 +1804,7 @@ mod tests {
             let version: u32 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 14);
+            assert_eq!(version, 16);
             let history: (String, i64, Option<String>) = connection.query_row(
                 "SELECT relation_kind, sequence, role FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
                 [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1833,7 +1860,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 16);
         let history: (Option<String>, String) = connection
             .query_row(
                 "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",

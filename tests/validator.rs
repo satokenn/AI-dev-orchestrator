@@ -34,7 +34,7 @@ fn shell_args(script: &str) -> [String; 2] {
 }
 
 #[test]
-fn checks_run_in_order_in_the_requested_workspace_and_map_output() {
+fn checks_run_in_order_and_map_safe_results() {
     let workspace = std::env::temp_dir();
     let checks = [
         ValidationCheck::new("first", shell()).args(shell_args("printf first; exit 0")),
@@ -50,20 +50,30 @@ fn checks_run_in_order_in_the_requested_workspace_and_map_output() {
     assert_eq!(results.checks()[0].name(), "first");
     assert!(results.checks()[0].passed());
     assert_eq!(results.checks()[0].exit_status(), Some(0));
-    assert_eq!(results.checks()[0].diagnostics(), "first");
+    assert_eq!(
+        results.checks()[0].diagnostics(),
+        "process exited successfully"
+    );
     assert_eq!(results.checks()[1].name(), "second");
     assert!(!results.checks()[1].passed());
     assert_eq!(results.checks()[1].exit_status(), Some(9));
-    assert_eq!(results.checks()[1].diagnostics(), "diagnostic");
+    assert_eq!(
+        results.checks()[1].diagnostics(),
+        "process exited with a non-zero status"
+    );
 }
 
 #[test]
 fn a_check_uses_workspace_as_its_default_cwd() {
-    let workspace = std::env::temp_dir();
+    let workspace = test_workspace("cwd");
+    let marker = workspace.join("validator-cwd-marker");
+    if marker.exists() {
+        std::fs::remove_file(&marker).expect("clear prior marker");
+    }
     let check = ValidationCheck::new("cwd", shell()).args(shell_args(if cfg!(unix) {
-        "pwd"
+        "touch validator-cwd-marker"
     } else {
-        "cd"
+        "type nul > validator-cwd-marker"
     }));
     let result = CommandValidator::new([check])
         .validate(&workspace)
@@ -72,10 +82,8 @@ fn a_check_uses_workspace_as_its_default_cwd() {
         .clone();
 
     assert!(result.passed());
-    if cfg!(unix) {
-        let cwd = std::fs::canonicalize(&workspace).expect("canonical workspace");
-        assert_eq!(result.diagnostics().trim(), cwd.to_string_lossy());
-    }
+    assert!(marker.exists(), "the command should run in the workspace");
+    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[test]

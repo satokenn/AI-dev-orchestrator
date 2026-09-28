@@ -776,6 +776,8 @@ pub enum ServiceError {
     OperationNotFound,
     InvalidStoredState,
     ValidationFailed,
+    ValidationCancelled,
+    ValidationInterrupted,
     PublicationFailed,
     PublicationRecoveryRequired,
     InvalidStateTransition(DomainError),
@@ -823,6 +825,10 @@ impl std::fmt::Display for ServiceError {
             }
             Self::ValidationFailed => {
                 formatter.write_str("Artifact validation could not be completed safely")
+            }
+            Self::ValidationCancelled => formatter.write_str("Artifact validation was cancelled"),
+            Self::ValidationInterrupted => {
+                formatter.write_str("Artifact validation was interrupted")
             }
             Self::PublicationFailed => {
                 formatter.write_str("Artifact publication failed before remote effects")
@@ -2574,6 +2580,24 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         expected_revision: u64,
         validator: &dyn Validator,
     ) -> Result<ArtifactValidationRecord, ServiceError> {
+        self.validate_artifact_with_cancellation(
+            task_id,
+            artifact_id,
+            expected_revision,
+            validator,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Validates an immutable Artifact snapshot while observing caller cancellation.
+    pub fn validate_artifact_with_cancellation(
+        &self,
+        task_id: &TaskId,
+        artifact_id: &str,
+        expected_revision: u64,
+        validator: &dyn Validator,
+        cancellation: CancellationToken,
+    ) -> Result<ArtifactValidationRecord, ServiceError> {
         static NEXT_VALIDATION: AtomicU64 = AtomicU64::new(0);
         let artifacts = ArtifactManager::new(self.workspaces, self.ledger);
         artifacts.check_revision(task_id, expected_revision)?;
@@ -2615,25 +2639,41 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 ArtifactManager::retained_workspace_error(&workspace, error.to_string()),
             ));
         }
-        let result: ValidationResult = match validator.validate(workspace.path()) {
-            Ok(result) => result,
-            Err(error) => {
-                return match artifacts.cleanup_unchanged_artifact_validation_workspace(
-                    task_id,
-                    &attempt_id,
-                    artifact_id,
-                    &workspace,
-                ) {
-                    Ok(()) => Err(ServiceError::ValidationFailed),
-                    Err(cleanup_error) => Err(ServiceError::Artifact(
-                        ArtifactManager::retained_workspace_error(
-                            &workspace,
-                            format!("validation failed ({error}); {cleanup_error}"),
-                        ),
-                    )),
-                };
-            }
-        };
+        let result: ValidationResult =
+            match validator.validate_with_cancellation(workspace.path(), cancellation) {
+                Ok(result) => result,
+                Err(error) => {
+                    let outcome = match &error {
+                        crate::ValidatorError::Cancelled => ServiceError::ValidationCancelled,
+                        crate::ValidatorError::Interrupted { stopped: false, .. } => {
+                            return Err(ServiceError::Artifact(
+                                ArtifactManager::retained_workspace_error(
+                                    &workspace,
+                                    "validation process stop was not confirmed",
+                                ),
+                            ));
+                        }
+                        crate::ValidatorError::Interrupted { stopped: true, .. } => {
+                            ServiceError::ValidationInterrupted
+                        }
+                        _ => ServiceError::ValidationFailed,
+                    };
+                    return match artifacts.cleanup_unchanged_artifact_validation_workspace(
+                        task_id,
+                        &attempt_id,
+                        artifact_id,
+                        &workspace,
+                    ) {
+                        Ok(()) => Err(outcome),
+                        Err(cleanup_error) => Err(ServiceError::Artifact(
+                            ArtifactManager::retained_workspace_error(
+                                &workspace,
+                                format!("validation did not complete safely ({cleanup_error})"),
+                            ),
+                        )),
+                    };
+                }
+            };
         if let Err(error) = artifacts.verify_workspace_tree(workspace.path(), artifact.tree_oid()) {
             return Err(ServiceError::Artifact(
                 ArtifactManager::retained_workspace_error(&workspace, error.to_string()),
@@ -5412,7 +5452,8 @@ mod tests {
                     Some(0),
                     "",
                 )],
-            ))
+            )
+            .with_config_identity(crate::REPOSITORY_CONFIG_PATH, "a".repeat(64)))
         }
     }
 
@@ -7131,6 +7172,33 @@ mod tests {
         assert!(!successful_workspace.exists());
         assert!(validation.passed());
         assert_eq!(validation.revision(), revision());
+        assert_eq!(validation.config_id(), Some(crate::REPOSITORY_CONFIG_PATH));
+        assert_eq!(validation.config_version(), Some("a".repeat(64).as_str()));
+        let stored_validation_config: (String, String) = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT config_id, config_version FROM artifact_validations WHERE id=?1",
+                rusqlite::params![validation.id()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_validation_config,
+            (crate::REPOSITORY_CONFIG_PATH.to_owned(), "a".repeat(64))
+        );
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            service.validate_artifact_with_cancellation(
+                &task_id,
+                &artifact_id,
+                revision(),
+                &CommandValidator::new([ValidationCheck::new("cancelled-check", "true")]),
+                cancellation,
+            ),
+            Err(ServiceError::ValidationCancelled)
+        ));
         let other_validation = service
             .validate_artifact(
                 &task_id,
