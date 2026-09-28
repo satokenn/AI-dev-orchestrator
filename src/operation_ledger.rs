@@ -1,18 +1,188 @@
 use std::{
-    fmt, fs, io,
+    fmt, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use fs2::FileExt;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::ValueRef};
 
 use crate::{ProviderRef, TaskId};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const DEFAULT_LOG_LIMIT: usize = 1024 * 1024;
+static LOG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+const V1_CHILD_TABLES: [(&str, &str, &str, &str); 7] = [
+    (
+        "operation_events",
+        "operation_id, sequence, kind, occurred_at, detail",
+        "operation_id TEXT NOT NULL REFERENCES operations(id), sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence)",
+        "sequence",
+    ),
+    (
+        "log_references",
+        "operation_id, stream, path, byte_count, truncated",
+        "operation_id TEXT NOT NULL REFERENCES operations(id), stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream)",
+        "stream",
+    ),
+    (
+        "validations",
+        "operation_id, artifact_ref, passed, summary",
+        "operation_id TEXT PRIMARY KEY REFERENCES operations(id), artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL",
+        "operation_id",
+    ),
+    (
+        "reviews",
+        "operation_id, artifact_ref, verdict, summary",
+        "operation_id TEXT PRIMARY KEY REFERENCES operations(id), artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL",
+        "operation_id",
+    ),
+    (
+        "usage",
+        "operation_id, input_units, output_units, cost, currency",
+        "operation_id TEXT PRIMARY KEY REFERENCES operations(id), input_units TEXT, output_units TEXT, cost TEXT, currency TEXT",
+        "operation_id",
+    ),
+    (
+        "budget_reservations",
+        "operation_id, amount, settled_amount, state",
+        "operation_id TEXT PRIMARY KEY REFERENCES operations(id), amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL",
+        "operation_id",
+    ),
+    (
+        "publications",
+        "operation_id, repository, branch, commit_sha, pull_request_url, ci_sha",
+        "operation_id TEXT PRIMARY KEY REFERENCES operations(id), repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT",
+        "operation_id",
+    ),
+];
+
+fn archive_v1_orphan_children(transaction: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
+    transaction.execute_batch(
+        "CREATE TABLE legacy_orphan_records (
+             source_table TEXT NOT NULL,
+             operation_id TEXT NOT NULL,
+             row_key TEXT NOT NULL,
+             row_json TEXT NOT NULL,
+             PRIMARY KEY(source_table, operation_id, row_key)
+         );",
+    )?;
+    for (table, columns, _, key_column) in V1_CHILD_TABLES {
+        let selected_columns = columns
+            .split(", ")
+            .map(|column| format!("child.{column}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {selected_columns} FROM {table} AS child \
+             WHERE NOT EXISTS (SELECT 1 FROM operations WHERE id=child.operation_id)"
+        );
+        let mut statement = transaction.prepare(&sql)?;
+        let column_names = columns.split(", ").collect::<Vec<_>>();
+        let key_index = column_names
+            .iter()
+            .position(|column| *column == key_column)
+            .expect("orphan key column must be part of the selected columns");
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let operation_id: String = row.get(0)?;
+            let row_key = match row.get_ref(key_index)? {
+                ValueRef::Integer(value) => value.to_string(),
+                ValueRef::Text(value) => String::from_utf8_lossy(value).into_owned(),
+                _ => {
+                    return Err(LedgerError::InvalidValue(format!(
+                        "unexpected v1 orphan key in {table}"
+                    )));
+                }
+            };
+            let mut values = serde_json::Map::new();
+            for (index, column) in column_names.iter().enumerate() {
+                values.insert((*column).to_owned(), sqlite_value_json(row.get_ref(index)?));
+            }
+            let row_json = serde_json::Value::Object(values).to_string();
+            transaction.execute(
+                "INSERT INTO legacy_orphan_records (source_table, operation_id, row_key, row_json) VALUES (?1, ?2, ?3, ?4)",
+                params![table, operation_id, row_key, row_json],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_value_json(value: ValueRef<'_>) -> serde_json::Value {
+    match value {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Integer(value) => serde_json::json!(value),
+        ValueRef::Real(value) => serde_json::json!(value),
+        ValueRef::Text(value) => match std::str::from_utf8(value) {
+            Ok(value) => serde_json::json!(value),
+            Err(_) => serde_json::json!({ "text_bytes_hex": bytes_to_hex(value) }),
+        },
+        ValueRef::Blob(value) => serde_json::json!({ "blob_hex": bytes_to_hex(value) }),
+    }
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    result
+}
+
+fn initialize_schema(connection: &mut Connection) -> Result<(), LedgerError> {
+    let observed_version: u32 =
+        connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if observed_version > SCHEMA_VERSION {
+        return Err(LedgerError::UnsupportedSchema(observed_version));
+    }
+    initialize_schema_after_observation(connection, observed_version)
+}
+
+fn initialize_schema_after_observation(
+    connection: &mut Connection,
+    _observed_version: u32,
+) -> Result<(), LedgerError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: u32 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(LedgerError::UnsupportedSchema(version));
+    }
+    if version >= 2 {
+        transaction.commit()?;
+        return Ok(());
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL, instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT, status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT);
+         CREATE TABLE IF NOT EXISTS task_revisions (task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence));
+         CREATE TABLE IF NOT EXISTS log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream));
+         CREATE TABLE IF NOT EXISTS validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT);
+         CREATE TABLE IF NOT EXISTS budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT);",
+    )?;
+    archive_v1_orphan_children(&transaction)?;
+    for (table, columns, definition, _) in V1_CHILD_TABLES {
+        let replacement = format!("{table}_v2");
+        transaction.execute_batch(&format!(
+            "CREATE TABLE {replacement} ({definition}); INSERT INTO {replacement} ({columns}) SELECT {columns} FROM {table} AS child WHERE EXISTS (SELECT 1 FROM operations WHERE id=child.operation_id); DROP TABLE {table}; ALTER TABLE {replacement} RENAME TO {table};"
+        ))?;
+    }
+    transaction.pragma_update(None, "user_version", 2)?;
+    transaction.commit()?;
+    Ok(())
+}
 
 /// Exclusive process lock for one canonical operation ledger.
 pub struct LedgerRunLock {
@@ -414,6 +584,9 @@ pub enum LedgerError {
     StaleRevision { expected: u64, actual: u64 },
     ActiveOperation(OperationId),
     TerminalConflict(OperationId),
+    BudgetReservationConflict(OperationId),
+    BudgetNotReserved(OperationId),
+    BudgetSettlementConflict(OperationId),
     UnsupportedSchema(u32),
     RecoveryLockRequired,
     RecoveryLockMismatch,
@@ -438,6 +611,19 @@ impl fmt::Display for LedgerError {
             Self::TerminalConflict(id) => write!(
                 f,
                 "terminal operation cannot be overwritten: {}",
+                id.as_str()
+            ),
+            Self::BudgetReservationConflict(id) => write!(
+                f,
+                "budget reservation conflicts with existing reservation: {}",
+                id.as_str()
+            ),
+            Self::BudgetNotReserved(id) => {
+                write!(f, "operation has no reserved budget: {}", id.as_str())
+            }
+            Self::BudgetSettlementConflict(id) => write!(
+                f,
+                "budget reservation was settled with a different amount: {}",
                 id.as_str()
             ),
             Self::UnsupportedSchema(v) => write!(f, "unsupported ledger schema: {v}"),
@@ -497,13 +683,13 @@ impl SqliteExecutionLedger {
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         Self::from_connection(Connection::open_in_memory()?)
     }
-    fn from_connection(connection: Connection) -> Result<Self, LedgerError> {
+    fn from_connection(mut connection: Connection) -> Result<Self, LedgerError> {
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(LedgerError::UnsupportedSchema(version));
         }
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL, instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT, status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT); CREATE TABLE IF NOT EXISTS task_revisions (task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence)); CREATE TABLE IF NOT EXISTS log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream)); CREATE TABLE IF NOT EXISTS validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT); CREATE TABLE IF NOT EXISTS budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT); PRAGMA user_version = 1;")?;
+        initialize_schema(&mut connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             log_limit: DEFAULT_LOG_LIMIT,
@@ -602,6 +788,21 @@ impl SqliteExecutionLedger {
     ) -> Result<LogReference, LedgerError> {
         let limit = self.log_limit.min(content.len());
         let truncated = limit < content.len();
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        // Serialize filesystem publication with the reference lookup across all
+        // SQLite connections, not just callers sharing this Rust instance.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1)",
+            params![id.as_str()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(LedgerError::InvalidValue(format!(
+                "unknown operation: {}",
+                id.as_str()
+            )));
+        }
         let directory = directory.as_ref();
         fs::create_dir_all(directory)?;
         let operation_component = safe_log_component(id.as_str())?;
@@ -618,15 +819,86 @@ impl SqliteExecutionLedger {
                 "log path escapes directory".into(),
             ));
         }
-        fs::write(&path, &content[..limit])?;
+        let log_content = &content[..limit];
+        let existing: Option<(String, i64, bool)> = transaction
+            .query_row(
+                "SELECT path, byte_count, truncated FROM log_references WHERE operation_id=?1 AND stream=?2",
+                params![id.as_str(), stream],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((stored_path, byte_count, stored_truncated)) = existing {
+            let stored_path = PathBuf::from(stored_path);
+            let metadata = fs::symlink_metadata(&stored_path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(LedgerError::InvalidValue(
+                    "stored log path is not a regular file".into(),
+                ));
+            }
+            if stored_path == path
+                && byte_count == limit as i64
+                && stored_truncated == truncated
+                && fs::read(&stored_path)? == log_content
+            {
+                transaction.commit()?;
+                return Ok(LogReference {
+                    path: stored_path,
+                    byte_count: limit as u64,
+                    truncated,
+                });
+            }
+            return Err(LedgerError::InvalidValue(
+                "log reference already exists with different content".into(),
+            ));
+        }
+        let (created_identity, created_in_this_call) = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(LedgerError::InvalidValue(
+                        "log path already exists and is not a regular file".into(),
+                    ));
+                }
+                if fs::read(&path)? != log_content {
+                    return Err(LedgerError::InvalidValue(
+                        "log path already exists with different content".into(),
+                    ));
+                }
+                // A previous call may have completed the file write but failed before
+                // registering its reference. Adopt only the exact requested bytes.
+                (metadata, false)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let (temporary_path, mut file) = create_log_staging_file(
+                    &canonical_directory,
+                    operation_component,
+                    stream_component,
+                )?;
+                let temporary_identity = file.metadata()?;
+                if let Err(error) = file.write_all(log_content) {
+                    drop(file);
+                    remove_staging_log_if_unchanged(
+                        &temporary_path,
+                        &temporary_identity,
+                        log_content,
+                    );
+                    return Err(error.into());
+                }
+                file.sync_all()?;
+                drop(file);
+                let publish_result = fs::hard_link(&temporary_path, &path);
+                remove_staging_log_if_unchanged(&temporary_path, &temporary_identity, log_content);
+                publish_result?;
+                (fs::symlink_metadata(&path)?, true)
+            }
+            Err(error) => return Err(error.into()),
+        };
         let reference = LogReference {
             path,
             byte_count: limit as u64,
             truncated,
         };
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.execute(
-            "INSERT OR REPLACE INTO log_references VALUES(?1, ?2, ?3, ?4, ?5)",
+        let insert_result = transaction.execute(
+            "INSERT INTO log_references VALUES(?1, ?2, ?3, ?4, ?5)",
             params![
                 id.as_str(),
                 stream,
@@ -634,7 +906,14 @@ impl SqliteExecutionLedger {
                 reference.byte_count as i64,
                 reference.truncated
             ],
-        )?;
+        );
+        if let Err(error) = insert_result {
+            if created_in_this_call {
+                remove_created_log_if_unchanged(reference.path(), &created_identity);
+            }
+            return Err(error.into());
+        }
+        transaction.commit()?;
         Ok(reference)
     }
     pub fn save_validation(
@@ -682,16 +961,57 @@ impl SqliteExecutionLedger {
         Ok(())
     }
     pub fn reserve_budget(&self, id: &OperationId, amount: &str) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.execute(
-            "INSERT OR IGNORE INTO budget_reservations VALUES(?1, ?2, NULL, 'reserved')",
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String, Option<String>)> = transaction
+            .query_row(
+                "SELECT amount, state, settled_amount FROM budget_reservations WHERE operation_id=?1",
+                params![id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((existing_amount, state, settled)) = existing {
+            if existing_amount == amount
+                && ((state == "reserved" && settled.is_none())
+                    || (state == "settled" && settled.is_some()))
+            {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(LedgerError::BudgetReservationConflict(id.clone()));
+        }
+        transaction.execute(
+            "INSERT INTO budget_reservations VALUES(?1, ?2, NULL, 'reserved')",
             params![id.as_str(), amount],
         )?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn settle_budget(&self, id: &OperationId, amount: &str) -> Result<(), LedgerError> {
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.execute("UPDATE budget_reservations SET settled_amount=?2, state='settled' WHERE operation_id=?1 AND state='reserved'", params![id.as_str(), amount])?;
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT state, settled_amount FROM budget_reservations WHERE operation_id=?1",
+                params![id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((state, Some(settled))) if state == "settled" && settled == amount => {
+                transaction.commit()?;
+                return Ok(());
+            }
+            Some((state, _)) if state == "reserved" => {
+                transaction.execute(
+                    "UPDATE budget_reservations SET settled_amount=?2, state='settled' WHERE operation_id=?1",
+                    params![id.as_str(), amount],
+                )?;
+            }
+            Some(_) => return Err(LedgerError::BudgetSettlementConflict(id.clone())),
+            None => return Err(LedgerError::BudgetNotReserved(id.clone())),
+        }
+        transaction.commit()?;
         Ok(())
     }
     pub fn save_publication(
@@ -848,6 +1168,63 @@ fn safe_log_component(value: &str) -> Result<&str, LedgerError> {
         )));
     }
     Ok(value)
+}
+
+fn create_log_staging_file(
+    directory: &Path,
+    operation: &str,
+    stream: &str,
+) -> Result<(PathBuf, fs::File), LedgerError> {
+    for _ in 0..32 {
+        let sequence = LOG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            ".{operation}-{stream}-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(LedgerError::InvalidValue(
+        "could not allocate a unique log staging file".into(),
+    ))
+}
+
+#[cfg(unix)]
+fn remove_created_log_if_unchanged(path: &Path, created: &fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+
+    if let Ok(current) = fs::symlink_metadata(path)
+        && current.dev() == created.dev()
+        && current.ino() == created.ino()
+    {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_created_log_if_unchanged(_path: &Path, _created: &fs::Metadata) {}
+
+#[cfg(unix)]
+fn remove_staging_log_if_unchanged(path: &Path, created: &fs::Metadata, _content: &[u8]) {
+    remove_created_log_if_unchanged(path, created);
+}
+
+#[cfg(not(unix))]
+fn remove_staging_log_if_unchanged(path: &Path, _created: &fs::Metadata, content: &[u8]) {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && !metadata.file_type().is_symlink()
+        && metadata.is_file()
+        && fs::read(path).is_ok_and(|staged| staged == content)
+    {
+        let _ = fs::remove_file(path);
+    }
 }
 
 impl ExecutionLedger for SqliteExecutionLedger {
@@ -1292,6 +1669,15 @@ mod tests {
         assert_eq!(reference.byte_count(), 3);
         assert!(reference.truncated());
         assert_eq!(fs::read(reference.path()).unwrap(), b"abc");
+        let replay = ledger
+            .save_log(
+                operation.id(),
+                "stdout",
+                reference.path().parent().unwrap(),
+                b"abcdef",
+            )
+            .unwrap();
+        assert_eq!(replay.path(), reference.path());
         let _ = fs::remove_file(reference.path());
     }
 
@@ -1308,5 +1694,679 @@ mod tests {
             Err(LedgerError::InvalidValue(_))
         ));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn save_log_rejects_unknown_operation_before_creating_files() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let directory = std::env::temp_dir().join(format!("ledger-missing-log-{}", now()));
+        assert!(matches!(
+            ledger.save_log(&OperationId::new("missing"), "stdout", &directory, b"x"),
+            Err(LedgerError::InvalidValue(_))
+        ));
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn save_log_recovers_an_exact_unreferenced_file() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let operation = ledger
+            .accept_operation(&request("r-log-orphan", "a"))
+            .unwrap();
+        let directory = std::env::temp_dir().join(format!("ledger-log-orphan-{}", now()));
+        fs::create_dir_all(&directory).unwrap();
+        let orphan = directory.join(format!("{}-stdout.log", operation.id().as_str()));
+        fs::write(&orphan, b"complete log").unwrap();
+
+        let reference = ledger
+            .save_log(operation.id(), "stdout", &directory, b"complete log")
+            .unwrap();
+        assert_eq!(reference.path(), orphan.canonicalize().unwrap());
+        assert_eq!(fs::read(reference.path()).unwrap(), b"complete log");
+        assert!(
+            ledger
+                .save_log(operation.id(), "stdout", &directory, b"different log")
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn save_log_serializes_replay_across_sqlite_connections() {
+        use std::sync::{Arc, Barrier};
+
+        let root = std::env::temp_dir().join(format!("ledger-log-race-{}", now()));
+        fs::create_dir_all(&root).unwrap();
+        let ledger_path = root.join("ledger.sqlite");
+        let log_directory = root.join("logs");
+        let first = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let operation = first.accept_operation(&request("r-log-race", "a")).unwrap();
+        let second = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let operation_id = operation.id().clone();
+        let first_operation_id = operation_id.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first_directory = log_directory.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.save_log(&first_operation_id, "stdout", first_directory, b"same log")
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second_directory = log_directory.clone();
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second.save_log(&operation_id, "stdout", second_directory, b"same log")
+        });
+
+        let first_reference = first_thread.join().unwrap().unwrap();
+        let second_reference = second_thread.join().unwrap().unwrap();
+        assert_eq!(first_reference.path(), second_reference.path());
+        assert_eq!(fs::read(first_reference.path()).unwrap(), b"same log");
+        let verifier = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let stored: String = verifier
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT path FROM log_references WHERE operation_id=?1 AND stream='stdout'",
+                params![operation.id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(stored), first_reference.path());
+        assert!(first_reference.path().is_file());
+        drop(verifier);
+        drop(first_reference);
+        drop(second_reference);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_log_does_not_follow_a_preexisting_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let operation = ledger.accept_operation(&request("r-symlink", "a")).unwrap();
+        let directory = std::env::temp_dir().join(format!("ledger-symlink-{}", now()));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("outside-target");
+        fs::write(&target, b"keep").unwrap();
+        let log_path = directory.join(format!("{}-stdout.log", operation.id().as_str()));
+        symlink(&target, &log_path).unwrap();
+
+        assert!(
+            ledger
+                .save_log(operation.id(), "stdout", &directory, b"overwrite")
+                .is_err()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+        assert!(
+            fs::symlink_metadata(&log_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_log_removes_its_new_file_when_reference_insert_fails() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let operation = ledger
+            .accept_operation(&request("r-log-insert", "a"))
+            .unwrap();
+        let directory = std::env::temp_dir().join(format!("ledger-log-insert-{}", now()));
+        ledger
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_log_insert BEFORE INSERT ON log_references BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            ledger
+                .save_log(operation.id(), "stdout", &directory, b"partial")
+                .is_err()
+        );
+        let orphan = directory.join(format!("{}-stdout.log", operation.id().as_str()));
+        if orphan.exists() {
+            assert_eq!(fs::read(&orphan).unwrap(), b"partial");
+        }
+        ledger
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_log_insert;")
+            .unwrap();
+        let reference = ledger
+            .save_log(operation.id(), "stdout", &directory, b"partial")
+            .unwrap();
+        assert_eq!(fs::read(reference.path()).unwrap(), b"partial");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn budget_reservation_and_settlement_are_idempotent_but_conflicts_fail() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let operation = ledger.accept_operation(&request("r-budget", "a")).unwrap();
+        ledger.reserve_budget(operation.id(), "10").unwrap();
+        ledger.reserve_budget(operation.id(), "10").unwrap();
+        assert!(matches!(
+            ledger.reserve_budget(operation.id(), "11"),
+            Err(LedgerError::BudgetReservationConflict(_))
+        ));
+        ledger.settle_budget(operation.id(), "7").unwrap();
+        ledger.settle_budget(operation.id(), "7").unwrap();
+        // A retry of the original reservation can arrive after the settlement
+        // committed if the reservation response was lost.
+        ledger.reserve_budget(operation.id(), "10").unwrap();
+        assert!(matches!(
+            ledger.settle_budget(operation.id(), "8"),
+            Err(LedgerError::BudgetSettlementConflict(_))
+        ));
+        assert!(matches!(
+            ledger.settle_budget(&OperationId::new("missing"), "1"),
+            Err(LedgerError::BudgetNotReserved(_))
+        ));
+    }
+
+    #[test]
+    fn budget_operations_are_serialized_across_ledger_connections() {
+        let path = recovery_test_path("budget-connections");
+        let first = SqliteExecutionLedger::open(&path).unwrap();
+        let operation = first
+            .accept_operation(&request("r-budget-connection", "a"))
+            .unwrap();
+        let second = SqliteExecutionLedger::open(&path).unwrap();
+        first.reserve_budget(operation.id(), "10").unwrap();
+        second.reserve_budget(operation.id(), "10").unwrap();
+        assert!(matches!(
+            second.reserve_budget(operation.id(), "11"),
+            Err(LedgerError::BudgetReservationConflict(_))
+        ));
+        first.settle_budget(operation.id(), "7").unwrap();
+        second.settle_budget(operation.id(), "7").unwrap();
+        assert!(matches!(
+            second.settle_budget(operation.id(), "8"),
+            Err(LedgerError::BudgetSettlementConflict(_))
+        ));
+        drop(second);
+        drop(first);
+        for path in [
+            path.clone(),
+            PathBuf::from(format!("{}.operations.sqlite3", path.display())),
+            PathBuf::from(format!("{}.operations.lock", path.display())),
+        ] {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn schema_v1_migration_preserves_all_children_and_adds_foreign_keys() {
+        let path = recovery_test_path("migration-v1");
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        connection.execute_batch(
+            "CREATE TABLE operations (id TEXT PRIMARY KEY);
+             INSERT INTO operations VALUES ('op-1');
+             CREATE TABLE operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence));
+             CREATE TABLE log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream));
+             CREATE TABLE validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL);
+             CREATE TABLE reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL);
+             CREATE TABLE usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT);
+             CREATE TABLE budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL);
+             CREATE TABLE publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT);
+             INSERT INTO operation_events VALUES ('op-1', 0, 'accepted', 42, 'kept');
+             INSERT INTO log_references VALUES ('op-1', 'stdout', '/tmp/log', 4, 0);
+             INSERT INTO validations VALUES ('op-1', 'tree-1', 1, 'passed');
+             INSERT INTO reviews VALUES ('op-1', 'tree-1', 'approve', 'ok');
+             INSERT INTO usage VALUES ('op-1', '2', '3', '0.1', 'USD');
+             INSERT INTO budget_reservations VALUES ('op-1', '10', '7', 'settled');
+             INSERT INTO publications VALUES ('op-1', 'repo', 'main', 'sha1', 'url', 'sha2');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        initialize_schema(&mut connection).unwrap();
+        drop(connection);
+
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        initialize_schema(&mut connection).unwrap();
+        for table in [
+            "operation_events",
+            "log_references",
+            "validations",
+            "reviews",
+            "usage",
+            "budget_reservations",
+            "publications",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE operation_id='op-1'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "row was not preserved in {table}");
+            let foreign_key_count: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_foreign_key_list('{table}') WHERE \"table\"='operations'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(foreign_key_count, 1, "missing FK on {table}");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT kind, occurred_at, detail FROM operation_events WHERE operation_id='op-1' AND sequence=0",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+                )
+                .unwrap(),
+            ("accepted".into(), 42, "kept".into())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT stream, path, byte_count, truncated FROM log_references WHERE operation_id='op-1'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, bool>(3)?)),
+                )
+                .unwrap(),
+            ("stdout".into(), "/tmp/log".into(), 4, false)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT artifact_ref, passed, summary FROM validations WHERE operation_id='op-1'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, String>(2)?)),
+                )
+                .unwrap(),
+            ("tree-1".into(), true, "passed".into())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT artifact_ref, verdict, summary FROM reviews WHERE operation_id='op-1'",
+                    [],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?
+                    )),
+                )
+                .unwrap(),
+            ("tree-1".into(), "approve".into(), "ok".into())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT input_units, output_units, cost, currency FROM usage WHERE operation_id='op-1'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+                )
+                .unwrap(),
+            ("2".into(), "3".into(), "0.1".into(), "USD".into())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT amount, settled_amount, state FROM budget_reservations WHERE operation_id='op-1'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                )
+                .unwrap(),
+            ("10".into(), "7".into(), "settled".into())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT repository, branch, commit_sha, pull_request_url, ci_sha FROM publications WHERE operation_id='op-1'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?)),
+                )
+                .unwrap(),
+            ("repo".into(), Some("main".into()), Some("sha1".into()), Some("url".into()), Some("sha2".into()))
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+        for orphan_insert in [
+            "INSERT INTO operation_events VALUES ('missing', 0, 'accepted', 43, 'orphan')",
+            "INSERT INTO log_references VALUES ('missing', 'stdout', '/tmp/orphan', 1, 0)",
+            "INSERT INTO validations VALUES ('missing', 'tree', 1, 'orphan')",
+            "INSERT INTO reviews VALUES ('missing', 'tree', 'approve', 'orphan')",
+            "INSERT INTO usage VALUES ('missing', NULL, NULL, NULL, NULL)",
+            "INSERT INTO budget_reservations VALUES ('missing', '1', NULL, 'reserved')",
+            "INSERT INTO publications VALUES ('missing', 'repo', NULL, NULL, NULL, NULL)",
+        ] {
+            assert!(connection.execute(orphan_insert, []).is_err());
+        }
+        drop(connection);
+        for path in [
+            path.clone(),
+            PathBuf::from(format!("{}.operations.sqlite3", path.display())),
+            PathBuf::from(format!("{}.operations.lock", path.display())),
+        ] {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn schema_v1_migration_archives_orphans_and_keeps_linked_rows() {
+        let path = recovery_test_path("migration-v1-orphans");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE operations (id TEXT PRIMARY KEY);
+             INSERT INTO operations VALUES ('op-1');
+             CREATE TABLE operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence));
+             CREATE TABLE log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream));
+             CREATE TABLE validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL);
+             CREATE TABLE reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL);
+             CREATE TABLE usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT);
+             CREATE TABLE budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL);
+             CREATE TABLE publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT);
+             INSERT INTO operation_events VALUES ('op-1', 0, 'accepted', 42, 'linked event');
+             INSERT INTO log_references VALUES ('op-1', 'stdout', '/tmp/linked.log', 6, 0);
+             INSERT INTO validations VALUES ('op-1', 'linked-tree', 1, 'linked validation');
+             INSERT INTO reviews VALUES ('op-1', 'linked-tree', 'approve', 'linked review');
+             INSERT INTO usage VALUES ('op-1', '2', '3', '0.1', 'USD');
+             INSERT INTO budget_reservations VALUES ('op-1', '10', '7', 'settled');
+             INSERT INTO publications VALUES ('op-1', 'repo', 'main', 'sha1', 'url', 'sha2');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+
+        // These public write paths were supported by schema v1, which did not
+        // enforce that every child operation_id had a corresponding parent.
+        let legacy_ledger = SqliteExecutionLedger {
+            connection: Mutex::new(connection),
+            log_limit: DEFAULT_LOG_LIMIT,
+            ledger_path: None,
+            operation_path: None,
+        };
+        let orphan_id = OperationId::new("orphan-op");
+        legacy_ledger
+            .append_event(&orphan_id, EventKind::Observation, "legacy event")
+            .unwrap();
+        legacy_ledger
+            .save_validation(
+                &orphan_id,
+                &ValidationRecord {
+                    artifact_ref: "orphan-tree".into(),
+                    passed: false,
+                    summary: "legacy validation".into(),
+                },
+            )
+            .unwrap();
+        legacy_ledger
+            .save_review(
+                &orphan_id,
+                &ReviewRecord {
+                    artifact_ref: "orphan-tree".into(),
+                    verdict: "request_changes".into(),
+                    summary: "legacy review".into(),
+                },
+            )
+            .unwrap();
+        legacy_ledger
+            .save_usage(
+                &orphan_id,
+                &UsageRecord {
+                    input_units: Some("12".into()),
+                    output_units: Some("5".into()),
+                    cost: Some("0.25".into()),
+                    currency: Some("USD".into()),
+                },
+            )
+            .unwrap();
+        legacy_ledger.reserve_budget(&orphan_id, "20").unwrap();
+        legacy_ledger
+            .save_publication(
+                &orphan_id,
+                &PublicationReference {
+                    repository: "owner/repo".into(),
+                    branch: Some("feature".into()),
+                    commit_sha: Some("commit".into()),
+                    pull_request_url: Some("https://example.invalid/pr/1".into()),
+                    ci_sha: Some("ci".into()),
+                },
+            )
+            .unwrap();
+
+        // In schema v1, save_log wrote the file and inserted this reference
+        // without checking operations. Reproduce that supported persisted row.
+        let log_directory = std::env::temp_dir().join(format!("ledger-v1-orphan-logs-{}", now()));
+        fs::create_dir_all(&log_directory).unwrap();
+        let log_path = log_directory.join("orphan-op-stderr.log");
+        fs::write(&log_path, b"legacy").unwrap();
+        legacy_ledger
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO log_references VALUES (?1, 'stderr', ?2, 6, 0)",
+                params![orphan_id.as_str(), log_path.to_string_lossy()],
+            )
+            .unwrap();
+
+        let connection = legacy_ledger.connection.lock().unwrap();
+        let mut expected_orphans = Vec::new();
+        for (table, columns, _, key_column) in V1_CHILD_TABLES {
+            let selected_columns = columns
+                .split(", ")
+                .map(|column| format!("child.{column}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {selected_columns} FROM {table} AS child WHERE child.operation_id=?1"
+            );
+            let mut statement = connection.prepare(&sql).unwrap();
+            let names = columns.split(", ").collect::<Vec<_>>();
+            let key_index = names.iter().position(|name| *name == key_column).unwrap();
+            let mut rows = statement.query(params![orphan_id.as_str()]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let row_key = match row.get_ref(key_index).unwrap() {
+                    ValueRef::Integer(value) => value.to_string(),
+                    ValueRef::Text(value) => String::from_utf8_lossy(value).into_owned(),
+                    _ => unreachable!("test fixture keys are text or integer"),
+                };
+                let mut object = serde_json::Map::new();
+                for (index, name) in names.iter().enumerate() {
+                    object.insert(
+                        (*name).to_owned(),
+                        sqlite_value_json(row.get_ref(index).unwrap()),
+                    );
+                }
+                expected_orphans.push((
+                    table,
+                    orphan_id.as_str().to_owned(),
+                    row_key,
+                    serde_json::Value::Object(object).to_string(),
+                    names
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        }
+        assert_eq!(expected_orphans.len(), 7);
+        drop(connection);
+        drop(legacy_ledger);
+
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        initialize_schema(&mut connection).unwrap();
+
+        for (table, operation_id, row_key, expected_json, expected_columns) in expected_orphans {
+            let archived: String = connection
+                .query_row(
+                    "SELECT row_json FROM legacy_orphan_records WHERE source_table=?1 AND operation_id=?2 AND row_key=?3",
+                    params![table, operation_id, row_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&archived).unwrap(),
+                serde_json::from_str::<serde_json::Value>(&expected_json).unwrap(),
+                "archived columns changed for {table}"
+            );
+            let value: serde_json::Value = serde_json::from_str(&archived).unwrap();
+            let actual_columns = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut expected_columns = expected_columns;
+            expected_columns.sort();
+            assert_eq!(
+                actual_columns, expected_columns,
+                "missing archived column in {table}"
+            );
+            let remaining: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE operation_id=?1"),
+                    params![operation_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0, "orphan row remained in normal table {table}");
+        }
+        for (table, _, _, _) in V1_CHILD_TABLES {
+            let linked_rows: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE operation_id='op-1'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(linked_rows, 1, "linked row was lost from {table}");
+            let foreign_keys: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_foreign_key_list('{table}') WHERE \"table\"='operations'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(foreign_keys, 1, "missing foreign key in {table}");
+            let invalid_insert = match table {
+                "operation_events" => {
+                    "INSERT INTO operation_events VALUES ('missing', 0, 'accepted', 1, 'x')"
+                }
+                "log_references" => {
+                    "INSERT INTO log_references VALUES ('missing', 'stdout', '/tmp/x', 1, 0)"
+                }
+                "validations" => "INSERT INTO validations VALUES ('missing', 'tree', 1, 'x')",
+                "reviews" => "INSERT INTO reviews VALUES ('missing', 'tree', 'approve', 'x')",
+                "usage" => "INSERT INTO usage VALUES ('missing', NULL, NULL, NULL, NULL)",
+                "budget_reservations" => {
+                    "INSERT INTO budget_reservations VALUES ('missing', '1', NULL, 'reserved')"
+                }
+                "publications" => {
+                    "INSERT INTO publications VALUES ('missing', 'repo', NULL, NULL, NULL, NULL)"
+                }
+                _ => unreachable!(),
+            };
+            assert!(connection.execute(invalid_insert, []).is_err());
+        }
+        let archive_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM legacy_orphan_records", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(archive_count, 7);
+        drop(connection);
+        for path in [
+            path.clone(),
+            PathBuf::from(format!("{}.operations.sqlite3", path.display())),
+            PathBuf::from(format!("{}.operations.lock", path.display())),
+        ] {
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_dir_all(log_directory);
+    }
+
+    #[test]
+    fn schema_initialization_rechecks_version_after_a_stale_v1_observation() {
+        let path = recovery_test_path("migration-v1-concurrent-init");
+        let mut first = Connection::open(&path).unwrap();
+        first
+            .execute_batch(
+                "CREATE TABLE operations (id TEXT PRIMARY KEY);
+                 CREATE TABLE operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence));
+                 CREATE TABLE log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream));
+                 CREATE TABLE validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL);
+                 CREATE TABLE reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL);
+                 CREATE TABLE usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT);
+                 CREATE TABLE budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL);
+                 CREATE TABLE publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+
+        // Model a second opener that read v1 before waiting for the migration lock.
+        let mut second = Connection::open(&path).unwrap();
+        let stale_version: u32 = second
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stale_version, 1);
+
+        initialize_schema(&mut first).unwrap();
+        // Pass the stale observation into the post-lock path to deterministically
+        // reproduce the old race without relying on thread scheduling.
+        initialize_schema_after_observation(&mut second, stale_version).unwrap();
+
+        let version: u32 = second
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let archive_table_count: i64 = second
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_orphan_records'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_table_count, 1);
+        for (table, _, _, _) in V1_CHILD_TABLES {
+            let foreign_keys: i64 = second
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_foreign_key_list('{table}') WHERE \"table\"='operations'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(foreign_keys, 1, "missing foreign key in {table}");
+        }
+        second.pragma_update(None, "user_version", 3).unwrap();
+        assert!(matches!(
+            initialize_schema_after_observation(&mut second, stale_version),
+            Err(LedgerError::UnsupportedSchema(3))
+        ));
+        drop(second);
+        drop(first);
+        for path in [
+            path.clone(),
+            PathBuf::from(format!("{}.operations.sqlite3", path.display())),
+            PathBuf::from(format!("{}.operations.lock", path.display())),
+        ] {
+            let _ = fs::remove_file(path);
+        }
     }
 }

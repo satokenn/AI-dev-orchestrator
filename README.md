@@ -41,6 +41,8 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 `Orchestrator` は、設定された `SqliteOperationLedger` に外部 Provider の起動前の受理・開始を記録し、workspace 準備、Provider実行、validation の結果を終了状態として保存します。CLI は指定された実行Ledgerのサイドカーへ自動的にOperation Ledgerを保存します。`SqliteOperationLedger` は同じ request ID の再送を同じ operation として返し、異なる payload、古い Task revision、同一 Task の実行中操作を拒否します。終了事実、event、validation、review、usage / budget、publication 参照、上限付き raw log、再起動時の `recovery_required` 診断を保存します。`recover`には対象ledger pathに対する`LedgerRunLock::acquire`で得たlockが必要で、別ledgerのlockは拒否されます。CLIも同じlockを保持して起動時復旧を行います。
 
+v1からv2への移行では、親operationのある子レコードを通常テーブルへ保ち、親のない旧レコードは`legacy_orphan_records`へ元テーブル名・operation ID・全列をJSONで保存します。これは旧APIが外部キーなしで書き込めた履歴を失わずに監査可能にするためのアーカイブであり、実在したoperationとは見なさず、通常のoperation取得・集計には含めません。v2の通常テーブルは引き続き`operations`への外部キーを強制します。
+
 ## WorkspaceManager
 
 `WorkspaceManager` は Git リポジトリの root を解決し、リポジトリ外の管理ディレクトリに Task / Attempt ごとの専用 branch と Git worktree を作成します。Provider を実行する前に `validate_provider_workspace`（または `ensure_provider_workspace`）で実行先を検証してください。main の working tree や、Manager が作成していないパスは拒否されます。
