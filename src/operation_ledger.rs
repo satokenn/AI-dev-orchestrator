@@ -140,11 +140,28 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 }
 
 fn initialize_schema(connection: &mut Connection) -> Result<(), LedgerError> {
-    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let observed_version: u32 =
+        connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if observed_version > SCHEMA_VERSION {
+        return Err(LedgerError::UnsupportedSchema(observed_version));
+    }
+    initialize_schema_after_observation(connection, observed_version)
+}
+
+fn initialize_schema_after_observation(
+    connection: &mut Connection,
+    _observed_version: u32,
+) -> Result<(), LedgerError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: u32 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(LedgerError::UnsupportedSchema(version));
     }
-    connection.execute_batch(
+    if version >= 2 {
+        transaction.commit()?;
+        return Ok(());
+    }
+    transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL, instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT, status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT);
          CREATE TABLE IF NOT EXISTS task_revisions (task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence));
@@ -155,18 +172,15 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), LedgerError> {
          CREATE TABLE IF NOT EXISTS budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT);",
     )?;
-    if version < 2 {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        archive_v1_orphan_children(&transaction)?;
-        for (table, columns, definition, _) in V1_CHILD_TABLES {
-            let replacement = format!("{table}_v2");
-            transaction.execute_batch(&format!(
-                "CREATE TABLE {replacement} ({definition}); INSERT INTO {replacement} ({columns}) SELECT {columns} FROM {table} AS child WHERE EXISTS (SELECT 1 FROM operations WHERE id=child.operation_id); DROP TABLE {table}; ALTER TABLE {replacement} RENAME TO {table};"
-            ))?;
-        }
-        transaction.pragma_update(None, "user_version", 2)?;
-        transaction.commit()?;
+    archive_v1_orphan_children(&transaction)?;
+    for (table, columns, definition, _) in V1_CHILD_TABLES {
+        let replacement = format!("{table}_v2");
+        transaction.execute_batch(&format!(
+            "CREATE TABLE {replacement} ({definition}); INSERT INTO {replacement} ({columns}) SELECT {columns} FROM {table} AS child WHERE EXISTS (SELECT 1 FROM operations WHERE id=child.operation_id); DROP TABLE {table}; ALTER TABLE {replacement} RENAME TO {table};"
+        ))?;
     }
+    transaction.pragma_update(None, "user_version", 2)?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -2286,5 +2300,73 @@ mod tests {
             let _ = fs::remove_file(path);
         }
         let _ = fs::remove_dir_all(log_directory);
+    }
+
+    #[test]
+    fn schema_initialization_rechecks_version_after_a_stale_v1_observation() {
+        let path = recovery_test_path("migration-v1-concurrent-init");
+        let mut first = Connection::open(&path).unwrap();
+        first
+            .execute_batch(
+                "CREATE TABLE operations (id TEXT PRIMARY KEY);
+                 CREATE TABLE operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence));
+                 CREATE TABLE log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream));
+                 CREATE TABLE validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL);
+                 CREATE TABLE reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL);
+                 CREATE TABLE usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT);
+                 CREATE TABLE budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL);
+                 CREATE TABLE publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+
+        // Model a second opener that read v1 before waiting for the migration lock.
+        let mut second = Connection::open(&path).unwrap();
+        let stale_version: u32 = second
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stale_version, 1);
+
+        initialize_schema(&mut first).unwrap();
+        // Pass the stale observation into the post-lock path to deterministically
+        // reproduce the old race without relying on thread scheduling.
+        initialize_schema_after_observation(&mut second, stale_version).unwrap();
+
+        let version: u32 = second
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let archive_table_count: i64 = second
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_orphan_records'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_table_count, 1);
+        for (table, _, _, _) in V1_CHILD_TABLES {
+            let foreign_keys: i64 = second
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_foreign_key_list('{table}') WHERE \"table\"='operations'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(foreign_keys, 1, "missing foreign key in {table}");
+        }
+        second.pragma_update(None, "user_version", 3).unwrap();
+        assert!(matches!(
+            initialize_schema_after_observation(&mut second, stale_version),
+            Err(LedgerError::UnsupportedSchema(3))
+        ));
+        drop(second);
+        drop(first);
+        for path in [
+            path.clone(),
+            PathBuf::from(format!("{}.operations.sqlite3", path.display())),
+            PathBuf::from(format!("{}.operations.lock", path.display())),
+        ] {
+            let _ = fs::remove_file(path);
+        }
     }
 }
