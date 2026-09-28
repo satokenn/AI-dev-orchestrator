@@ -289,7 +289,7 @@ impl<'a> ArtifactManager<'a> {
     fn ensure_tree_object(&self, record: &ArtifactRecord) -> Result<(), ArtifactError> {
         let output = self
             .runner
-            .run_with_stdin(
+            .run_git_with_stdin(
                 ProcessRequest::new("git")
                     .args(["cat-file", "--batch-check"])
                     .cwd(record.repository_root()),
@@ -372,7 +372,7 @@ impl<'a> ArtifactManager<'a> {
             request = request.env(*name, value.clone());
         }
         self.runner
-            .run(request)
+            .run_git(request)
             .map_err(|error| ArtifactError::Git(process_error(error)))
     }
 }
@@ -454,7 +454,20 @@ mod tests {
     }
 
     fn git(directory: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        git_with_inherited_environment(directory, args, &[])
+    }
+
+    fn git_with_inherited_environment(
+        directory: &Path,
+        args: &[&str],
+        inherited_environment: &[(&str, &str)],
+    ) -> String {
+        let mut command = Command::new("git");
+        for (name, value) in inherited_environment {
+            command.env(name, value);
+        }
+        crate::process_runner::clear_git_location_environment(&mut command);
+        let output = command
             .args(args)
             .current_dir(directory)
             .output()
@@ -468,7 +481,9 @@ mod tests {
     }
 
     fn git_status(directory: &Path, args: &[&str]) -> bool {
-        Command::new("git")
+        let mut command = Command::new("git");
+        crate::process_runner::clear_git_location_environment(&mut command);
+        command
             .args(args)
             .current_dir(directory)
             .output()
@@ -487,6 +502,40 @@ mod tests {
         git(&path, &["add", ".gitignore", "source.txt"]);
         git(&path, &["commit", "-m", "initial"]);
         path
+    }
+
+    #[test]
+    fn test_git_helpers_ignore_per_child_injected_repository_environment() {
+        let repository = repository();
+        let expected = git(&repository, &["rev-parse", "--show-toplevel"]);
+        let invalid_git_dir = repository
+            .join(".git.missing")
+            .to_string_lossy()
+            .into_owned();
+        let invalid_work_tree = repository
+            .join("missing-worktree")
+            .to_string_lossy()
+            .into_owned();
+        let invalid_objects = repository
+            .join("missing-objects")
+            .to_string_lossy()
+            .into_owned();
+        let invalid_index = repository
+            .join("missing-index")
+            .to_string_lossy()
+            .into_owned();
+        let actual = git_with_inherited_environment(
+            &repository,
+            &["rev-parse", "--show-toplevel"],
+            &[
+                ("GIT_DIR", &invalid_git_dir),
+                ("GIT_WORK_TREE", &invalid_work_tree),
+                ("GIT_OBJECT_DIRECTORY", &invalid_objects),
+                ("GIT_INDEX_FILE", &invalid_index),
+            ],
+        );
+        assert_eq!(actual, expected);
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]

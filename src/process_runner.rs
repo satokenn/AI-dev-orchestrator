@@ -12,6 +12,20 @@ use std::time::{Duration, Instant};
 const MAX_CAPTURE_BYTES_PER_STREAM: usize = 1024 * 1024;
 const STOP_GRACE_PERIOD: Duration = Duration::from_millis(200);
 const PIPE_DRAIN_PERIOD: Duration = Duration::from_millis(200);
+const GIT_LOCATION_ENVIRONMENT: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+];
+
+pub(crate) fn clear_git_location_environment(command: &mut Command) {
+    for name in GIT_LOCATION_ENVIRONMENT {
+        command.env_remove(name);
+    }
+}
 
 /// A command invocation independent of a shell.
 #[derive(Debug, Clone)]
@@ -21,6 +35,8 @@ pub struct ProcessRequest {
     pub cwd: Option<PathBuf>,
     pub env: Vec<(OsString, OsString)>,
     pub timeout: Option<Duration>,
+    #[cfg(test)]
+    test_inherited_env: Vec<(OsString, OsString)>,
 }
 
 impl ProcessRequest {
@@ -32,6 +48,8 @@ impl ProcessRequest {
             cwd: None,
             env: Vec::new(),
             timeout: None,
+            #[cfg(test)]
+            test_inherited_env: Vec::new(),
         }
     }
     #[must_use]
@@ -52,6 +70,11 @@ impl ProcessRequest {
     #[must_use]
     pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+    #[cfg(test)]
+    fn test_inherited_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.test_inherited_env.push((key.into(), value.into()));
         self
     }
     #[must_use]
@@ -131,10 +154,16 @@ pub struct ProcessRunner;
 impl ProcessRunner {
     /// Runs a command without an external cancellation signal.
     pub fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
-        self.run_inner(request, CancellationToken::new(), None)
+        self.run_inner(request, CancellationToken::new(), None, false)
+    }
+
+    /// Runs Git without inherited repository-location overrides.
+    pub(crate) fn run_git(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
+        self.run_inner(request, CancellationToken::new(), None, true)
     }
 
     /// Runs a command with a small, bounded stdin payload.
+    #[cfg(test)]
     pub(crate) fn run_with_stdin(
         &self,
         request: ProcessRequest,
@@ -150,7 +179,33 @@ impl ProcessRunner {
                 "process stdin input exceeds the 128 byte limit",
             )));
         }
-        self.run_inner(request, CancellationToken::new(), Some(input.to_vec()))
+        self.run_inner(
+            request,
+            CancellationToken::new(),
+            Some(input.to_vec()),
+            false,
+        )
+    }
+
+    /// Runs Git with bounded stdin and without inherited repository-location overrides.
+    pub(crate) fn run_git_with_stdin(
+        &self,
+        request: ProcessRequest,
+        input: &[u8],
+    ) -> Result<ProcessOutput, ProcessError> {
+        const MAX_STDIN_BYTES: usize = 128;
+        if input.len() > MAX_STDIN_BYTES {
+            return Err(ProcessError::Spawn(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process stdin input exceeds the 128 byte limit",
+            )));
+        }
+        self.run_inner(
+            request,
+            CancellationToken::new(),
+            Some(input.to_vec()),
+            true,
+        )
     }
 
     /// Runs a command, stopping it when cancelled or when its timeout elapses.
@@ -159,7 +214,7 @@ impl ProcessRunner {
         request: ProcessRequest,
         token: CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_inner(request, token, None)
+        self.run_inner(request, token, None, false)
     }
 
     fn run_inner(
@@ -167,6 +222,7 @@ impl ProcessRunner {
         request: ProcessRequest,
         token: CancellationToken,
         input: Option<Vec<u8>>,
+        clear_git_env: bool,
     ) -> Result<ProcessOutput, ProcessError> {
         let timeout = request.timeout;
         let mut command = Command::new(&request.command);
@@ -181,6 +237,13 @@ impl ProcessRunner {
             .stderr(Stdio::piped());
         if let Some(cwd) = request.cwd {
             command.current_dir(cwd);
+        }
+        #[cfg(test)]
+        for (key, value) in request.test_inherited_env {
+            command.env(key, value);
+        }
+        if clear_git_env {
+            clear_git_location_environment(&mut command);
         }
         for (key, value) in request.env {
             command.env(key, value);
@@ -453,7 +516,11 @@ fn process_group_exists(group: &str) -> Result<bool, ProcessError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     fn shell() -> &'static str {
         if cfg!(windows) { "cmd" } else { "sh" }
@@ -473,6 +540,45 @@ mod tests {
         assert_eq!(output.stdout, b"out");
         assert_eq!(output.stderr, b"err");
         assert_eq!(output.exit_code(), Some(0));
+    }
+
+    #[test]
+    fn git_location_environment_is_cleared_per_child_before_overrides() {
+        let directory = std::env::temp_dir().join(format!(
+            "process-runner-git-env-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let mut init = Command::new("git");
+        clear_git_location_environment(&mut init);
+        let initialized = init
+            .args(["init", "-q"])
+            .current_dir(&directory)
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+
+        let invalid = directory.join("missing-git-location").into_os_string();
+        let output = ProcessRunner
+            .run_git(
+                ProcessRequest::new("git")
+                    .args(["rev-parse", "--show-toplevel"])
+                    .cwd(&directory)
+                    .test_inherited_env("GIT_DIR", invalid.clone())
+                    .test_inherited_env("GIT_WORK_TREE", invalid.clone())
+                    .test_inherited_env("GIT_OBJECT_DIRECTORY", invalid.clone())
+                    .test_inherited_env("GIT_INDEX_FILE", invalid),
+            )
+            .expect("Git uses the requested repository");
+        assert_eq!(
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()),
+            directory.canonicalize().unwrap()
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
