@@ -14,7 +14,7 @@ Serviceからv2 ContextPageを組み立てる場合は次のread-only APIを使�
 ```rust
 let context = service.get_context(
     &task_id,
-    &[TaskContextSection::Providers, TaskContextSection::Attempts],
+    &[TaskContextSection::Providers, TaskContextSection::Usage, TaskContextSection::Attempts],
     20,
     &BTreeMap::new(),
 )?;
@@ -28,7 +28,7 @@ Model利用権を調べていないため、それらとProvider availabilityは
 `AttemptTargetObservation`はLedger上のrequested Provider / Modelとobserved Provider / Modelを別fieldとして読み、
 未記録のobserved値をrequested値で補完しない。
 
-この観測はread-only contextを組み立てる時に取得し、観測履歴としてLedgerへ保存しない。`providers` detailsには
+この観測はread-only contextを組み立てる時に取得し、観測履歴としてLedgerへ保存しない。別の`usage` ContextPageは既にLedgerに保存されたProvider報告metricだけを返し、quotaやbudgetを補わない。`providers` detailsには
 authentication、CLI状態、Modelごとの状態と、それぞれのsource・timestamp・unknown理由を保持する。
 `attempts` detailsもLedgerのrequested Provider / Modelとobserved Provider / Modelを別々のEvidenceとして返し、
 requested値をobserved値へコピーしない。Provider APIのquota、rate limit、credit、reset、実使用量・料金、repository設定budgetとcomputed remainderも

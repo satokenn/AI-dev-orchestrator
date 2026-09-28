@@ -2080,6 +2080,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if request.request_id.trim().is_empty() {
             return Err(ServiceError::InvalidRequest("request_id must not be empty"));
         }
+        if matches!(request.input, AttemptInput::Artifact(_)) {
+            return Err(ServiceError::PolicyDenied(
+                "ArtifactInput requires a successful changes_requested ReviewVerdict",
+            ));
+        }
         if let Some(accepted) = self.idempotent_acceptance(request)? {
             return Ok(accepted);
         }
@@ -2170,6 +2175,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if task.attempts().len() >= self.max_attempts {
             return Err(ServiceError::PolicyDenied("maximum attempts reached"));
         }
+        if request.role.as_str() != "implementer" {
+            return Err(ServiceError::PolicyDenied(
+                "only implementer Attempts are currently representable",
+            ));
+        }
         let busy: Option<String> = transaction.query_row(
             "SELECT id FROM service_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
             params![request.task_id.as_str()], |row| row.get(0),
@@ -2204,6 +2214,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 )));
             }
         }
+        if !task.attempts().is_empty() {
+            return Err(ServiceError::PolicyDenied(
+                "follow-up Attempt relation requires explicit supporting evidence",
+            ));
+        }
 
         if task.state() == TaskState::Pending {
             task.start()?;
@@ -2226,7 +2241,14 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             "UPDATE tasks SET state=?2 WHERE id=?1",
             params![request.task_id.as_str(), task_state_to_str(task.state())],
         )?;
-        insert_queued_attempt(&transaction, &request.task_id, &attempt)?;
+        insert_queued_attempt(
+            &transaction,
+            &request.task_id,
+            &attempt,
+            1,
+            &request.role,
+            "initial",
+        )?;
         let new_revision = actual_revision
             .checked_add(1)
             .ok_or(ServiceError::InvalidStoredState)?;
@@ -2272,6 +2294,14 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             return self.get_operation(operation_id);
         }
         if !self.claim_operation(operation_id)? {
+            return self.get_operation(operation_id);
+        }
+        if stored.input_artifact_id.is_some() {
+            self.finish_without_start(
+                operation_id,
+                "review_evidence_required",
+                ServiceOperationStatus::Failed,
+            )?;
             return self.get_operation(operation_id);
         }
         let provider = match self.providers.resolve(&stored.provider) {
@@ -3766,8 +3796,16 @@ fn insert_queued_attempt(
     tx: &rusqlite::Transaction<'_>,
     task_id: &TaskId,
     attempt: &Attempt,
+    sequence: usize,
+    role: &TaskRole,
+    relation_kind: &str,
 ) -> Result<(), ServiceError> {
     tx.execute("INSERT INTO attempts(task_id,id,provider,state,started_at,finished_at,failure_reason,requested_model_kind,requested_model,observed_provider,observed_model,semantics_version) VALUES(?1,?2,?3,'queued',NULL,NULL,NULL,?4,?5,NULL,NULL,'provider_call_v2')",params![task_id.as_str(),attempt.id().as_str(),attempt.provider().as_str(),attempt.requested_model().map(model_choice_kind),attempt.requested_model().and_then(model_choice_name)])?;
+    tx.execute(
+        "INSERT INTO service_attempt_history(task_id,attempt_id,sequence,role,relation_kind,related_attempt_id)
+         VALUES(?1,?2,?3,?4,?5,NULL)",
+        params![task_id.as_str(), attempt.id().as_str(), sequence as i64, role.as_str(), relation_kind],
+    )?;
     Ok(())
 }
 
@@ -4164,6 +4202,7 @@ mod tests {
             availability_checks: checks,
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
             requested_models: None,
@@ -4662,6 +4701,7 @@ mod tests {
         availability_checks: Arc<AtomicUsize>,
         fail: bool,
         unknown_interrupt: bool,
+        provider_failure: Option<FakeProviderFailure>,
         execute_delay: Duration,
         reference: ProviderRef,
         requested_models: Option<Arc<Mutex<Vec<ModelChoice>>>>,
@@ -4670,6 +4710,13 @@ mod tests {
         write_ignored: Option<(String, String)>,
         write_gitignore: Option<String>,
         require_file: Option<(String, String)>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeProviderFailure {
+        ExecutionFailed,
+        Cancelled,
+        CancelledWithOutput,
     }
 
     impl AgentProvider for FakeProvider {
@@ -4700,6 +4747,25 @@ mod tests {
             if let Some(contents) = &self.write_gitignore {
                 fs::write(request.workspace().join(".gitignore"), contents).unwrap();
             }
+            match self.provider_failure {
+                Some(FakeProviderFailure::ExecutionFailed) => {
+                    return Err(ProviderError::ExecutionFailed(
+                        "RAW_EXECUTION_DIAGNOSTIC_SECRET".into(),
+                    ));
+                }
+                Some(FakeProviderFailure::Cancelled) => return Err(ProviderError::Cancelled),
+                Some(FakeProviderFailure::CancelledWithOutput) => {
+                    return Err(ProviderError::CancelledWithOutput.with_captured_output(
+                        crate::CapturedOutput::new(
+                            b"RAW_STDOUT_SECRET".to_vec(),
+                            b"RAW_STDERR_SECRET".to_vec(),
+                            None,
+                            false,
+                        ),
+                    ));
+                }
+                None => {}
+            }
             if self.unknown_interrupt {
                 return Err(ProviderError::Interrupted {
                     reason: crate::StopReason::TimedOut,
@@ -4727,6 +4793,21 @@ mod tests {
                 )])),
             )
             .with_observed_target(observed_target.0, observed_target.1))
+        }
+        fn execute_with_cancellation(
+            &self,
+            request: &ProviderRequest,
+            cancellation: CancellationToken,
+        ) -> Result<ProviderResult, ProviderError> {
+            if !matches!(self.provider_failure, Some(FakeProviderFailure::Cancelled)) {
+                return self.execute(request);
+            }
+
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            while !cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(ProviderError::Cancelled)
         }
         fn check_availability(&self) -> Result<(), ProviderError> {
             self.availability_checks.fetch_add(1, Ordering::SeqCst);
@@ -5222,6 +5303,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
             requested_models: None,
@@ -5478,6 +5560,7 @@ mod tests {
         fail: bool,
         execute_delay: Duration,
         unknown_interrupt: bool,
+        provider_failure: Option<FakeProviderFailure>,
     ) -> (
         Repo,
         SqliteExecutionLedger,
@@ -5487,13 +5570,21 @@ mod tests {
         Arc<AtomicUsize>,
         TaskId,
     ) {
-        service_parts_with_model_capture(fail, execute_delay, unknown_interrupt, None, None)
+        service_parts_with_model_capture(
+            fail,
+            execute_delay,
+            unknown_interrupt,
+            provider_failure,
+            None,
+            None,
+        )
     }
 
     fn service_parts_with_model_capture(
         fail: bool,
         execute_delay: Duration,
         unknown_interrupt: bool,
+        provider_failure: Option<FakeProviderFailure>,
         requested_models: Option<Arc<Mutex<Vec<ModelChoice>>>>,
         observed_target: Option<(Option<ProviderRef>, Option<ModelRef>)>,
     ) -> (
@@ -5524,6 +5615,7 @@ mod tests {
             availability_checks: checks.clone(),
             fail,
             unknown_interrupt,
+            provider_failure,
             execute_delay,
             reference: ProviderRef::new("fake"),
             requested_models: requested_models.clone(),
@@ -5549,6 +5641,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
             requested_models: None,
@@ -5586,6 +5679,7 @@ mod tests {
                 availability_checks: Arc::new(AtomicUsize::new(0)),
                 fail: false,
                 unknown_interrupt: false,
+                provider_failure: None,
                 execute_delay: Duration::ZERO,
                 reference: ProviderRef::new("fake"),
                 requested_models: None,
@@ -5713,6 +5807,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
             requested_models: None,
@@ -5754,6 +5849,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
             requested_models: None,
@@ -5803,7 +5899,7 @@ mod tests {
     #[test]
     fn named_model_is_fail_closed_before_provider_side_effects() {
         let (repo, ledger, workspace, providers, calls, checks, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
@@ -5898,6 +5994,7 @@ mod tests {
                 false,
                 Duration::ZERO,
                 false,
+                None,
                 Some(requested_models.clone()),
                 Some((None, Some(ModelRef::new("observed-model")))),
             );
@@ -5945,7 +6042,7 @@ mod tests {
     #[test]
     fn named_model_is_revalidated_before_claim_and_terminalized_idempotently() {
         let (repo, ledger, workspace, providers, calls, checks, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -5996,7 +6093,7 @@ mod tests {
     #[test]
     fn named_model_is_revalidated_immediately_before_provider_execution() {
         let (repo, ledger, workspace, providers, calls, checks, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -6067,7 +6164,7 @@ mod tests {
             ("missing-entry", Ok(None)),
         ] {
             let (repo, ledger, workspace, providers, calls, checks, task_id) =
-                service_parts(false, Duration::ZERO, false);
+                service_parts(false, Duration::ZERO, false, None);
             let catalog = CatalogSequence::outcomes([supported(), outcome]);
             let service =
                 OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
@@ -6110,7 +6207,7 @@ mod tests {
             ("final-error", Err(ModelCatalogError)),
         ] {
             let (repo, ledger, workspace, providers, calls, checks, task_id) =
-                service_parts(false, Duration::ZERO, false);
+                service_parts(false, Duration::ZERO, false, None);
             let supported = || {
                 Ok(Some(ModelCatalogEntry {
                     source: "test-catalog".into(),
@@ -6157,7 +6254,7 @@ mod tests {
             (ModelCapabilityStatus::Supported, 600),
         ] {
             let (repo, ledger, workspace, providers, calls, checks, task_id) =
-                service_parts(false, Duration::ZERO, false);
+                service_parts(false, Duration::ZERO, false, None);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -6194,7 +6291,7 @@ mod tests {
     fn zero_and_subsecond_freshness_are_compared_at_duration_precision() {
         for max_age in [Duration::ZERO, Duration::from_millis(500)] {
             let (repo, ledger, workspace, providers, calls, checks, task_id) =
-                service_parts(false, Duration::ZERO, false);
+                service_parts(false, Duration::ZERO, false, None);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -6228,9 +6325,43 @@ mod tests {
     }
 
     #[test]
+    fn non_implementer_role_is_rejected_before_persistence() {
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let mut req = request(&repo, &task_id, 0, "unsupported-role");
+        req.role = TaskRole::new("reviewer");
+        assert!(matches!(
+            service.submit_attempt(&req),
+            Err(ServiceError::PolicyDenied(
+                "only implementer Attempts are currently representable"
+            ))
+        ));
+        let connection = ledger.lock_connection().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM attempts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM service_attempt_history", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn base_input_acceptance_is_atomic_idempotent_and_records_safe_success() {
         let (repo, ledger, workspace, providers, calls, checks, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
@@ -6279,6 +6410,49 @@ mod tests {
         assert_eq!(agent_rows, 0);
         let unsafe_text:i64=connection.query_row("SELECT COUNT(*) FROM service_operations WHERE id=?1 AND (instruction LIKE '%RAW_STDOUT_SECRET%' OR instruction LIKE '%RAW_STDERR_SECRET%' OR diagnostic_code LIKE '%SECRET%')",params![result.operation_id().as_str()],|row|row.get(0)).unwrap();
         assert_eq!(unsafe_text, 0);
+        let initial_relation: (i64, String, String, Option<String>) = connection.query_row(
+            "SELECT sequence, role, relation_kind, related_attempt_id FROM service_attempt_history
+             WHERE task_id=?1 AND attempt_id=?2",
+            params![task_id.as_str(), result.attempt_id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            initial_relation,
+            (1, "implementer".into(), "initial".into(), None)
+        );
+        let revision: u64 = connection
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64;
+        drop(connection);
+        assert!(matches!(
+            service.submit_attempt(&request(&repo, &task_id, revision, "unsupported-follow-up")),
+            Err(ServiceError::PolicyDenied(
+                "follow-up Attempt relation requires explicit supporting evidence"
+            ))
+        ));
+        let connection = ledger.lock_connection().unwrap();
+        let history_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM service_attempt_history WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history_rows, 1);
+        assert_eq!(
+            connection
+                .query_row::<i64, _, _>(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get(0)
+                )
+                .unwrap() as u64,
+            revision
+        );
         drop(connection);
         assert!(
             workspace
@@ -6319,6 +6493,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
             requested_models: None,
@@ -6359,271 +6534,20 @@ mod tests {
     }
 
     #[test]
-    fn artifact_input_rework_is_task_scoped_and_captures_output() {
-        let repo = Repo::new();
-        fs::write(repo.0.join(".gitignore"), "*.excluded\n").unwrap();
-        git(&repo.0, &["add", ".gitignore"]);
-        git(&repo.0, &["commit", "-m", "ignore generated fixture"]);
-        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
-        let task_id = TaskId::new("artifact-rework-task");
-        ledger
-            .save_task(&Task::new(
-                task_id.clone(),
-                "task description",
-                TaskRole::new("implementer"),
-            ))
+    fn artifact_input_requires_review_evidence_before_acceptance() {
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 4, Duration::from_secs(30))
+                .unwrap();
+        let first = service
+            .submit_attempt(&request(&repo, &task_id, 0, "artifact-evidence-first"))
             .unwrap();
-        let workspace = WorkspaceManager::new(&repo.0).unwrap();
-        let first_provider = FakeProvider {
-            calls: Arc::new(AtomicUsize::new(0)),
-            availability_checks: Arc::new(AtomicUsize::new(0)),
-            fail: false,
-            unknown_interrupt: false,
-            execute_delay: Duration::ZERO,
-            reference: ProviderRef::new("fake"),
-            requested_models: None,
-            observed_target: None,
-            write_output: Some(("persisted-result-6f32.txt".into(), "saved result".into())),
-            write_ignored: None,
-            write_gitignore: None,
-            require_file: None,
-        };
-        let mut first_registry = ProviderRegistry::new();
-        first_registry.register(first_provider);
-        let first_service = OperationService::new(
-            &ledger,
-            &workspace,
-            &first_registry,
-            4,
-            Duration::from_secs(30),
-        )
-        .unwrap();
-        let first = first_service
-            .submit_attempt(&request(&repo, &task_id, 0, "first-artifact"))
-            .unwrap();
-        let first_result = first_service
+        let result = service
             .run(first.operation_id(), CancellationToken::new())
-            .unwrap();
-        let artifact_id = first_result.output_artifact_id().unwrap().to_owned();
-        assert!(
-            workspace
-                .worktree_path(&task_id, first_result.attempt_id())
-                .join("persisted-result-6f32.txt")
-                .exists()
-        );
-        let tree: String = ledger
-            .lock_connection()
-            .unwrap()
-            .query_row(
-                "SELECT tree_oid FROM service_artifacts WHERE id=?1",
-                params![artifact_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            git(&repo.0, &["ls-tree", "-r", "--name-only", &tree])
-                .contains("persisted-result-6f32.txt")
-        );
-        let persisted_state: String = ledger
-            .lock_connection()
-            .unwrap()
-            .query_row(
-                "SELECT state FROM service_artifacts WHERE task_id=?1 AND id=?2",
-                params![task_id.as_str(), artifact_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(persisted_state, "available");
-        let artifact_ref: String = ledger
-            .lock_connection()
-            .unwrap()
-            .query_row(
-                "SELECT ref_name FROM service_artifacts WHERE task_id=?1 AND id=?2",
-                params![task_id.as_str(), artifact_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        git(&repo.0, &["update-ref", "-d", &artifact_ref]);
-        ArtifactManager::new(&workspace, &ledger)
-            .verify_input(&task_id, &artifact_id)
-            .unwrap();
-        assert_eq!(git(&repo.0, &["rev-parse", &artifact_ref]), tree);
-
-        let revision: u64 = ledger
-            .lock_connection()
-            .unwrap()
-            .query_row(
-                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
-                params![task_id.as_str()],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap() as u64;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let second_provider = FakeProvider {
-            calls: calls.clone(),
-            availability_checks: Arc::new(AtomicUsize::new(0)),
-            fail: false,
-            unknown_interrupt: false,
-            execute_delay: Duration::ZERO,
-            reference: ProviderRef::new("fake"),
-            requested_models: None,
-            observed_target: None,
-            write_output: Some(("revision.txt".into(), "second".into())),
-            write_ignored: None,
-            write_gitignore: None,
-            require_file: Some(("persisted-result-6f32.txt".into(), "saved result".into())),
-        };
-        let mut second_registry = ProviderRegistry::new();
-        second_registry.register(second_provider);
-        let second_service = OperationService::new(
-            &ledger,
-            &workspace,
-            &second_registry,
-            4,
-            Duration::from_secs(30),
-        )
-        .unwrap();
-        let other_task = TaskId::new("artifact-rework-other-task");
-        ledger
-            .save_task(&Task::new(
-                other_task.clone(),
-                "unrelated task",
-                TaskRole::new("implementer"),
-            ))
-            .unwrap();
-        let foreign_input = AttemptRunRequest::with_artifact(
-            "foreign-artifact",
-            other_task,
-            0,
-            ProviderRef::new("fake"),
-            ModelChoice::ProviderDefault,
-            "must reject",
-            TaskRole::new("implementer"),
-            ArtifactInput::new(&artifact_id),
-        );
-        assert!(matches!(
-            second_service.submit_attempt(&foreign_input),
-            Err(ServiceError::Artifact(ArtifactError::NotFound))
-        ));
-        let req = AttemptRunRequest::with_artifact(
-            "second-artifact",
-            task_id.clone(),
-            revision,
-            ProviderRef::new("fake"),
-            ModelChoice::ProviderDefault,
-            "continue from prior result",
-            TaskRole::new("implementer"),
-            ArtifactInput::new(&artifact_id),
-        );
-        let accepted = second_service.submit_attempt(&req).unwrap();
-        assert_eq!(
-            second_service.submit_attempt(&req).unwrap().operation_id(),
-            accepted.operation_id()
-        );
-        let changed_input = AttemptRunRequest::with_artifact(
-            "second-artifact",
-            task_id.clone(),
-            revision,
-            ProviderRef::new("fake"),
-            ModelChoice::ProviderDefault,
-            "continue from prior result",
-            TaskRole::new("implementer"),
-            ArtifactInput::new("different-artifact"),
-        );
-        assert!(matches!(
-            second_service.submit_attempt(&changed_input),
-            Err(ServiceError::IdempotencyConflict)
-        ));
-        let result = second_service
-            .run(accepted.operation_id(), CancellationToken::new())
             .unwrap();
         assert_eq!(result.status(), ServiceOperationStatus::Completed);
-        assert_eq!(result.input_artifact_id(), Some(artifact_id.as_str()));
-        assert!(result.output_artifact_id().is_some());
-        assert_ne!(result.output_artifact_id(), result.input_artifact_id());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let corrupt_ref: String = ledger
-            .lock_connection()
-            .unwrap()
-            .query_row(
-                "SELECT ref_name FROM service_artifacts WHERE id=?1",
-                params![artifact_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let replacement_tree: String = ledger
-            .lock_connection()
-            .unwrap()
-            .query_row(
-                "SELECT tree_oid FROM service_artifacts WHERE id=?1",
-                params![result.output_artifact_id().unwrap()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        git(&repo.0, &["update-ref", &corrupt_ref, &replacement_tree]);
-        assert!(matches!(
-            ArtifactManager::new(&workspace, &ledger).verify_input(&task_id, &artifact_id),
-            Err(ArtifactError::RecoveryRequired)
-        ));
-        let artifact_state: String = ledger
-            .lock_connection()
-            .unwrap()
-            .query_row(
-                "SELECT state FROM service_artifacts WHERE id=?1",
-                params![artifact_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(artifact_state, "recovery_required");
-        cleanup_fixture_worktree(&repo, &workspace, &task_id, first_result.attempt_id());
-        cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
-    }
-
-    #[test]
-    fn artifact_rework_rejects_input_file_ignored_by_provider_gitignore() {
-        let repo = Repo::new();
-        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
-        let task_id = TaskId::new("artifact-ignore-rework-task");
-        ledger
-            .save_task(&Task::new(
-                task_id.clone(),
-                "task description",
-                TaskRole::new("implementer"),
-            ))
-            .unwrap();
-        let workspace = WorkspaceManager::new(&repo.0).unwrap();
-        let first_provider = FakeProvider {
-            calls: Arc::new(AtomicUsize::new(0)),
-            availability_checks: Arc::new(AtomicUsize::new(0)),
-            fail: false,
-            unknown_interrupt: false,
-            execute_delay: Duration::ZERO,
-            reference: ProviderRef::new("fake"),
-            requested_models: None,
-            observed_target: None,
-            write_output: Some(("carried-input.txt".into(), "saved input".into())),
-            write_ignored: None,
-            write_gitignore: None,
-            require_file: None,
-        };
-        let mut first_registry = ProviderRegistry::new();
-        first_registry.register(first_provider);
-        let first_service = OperationService::new(
-            &ledger,
-            &workspace,
-            &first_registry,
-            4,
-            Duration::from_secs(30),
-        )
-        .unwrap();
-        let first = first_service
-            .submit_attempt(&request(&repo, &task_id, 0, "ignore-first"))
-            .unwrap();
-        let first_result = first_service
-            .run(first.operation_id(), CancellationToken::new())
-            .unwrap();
-        assert_eq!(first_result.status(), ServiceOperationStatus::Completed);
-        let artifact_id = first_result.output_artifact_id().unwrap().to_owned();
+        let artifact_id = result.output_artifact_id().unwrap().to_owned();
         let revision: u64 = ledger
             .lock_connection()
             .unwrap()
@@ -6633,65 +6557,52 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap() as u64;
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let second_provider = FakeProvider {
-            calls: calls.clone(),
-            availability_checks: Arc::new(AtomicUsize::new(0)),
-            fail: false,
-            unknown_interrupt: false,
-            execute_delay: Duration::ZERO,
-            reference: ProviderRef::new("fake"),
-            requested_models: None,
-            observed_target: None,
-            write_output: None,
-            write_ignored: None,
-            write_gitignore: Some("/carried-input.txt\n".into()),
-            require_file: Some(("carried-input.txt".into(), "saved input".into())),
-        };
-        let mut second_registry = ProviderRegistry::new();
-        second_registry.register(second_provider);
-        let second_service = OperationService::new(
-            &ledger,
-            &workspace,
-            &second_registry,
-            4,
-            Duration::from_secs(30),
-        )
-        .unwrap();
-        let second_request = AttemptRunRequest::with_artifact(
-            "ignore-second",
+        let input = AttemptRunRequest::with_artifact(
+            "artifact-evidence-follow-up",
             task_id.clone(),
             revision,
             ProviderRef::new("fake"),
             ModelChoice::ProviderDefault,
-            "continue from saved input",
+            "revise the reviewed Artifact",
             TaskRole::new("implementer"),
-            ArtifactInput::new(&artifact_id),
+            ArtifactInput::new(artifact_id),
         );
-        let accepted = second_service.submit_attempt(&second_request).unwrap();
-        let result = second_service
-            .run(accepted.operation_id(), CancellationToken::new())
-            .unwrap();
-
+        assert!(matches!(
+            service.submit_attempt(&input),
+            Err(ServiceError::PolicyDenied(
+                "ArtifactInput requires a successful changes_requested ReviewVerdict"
+            ))
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(result.status(), ServiceOperationStatus::RecoveryRequired);
-        assert_eq!(result.diagnostic_code(), Some("artifact_capture_failed"));
-        assert_eq!(result.output_artifact_id(), None);
-        let retained_path = result.workspace_path().unwrap();
+        let connection = ledger.lock_connection().unwrap();
+        let counts: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM attempts WHERE task_id=?1),\
+                        (SELECT COUNT(*) FROM service_operations WHERE task_id=?1),\
+                        (SELECT COUNT(*) FROM service_attempt_history WHERE task_id=?1)",
+                params![task_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1));
         assert_eq!(
-            fs::read_to_string(retained_path.join("carried-input.txt")).unwrap(),
-            "saved input"
+            connection
+                .query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap() as u64,
+            revision
         );
-        assert!(retained_path.join(".gitignore").exists());
-        cleanup_fixture_worktree(&repo, &workspace, &task_id, first_result.attempt_id());
+        drop(connection);
         cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
     }
 
     #[test]
     fn provider_timeout_is_recorded_without_raw_streams() {
         let (repo, ledger, workspace, providers, calls, _, task_id) =
-            service_parts(true, Duration::ZERO, false);
+            service_parts(true, Duration::ZERO, false, None);
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
@@ -6713,9 +6624,85 @@ mod tests {
     }
 
     #[test]
+    fn provider_failures_and_cancelled_output_are_persisted_without_raw_diagnostics() {
+        for (request_id, failure, status, attempt_state, diagnostic) in [
+            (
+                "provider-execution-failure",
+                FakeProviderFailure::ExecutionFailed,
+                ServiceOperationStatus::Failed,
+                AttemptState::Failed,
+                "provider_failed",
+            ),
+            (
+                "provider-cancelled",
+                FakeProviderFailure::Cancelled,
+                ServiceOperationStatus::Cancelled,
+                AttemptState::Cancelled,
+                "cancelled",
+            ),
+            (
+                "provider-cancelled-output",
+                FakeProviderFailure::CancelledWithOutput,
+                ServiceOperationStatus::Cancelled,
+                AttemptState::Cancelled,
+                "cancelled",
+            ),
+        ] {
+            let (repo, ledger, workspace, providers, calls, _, task_id) =
+                service_parts(false, Duration::ZERO, false, Some(failure));
+            let service =
+                OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                    .unwrap();
+            let accepted = service
+                .submit_attempt(&request(&repo, &task_id, 0, request_id))
+                .unwrap();
+            let cancellation = CancellationToken::new();
+            let cancellation_driver = if matches!(failure, FakeProviderFailure::Cancelled) {
+                let driver_token = cancellation.clone();
+                Some(thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(10));
+                    driver_token.cancel();
+                }))
+            } else {
+                None
+            };
+            let result = service.run(accepted.operation_id(), cancellation).unwrap();
+            if let Some(driver) = cancellation_driver {
+                driver.join().unwrap();
+            }
+
+            assert_eq!(result.status(), status);
+            assert_eq!(result.attempt_state(), attempt_state);
+            assert_eq!(result.diagnostic_code(), Some(diagnostic));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let snapshot_text = format!("{result:?}");
+            assert!(!snapshot_text.contains("RAW_STDOUT_SECRET"));
+            assert!(!snapshot_text.contains("RAW_STDERR_SECRET"));
+            assert_eq!(
+                service
+                    .run(accepted.operation_id(), CancellationToken::new())
+                    .unwrap(),
+                result
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let connection = ledger.lock_connection().unwrap();
+            let raw_output_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM service_operations WHERE id=?1 AND (instruction LIKE '%RAW_STDOUT_SECRET%' OR instruction LIKE '%RAW_STDERR_SECRET%' OR diagnostic_code LIKE '%RAW_%')",
+                    params![result.operation_id().as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(raw_output_count, 0);
+            drop(connection);
+            cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+        }
+    }
+
+    #[test]
     fn unconfirmed_provider_stop_preserves_running_attempt_as_unknown() {
         let (repo, ledger, workspace, providers, calls, _, task_id) =
-            service_parts(false, Duration::ZERO, true);
+            service_parts(false, Duration::ZERO, true, None);
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
@@ -6761,7 +6748,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (repo, ledger, workspace, providers, calls, _, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         fs::write(repo.0.join(".gitignore"), "hook-secret.txt\n").unwrap();
         git(&repo.0, &["add", ".gitignore"]);
         git(&repo.0, &["commit", "-m", "ignore hook fixture"]);
@@ -6811,7 +6798,7 @@ mod tests {
     #[test]
     fn failed_acceptance_rolls_back_operation_task_and_attempt_together() {
         let (repo, ledger, workspace, providers, calls, _, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         let connection = ledger.lock_connection().unwrap();
         connection.execute_batch("CREATE TRIGGER reject_service_attempt BEFORE INSERT ON attempts WHEN NEW.semantics_version='provider_call_v2' BEGIN SELECT RAISE(ABORT, 'test transaction rollback'); END;").unwrap();
         drop(connection);
@@ -6842,6 +6829,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(operation_count, 0);
+        let history_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM service_attempt_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(history_count, 0);
         let revision: i64 = connection
             .query_row(
                 "SELECT revision FROM service_task_revisions WHERE task_id=?1",
@@ -6872,6 +6865,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::from_millis(250),
             reference: ProviderRef::new("fake"),
             requested_models: None,
@@ -6944,6 +6938,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
             requested_models: None,
@@ -7021,6 +7016,7 @@ mod tests {
             availability_checks: Arc::new(AtomicUsize::new(0)),
             fail: false,
             unknown_interrupt: false,
+            provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
             requested_models: None,
@@ -7961,7 +7957,7 @@ mod tests {
     #[test]
     fn second_in_memory_service_does_not_recover_another_service_live_operation() {
         let (repo, ledger, workspace, providers, _, _, task_id) =
-            service_parts(false, Duration::ZERO, false);
+            service_parts(false, Duration::ZERO, false, None);
         let first =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();

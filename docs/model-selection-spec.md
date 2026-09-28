@@ -688,7 +688,7 @@ Issue #59、snapshot の収集・集計は Issue #60 で実装する。
 
 1. Issue #58 で role / review を Domain と Ledger のどこへ保持するか決める。
 2. Issue #59 で `ModelChoice` と実際に使用した Model を Provider / Attempt / Ledger へ接続する。
-3. Issue #60 で source と時刻を持つProvider observationとrequested/observed Attempt targetを`task.get_context` v2へ接続する。取得不能な値はunknownのまま渡す。
+3. Issue #60 でsourceと時刻を持つProvider observation、requested/observed Attempt target、およびLedgerに保存済みのProvider報告Usage metricをread-only `task.get_context` v2へ接続する。取得不能な値はunknownのまま渡す。このUsage pageはAPI usage / budget snapshotや過去実績の集計を行わず、Attempt / Provider / Modelの履歴実績を選定に使うsummaryはIssue #67で扱う。
 4. Issue #61 で既存 `PlannerRequest` / `PlannerDecision` をこの入力／出力へ拡張し、Rust 側検証を実装する。
 
 各 Issue はこの仕様の field を Provider 固有形式へ置き換えず、取得不能な field は `unknown` として
