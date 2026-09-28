@@ -689,8 +689,11 @@ impl SqliteExecutionLedger {
     ) -> Result<LogReference, LedgerError> {
         let limit = self.log_limit.min(content.len());
         let truncated = limit < content.len();
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        let exists: bool = connection.query_row(
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        // Serialize filesystem publication with the reference lookup across all
+        // SQLite connections, not just callers sharing this Rust instance.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1)",
             params![id.as_str()],
             |row| row.get(0),
@@ -718,7 +721,7 @@ impl SqliteExecutionLedger {
             ));
         }
         let log_content = &content[..limit];
-        let existing: Option<(String, i64, bool)> = connection
+        let existing: Option<(String, i64, bool)> = transaction
             .query_row(
                 "SELECT path, byte_count, truncated FROM log_references WHERE operation_id=?1 AND stream=?2",
                 params![id.as_str(), stream],
@@ -738,6 +741,7 @@ impl SqliteExecutionLedger {
                 && stored_truncated == truncated
                 && fs::read(&stored_path)? == log_content
             {
+                transaction.commit()?;
                 return Ok(LogReference {
                     path: stored_path,
                     byte_count: limit as u64,
@@ -794,7 +798,7 @@ impl SqliteExecutionLedger {
             byte_count: limit as u64,
             truncated,
         };
-        let insert_result = connection.execute(
+        let insert_result = transaction.execute(
             "INSERT INTO log_references VALUES(?1, ?2, ?3, ?4, ?5)",
             params![
                 id.as_str(),
@@ -810,6 +814,7 @@ impl SqliteExecutionLedger {
             }
             return Err(error.into());
         }
+        transaction.commit()?;
         Ok(reference)
     }
     pub fn save_validation(
@@ -1625,6 +1630,56 @@ mod tests {
                 .is_err()
         );
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn save_log_serializes_replay_across_sqlite_connections() {
+        use std::sync::{Arc, Barrier};
+
+        let root = std::env::temp_dir().join(format!("ledger-log-race-{}", now()));
+        fs::create_dir_all(&root).unwrap();
+        let ledger_path = root.join("ledger.sqlite");
+        let log_directory = root.join("logs");
+        let first = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let operation = first.accept_operation(&request("r-log-race", "a")).unwrap();
+        let second = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let operation_id = operation.id().clone();
+        let first_operation_id = operation_id.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first_directory = log_directory.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.save_log(&first_operation_id, "stdout", first_directory, b"same log")
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second_directory = log_directory.clone();
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second.save_log(&operation_id, "stdout", second_directory, b"same log")
+        });
+
+        let first_reference = first_thread.join().unwrap().unwrap();
+        let second_reference = second_thread.join().unwrap().unwrap();
+        assert_eq!(first_reference.path(), second_reference.path());
+        assert_eq!(fs::read(first_reference.path()).unwrap(), b"same log");
+        let verifier = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let stored: String = verifier
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT path FROM log_references WHERE operation_id=?1 AND stream='stdout'",
+                params![operation.id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(stored), first_reference.path());
+        assert!(first_reference.path().is_file());
+        drop(verifier);
+        drop(first_reference);
+        drop(second_reference);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
