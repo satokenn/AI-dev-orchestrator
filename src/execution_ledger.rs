@@ -1101,31 +1101,9 @@ fn create_review_schema(connection: &Connection) -> Result<(), rusqlite::Error> 
              FOREIGN KEY(task_id,source_attempt_id) REFERENCES attempts(task_id,id)
          );
          CREATE INDEX IF NOT EXISTS artifact_reviews_by_artifact
-             ON artifact_review_verdicts(task_id,artifact_id,created_at,id);
-         WITH ordered AS (
-             SELECT attempt.task_id,attempt.id,
-                    ROW_NUMBER() OVER (PARTITION BY attempt.task_id ORDER BY attempt.rowid) AS sequence,
-                    CASE WHEN EXISTS (
-                        SELECT 1 FROM service_operations operation
-                        WHERE operation.task_id=attempt.task_id AND operation.attempt_id=attempt.id
-                    ) THEN (
-                        SELECT CASE WHEN COUNT(*)=1 THEN MAX(operation.role) END
-                        FROM service_operations operation
-                        WHERE operation.task_id=attempt.task_id AND operation.attempt_id=attempt.id
-                    ) WHEN attempt.semantics_version='legacy_validation_coupled'
-                        THEN NULLIF(task.role,'unspecified')
-                    ELSE NULL END AS role
-             FROM attempts attempt
-             JOIN tasks task ON task.id=attempt.task_id
-         )
-         INSERT OR IGNORE INTO service_attempt_history
-             (task_id,attempt_id,sequence,role,relation_kind,related_attempt_id)
-         SELECT task_id,id,sequence,role,
-                CASE WHEN sequence=1 AND role='implementer'
-                     THEN 'initial' ELSE 'legacy_unspecified' END,
-                NULL
-         FROM ordered;",
-    )
+             ON artifact_review_verdicts(task_id,artifact_id,created_at,id);",
+    )?;
+    backfill_legacy_attempt_history(connection)
 }
 
 fn create_artifact_evidence_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
