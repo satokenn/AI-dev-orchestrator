@@ -94,6 +94,8 @@ ValidatorのcancelはValidation failureや`invalid_output`ではない。Provide
 
 reviewはreviewer roleの通常のAttemptとして実行し、正常なreviewer Attemptは対象ArtifactへのReviewVerdictを1件持てる。`approved` はreviewerの見解であり、`changes_requested` はreview処理の失敗ではない。
 
+ReviewVerdictの保存直前に、reviewer Attemptの開始時点で記録したTask revisionと現在revisionを照合する。Provider呼出し後でも、review中に別の操作がTask revisionを進めていれば、そのverdictは保存せず、診断code `stale_task_revision` でreviewer AttemptとOperationを`failed`終端にする。Artifactやworkspaceの既存整合性gateも別に維持する。
+
 監督Codexは差分、Validation、review、CI等を評価し、対象Artifactに次のCodexDecisionを残す。
 
 | 判断 | 意味 |

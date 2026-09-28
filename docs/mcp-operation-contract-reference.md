@@ -301,9 +301,9 @@ OperationServiceは`task.create`の前にtitle、description、各constraint、I
 
 Taskと選択したsectionのsnapshotを読む。読取専用。
 
-このService sliceは`providers`、`usage`、`attempts`のContextPageを生成する。`usage`はOperation Service Ledgerに保存されたProvider報告metricだけを返し、budgetやquotaは作らない。保存値をJSON numberとして保持できない場合は`value:null`、`basis:"unknown"`とし、元の文字列値は返さない。観測時刻にはOperationの完了時刻を使い、未保存ならnullとする。MCP transportは#45の対象であり、ここでは未実装。
+このRust `OperationService` sliceは`providers`、`usage`、`attempts`、`reviews`のContextPageを生成する。ここでいうsliceはRust APIであり、MCP toolやtransportの実装ではない。MCP `task.get_context`への接続はIssue #45の対象として別途行う。
 保存済みTask snapshotの要求textはcontext返却前にもSecretScannerでredactし、固定点であることを確認する。これにより既存の未redacted snapshotもraw textを返さない。SecretScannerが未設定、redactionが失敗、または固定点を作れない場合はProvider probeより前に`policy_denied`とし、raw snapshotを含む応答を返さない。
-`providers` sectionではprovider observationsを同一snapshot内で一括返し、件数がpage_sizeを超える場合はrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化し、cursorはTask、section、page size、Task revisionに束縛する。
+`providers` sectionではprovider observationsを同一snapshot内で一括返し、件数がpage_sizeを超える場合はrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化し、cursorはTask、section、page size、Task revisionに束縛する。Review verdict historyも同じ順序でpage化する。
 Provider観測sourceがProvider一覧を列挙できない場合は、空配列として成功したように見せずcontext取得を失敗させる。
 
 | Request field | JSON type | Required | 意味 |
@@ -322,6 +322,32 @@ Provider観測sourceがProvider一覧を列挙できない場合は、空配列�
 | `task` | `TaskSnapshot` | 必須 | ID、revision、state、要求snapshot |
 | `sections` | `object<string, ContextPage>` | 必須 | 要求されたsectionごとのpage |
 | `observed_at` | `string (format: date-time)` | 必須 | snapshot観測時刻 |
+
+#### 現在実装済みのRust section
+
+契約全体ではsection enumに将来の項目も含むが、このRust sliceが現在生成するsectionは`providers`、`usage`、`attempts`、`reviews`である。`reviews` itemの`details`は`review_verdict_id`、`reviewer_attempt_id`、`artifact_id`、`verdict`を含み、`verdict`は`approved`、`changes_requested`、`inconclusive`のいずれか。これはRust APIの実装状況を示し、MCP tool / transportは未実装である。
+
+例（`sections.reviews.items`）:
+
+~~~json
+{
+  "id": "review-17",
+  "kind": "review_verdict",
+  "state": "approved",
+  "occurred_at": "2026-09-28T04:05:06.000Z",
+  "summary": "The requested behavior is present.",
+  "references": [
+    {"kind": "attempt", "id": "service-attempt-17"},
+    {"kind": "artifact", "id": "artifact-12"}
+  ],
+  "details": {
+    "review_verdict_id": "review-17",
+    "reviewer_attempt_id": "service-attempt-17",
+    "artifact_id": "artifact-12",
+    "verdict": "approved"
+  }
+}
+~~~
 
 例（`sections.attempts.items`の一部）:
 
@@ -380,6 +406,40 @@ Provider観測sourceがProvider一覧を列挙できない場合は、空配列�
 入力Artifactは同じTaskに属する必要がある。branch/pathだけのbase指定は認めない。
 
 成功outputは`OperationAcceptance`。`attempt_id`を必須とする。受付時の`operation.state`は`accepted`。
+
+#### 任意の意味レビューを依頼するRust API
+
+現在のRust serviceは、監督側が明示的に呼び出す`OperationService::submit_artifact_review`を提供する。これは仕様にあるreviewer Attemptの契約を実装するが、MCP toolやtransportではない（MCP Issue #45は別作業）。入力は`ArtifactReviewRequest::new(request_id, task_id, expected_revision, provider_id, model_id, artifact_id, validation_ids, criteria)`で組み立てる。すべてのvalidation IDは重複不可で、少なくとも1件を指定する。criteriaも空文字を含まない1件以上を指定する。
+
+Rust呼び出し例:
+
+~~~rust,ignore
+let accepted = service.submit_artifact_review(&ArtifactReviewRequest::new(
+    "review-request-17",
+    task_id.clone(),
+    current_revision,
+    ProviderRef::new("codex"),
+    ModelChoice::ProviderDefault,
+    artifact_id,
+    vec![validation_id],
+    vec!["Check the requested behavior".into()],
+))?;
+let operation = service.run(accepted.operation_id(), CancellationToken::new())?;
+~~~
+
+依頼時にTask revisionが一致し、対象Artifactが同一Taskの現在の最新available Artifactであり、Artifactの作成元が成功した`implementer` Attemptであることを検証する。指定された各Validationは同じArtifact IDとtreeに属さなければならない。Task要求、Artifact差分、Validationの結果、criteriaはProviderへ渡す前にSecretScannerでredactし、redaction固定点を確認する。Scannerがない・失敗する場合は受付を拒否する。Provider adapterがread-only workspaceを強制できない場合は起動前に拒否し、実行後にもworkspace treeがArtifactと一致することを確認する。受付後に別Artifactが最新になった場合、workspaceが変わった場合、Providerが有効なJSON verdictを返さない場合はOperationを固定診断code付きで`failed`にし、ReviewVerdictを保存しない。Provider summaryのredactionに失敗した場合も、raw summaryを永続化せずOperationを`failed`にする。
+
+Provider終了後、verdict保存直前に、reviewer Attempt開始後に記録したTask revisionと現在revisionを照合する。review中にValidationなど別操作がrevisionを進めていた場合は、Provider呼出しが成功していてもReviewVerdictを保存せず、`stale_task_revision`を診断codeとしてreviewer AttemptとOperationを`failed`終端にする。正常なreview自身による開始時・終端時のrevision更新は、この比較でstale扱いしない。
+
+レビュー依頼はredacted後のpromptが16 KiBを超えると受付前に`policy_denied`で拒否する。これは各OSのprocess argument上限を越えてProviderを起動できなくなる事態を避けるためである。同一request IDの再送は保存済みのTask、revision、Provider/Model、Artifact、Validation、redacted criteriaが一致すれば、Artifactが後から古くなっていても元のOperationAcceptanceを返す。不一致や通常のAttemptが同じrequest IDを使用していた場合は`idempotency_conflict`とする。
+
+Providerが返す`AgentResult.summary`は次の構造化JSONでなければならない:
+
+~~~json
+{"verdict":"changes_requested","summary":"The parser still rejects escaped delimiters."}
+~~~
+
+有効なverdictでProvider実行が成功した場合、Operationは`completed`、reviewer Attemptは`succeeded`となり、`ReviewVerdict`を1件保存する。`changes_requested`もreview処理の失敗ではない。Verdictはレビュー担当の意見であり、Taskを完了・再作業へ自動遷移させたり、監督Codexの採否を決めたりしない。
 
 ### `operation.get`
 

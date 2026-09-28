@@ -421,6 +421,54 @@ impl<'a> ArtifactManager<'a> {
         self.read(task, id)
     }
 
+    pub(crate) fn review_diff(
+        &self,
+        task: &TaskId,
+        id: &str,
+    ) -> Result<(ArtifactRecord, String), ArtifactError> {
+        let artifact = self.read(task, id)?;
+        let output = self.run_git(
+            artifact.repository_root(),
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--binary",
+                artifact.base_commit(),
+                artifact.tree_oid(),
+            ],
+            &[],
+        )?;
+        if output.output_truncated {
+            return Err(ArtifactError::Git(
+                "Artifact diff output was truncated".into(),
+            ));
+        }
+        let diff = String::from_utf8(output.stdout)
+            .map_err(|_| ArtifactError::Invalid("Artifact diff is not UTF-8".into()))?;
+        Ok((artifact, diff))
+    }
+
+    pub(crate) fn verify_review_workspace(
+        &self,
+        workspace: &Workspace,
+        task: &TaskId,
+        attempt: &AttemptId,
+        artifact_id: &str,
+    ) -> Result<(), ArtifactError> {
+        let artifact = self.read(task, artifact_id)?;
+        self.workspaces
+            .validate_artifact_workspace(workspace, task, attempt)?;
+        let actual = self.snapshot(workspace.path())?;
+        if actual != artifact.tree_oid() {
+            return Err(ArtifactError::WorkspaceChanged {
+                expected: artifact.tree_oid().to_owned(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_revision(
         &self,
         task: &TaskId,
@@ -1334,6 +1382,57 @@ mod tests {
             b"fatal: cannot open .git/objects: I/O error"
         ));
         assert!(!is_missing_git_object_diagnostic(b""));
+    }
+
+    #[test]
+    fn review_diff_rejects_truncated_git_output() {
+        let root = std::env::temp_dir().join(format!("artifact-review-diff-{}", new_id()));
+        let repository = root.join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        git(
+            &repository,
+            &["config", "user.email", "artifact-test@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Artifact Test"]);
+        fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let base = git(&repository, &["rev-parse", "HEAD"]);
+        fs::write(repository.join("large.bin"), vec![b'x'; 1_100_000]).unwrap();
+        git(&repository, &["add", "large.bin"]);
+        let tree = git(&repository, &["write-tree"]);
+        let repository = fs::canonicalize(repository).unwrap();
+        let task = TaskId::new("review-diff-truncated-task");
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        ledger
+            .save_task(&Task::new(
+                task.clone(),
+                "diff",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let artifact_id = "large-review-diff";
+        let ref_name = format!("{REF_PREFIX}{artifact_id}");
+        git(&repository, &["update-ref", &ref_name, &tree]);
+        ledger.lock_connection().unwrap().execute(
+            "INSERT INTO service_artifacts(id,task_id,base_commit,tree_oid,repository_root,ref_name,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,'available',0)",
+            rusqlite::params![artifact_id, task.as_str(), base, tree, repository.to_string_lossy().as_ref(), ref_name],
+        ).unwrap();
+        let workspaces = WorkspaceManager::new(&repository).unwrap();
+        let manager = ArtifactManager::new(&workspaces, &ledger);
+        assert!(matches!(
+            manager.review_diff(&task, artifact_id),
+            Err(ArtifactError::Git(message)) if message.contains("truncated")
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

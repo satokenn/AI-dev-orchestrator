@@ -60,11 +60,12 @@ pub use operation_ledger::{
 };
 pub use operation_service::{
     ArtifactInput, ArtifactPublicationAcceptance, ArtifactPublicationPhase,
-    ArtifactPublicationRequest, ArtifactPublicationSnapshot, AttemptInput, AttemptRunRequest,
-    BaseInput, ModelCapabilityStatus, ModelCatalog, ModelCatalogEntry, ModelCatalogError,
-    OperationAcceptance, OperationService, OperationSnapshot, ServiceError, ServiceOperationStatus,
-    TaskContextPage, TaskContextResult, TaskContextSection, TaskCreateRequest, TaskCreationResult,
-    TaskIssueSnapshot, TaskRequestSnapshot, TaskSource,
+    ArtifactPublicationRequest, ArtifactPublicationSnapshot, ArtifactReviewRequest, AttemptInput,
+    AttemptRunRequest, BaseInput, ModelCapabilityStatus, ModelCatalog, ModelCatalogEntry,
+    ModelCatalogError, OperationAcceptance, OperationService, OperationSnapshot, ReviewVerdict,
+    ReviewVerdictRecord, ServiceError, ServiceOperationStatus, TaskContextPage, TaskContextResult,
+    TaskContextSection, TaskCreateRequest, TaskCreationResult, TaskIssueSnapshot,
+    TaskRequestSnapshot, TaskSource,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,
@@ -77,7 +78,9 @@ pub use planner::{
 pub use process_runner::{
     CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner, StopReason,
 };
-pub use provider::{AgentProvider, CapturedOutput, ProviderError, ProviderRequest, ProviderResult};
+pub use provider::{
+    AgentProvider, CapturedOutput, ProviderError, ProviderRequest, ProviderResult, WorkspaceAccess,
+};
 pub use repository_config::{
     REPOSITORY_CONFIG_PATH, RepositoryConfig, RepositoryConfigError, RepositoryConfiguredValidator,
     ValidationCheckConfig, ValidationConfig, init_repository, load_repository_config,
