@@ -130,7 +130,15 @@ Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`�
 
 公開操作はProvider Attemptを偽装せず、専用の受付・phase・結果Ledgerへ保存する。呼び出し側は`publish_artifact`で受付を行い、返されたoperationと同じrequest/payloadで`run_artifact_publication`を起動し、`get_artifact_publication_operation`で結果を読む。LedgerにはArtifact tree、validation/decision ID、作成commit SHA、Draft PR番号・URL・状態を保存し、title/body等のraw payloadは保存しない。冪等照合には長さ付きfield列から計算したSHA-256 digestを使う。Artifact treeと完全なpublication payloadは受付前と外部効果直前の両方でscanする。後段で検出・失敗した場合は副作用前に`failed`で閉じる。GitHub CLIにはtitle/bodyをargvや一時ファイルに渡さず、ProcessRunnerが提供するstdin bytesで`gh api --input -`へ直接渡す。stdinは`write_all`相当で全byteを送り、stdout/stderr captureへ混ぜない。Unix系では非blocking socketをProcessRunnerの監視loopから書き込むため、timeout/cancel時にwriter threadやpayloadを残さずsenderを閉じる。入力を送り切る前に子が終了してreaderが残った場合はprocess groupを停止し、固定diagnostic付き`Interrupted`を返す。
 
-このMVPはMCP/CLIの`publication.publish`・`operation.get`にはまだ接続されておらず、Rust Serviceに専用の`publish_artifact` / `get_artifact_publication_operation` APIを提供する段階である。既存の`operation.get`はProvider Attempt操作用のまま。公開用cancel APIは未接続である。起動時に未claimの`accepted` publicationは外部効果が始まっていないため`failed`（`interrupted_before_start`）へ移し、実行claim後の`running` publicationは外部効果の有無を断定できないため`recovery_required`へ移す。どちらも外部操作を再実行しない。SQLite schema v13はPublication専用Ledger tableを追加し、v14ではTask要求snapshotとcaller単位の冪等記録を追加する。schema v11ではArtifactとAttempt historyの分岐を統合し、v12でArtifact Validation / CodexDecision tablesを追加する。schema v12 Ledgerからv14へのmigrationも既存recordを保持する。したがって、MCP wire契約全体を実装済みとは扱わない。
+このMVPはMCP/CLIの`publication.publish`・`operation.get`にはまだ接続されておらず、Rust Serviceに専用の`publish_artifact` / `get_artifact_publication_operation` APIを提供する段階である。既存の`operation.get`はProvider Attempt操作用のまま。公開用cancel APIは未接続である。起動時に未claimの`accepted` publicationは外部効果が始まっていないため`failed`（`interrupted_before_start`）へ移し、実行claim後の`running` publicationは外部効果の有無を断定できないため`recovery_required`へ移す。どちらも外部操作を再実行しない。SQLite schema v13はPublication専用Ledger table、v14はTask要求snapshotとcaller単位の冪等記録、v15はCI Observation tablesを追加する。schema v11ではArtifactとAttempt historyの分岐を統合し、v12でArtifact Validation / CodexDecision tablesを追加する。schema v12 Ledgerからv15へのmigrationも既存recordを保持する。したがって、MCP wire契約全体を実装済みとは扱わない。
+
+### CI観測runtimeの準備実装
+
+Issue #79 の内部準備runtimeは、PR head SHA、check状態、Required Check集合をObservationとしてLedgerへ保存する。Publicationの保存SHAとの照合、Operation Serviceでの受付、MCP応答への接続は未実装であり、直接指定したCI観測をPublication証拠として扱わない。
+
+Required Check集合をRuleset由来として確定するには、classic branch protection APIからHTTP 200を受け取り、classic側のRequired Checkが空だと確認したうえで、対象branchのRulesetを取得できなければならない。404、権限不足、取得失敗、応答形式不明、classic側にRequired Checkがある場合は集合とaggregateを`unknown`にする。GitHubは保護設定のないbranchにも404を返すため、この保守的な条件では通常の未保護branchやread権限が足りない環境で、Ruleset側のcheckが成功していても`unknown`が続くことがある。classic branch protectionとtrusted configurationのcheck集合は現在のwire sourceで表現できないため、Ruleset由来へ混ぜない。
+
+PRの`wait`は最初に観測したhead SHAを固定する。再poll時にPR詳細を取得できなければ、その古いSHAを現在のheadとみなさず、直前のObservation IDを添えてUnavailableで停止する。commit SHAだけを直接指定した場合はbase branchを確定できないため、Required Check集合とaggregateは`unknown`である。
 
 ## 旧データとの互換性
 

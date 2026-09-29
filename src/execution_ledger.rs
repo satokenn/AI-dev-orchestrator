@@ -11,12 +11,28 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::ci::{
+    CiAggregateState, CiCheck, CiCheckDetailState, CiCheckSource, CiCheckState, CiObservation,
+    CiTarget, RequiredCheck, RequiredCheckSet, RequiredCheckSetSource, RequiredCheckSetState,
+};
 use crate::domain::AttemptTargets;
 use crate::{
     AgentResult, Attempt, AttemptFailureReason, AttemptId, AttemptSemantics, AttemptState,
     ModelChoice, ModelRef, ProviderRef, Task, TaskId, TaskRole, TaskState, UsageCost, UsageMetric,
     ValidationCheckResult, ValidationResult,
 };
+
+type CiObservationRow = (
+    Option<String>,
+    String,
+    Option<i64>,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    Option<i64>,
+);
 
 /// A persisted attempt together with the task it belongs to and execution times.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,7 +154,7 @@ type PublicationTaskRow = (
 
 // Version 10 was independently used by the parent Attempt-history migration and
 // the Artifact migration. Version 11 reconciles both layouts and is idempotent.
-const LATEST_SCHEMA_VERSION: u32 = 14;
+const LATEST_SCHEMA_VERSION: u32 = 15;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -297,6 +313,7 @@ impl SqliteExecutionLedger {
         create_artifact_evidence_schema(&transaction)?;
         create_artifact_publication_schema(&transaction)?;
         create_task_creation_schema(&transaction)?;
+        create_ci_observation_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -385,6 +402,138 @@ impl SqliteExecutionLedger {
             params![record.idempotency_key(), record.task_id(), record.repository(), record.branch(), record.commit_sha(), record.pull_request(), record.phase().as_str(), record.workspace().map(|p| p.to_string_lossy().into_owned()), record.base(), record.title(), record.body()],
         )?;
         Ok(())
+    }
+
+    pub fn save_ci_observation(&self, observation: &CiObservation) -> Result<(), LedgerError> {
+        let mut connection = self.lock_connection()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO ci_observations(id,task_id,repository,pull_request_number,head_sha,observed_at_ms,state,required_checks_state,required_checks_source,required_checks_observed_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                observation.id,
+                observation.task_id.as_ref().map(TaskId::as_str),
+                observation.target.repository,
+                observation.target.pull_request_number.map(i64::try_from).transpose().map_err(|_| LedgerError::InvalidStoredValue("CI pull request number exceeds SQLite integer range".into()))?,
+                observation.target.head_sha,
+                observation.observed_at_ms,
+                observation.state.as_str(),
+                observation.required_checks.state.as_str(),
+                observation.required_checks.source.as_str(),
+                observation.required_checks.observed_at_ms,
+            ],
+        )?;
+        for (sequence, check) in observation.checks.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO ci_observation_checks(observation_id,sequence,name,state,detail_state,url,completed_at,required,app_id,source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    observation.id,
+                    i64::try_from(sequence).map_err(|_| LedgerError::InvalidStoredValue("too many CI checks".into()))?,
+                    check.name,
+                    check.state.as_str(),
+                    check.detail_state.as_str(),
+                    check.url,
+                    check.completed_at,
+                    check.required.map(i64::from),
+                    check.app_id,
+                    check.source.as_str(),
+                ],
+            )?;
+        }
+        for (sequence, required) in observation.required_checks.checks.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO ci_observation_required_checks(observation_id,sequence,name,app_id) VALUES(?1,?2,?3,?4)",
+                params![
+                    observation.id,
+                    i64::try_from(sequence).map_err(|_| LedgerError::InvalidStoredValue("too many required CI checks".into()))?,
+                    required.name,
+                    required.app_id,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn get_ci_observation(&self, id: &str) -> Result<Option<CiObservation>, LedgerError> {
+        let connection = self.lock_connection()?;
+        let row: Option<CiObservationRow> = connection.query_row(
+            "SELECT task_id,repository,pull_request_number,head_sha,observed_at_ms,state,required_checks_state,required_checks_source,required_checks_observed_at_ms FROM ci_observations WHERE id=?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
+        ).optional()?;
+        let Some((
+            task_id,
+            repository,
+            pull_request_number,
+            head_sha,
+            observed_at_ms,
+            state,
+            required_state,
+            required_source,
+            required_at,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let mut check_statement = connection.prepare(
+            "SELECT name,state,detail_state,url,completed_at,required,app_id,source FROM ci_observation_checks WHERE observation_id=?1 ORDER BY sequence",
+        )?;
+        let checks = check_statement
+            .query_map(params![id], |row| {
+                let state: String = row.get(1)?;
+                let detail_state: String = row.get(2)?;
+                let source: String = row.get(7)?;
+                Ok(CiCheck {
+                    name: row.get(0)?,
+                    state: CiCheckState::parse(&state).map_err(to_sql_conversion_error)?,
+                    detail_state: CiCheckDetailState::parse(&detail_state)
+                        .map_err(to_sql_conversion_error)?,
+                    url: row.get(3)?,
+                    completed_at: row.get(4)?,
+                    required: row.get::<_, Option<i64>>(5)?.map(|value| value != 0),
+                    app_id: row.get(6)?,
+                    source: CiCheckSource::parse(&source).map_err(to_sql_conversion_error)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut required_statement = connection.prepare(
+            "SELECT name,app_id FROM ci_observation_required_checks WHERE observation_id=?1 ORDER BY sequence",
+        )?;
+        let required_checks = required_statement
+            .query_map(params![id], |row| {
+                Ok(RequiredCheck {
+                    name: row.get(0)?,
+                    app_id: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let task_id = task_id.map(TaskId::new);
+        let pull_request_number =
+            pull_request_number
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    LedgerError::InvalidStoredValue("negative CI pull request number".into())
+                })?;
+        Ok(Some(CiObservation {
+            id: id.to_owned(),
+            task_id,
+            target: CiTarget {
+                repository,
+                pull_request_number,
+                head_sha,
+            },
+            observed_at_ms,
+            state: CiAggregateState::parse(&state)?,
+            checks,
+            required_checks: RequiredCheckSet {
+                state: RequiredCheckSetState::parse(&required_state)?,
+                checks: required_checks,
+                source: RequiredCheckSetSource::parse(&required_source)?,
+                observed_at_ms: required_at,
+            },
+        }))
     }
 
     /// Saves task metadata. Existing attempt rows are retained and loaded by
@@ -954,6 +1103,7 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
             12 => create_artifact_evidence_schema(connection)?,
             13 => create_artifact_publication_schema(connection)?,
             14 => create_task_creation_schema(connection)?,
+            15 => create_ci_observation_schema(connection)?,
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
@@ -1029,6 +1179,49 @@ fn create_artifact_evidence_schema(connection: &Connection) -> Result<(), rusqli
              ON artifact_codex_decisions(task_id, artifact_id, decision);
         ",
     )
+}
+
+fn create_ci_observation_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ci_observations (
+             id TEXT PRIMARY KEY NOT NULL,
+             task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+             repository TEXT NOT NULL,
+             pull_request_number INTEGER,
+             head_sha TEXT NOT NULL,
+             observed_at_ms INTEGER NOT NULL,
+             state TEXT NOT NULL CHECK(state IN ('pending','passed','failed','unknown')),
+             required_checks_state TEXT NOT NULL CHECK(required_checks_state IN ('known','unknown')),
+             required_checks_source TEXT NOT NULL CHECK(required_checks_source IN ('github_ruleset','trusted_configuration','unknown')),
+             required_checks_observed_at_ms INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS ci_observations_by_task ON ci_observations(task_id, observed_at_ms);
+         CREATE INDEX IF NOT EXISTS ci_observations_by_target ON ci_observations(repository, pull_request_number, head_sha);
+         CREATE TABLE IF NOT EXISTS ci_observation_checks (
+             observation_id TEXT NOT NULL REFERENCES ci_observations(id) ON DELETE CASCADE,
+             sequence INTEGER NOT NULL,
+             name TEXT NOT NULL,
+             state TEXT NOT NULL CHECK(state IN ('pending','passed','failed','unknown')),
+             detail_state TEXT NOT NULL CHECK(detail_state IN ('not_registered','pending','passed','failed','cancelled','unavailable','unknown')),
+             url TEXT,
+             completed_at TEXT,
+             required INTEGER CHECK(required IN (0,1)),
+             app_id INTEGER,
+             source TEXT NOT NULL CHECK(source IN ('github_check_runs','github_commit_statuses','unknown')),
+             PRIMARY KEY(observation_id, sequence)
+         );
+         CREATE TABLE IF NOT EXISTS ci_observation_required_checks (
+             observation_id TEXT NOT NULL REFERENCES ci_observations(id) ON DELETE CASCADE,
+             sequence INTEGER NOT NULL,
+             name TEXT NOT NULL,
+             app_id INTEGER,
+             PRIMARY KEY(observation_id, sequence)
+         );",
+    )
+}
+
+fn to_sql_conversion_error(error: LedgerError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
 
 fn create_service_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -1665,10 +1858,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unspecified_role, (None, "legacy_unspecified".into()));
+        let ci_observation_table: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_observations')", [], |row| row.get(0)).unwrap();
+        assert!(ci_observation_table);
     }
 
     #[test]
-    fn schema_v12_migration_adds_publication_and_task_creation_tables() {
+    fn schema_v12_migration_adds_publication_task_creation_and_ci_tables() {
         let connection = Connection::open_in_memory().unwrap();
         create_latest_schema(&connection).unwrap();
         create_service_schema(&connection).unwrap();
@@ -1696,7 +1891,7 @@ mod tests {
         let version: u32 = migrated
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         let has_publication_table: bool = migrated
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifact_publication_operations')",
@@ -1713,6 +1908,14 @@ mod tests {
             )
             .unwrap();
         assert!(has_task_snapshot_table);
+        let has_ci_observation_table: bool = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_observations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_ci_observation_table);
         let preserved_task: String = migrated
             .query_row(
                 "SELECT description FROM tasks WHERE id='task-v11'",
@@ -1724,14 +1927,137 @@ mod tests {
     }
 
     #[test]
+    fn schema_v14_ci_migration_preserves_task_snapshot_idempotency_and_attempt_history() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_latest_schema(&connection).unwrap();
+        create_service_schema(&connection).unwrap();
+        create_artifact_service_schema(&connection).unwrap();
+        create_artifact_evidence_schema(&connection).unwrap();
+        create_artifact_publication_schema(&connection).unwrap();
+        create_task_creation_schema(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO tasks(id,description,role,state) VALUES ('task-v14','existing request','unspecified','active')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO attempts(task_id,id,provider,state,started_at,finished_at,requested_model_kind,requested_model,observed_provider,observed_model,semantics_version)
+                 VALUES('task-v14','attempt-v14','codex','succeeded',1234,5678,'named','gpt-6-luna','codex','gpt-6-luna','provider_call_v2')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_results(task_id,attempt_id,summary,reported_success) VALUES ('task-v14','attempt-v14','preserved provider result',1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO service_attempt_history(task_id,attempt_id,sequence,role,relation_kind,related_attempt_id)
+                 VALUES('task-v14','attempt-v14',1,'implementer','initial',NULL)",
+                [],
+            )
+            .unwrap();
+
+        let request_json = r#"{"source":"manual","title":"Preserve v14 task","description":"existing request","constraints":[],"issue":null}"#;
+        connection
+            .execute(
+                "INSERT INTO task_request_snapshots(task_id,request_json) VALUES('task-v14',?1)",
+                params![request_json],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO task_create_idempotency(caller,tool_name,request_id,request_json,task_id)
+                 VALUES('supervisor-session','task.create','request-v14',?1,'task-v14')",
+                params![request_json],
+            )
+            .unwrap();
+        set_schema_version(&connection, 14).unwrap();
+
+        let ci_table_before_migration: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_observations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!ci_table_before_migration);
+
+        let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
+        let attempt = ledger
+            .get_attempt(&TaskId::new("task-v14"), &AttemptId::new("attempt-v14"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.started_at(), Some(1234));
+        assert_eq!(attempt.finished_at(), Some(5678));
+        assert_eq!(attempt.attempt().provider().as_str(), "codex");
+        assert_eq!(
+            attempt.attempt().agent_result().unwrap().summary(),
+            "preserved provider result"
+        );
+
+        let connection = ledger.lock_connection().unwrap();
+        let snapshot: String = connection
+            .query_row(
+                "SELECT request_json FROM task_request_snapshots WHERE task_id='task-v14'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(snapshot, request_json);
+        let idempotency: (String, String, String) = connection
+            .query_row(
+                "SELECT caller,request_json,task_id FROM task_create_idempotency
+                 WHERE caller='supervisor-session' AND tool_name='task.create' AND request_id='request-v14'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            idempotency,
+            (
+                "supervisor-session".into(),
+                request_json.into(),
+                "task-v14".into()
+            )
+        );
+        let history: (i64, String, String, Option<String>) = connection
+            .query_row(
+                "SELECT sequence,role,relation_kind,related_attempt_id FROM service_attempt_history
+                 WHERE task_id='task-v14' AND attempt_id='attempt-v14'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(history, (1, "implementer".into(), "initial".into(), None));
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 15);
+        let ci_table_after_migration: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_observations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ci_table_after_migration);
+    }
+
+    #[test]
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 15;")
+            .execute_batch("PRAGMA user_version = 16;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(15))
+            Err(LedgerError::UnsupportedSchemaVersion(16))
         ));
     }
 
@@ -1777,7 +2103,7 @@ mod tests {
             let version: u32 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 14);
+            assert_eq!(version, 15);
             let history: (String, i64, Option<String>) = connection.query_row(
                 "SELECT relation_kind, sequence, role FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
                 [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1833,7 +2159,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         let history: (Option<String>, String) = connection
             .query_row(
                 "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",

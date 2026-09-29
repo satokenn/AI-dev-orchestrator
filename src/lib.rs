@@ -5,6 +5,7 @@
 mod antigravity;
 mod artifact;
 pub mod artifact_publication;
+mod ci;
 pub mod cli;
 mod codex_provider;
 mod copilot_provider;
@@ -30,6 +31,12 @@ pub use artifact_publication::{
     ArtifactPublicationGateway, ArtifactPublicationPayload, DraftPullRequest,
     GitHubArtifactPublicationGateway, PublicationGatewayError, SecretScanError, SecretScanResult,
     SecretScanner,
+};
+pub use ci::{
+    CiAggregateState, CiCheck, CiCheckDetailState, CiCheckSource, CiCheckState, CiError,
+    CiObservation, CiProvider, CiProviderError, CiProviderSnapshot, CiQueryTarget, CiRuntime,
+    CiTarget, GhCiProvider, RawCiCheck, RequiredCheck, RequiredCheckSet, RequiredCheckSetSource,
+    RequiredCheckSetState,
 };
 pub use codex_provider::CodexProvider;
 pub use copilot_provider::CopilotProvider;
