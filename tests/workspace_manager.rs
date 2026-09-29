@@ -132,6 +132,37 @@ fn rejects_existing_path_and_branch_without_overwriting_them() {
 }
 
 #[test]
+fn create_at_base_rejects_refs_and_non_full_object_ids_before_creating_worktree() {
+    let repository = repository();
+    let manager = WorkspaceManager::new(&repository).expect("resolve repository root");
+    let task = TaskId::new("invalid-base-task");
+    let attempt = AttemptId::new("invalid-base-attempt");
+    let branch = manager.branch_name(&task, &attempt);
+    let base = git(&repository, &["rev-parse", "HEAD"]);
+    let full_oid = base.trim();
+    let abbreviated_oid = &full_oid[..7];
+
+    for invalid_base in ["HEAD", abbreviated_oid, "not-an-object-id"] {
+        assert!(matches!(
+            manager.create_at_base(&task, &attempt, invalid_base),
+            Err(WorkspaceError::InvalidBaseCommit { .. })
+        ));
+        assert!(
+            !manager.worktree_path(&task, &attempt).exists(),
+            "invalid base {invalid_base:?} must not create a worktree"
+        );
+        assert!(
+            git(&repository, &["branch", "--list", &branch])
+                .trim()
+                .is_empty(),
+            "invalid base {invalid_base:?} must not create a branch"
+        );
+    }
+
+    fs::remove_dir_all(repository).expect("remove test repository");
+}
+
+#[test]
 fn dirty_cleanup_preserves_contents_until_force_is_requested() {
     let repository = repository();
     let manager = WorkspaceManager::new(&repository).expect("resolve repository root");
