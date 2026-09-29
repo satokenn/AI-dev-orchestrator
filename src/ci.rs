@@ -422,11 +422,25 @@ pub trait CiProvider {
         target: &CiQueryTarget,
         timeout: Duration,
     ) -> Result<CiProviderSnapshot, CiProviderError>;
+
+    /// Observes against an explicit GitHub hostname. Providers that cannot pin
+    /// the host fail closed instead of silently using their default host.
+    fn observe_on_host(
+        &self,
+        _target: &CiQueryTarget,
+        _timeout: Duration,
+        _host: &str,
+    ) -> Result<CiProviderSnapshot, CiProviderError> {
+        Err(CiProviderError::Unavailable(
+            "CI Provider does not support explicit GitHub host selection".into(),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CiProviderError {
     Unavailable(String),
+    HeadChanged { expected: String, actual: String },
     InvalidResponse(String),
 }
 
@@ -434,6 +448,12 @@ impl fmt::Display for CiProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable(message) => write!(f, "CI observation unavailable: {message}"),
+            Self::HeadChanged { expected, actual } => {
+                write!(
+                    f,
+                    "PR head changed from {expected} to {actual} while CI checks were collected"
+                )
+            }
             Self::InvalidResponse(message) => write!(f, "invalid GitHub CI response: {message}"),
         }
     }
@@ -507,13 +527,13 @@ impl From<LedgerError> for CiError {
     }
 }
 
-pub struct CiRuntime<'a, P> {
+pub struct CiRuntime<'a, P: ?Sized> {
     ledger: &'a SqliteExecutionLedger,
     provider: &'a P,
     poll_interval: Duration,
     api_timeout: Duration,
 }
-impl<'a, P: CiProvider> CiRuntime<'a, P> {
+impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
     pub fn new(
         ledger: &'a SqliteExecutionLedger,
         provider: &'a P,
@@ -537,19 +557,34 @@ impl<'a, P: CiProvider> CiRuntime<'a, P> {
         task_id: Option<&TaskId>,
         query: &CiQueryTarget,
     ) -> Result<CiObservation, CiError> {
-        self.observe_until(task_id, query, self.api_timeout)
+        self.observe_until(task_id, query, self.api_timeout, None)
+    }
+    pub(crate) fn observe_on_host(
+        &self,
+        task_id: Option<&TaskId>,
+        query: &CiQueryTarget,
+        host: &str,
+    ) -> Result<CiObservation, CiError> {
+        if !valid_gh_hostname(host) {
+            return Err(CiError::InvalidTarget(
+                "GitHub host must be a valid hostname".into(),
+            ));
+        }
+        self.observe_until(task_id, query, self.api_timeout, Some(host))
     }
     fn observe_until(
         &self,
         task_id: Option<&TaskId>,
         query: &CiQueryTarget,
         timeout: Duration,
+        host: Option<&str>,
     ) -> Result<CiObservation, CiError> {
         validate_query_target(query)?;
-        let snapshot = self
-            .provider
-            .observe(query, timeout)
-            .map_err(CiError::Provider)?;
+        let snapshot = match host {
+            Some(host) => self.provider.observe_on_host(query, timeout, host),
+            None => self.provider.observe(query, timeout),
+        }
+        .map_err(CiError::Provider)?;
         let target_matches = match query {
             CiQueryTarget::PullRequest {
                 repository, number, ..
@@ -605,6 +640,29 @@ impl<'a, P: CiProvider> CiRuntime<'a, P> {
         query: &CiQueryTarget,
         deadline: Instant,
     ) -> Result<CiObservation, CiError> {
+        self.wait_until(task_id, query, deadline, None)
+    }
+    pub(crate) fn wait_on_host(
+        &self,
+        task_id: &TaskId,
+        query: &CiQueryTarget,
+        deadline: Instant,
+        host: &str,
+    ) -> Result<CiObservation, CiError> {
+        if !valid_gh_hostname(host) {
+            return Err(CiError::InvalidTarget(
+                "GitHub host must be a valid hostname".into(),
+            ));
+        }
+        self.wait_until(task_id, query, deadline, Some(host))
+    }
+    fn wait_until(
+        &self,
+        task_id: &TaskId,
+        query: &CiQueryTarget,
+        deadline: Instant,
+        host: Option<&str>,
+    ) -> Result<CiObservation, CiError> {
         if deadline <= Instant::now() {
             return Err(CiError::Timeout {
                 last_observation_id: None,
@@ -637,7 +695,7 @@ impl<'a, P: CiProvider> CiRuntime<'a, P> {
                 },
                 CiQueryTarget::Commit { .. } => query.clone(),
             };
-            let observation = match self.observe_until(Some(task_id), &poll_query, timeout) {
+            let observation = match self.observe_until(Some(task_id), &poll_query, timeout, host) {
                 Ok(observation) => observation,
                 Err(CiError::HeadShaMismatch { expected, actual })
                     if pinned_sha.as_deref() == Some(expected.as_str()) && last.is_some() =>
@@ -660,6 +718,21 @@ impl<'a, P: CiProvider> CiRuntime<'a, P> {
                     return Err(CiError::Unavailable {
                         reason,
                         last_observation_id,
+                    });
+                }
+                Err(CiError::Provider(CiProviderError::HeadChanged { expected, actual })) => {
+                    if let Some(observation) = last {
+                        return Err(CiError::HeadChanged {
+                            expected,
+                            actual,
+                            last_observation_id: observation.id,
+                        });
+                    }
+                    return Err(CiError::Unavailable {
+                        reason: format!(
+                            "PR head changed from {expected} to {actual} during CI observation"
+                        ),
+                        last_observation_id: None,
                     });
                 }
                 Err(error) => return Err(error),
@@ -858,21 +931,41 @@ fn aggregate(snapshot: &CiProviderSnapshot) -> (Vec<CiCheck>, CiAggregateState) 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GhCiProvider {
     executable: std::path::PathBuf,
+    hostname: Option<String>,
 }
 impl Default for GhCiProvider {
     fn default() -> Self {
         Self::new()
     }
 }
+fn pull_request_head_sha(value: &Value) -> Result<String, CiProviderError> {
+    let pr = page_values(value)
+        .first()
+        .copied()
+        .ok_or_else(|| CiProviderError::InvalidResponse("PR response was empty".into()))?;
+    let sha = pr
+        .pointer("/head/sha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CiProviderError::InvalidResponse("PR response omitted head SHA".into()))?;
+    if !valid_sha(sha) {
+        return Err(CiProviderError::InvalidResponse(
+            "PR response contained an invalid head SHA".into(),
+        ));
+    }
+    Ok(sha.to_owned())
+}
+
 impl GhCiProvider {
     pub fn new() -> Self {
         Self {
             executable: "gh".into(),
+            hostname: None,
         }
     }
     pub fn with_executable(executable: impl Into<std::path::PathBuf>) -> Self {
         Self {
             executable: executable.into(),
+            hostname: None,
         }
     }
 }
@@ -968,6 +1061,18 @@ impl CiProvider for GhCiProvider {
                 }
                 Err(_) => false,
             };
+        if let Some(number) = pr_number {
+            let current_pr = remaining_timeout(deadline).and_then(|remaining| {
+                self.api_json(&format!("repos/{repository}/pulls/{number}"), remaining)
+            })?;
+            let current_sha = pull_request_head_sha(&current_pr)?;
+            if current_sha != sha {
+                return Err(CiProviderError::HeadChanged {
+                    expected: sha,
+                    actual: current_sha,
+                });
+            }
+        }
         Ok(CiProviderSnapshot {
             target: CiTarget {
                 repository,
@@ -980,6 +1085,24 @@ impl CiProvider for GhCiProvider {
             commit_statuses_available,
             observed_at_ms: now,
         })
+    }
+
+    fn observe_on_host(
+        &self,
+        query: &CiQueryTarget,
+        timeout: Duration,
+        host: &str,
+    ) -> Result<CiProviderSnapshot, CiProviderError> {
+        if !valid_gh_hostname(host) {
+            return Err(CiProviderError::InvalidResponse(
+                "GitHub hostname is invalid".into(),
+            ));
+        }
+        Self {
+            executable: self.executable.clone(),
+            hostname: Some(host.to_owned()),
+        }
+        .observe(query, timeout)
     }
 }
 
@@ -1010,11 +1133,7 @@ impl GhCiProvider {
         timeout: Duration,
     ) -> Result<Option<Value>, CiProviderError> {
         let output = crate::ProcessRunner
-            .run(
-                crate::ProcessRequest::new(self.executable.as_os_str().to_owned())
-                    .args(["api", "--include", endpoint])
-                    .timeout(timeout),
-            )
+            .run(self.api_request(endpoint, &["--include"], timeout))
             .map_err(|_| {
                 CiProviderError::Unavailable("GitHub API command did not complete".into())
             })?;
@@ -1097,11 +1216,7 @@ fn required_check_set_from_sources(
 impl GhCiProvider {
     fn api_json(&self, endpoint: &str, timeout: Duration) -> Result<Value, CiProviderError> {
         let output = crate::ProcessRunner
-            .run(
-                crate::ProcessRequest::new(self.executable.as_os_str().to_owned())
-                    .args(["api", "--paginate", "--slurp", endpoint])
-                    .timeout(timeout),
-            )
+            .run(self.api_request(endpoint, &["--paginate", "--slurp"], timeout))
             .map_err(|_| {
                 CiProviderError::Unavailable("GitHub API command did not complete".into())
             })?;
@@ -1113,6 +1228,37 @@ impl GhCiProvider {
         serde_json::from_slice(&output.stdout)
             .map_err(|error| CiProviderError::InvalidResponse(error.to_string()))
     }
+
+    fn api_request(
+        &self,
+        endpoint: &str,
+        flags: &[&str],
+        timeout: Duration,
+    ) -> crate::ProcessRequest {
+        let mut args = vec!["api".into()];
+        args.extend(flags.iter().map(|flag| (*flag).into()));
+        if let Some(hostname) = &self.hostname {
+            args.push("--hostname".into());
+            args.push(hostname.into());
+        }
+        args.push(endpoint.into());
+        let mut request =
+            crate::ProcessRequest::new(self.executable.as_os_str().to_owned()).timeout(timeout);
+        request.args = args;
+        request
+    }
+}
+
+fn valid_gh_hostname(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+        })
 }
 
 fn parse_rules(value: &Value) -> Result<Vec<RequiredCheck>, CiProviderError> {
@@ -1328,12 +1474,12 @@ for arg in "$@"; do endpoint=$arg; done
 case "$endpoint" in
   repos/owner/repo/pulls/42)
     sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-    if [ "$mode" = 'head_change' ]; then
+    if [ "$mode" = 'head_change' ] || [ "$mode" = 'head_recheck_unavailable' ]; then
       count=0
       if [ -f "$counter" ]; then count=$(cat "$counter"); fi
       count=$((count + 1))
       printf '%s' "$count" > "$counter"
-      if [ "$count" -gt 1 ]; then sha='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; fi
+      if [ "$count" -gt 1 ] && [ "$mode" = 'head_change' ]; then sha='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; fi
     fi
     printf '%s' '[{"head":{"sha":"'"$sha"'"},"base":{"ref":"main"}}]'
     ;;
@@ -1348,13 +1494,14 @@ case "$endpoint" in
     printf '%s' '[[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"build","integration_id":7}]}}]]'
     ;;
   *check-runs*)
-    if [ "$mode" = 'failure' ]; then conclusion='failure'; status='completed'; elif [ "$mode" = 'head_change' ]; then conclusion=''; status='in_progress'; else conclusion='success'; status='completed'; fi
+    if [ "$mode" = 'failure' ]; then conclusion='failure'; status='completed'; else conclusion='success'; status='completed'; fi
     printf '%s' '[{"check_runs":[{"name":"build","status":"'"$status"'","conclusion":"'"$conclusion"'","app":{"id":7}}]}]'
     ;;
   *statuses*) printf '%s' '[[]]' ;;
   *) printf '%s\n' "unexpected fake gh endpoint: $endpoint" >&2; exit 2 ;;
 esac
 if [ "$mode" = 'unavailable' ] && [ "$endpoint" = 'repos/owner/repo/pulls/42' ]; then exit 1; fi
+if [ "$mode" = 'head_recheck_unavailable' ] && [ "$endpoint" = 'repos/owner/repo/pulls/42' ] && [ "$(cat "$counter")" -gt 1 ]; then exit 1; fi
 "#
         .replace("__MODE__", mode)
         .replace("__COUNTER__", &counter.display().to_string());
@@ -1539,7 +1686,70 @@ if [ "$mode" = 'unavailable' ] && [ "$endpoint" = 'repos/owner/repo/pulls/42' ];
 
     #[cfg(unix)]
     #[test]
-    fn gh_adapter_fake_executable_detects_head_change_during_wait() {
+    fn gh_adapter_does_not_persist_checks_when_pr_head_changes_during_collection() {
+        let fake = fake_gh("head_change");
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let provider = GhCiProvider::with_executable(&fake.executable);
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let target = CiQueryTarget::PullRequest {
+            repository: "owner/repo".into(),
+            number: 42,
+            expected_head_sha: None,
+        };
+
+        assert!(matches!(
+            runtime.observe(None, &target),
+            Err(CiError::Provider(CiProviderError::HeadChanged { expected, actual }))
+                if expected == "a".repeat(40) && actual == "b".repeat(40)
+        ));
+        let count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM ci_observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_adapter_does_not_persist_checks_when_pr_head_recheck_is_unavailable() {
+        let fake = fake_gh("head_recheck_unavailable");
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let provider = GhCiProvider::with_executable(&fake.executable);
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let target = CiQueryTarget::PullRequest {
+            repository: "owner/repo".into(),
+            number: 42,
+            expected_head_sha: None,
+        };
+
+        assert!(matches!(
+            runtime.observe(None, &target),
+            Err(CiError::Provider(CiProviderError::Unavailable(_)))
+        ));
+        let count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM ci_observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_adapter_wait_does_not_return_stale_success_after_head_changes_during_collection() {
         let fake = fake_gh("head_change");
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
         let task_id = save_task(&ledger, "ci-gh-head-change-task");
@@ -1562,22 +1772,64 @@ if [ "$mode" = 'unavailable' ] && [ "$endpoint" = 'repos/owner/repo/pulls/42' ];
                 Instant::now() + Duration::from_secs(1),
             )
             .unwrap_err();
+        assert!(matches!(
+            error,
+            CiError::Unavailable { reason, last_observation_id: None }
+                if reason.contains("head changed")
+        ));
+        let count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM ci_observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn wait_preserves_confirmed_head_change_after_prior_observation() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = save_task(&ledger, "ci-gh-head-change-after-observation-task");
+        let provider = FakeProvider::unavailable_after(
+            snapshot(&"a".repeat(40), CiCheckDetailState::Pending),
+            CiProviderError::HeadChanged {
+                expected: "a".repeat(40),
+                actual: "b".repeat(40),
+            },
+        );
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(10),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let error = runtime
+            .wait(
+                &task_id,
+                &CiQueryTarget::PullRequest {
+                    repository: "owner/repo".into(),
+                    number: 4,
+                    expected_head_sha: None,
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
         let CiError::HeadChanged {
             expected,
             actual,
             last_observation_id,
         } = error
         else {
-            panic!("expected a pinned-head change error: {error:?}");
+            panic!("expected confirmed head change, got {error:?}");
         };
         assert_eq!(expected, "a".repeat(40));
         assert_eq!(actual, "b".repeat(40));
-        let previous = ledger
+        let last = ledger
             .get_ci_observation(&last_observation_id)
             .unwrap()
             .unwrap();
-        assert_eq!(previous.target().head_sha(), "a".repeat(40));
-        assert_eq!(previous.state(), CiAggregateState::Pending);
+        assert_eq!(last.target().head_sha(), "a".repeat(40));
+        assert_eq!(last.state(), CiAggregateState::Pending);
     }
 
     #[test]
