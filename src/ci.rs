@@ -10,7 +10,7 @@ use std::{
 
 use serde_json::Value;
 
-use crate::{LedgerError, SqliteExecutionLedger, TaskId};
+use crate::{CancellationToken, LedgerError, SqliteExecutionLedger, TaskId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CiQueryTarget {
@@ -481,6 +481,9 @@ pub enum CiError {
     Timeout {
         last_observation_id: Option<String>,
     },
+    Cancelled {
+        last_observation_id: Option<String>,
+    },
 }
 impl fmt::Display for CiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -517,6 +520,12 @@ impl fmt::Display for CiError {
             Self::Timeout {
                 last_observation_id: None,
             } => f.write_str("CI wait deadline elapsed before the first observation"),
+            Self::Cancelled {
+                last_observation_id: Some(id),
+            } => write!(f, "CI wait was cancelled; last observation {id}"),
+            Self::Cancelled {
+                last_observation_id: None,
+            } => f.write_str("CI wait was cancelled before the first observation"),
         }
     }
 }
@@ -640,7 +649,16 @@ impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
         query: &CiQueryTarget,
         deadline: Instant,
     ) -> Result<CiObservation, CiError> {
-        self.wait_until(task_id, query, deadline, None)
+        self.wait_until(task_id, query, deadline, None, None)
+    }
+    pub(crate) fn wait_with_cancellation(
+        &self,
+        task_id: &TaskId,
+        query: &CiQueryTarget,
+        deadline: Instant,
+        token: &CancellationToken,
+    ) -> Result<CiObservation, CiError> {
+        self.wait_until(task_id, query, deadline, None, Some(token))
     }
     pub(crate) fn wait_on_host(
         &self,
@@ -654,7 +672,22 @@ impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
                 "GitHub host must be a valid hostname".into(),
             ));
         }
-        self.wait_until(task_id, query, deadline, Some(host))
+        self.wait_until(task_id, query, deadline, Some(host), None)
+    }
+    pub(crate) fn wait_on_host_with_cancellation(
+        &self,
+        task_id: &TaskId,
+        query: &CiQueryTarget,
+        deadline: Instant,
+        host: &str,
+        token: &CancellationToken,
+    ) -> Result<CiObservation, CiError> {
+        if !valid_gh_hostname(host) {
+            return Err(CiError::InvalidTarget(
+                "GitHub host must be a valid hostname".into(),
+            ));
+        }
+        self.wait_until(task_id, query, deadline, Some(host), Some(token))
     }
     fn wait_until(
         &self,
@@ -662,6 +695,7 @@ impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
         query: &CiQueryTarget,
         deadline: Instant,
         host: Option<&str>,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<CiObservation, CiError> {
         if deadline <= Instant::now() {
             return Err(CiError::Timeout {
@@ -676,6 +710,11 @@ impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
             CiQueryTarget::Commit { sha, .. } => Some(sha.clone()),
         };
         loop {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(CiError::Cancelled {
+                    last_observation_id: last.map(|observation| observation.id),
+                });
+            }
             let now = Instant::now();
             if now >= deadline {
                 return Err(CiError::Timeout {
@@ -695,7 +734,17 @@ impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
                 },
                 CiQueryTarget::Commit { .. } => query.clone(),
             };
-            let observation = match self.observe_until(Some(task_id), &poll_query, timeout, host) {
+            let observed = self.observe_until(Some(task_id), &poll_query, timeout, host);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(CiError::Cancelled {
+                    last_observation_id: observed
+                        .as_ref()
+                        .ok()
+                        .map(|observation| observation.id.clone())
+                        .or_else(|| last.map(|observation| observation.id)),
+                });
+            }
+            let observation = match observed {
                 Ok(observation) => observation,
                 Err(CiError::HeadShaMismatch { expected, actual })
                     if pinned_sha.as_deref() == Some(expected.as_str()) && last.is_some() =>
@@ -737,6 +786,11 @@ impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
                 }
                 Err(error) => return Err(error),
             };
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(CiError::Cancelled {
+                    last_observation_id: Some(observation.id),
+                });
+            }
             if let Some(expected) = pinned_sha.as_ref() {
                 if expected.as_str() != observation.target.head_sha {
                     return Err(CiError::HeadChanged {
@@ -764,12 +818,24 @@ impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
                 return Ok(observation);
             }
             last = Some(observation);
-            thread::sleep(self.poll_interval.min(remaining));
+            let sleep_for = self.poll_interval.min(remaining);
+            let sleep_deadline = Instant::now() + sleep_for;
+            while Instant::now() < sleep_deadline {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return Err(CiError::Cancelled {
+                        last_observation_id: last.map(|observation| observation.id),
+                    });
+                }
+                thread::sleep(
+                    Duration::from_millis(10)
+                        .min(sleep_deadline.saturating_duration_since(Instant::now())),
+                );
+            }
         }
     }
 }
 
-fn validate_query_target(query: &CiQueryTarget) -> Result<(), CiError> {
+pub(crate) fn validate_query_target(query: &CiQueryTarget) -> Result<(), CiError> {
     let (repository, sha) = match query {
         CiQueryTarget::PullRequest {
             repository,
@@ -1769,7 +1835,7 @@ if [ "$mode" = 'head_recheck_unavailable' ] && [ "$endpoint" = 'repos/owner/repo
                     number: 42,
                     expected_head_sha: None,
                 },
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(10),
             )
             .unwrap_err();
         assert!(matches!(

@@ -617,6 +617,10 @@ CI状態をdeadlineまで待つ。長時間処理。
 
 `publication_id`と`target`は同時に指定しない。成功outputは`OperationAcceptance`。期限までにCIが確定しない場合、operationは`failed`、`result`はnull、`error.code`は`timeout`、`error.details_ref`は最後に永続化した`CiObservation` IDを返す。CI結果が未確定でもObservation自体を永続化できた場合はこのtimeout応答であり、成功扱いではない。Serviceがoperationの終了状態または最後の観測値の永続化を確定できない中断の場合は`recovery_required`とし、結果を推測しない。
 
+冪等性scopeは共通規則どおり信頼されたcaller、`ci.wait`、`request_id`の組み合わせ。deadlineはepoch秒とnanosecond部分を保存・比較し、同じミリ秒内でも異なるdeadlineは`idempotency_conflict`。既存DBから移行する旧scope不明の行はcallerをnullのまま保持し、新しいcaller scopeへ割り当てない。
+
+Rust Serviceには低レベルtarget-stop hookがある。受理済みwaitは即時に`cancelled`へ終端化できる。実行中waitは`cancelling`を永続化し、同じprocess内でそのLedgerを共有するworkerへCancellationTokenを送る。現在実行中の同期Provider poll自体は中断せず、Providerが渡されたtimeout内に戻った境界で停止を確認してから`cancelled`へ終端化する。pollが戻らない間は`cancelling`のまま終端を偽らず、workerが存在しない場合や再起動後に停止を確認できない場合は`recovery_required`。このhookは共通`operation.cancel`用の新規OperationAcceptanceを作らず、Task自体もcancelしない。後続のcancel Service/transportがこれらのtarget hookを調整する。
+
 ### `task.finish`
 
 Task完了を要求する。指定されたArtifact、accepted decision、policy必須の証拠を照合し、満たさなければ状態を変えない。

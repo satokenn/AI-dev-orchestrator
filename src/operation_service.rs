@@ -13,6 +13,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 static NEXT_PUBLICATION_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_CI_WAIT_OPERATION_ID: AtomicU64 = AtomicU64::new(0);
 
 use crate::{
     Attempt, AttemptFailureReason, AttemptId, AttemptSemantics, AttemptState, CancellationToken,
@@ -345,6 +346,36 @@ pub enum CiServiceTarget {
     Commit { repository: String, sha: String },
 }
 
+/// Immutable asynchronous `ci.wait` request. The enum enforces the exclusive
+/// Publication ID versus direct-target choice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CiWaitRequest {
+    request_id: String,
+    task_id: TaskId,
+    expected_revision: u64,
+    target: CiServiceTarget,
+    deadline: SystemTime,
+}
+
+impl CiWaitRequest {
+    #[must_use]
+    pub fn new(
+        request_id: impl Into<String>,
+        task_id: TaskId,
+        expected_revision: u64,
+        target: CiServiceTarget,
+        deadline: SystemTime,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            task_id,
+            expected_revision,
+            target,
+            deadline,
+        }
+    }
+}
+
 impl ArtifactPublicationRequest {
     #[must_use]
     pub fn new(
@@ -372,10 +403,34 @@ impl ArtifactPublicationRequest {
 pub enum ServiceOperationStatus {
     Accepted,
     Running,
+    Cancelling,
     Completed,
     Failed,
     Cancelled,
     RecoveryRequired,
+}
+
+/// Current outcome of a target-side cancellation request. `Running` means the
+/// signal was accepted but the worker has not yet confirmed it stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CiWaitCancelTargetState {
+    Cancelled,
+    Running,
+    RecoveryRequired,
+}
+
+struct ActiveCiWaitGuard<'a> {
+    ledger: &'a SqliteExecutionLedger,
+    operation_id: String,
+    token: CancellationToken,
+}
+
+impl Drop for ActiveCiWaitGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .ledger
+            .remove_ci_wait_cancellation(&self.operation_id, &self.token);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,6 +610,7 @@ impl ServiceOperationStatus {
         match self {
             Self::Accepted => "accepted",
             Self::Running => "running",
+            Self::Cancelling => "cancelling",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -566,6 +622,7 @@ impl ServiceOperationStatus {
         match value {
             "accepted" => Ok(Self::Accepted),
             "running" => Ok(Self::Running),
+            "cancelling" => Ok(Self::Cancelling),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
@@ -599,6 +656,78 @@ impl OperationAcceptance {
     #[must_use]
     pub const fn status(&self) -> ServiceOperationStatus {
         self.status
+    }
+}
+
+/// Acceptance for asynchronous `ci.wait`; it has no Attempt ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CiWaitAcceptance {
+    operation_id: OperationId,
+    revision: u64,
+    status: ServiceOperationStatus,
+}
+
+impl CiWaitAcceptance {
+    #[must_use]
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    #[must_use]
+    pub const fn status(&self) -> ServiceOperationStatus {
+        self.status
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CiWaitOperationSnapshot {
+    operation_id: OperationId,
+    task_id: TaskId,
+    status: ServiceOperationStatus,
+    observation: Option<CiObservation>,
+    error_code: Option<String>,
+    details_ref: Option<String>,
+    revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OperationGetResult {
+    Attempt(OperationSnapshot),
+    CiWait(CiWaitOperationSnapshot),
+    ArtifactPublication(ArtifactPublicationSnapshot),
+}
+
+impl CiWaitOperationSnapshot {
+    #[must_use]
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    #[must_use]
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    #[must_use]
+    pub const fn status(&self) -> ServiceOperationStatus {
+        self.status
+    }
+    #[must_use]
+    pub const fn observation(&self) -> Option<&CiObservation> {
+        self.observation.as_ref()
+    }
+    #[must_use]
+    pub fn error_code(&self) -> Option<&str> {
+        self.error_code.as_deref()
+    }
+    #[must_use]
+    pub fn details_ref(&self) -> Option<&str> {
+        self.details_ref.as_deref()
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
     }
 }
 
@@ -2272,6 +2401,461 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         .map_err(ServiceError::from)
     }
 
+    /// Persist an asynchronous CI wait request and return its acceptance.
+    /// The caller schedules `run_ci_wait_operation` separately.
+    pub fn accept_ci_wait(
+        &self,
+        caller: &str,
+        request: &CiWaitRequest,
+    ) -> Result<CiWaitAcceptance, ServiceError> {
+        if caller.trim().is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "caller identity must not be empty",
+            ));
+        }
+        if request.request_id.trim().is_empty() {
+            return Err(ServiceError::InvalidRequest("request_id must not be empty"));
+        }
+        let deadline = request
+            .deadline
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ServiceError::InvalidRequest("CI deadline must be after Unix epoch"))?;
+        let deadline_seconds: i64 = deadline
+            .as_secs()
+            .try_into()
+            .map_err(|_| ServiceError::InvalidRequest("CI deadline is out of range"))?;
+        let deadline_nanos = i64::from(deadline.subsec_nanos());
+        let expected_revision: i64 = request
+            .expected_revision
+            .try_into()
+            .map_err(|_| ServiceError::InvalidRequest("revision is out of range"))?;
+        let target_json = ci_target_json(&request.target);
+        // Resolve an idempotent replay before checking the live revision; the
+        // original acceptance remains authoritative even after Task changes.
+        let previous: Option<(String, String, String, i64, i64, i64)> = {
+            let connection = self.ledger.lock_connection()?;
+            connection.query_row(
+                "SELECT id,task_id,target_json,deadline_seconds,deadline_nanos,expected_revision FROM service_ci_wait_operations WHERE caller=?1 AND tool_name='ci.wait' AND request_id=?2",
+                params![caller,request.request_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+            ).optional()?
+        };
+        if let Some((id, task, stored_target, stored_seconds, stored_nanos, revision)) = previous {
+            if task != request.task_id.as_str()
+                || stored_target != target_json
+                || stored_seconds != deadline_seconds
+                || stored_nanos != deadline_nanos
+                || revision != expected_revision
+            {
+                return Err(ServiceError::IdempotencyConflict);
+            }
+            let snapshot = self.get_ci_wait_operation(&OperationId::new(id))?;
+            return Ok(CiWaitAcceptance {
+                operation_id: snapshot.operation_id,
+                revision: snapshot.revision,
+                status: snapshot.status,
+            });
+        }
+        self.ci_runtime()?;
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String,String,String,i64,i64,i64)> = tx.query_row(
+            "SELECT id,task_id,target_json,deadline_seconds,deadline_nanos,expected_revision FROM service_ci_wait_operations WHERE caller=?1 AND tool_name='ci.wait' AND request_id=?2",
+            params![caller,request.request_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        ).optional()?;
+        if let Some((id, task, stored_target, stored_seconds, stored_nanos, revision)) = existing {
+            if task != request.task_id.as_str()
+                || stored_target != target_json
+                || stored_seconds != deadline_seconds
+                || stored_nanos != deadline_nanos
+                || revision != expected_revision
+            {
+                return Err(ServiceError::IdempotencyConflict);
+            }
+            tx.commit()?;
+            drop(connection);
+            let snapshot = self.get_ci_wait_operation(&OperationId::new(id))?;
+            return Ok(CiWaitAcceptance {
+                operation_id: snapshot.operation_id,
+                revision: snapshot.revision,
+                status: snapshot.status,
+            });
+        }
+        let direct_query = match &request.target {
+            CiServiceTarget::Publication(_) => None,
+            CiServiceTarget::PullRequest { repository, number } => {
+                Some(CiQueryTarget::PullRequest {
+                    repository: repository.clone(),
+                    number: *number,
+                    expected_head_sha: None,
+                })
+            }
+            CiServiceTarget::Commit { repository, sha } => Some(CiQueryTarget::Commit {
+                repository: repository.clone(),
+                sha: sha.clone(),
+            }),
+        };
+        if let Some(query) = direct_query {
+            crate::ci::validate_query_target(&query)
+                .map_err(|_| ServiceError::InvalidRequest("invalid CI target"))?;
+        }
+        // Revision, Task state and Publication binding are read under the same
+        // immediate transaction as the acceptance insert, closing stale-accept
+        // races with Task mutations.
+        let actual: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![request.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let actual = actual.ok_or(ServiceError::TaskNotFound)?;
+        let actual_u64 = u64::try_from(actual).map_err(|_| ServiceError::InvalidStoredState)?;
+        if actual_u64 != request.expected_revision {
+            return Err(ServiceError::StaleRevision {
+                expected: request.expected_revision,
+                actual: actual_u64,
+            });
+        }
+        let task_state: String = tx
+            .query_row(
+                "SELECT state FROM tasks WHERE id=?1",
+                params![request.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ServiceError::TaskNotFound)?;
+        if matches!(task_state.as_str(), "completed" | "cancelled") {
+            return Err(ServiceError::PolicyDenied(
+                "CI wait requires an active Task",
+            ));
+        }
+        resolve_ci_target_in_connection(&tx, &request.target, Some(&request.task_id))?;
+        // Check expiry only after both idempotency lookups. Replaying an
+        // accepted request remains valid after its original deadline.
+        if request.deadline <= SystemTime::now() {
+            return Err(ServiceError::InvalidRequest(
+                "CI deadline must be in the future",
+            ));
+        }
+        let id = format!(
+            "ci-wait-{}-{}",
+            now_ms(),
+            NEXT_CI_WAIT_OPERATION_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        tx.execute("INSERT INTO service_ci_wait_operations(id,caller,tool_name,request_id,task_id,expected_revision,target_json,deadline_seconds,deadline_nanos,status,accepted_at) VALUES(?1,?2,'ci.wait',?3,?4,?5,?6,?7,?8,'accepted',?9)",
+            params![id,caller,request.request_id,request.task_id.as_str(),expected_revision,target_json,deadline_seconds,deadline_nanos,now_ms()])?;
+        tx.commit()?;
+        Ok(CiWaitAcceptance {
+            operation_id: OperationId::new(id),
+            revision: request.expected_revision,
+            status: ServiceOperationStatus::Accepted,
+        })
+    }
+
+    /// Execute an accepted CI wait once. Repeated calls return stored state and
+    /// never repeat an operation that has already been claimed.
+    pub fn run_ci_wait_operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CiWaitOperationSnapshot, ServiceError> {
+        let token = CancellationToken::new();
+        self.run_ci_wait_operation_inner(operation_id, &token)
+    }
+
+    fn run_ci_wait_operation_inner(
+        &self,
+        operation_id: &OperationId,
+        cancellation: &CancellationToken,
+    ) -> Result<CiWaitOperationSnapshot, ServiceError> {
+        let current = self.get_ci_wait_operation(operation_id)?;
+        if current.status() != ServiceOperationStatus::Accepted {
+            return Ok(current);
+        }
+        // Check the injected observer before claiming the operation, so a
+        // configuration error leaves the durable operation retryable.
+        let runtime = self.ci_runtime()?;
+        let claim = {
+            let mut connection = self.ledger.lock_connection()?;
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let row: (String,String,String,i64,i64,String) = tx.query_row(
+                "SELECT task_id,status,target_json,deadline_seconds,deadline_nanos,request_id FROM service_ci_wait_operations WHERE id=?1",
+                params![operation_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+            ).optional()?.ok_or(ServiceError::OperationNotFound)?;
+            if row.1 != "accepted" {
+                if row.1 == "cancelling" {
+                    tx.execute("UPDATE service_ci_wait_operations SET status='cancelled',error_code='cancelled',finished_at=?2 WHERE id=?1 AND status='cancelling'",params![operation_id.as_str(),now_ms()])?;
+                }
+                tx.commit()?;
+                drop(connection);
+                return self.get_ci_wait_operation(operation_id);
+            }
+            tx.execute("UPDATE service_ci_wait_operations SET status='running',started_at=?2 WHERE id=?1 AND status='accepted'",params![operation_id.as_str(),now_ms()])?;
+            self.ledger
+                .register_ci_wait_cancellation(operation_id.as_str(), cancellation.clone())?;
+            let registration_guard = ActiveCiWaitGuard {
+                ledger: self.ledger,
+                operation_id: operation_id.as_str().to_owned(),
+                token: cancellation.clone(),
+            };
+            tx.commit()?;
+            (row, registration_guard)
+        };
+        let (claim, _registration_guard) = claim;
+        let prepared = (|| {
+            let task_id = TaskId::new(claim.0);
+            let target = parse_ci_target(&claim.2)?;
+            let deadline = UNIX_EPOCH
+                .checked_add(Duration::new(
+                    u64::try_from(claim.3).map_err(|_| ServiceError::InvalidStoredState)?,
+                    u32::try_from(claim.4).map_err(|_| ServiceError::InvalidStoredState)?,
+                ))
+                .ok_or(ServiceError::InvalidStoredState)?;
+            let remaining = deadline
+                .duration_since(SystemTime::now())
+                .unwrap_or_default();
+            let resolved = self.resolve_ci_target(&target, Some(&task_id))?;
+            let run_deadline = Instant::now()
+                .checked_add(remaining)
+                .ok_or(ServiceError::InvalidStoredState)?;
+            Ok::<_, ServiceError>((task_id, resolved, run_deadline))
+        })();
+        let (task_id, resolved, run_deadline) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let (status, code) = match error {
+                    ServiceError::Ledger(_) | ServiceError::Sqlite(_) => {
+                        ("recovery_required", "recovery_required")
+                    }
+                    _ => ("failed", "internal_error"),
+                };
+                self.finish_ci_wait(operation_id, status, None, Some(code), None)?;
+                return self.get_ci_wait_operation(operation_id);
+            }
+        };
+        let result = match resolved.2 {
+            Some(host) => runtime.wait_on_host_with_cancellation(
+                &task_id,
+                &resolved.1,
+                run_deadline,
+                &host,
+                cancellation,
+            ),
+            None => {
+                runtime.wait_with_cancellation(&task_id, &resolved.1, run_deadline, cancellation)
+            }
+        };
+        match result {
+            Ok(observation) => self.finish_ci_wait(
+                operation_id,
+                "completed",
+                Some(observation.id()),
+                None,
+                None,
+            )?,
+            Err(CiError::Timeout {
+                last_observation_id,
+            }) => self.finish_ci_wait(
+                operation_id,
+                "failed",
+                None,
+                Some("timeout"),
+                last_observation_id.as_deref(),
+            )?,
+            Err(CiError::Cancelled {
+                last_observation_id,
+            }) => self.finish_ci_wait(
+                operation_id,
+                "cancelled",
+                None,
+                Some("cancelled"),
+                last_observation_id.as_deref(),
+            )?,
+            Err(CiError::Ledger(_)) => self.finish_ci_wait(
+                operation_id,
+                "recovery_required",
+                None,
+                Some("recovery_required"),
+                None,
+            )?,
+            Err(CiError::Unavailable {
+                last_observation_id,
+                ..
+            }) => self.finish_ci_wait(
+                operation_id,
+                "failed",
+                None,
+                Some("internal_error"),
+                last_observation_id.as_deref(),
+            )?,
+            Err(CiError::HeadChanged {
+                last_observation_id,
+                ..
+            }) => self.finish_ci_wait(
+                operation_id,
+                "failed",
+                None,
+                Some("internal_error"),
+                Some(&last_observation_id),
+            )?,
+            Err(_) => {
+                self.finish_ci_wait(operation_id, "failed", None, Some("internal_error"), None)?
+            }
+        }
+        self.get_ci_wait_operation(operation_id)
+    }
+
+    pub fn get_ci_wait_operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CiWaitOperationSnapshot, ServiceError> {
+        let connection = self.ledger.lock_connection()?;
+        let row: (String,String,Option<String>,Option<String>,Option<String>,i64) = connection.query_row(
+            "SELECT task_id,status,observation_id,error_code,details_ref,expected_revision FROM service_ci_wait_operations WHERE id=?1",
+            params![operation_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        ).optional()?.ok_or(ServiceError::OperationNotFound)?;
+        drop(connection);
+        let status = match row.1.as_str() {
+            "accepted" => ServiceOperationStatus::Accepted,
+            "running" => ServiceOperationStatus::Running,
+            "cancelling" => ServiceOperationStatus::Cancelling,
+            "completed" => ServiceOperationStatus::Completed,
+            "failed" => ServiceOperationStatus::Failed,
+            "cancelled" => ServiceOperationStatus::Cancelled,
+            "recovery_required" => ServiceOperationStatus::RecoveryRequired,
+            _ => return Err(ServiceError::InvalidStoredState),
+        };
+        let observation = if status == ServiceOperationStatus::Completed {
+            row.2
+                .as_deref()
+                .map(|id| self.ledger.get_ci_observation(id))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        Ok(CiWaitOperationSnapshot {
+            operation_id: operation_id.clone(),
+            task_id: TaskId::new(row.0),
+            status,
+            observation,
+            error_code: row.3,
+            details_ref: row.4,
+            revision: u64::try_from(row.5).map_err(|_| ServiceError::InvalidStoredState)?,
+        })
+    }
+
+    /// Requests cancellation of an accepted/running CI wait target. The
+    /// general `operation.cancel` acceptance adapter calls this target hook;
+    /// this method itself is not that separate acceptance operation.
+    pub fn request_ci_wait_cancellation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CiWaitCancelTargetState, ServiceError> {
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status: String = tx
+            .query_row(
+                "SELECT status FROM service_ci_wait_operations WHERE id=?1",
+                params![operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ServiceError::OperationNotFound)?;
+        let target = match status.as_str() {
+            "accepted" => {
+                tx.execute("UPDATE service_ci_wait_operations SET status='cancelled',error_code='cancelled',finished_at=?2 WHERE id=?1 AND status='accepted'",params![operation_id.as_str(),now_ms()])?;
+                CiWaitCancelTargetState::Cancelled
+            }
+            "running" | "cancelling" => {
+                let token = self
+                    .ledger
+                    .get_ci_wait_cancellation(operation_id.as_str())?;
+                if token.is_some() {
+                    tx.execute("UPDATE service_ci_wait_operations SET status='cancelling' WHERE id=?1 AND status IN ('running','cancelling')",params![operation_id.as_str()])?;
+                    CiWaitCancelTargetState::Running
+                } else {
+                    tx.execute("UPDATE service_ci_wait_operations SET status='recovery_required',error_code='cancel_worker_unavailable',finished_at=?2 WHERE id=?1 AND status IN ('running','cancelling')",params![operation_id.as_str(),now_ms()])?;
+                    CiWaitCancelTargetState::RecoveryRequired
+                }
+            }
+            "recovery_required" => CiWaitCancelTargetState::RecoveryRequired,
+            _ => {
+                return Err(ServiceError::PolicyDenied(
+                    "CI wait operation is already terminal",
+                ));
+            }
+        };
+        tx.commit()?;
+        drop(connection);
+        if target == CiWaitCancelTargetState::Running {
+            if let Some(token) = self
+                .ledger
+                .get_ci_wait_cancellation(operation_id.as_str())?
+            {
+                token.cancel();
+            }
+        }
+        Ok(target)
+    }
+
+    /// Target-side delegate used by `task.cancel` acceptance to request stop
+    /// for each active CI wait belonging to the Task. It is not the
+    /// contract-level `task.cancel` acceptance and does not mark the Task
+    /// cancelled; the outer operation coordinates every active kind.
+    pub fn request_task_ci_wait_cancellations(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<(OperationId, CiWaitCancelTargetState)>, ServiceError> {
+        let ids = {
+            let connection = self.ledger.lock_connection()?;
+            let mut statement = connection.prepare("SELECT id FROM service_ci_wait_operations WHERE task_id=?1 AND status IN ('accepted','running','cancelling') ORDER BY accepted_at,id")?;
+            statement
+                .query_map(params![task_id.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        ids.into_iter()
+            .map(|id| {
+                let operation_id = OperationId::new(id);
+                let state = self.request_ci_wait_cancellation(&operation_id)?;
+                Ok((operation_id, state))
+            })
+            .collect()
+    }
+
+    /// Additive union getter for operation kinds currently implemented by this
+    /// Service. Existing attempt-specific `get` remains source compatible.
+    pub fn get_operation_result(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<OperationGetResult, ServiceError> {
+        match self.get_operation(operation_id) {
+            Ok(snapshot) => Ok(OperationGetResult::Attempt(snapshot)),
+            Err(ServiceError::OperationNotFound) => {
+                match self.get_ci_wait_operation(operation_id) {
+                    Ok(snapshot) => Ok(OperationGetResult::CiWait(snapshot)),
+                    Err(ServiceError::OperationNotFound) => self
+                        .get_artifact_publication_operation(operation_id)
+                        .map(OperationGetResult::ArtifactPublication),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn finish_ci_wait(
+        &self,
+        id: &OperationId,
+        status: &str,
+        observation_id: Option<&str>,
+        error: Option<&str>,
+        details_ref: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let connection = self.ledger.lock_connection()?;
+        connection.execute("UPDATE service_ci_wait_operations SET status=CASE WHEN status='cancelling' THEN 'cancelled' ELSE ?2 END,observation_id=CASE WHEN status='cancelling' THEN NULL ELSE ?3 END,error_code=CASE WHEN status='cancelling' THEN 'cancelled' ELSE ?4 END,details_ref=?5,finished_at=?6 WHERE id=?1 AND status IN ('running','cancelling')",params![id.as_str(),status,observation_id,error,details_ref,now_ms()])?;
+        Ok(())
+    }
+
     fn ci_runtime(&self) -> Result<CiRuntime<'a, dyn CiProvider + Sync + 'a>, ServiceError> {
         let provider = self
             .ci_provider
@@ -2290,61 +2874,8 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         target: &CiServiceTarget,
         task_id: Option<&TaskId>,
     ) -> Result<(Option<TaskId>, CiQueryTarget, Option<String>), ServiceError> {
-        match target {
-            CiServiceTarget::PullRequest { repository, number } => Ok((
-                task_id.cloned(),
-                CiQueryTarget::PullRequest {
-                    repository: repository.clone(),
-                    number: *number,
-                    expected_head_sha: None,
-                },
-                None,
-            )),
-            CiServiceTarget::Commit { repository, sha } => Ok((
-                task_id.cloned(),
-                CiQueryTarget::Commit {
-                    repository: repository.clone(),
-                    sha: sha.clone(),
-                },
-                None,
-            )),
-            CiServiceTarget::Publication(publication_id) => {
-                let publication = self.get_artifact_publication_by_id(publication_id)?;
-                if publication.state() != ServiceOperationStatus::Completed
-                    || publication.phase() != ArtifactPublicationPhase::Published
-                {
-                    return Err(ServiceError::PolicyDenied(
-                        "CI requires a completed Publication operation",
-                    ));
-                }
-                if task_id.is_some_and(|task_id| task_id != publication.task_id()) {
-                    return Err(ServiceError::PolicyDenied(
-                        "Publication operation belongs to a different Task",
-                    ));
-                }
-                let commit_sha = publication
-                    .commit_sha()
-                    .ok_or(ServiceError::InvalidStoredState)?;
-                let pull_request = publication
-                    .pull_request()
-                    .ok_or(ServiceError::InvalidStoredState)?;
-                if commit_sha != pull_request.head_sha() {
-                    return Err(ServiceError::InvalidStoredState);
-                }
-                let repository =
-                    repository_from_pull_request_url(pull_request.url(), pull_request.number())
-                        .ok_or(ServiceError::InvalidStoredState)?;
-                Ok((
-                    Some(publication.task_id().clone()),
-                    CiQueryTarget::PullRequest {
-                        repository,
-                        number: pull_request.number(),
-                        expected_head_sha: Some(commit_sha.to_owned()),
-                    },
-                    Some("github.com".to_owned()),
-                ))
-            }
-        }
+        let connection = self.ledger.lock_connection()?;
+        resolve_ci_target_in_connection(&connection, target, task_id)
     }
 
     fn current_task_revision(&self, task_id: &TaskId) -> Result<u64, ServiceError> {
@@ -2930,6 +3461,16 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             bump_revision(&tx, &task_id)?;
             recovered.push(OperationId::new(operation_id));
         }
+        let pending_ci_waits = {
+            let mut statement = tx.prepare("SELECT id FROM service_ci_wait_operations WHERE status IN ('accepted','running','cancelling') ORDER BY rowid")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for operation_id in pending_ci_waits {
+            tx.execute("UPDATE service_ci_wait_operations SET status='recovery_required',error_code='interrupted',finished_at=?2 WHERE id=?1 AND status IN ('accepted','running','cancelling')", params![operation_id, now_ms()])?;
+            recovered.push(OperationId::new(operation_id));
+        }
         tx.commit()?;
         Ok(recovered)
     }
@@ -3236,6 +3777,130 @@ fn now_ms() -> i64 {
         .map_or(0, |duration| {
             i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
         })
+}
+
+fn ci_target_json(target: &CiServiceTarget) -> String {
+    let value = match target {
+        CiServiceTarget::Publication(id) => {
+            serde_json::json!({"kind":"publication","id":id.as_str()})
+        }
+        CiServiceTarget::PullRequest { repository, number } => {
+            serde_json::json!({"kind":"pull_request","repository":repository,"number":number})
+        }
+        CiServiceTarget::Commit { repository, sha } => {
+            serde_json::json!({"kind":"commit","repository":repository,"sha":sha})
+        }
+    };
+    value.to_string()
+}
+
+type StoredPublicationCiTarget = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+);
+
+fn resolve_ci_target_in_connection(
+    connection: &rusqlite::Connection,
+    target: &CiServiceTarget,
+    task_id: Option<&TaskId>,
+) -> Result<(Option<TaskId>, CiQueryTarget, Option<String>), ServiceError> {
+    match target {
+        CiServiceTarget::PullRequest { repository, number } => Ok((
+            task_id.cloned(),
+            CiQueryTarget::PullRequest {
+                repository: repository.clone(),
+                number: *number,
+                expected_head_sha: None,
+            },
+            None,
+        )),
+        CiServiceTarget::Commit { repository, sha } => Ok((
+            task_id.cloned(),
+            CiQueryTarget::Commit {
+                repository: repository.clone(),
+                sha: sha.clone(),
+            },
+            None,
+        )),
+        CiServiceTarget::Publication(publication_id) => {
+            let row: Option<StoredPublicationCiTarget> = connection.query_row(
+                "SELECT publication.task_id,publication.status,publication.phase,publication.commit_sha,publication.pull_request_number,publication.pull_request_url,publication.is_draft
+                 FROM service_publication_ids identity JOIN service_artifact_publication_operations publication ON publication.id=identity.operation_id
+                 WHERE identity.publication_id=?1",
+                params![publication_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+            ).optional()?;
+            let (saved_task, status, phase, sha, number, url, draft) =
+                row.ok_or(ServiceError::InvalidRequest("publication_id was not found"))?;
+            if status != "completed" || phase != "published" || draft != Some(1) {
+                return Err(ServiceError::PolicyDenied(
+                    "CI requires a completed Publication operation",
+                ));
+            }
+            let saved_task = TaskId::new(saved_task);
+            if task_id.is_some_and(|task_id| task_id != &saved_task) {
+                return Err(ServiceError::PolicyDenied(
+                    "Publication operation belongs to a different Task",
+                ));
+            }
+            let sha = sha.ok_or(ServiceError::InvalidStoredState)?;
+            let number = u64::try_from(number.ok_or(ServiceError::InvalidStoredState)?)
+                .map_err(|_| ServiceError::InvalidStoredState)?;
+            let url = url.ok_or(ServiceError::InvalidStoredState)?;
+            let repository = repository_from_pull_request_url(&url, number)
+                .ok_or(ServiceError::InvalidStoredState)?;
+            Ok((
+                Some(saved_task),
+                CiQueryTarget::PullRequest {
+                    repository,
+                    number,
+                    expected_head_sha: Some(sha),
+                },
+                Some("github.com".to_owned()),
+            ))
+        }
+    }
+}
+
+fn parse_ci_target(value: &str) -> Result<CiServiceTarget, ServiceError> {
+    let value: serde_json::Value =
+        serde_json::from_str(value).map_err(|_| ServiceError::InvalidStoredState)?;
+    match value.get("kind").and_then(serde_json::Value::as_str) {
+        Some("publication") => Ok(CiServiceTarget::Publication(PublicationId::new(
+            value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ServiceError::InvalidStoredState)?,
+        ))),
+        Some("pull_request") => Ok(CiServiceTarget::PullRequest {
+            repository: value
+                .get("repository")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            number: value
+                .get("number")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(ServiceError::InvalidStoredState)?,
+        }),
+        Some("commit") => Ok(CiServiceTarget::Commit {
+            repository: value
+                .get("repository")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            sha: value
+                .get("sha")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+        }),
+        _ => Err(ServiceError::InvalidStoredState),
+    }
 }
 
 fn new_publication_id() -> PublicationId {
@@ -3814,6 +4479,37 @@ mod tests {
         snapshot: crate::CiProviderSnapshot,
         queries: Mutex<Vec<CiQueryTarget>>,
         hosts: Mutex<Vec<String>>,
+    }
+
+    struct BlockingCiProvider {
+        snapshot: crate::CiProviderSnapshot,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    struct SyncTestResolver;
+
+    impl crate::ProviderResolver for SyncTestResolver {
+        fn resolve(
+            &self,
+            provider: &ProviderRef,
+        ) -> Result<&dyn AgentProvider, crate::ProviderResolutionError> {
+            Err(crate::ProviderResolutionError::UnknownProvider {
+                provider: provider.clone(),
+            })
+        }
+    }
+
+    impl crate::CiProvider for BlockingCiProvider {
+        fn observe(
+            &self,
+            _target: &CiQueryTarget,
+            _timeout: Duration,
+        ) -> Result<crate::CiProviderSnapshot, CiProviderError> {
+            self.entered.wait();
+            self.release.wait();
+            Ok(self.snapshot.clone())
+        }
     }
 
     impl crate::CiProvider for FakeCiProvider {
@@ -6390,6 +7086,641 @@ mod tests {
                 .unwrap(),
             observation
         );
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn asynchronous_ci_wait_is_idempotently_accepted_and_retrieved() {
+        let fixture = artifact_publication_fixture();
+        let head_sha = "d".repeat(40);
+        let provider = FakeCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(5), &head_sha),
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+        let deadline = SystemTime::now() + Duration::from_secs(2);
+        let request = CiWaitRequest::new(
+            "ci-wait-idempotency",
+            fixture.task_id.clone(),
+            task_revision(&fixture.ledger, &fixture.task_id),
+            CiServiceTarget::PullRequest {
+                repository: "owner/repo".into(),
+                number: 5,
+            },
+            deadline,
+        );
+        let accepted = service.accept_ci_wait("caller-a", &request).unwrap();
+        assert_eq!(accepted.status(), ServiceOperationStatus::Accepted);
+        assert!(
+            provider.queries.lock().unwrap().is_empty(),
+            "acceptance must not perform CI I/O"
+        );
+        assert_eq!(
+            service.accept_ci_wait("caller-a", &request).unwrap(),
+            accepted
+        );
+        let other_caller = service.accept_ci_wait("caller-b", &request).unwrap();
+        assert_ne!(other_caller.operation_id(), accepted.operation_id());
+        let conflict = CiWaitRequest::new(
+            "ci-wait-idempotency",
+            fixture.task_id.clone(),
+            request.expected_revision,
+            CiServiceTarget::Commit {
+                repository: "owner/repo".into(),
+                sha: head_sha,
+            },
+            deadline,
+        );
+        assert!(matches!(
+            service.accept_ci_wait("caller-a", &conflict),
+            Err(ServiceError::IdempotencyConflict)
+        ));
+        let completed = service
+            .run_ci_wait_operation(accepted.operation_id())
+            .unwrap();
+        assert_eq!(completed.status(), ServiceOperationStatus::Completed);
+        assert_eq!(
+            completed.observation().unwrap().task_id(),
+            Some(&fixture.task_id)
+        );
+        assert!(matches!(
+            service
+                .get_operation_result(accepted.operation_id())
+                .unwrap(),
+            OperationGetResult::CiWait(_)
+        ));
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn asynchronous_ci_wait_timeout_exposes_only_details_reference() {
+        let fixture = artifact_publication_fixture();
+        let head_sha = "e".repeat(40);
+        let mut snapshot = ci_provider_snapshot("owner/repo", Some(6), &head_sha);
+        snapshot.checks[0].detail_state = CiCheckDetailState::Pending;
+        snapshot.checks[0].completed_at = None;
+        let provider = FakeCiProvider {
+            snapshot,
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+        let request = CiWaitRequest::new(
+            "ci-wait-timeout",
+            fixture.task_id.clone(),
+            task_revision(&fixture.ledger, &fixture.task_id),
+            CiServiceTarget::PullRequest {
+                repository: "owner/repo".into(),
+                number: 6,
+            },
+            SystemTime::now() + Duration::from_millis(20),
+        );
+        let accepted = service.accept_ci_wait("caller-a", &request).unwrap();
+        let failed = service
+            .run_ci_wait_operation(accepted.operation_id())
+            .unwrap();
+        assert_eq!(failed.status(), ServiceOperationStatus::Failed);
+        assert_eq!(failed.error_code(), Some("timeout"));
+        assert!(failed.observation().is_none());
+        let detail = failed
+            .details_ref()
+            .expect("last persisted observation reference");
+        assert!(fixture.ledger.get_ci_observation(detail).unwrap().is_some());
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn ci_wait_preparation_failure_finishes_claimed_operation() {
+        let fixture = artifact_publication_fixture();
+        let head_sha = "8".repeat(40);
+        let provider = FakeCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(8), &head_sha),
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+        let request = CiWaitRequest::new(
+            "ci-wait-bad-stored-target",
+            fixture.task_id.clone(),
+            task_revision(&fixture.ledger, &fixture.task_id),
+            CiServiceTarget::PullRequest {
+                repository: "owner/repo".into(),
+                number: 8,
+            },
+            SystemTime::now() + Duration::from_secs(5),
+        );
+        let accepted = service.accept_ci_wait("caller-a", &request).unwrap();
+        fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "UPDATE service_ci_wait_operations SET target_json='not-json' WHERE id=?1",
+                params![accepted.operation_id().as_str()],
+            )
+            .unwrap();
+
+        let failed = service
+            .run_ci_wait_operation(accepted.operation_id())
+            .unwrap();
+        assert_eq!(failed.status(), ServiceOperationStatus::Failed);
+        assert_eq!(failed.error_code(), Some("internal_error"));
+        assert!(failed.observation().is_none());
+        assert_eq!(
+            service
+                .run_ci_wait_operation(accepted.operation_id())
+                .unwrap(),
+            failed
+        );
+        assert!(provider.queries.lock().unwrap().is_empty());
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn ci_wait_rejects_invalid_new_requests_but_replays_expired_acceptance() {
+        let fixture = artifact_publication_fixture();
+        let head_sha = "7".repeat(40);
+        let provider = FakeCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(8), &head_sha),
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+        let revision = task_revision(&fixture.ledger, &fixture.task_id);
+        let future = SystemTime::now() + Duration::from_secs(5);
+        let direct = CiServiceTarget::PullRequest {
+            repository: "owner/repo".into(),
+            number: 8,
+        };
+
+        for request in [
+            CiWaitRequest::new(
+                " ",
+                fixture.task_id.clone(),
+                revision,
+                direct.clone(),
+                future,
+            ),
+            CiWaitRequest::new(
+                "ci-wait-past",
+                fixture.task_id.clone(),
+                revision,
+                direct.clone(),
+                SystemTime::now() - Duration::from_secs(1),
+            ),
+            CiWaitRequest::new(
+                "ci-wait-bad-repository",
+                fixture.task_id.clone(),
+                revision,
+                CiServiceTarget::PullRequest {
+                    repository: "owner/repo/extra".into(),
+                    number: 8,
+                },
+                future,
+            ),
+            CiWaitRequest::new(
+                "ci-wait-bad-sha",
+                fixture.task_id.clone(),
+                revision,
+                CiServiceTarget::Commit {
+                    repository: "owner/repo".into(),
+                    sha: "short".into(),
+                },
+                future,
+            ),
+        ] {
+            assert!(matches!(
+                service.accept_ci_wait("caller-a", &request),
+                Err(ServiceError::InvalidRequest(_))
+            ));
+        }
+
+        let replay_deadline = SystemTime::now() + Duration::from_millis(150);
+        let request = CiWaitRequest::new(
+            "ci-wait-expired-replay",
+            fixture.task_id.clone(),
+            revision,
+            direct.clone(),
+            replay_deadline,
+        );
+        let accepted = service.accept_ci_wait("caller-a", &request).unwrap();
+        let precise_conflict = CiWaitRequest::new(
+            "ci-wait-expired-replay",
+            fixture.task_id.clone(),
+            revision,
+            direct.clone(),
+            replay_deadline + Duration::from_nanos(1),
+        );
+        assert!(matches!(
+            service.accept_ci_wait("caller-a", &precise_conflict),
+            Err(ServiceError::IdempotencyConflict)
+        ));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            service.accept_ci_wait("caller-a", &request).unwrap(),
+            accepted
+        );
+        assert!(provider.queries.lock().unwrap().is_empty());
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn ci_wait_cancel_before_run_is_terminal_without_provider_io() {
+        let fixture = artifact_publication_fixture();
+        let head_sha = "c".repeat(40);
+        let provider = FakeCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(9), &head_sha),
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+        let request = CiWaitRequest::new(
+            "ci-wait-cancel-before-run",
+            fixture.task_id.clone(),
+            task_revision(&fixture.ledger, &fixture.task_id),
+            CiServiceTarget::PullRequest {
+                repository: "owner/repo".into(),
+                number: 9,
+            },
+            SystemTime::now() + Duration::from_secs(10),
+        );
+        let accepted = service.accept_ci_wait("caller-a", &request).unwrap();
+        assert_eq!(
+            service
+                .request_ci_wait_cancellation(accepted.operation_id())
+                .unwrap(),
+            CiWaitCancelTargetState::Cancelled
+        );
+        let snapshot = service
+            .run_ci_wait_operation(accepted.operation_id())
+            .unwrap();
+        assert_eq!(snapshot.status(), ServiceOperationStatus::Cancelled);
+        assert_eq!(snapshot.error_code(), Some("cancelled"));
+        assert!(provider.queries.lock().unwrap().is_empty());
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn ci_wait_running_cancel_waits_for_worker_stop_confirmation() {
+        let fixture = artifact_publication_fixture();
+        let resolver = SyncTestResolver;
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let provider = BlockingCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(10), &"a".repeat(40)),
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        let worker_service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &resolver,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(2))
+        .unwrap();
+        let cancel_service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &resolver,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(2))
+        .unwrap();
+        let request = CiWaitRequest::new(
+            "ci-wait-running-cancel",
+            fixture.task_id.clone(),
+            task_revision(&fixture.ledger, &fixture.task_id),
+            CiServiceTarget::PullRequest {
+                repository: "owner/repo".into(),
+                number: 10,
+            },
+            SystemTime::now() + Duration::from_secs(10),
+        );
+        let accepted = worker_service.accept_ci_wait("caller-a", &request).unwrap();
+        thread::scope(|scope| {
+            let operation_id = accepted.operation_id().clone();
+            let worker =
+                scope.spawn(move || worker_service.run_ci_wait_operation(&operation_id).unwrap());
+            entered.wait();
+            let duplicate = cancel_service
+                .run_ci_wait_operation(accepted.operation_id())
+                .unwrap();
+            assert_eq!(duplicate.status(), ServiceOperationStatus::Running);
+            assert_eq!(
+                cancel_service
+                    .request_ci_wait_cancellation(accepted.operation_id())
+                    .unwrap(),
+                CiWaitCancelTargetState::Running
+            );
+            assert_eq!(
+                cancel_service
+                    .get_ci_wait_operation(accepted.operation_id())
+                    .unwrap()
+                    .status(),
+                ServiceOperationStatus::Cancelling
+            );
+            release.wait();
+            let stopped = worker.join().unwrap();
+            assert_eq!(stopped.status(), ServiceOperationStatus::Cancelled);
+            assert_eq!(stopped.error_code(), Some("cancelled"));
+        });
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn ci_wait_cancel_without_registered_worker_requires_recovery() {
+        let fixture = artifact_publication_fixture();
+        let head_sha = "b".repeat(40);
+        let provider = FakeCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(11), &head_sha),
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+        let request = CiWaitRequest::new(
+            "ci-wait-lost-worker",
+            fixture.task_id.clone(),
+            task_revision(&fixture.ledger, &fixture.task_id),
+            CiServiceTarget::PullRequest {
+                repository: "owner/repo".into(),
+                number: 11,
+            },
+            SystemTime::now() + Duration::from_secs(10),
+        );
+        let accepted = service.accept_ci_wait("caller-a", &request).unwrap();
+        fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "UPDATE service_ci_wait_operations SET status='running' WHERE id=?1",
+                params![accepted.operation_id().as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            service
+                .request_ci_wait_cancellation(accepted.operation_id())
+                .unwrap(),
+            CiWaitCancelTargetState::RecoveryRequired
+        );
+        let snapshot = service
+            .run_ci_wait_operation(accepted.operation_id())
+            .unwrap();
+        assert_eq!(snapshot.status(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(snapshot.error_code(), Some("cancel_worker_unavailable"));
+        assert!(provider.queries.lock().unwrap().is_empty());
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn startup_recovery_marks_accepted_ci_wait_without_replaying_it() {
+        let fixture = artifact_publication_fixture_with_persistent_ledger(true);
+        let head_sha = "f".repeat(40);
+        let provider = FakeCiProvider {
+            snapshot: ci_provider_snapshot("owner/repo", Some(7), &head_sha),
+            queries: Mutex::new(Vec::new()),
+            hosts: Mutex::new(Vec::new()),
+        };
+        let request = CiWaitRequest::new(
+            "ci-wait-interrupted",
+            fixture.task_id.clone(),
+            task_revision(&fixture.ledger, &fixture.task_id),
+            CiServiceTarget::PullRequest {
+                repository: "owner/repo".into(),
+                number: 7,
+            },
+            SystemTime::now() + Duration::from_secs(10),
+        );
+        let accepted = {
+            let service = OperationService::new(
+                &fixture.ledger,
+                &fixture.workspace,
+                &fixture.providers,
+                3,
+                Duration::from_secs(30),
+            )
+            .unwrap()
+            .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+            .unwrap();
+            let accepted = service.accept_ci_wait("caller-a", &request).unwrap();
+            drop(service);
+            accepted
+        };
+        let database_path = fixture.repo.0.join("service-ledger.sqlite");
+        drop(fixture.ledger);
+        let ledger = SqliteExecutionLedger::open(database_path).unwrap();
+        let service = OperationService::new(
+            &ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+        .unwrap();
+        let recovered = service
+            .run_ci_wait_operation(accepted.operation_id())
+            .unwrap();
+        assert_eq!(recovered.status(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(recovered.error_code(), Some("interrupted"));
+        assert!(recovered.observation().is_none());
+        assert!(provider.queries.lock().unwrap().is_empty());
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn ci_wait_acceptance_rechecks_revision_after_a_concurrent_task_update() {
+        let fixture = artifact_publication_fixture();
+        let path = std::env::temp_dir().join(format!(
+            "ci-wait-race-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let ledger = SqliteExecutionLedger::open(&path).unwrap();
+        let task_id = TaskId::new("ci-wait-race-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "race task",
+                TaskRole::new("reviewer"),
+            ))
+            .unwrap();
+        let current_revision = 4_u64;
+        {
+            let connection = ledger.lock_connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+                    params![task_id.as_str(), current_revision as i64],
+                )
+                .unwrap();
+        }
+        let head_sha = "9".repeat(40);
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let request = CiWaitRequest::new(
+            "ci-wait-race-request",
+            task_id.clone(),
+            current_revision,
+            CiServiceTarget::PullRequest {
+                repository: "owner/repo".into(),
+                number: 9,
+            },
+            SystemTime::now() + Duration::from_secs(5),
+        );
+        let mut competing = rusqlite::Connection::open(&path).unwrap();
+        let tx = competing
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(
+            "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+            params![task_id.as_str(), (current_revision + 1) as i64],
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            let ledger = &ledger;
+            let workspace = &fixture.workspace;
+            let queries = Arc::clone(&queries);
+            let request = request.clone();
+            let acceptance = scope.spawn(move || {
+                let providers = ProviderRegistry::new();
+                let provider = FakeCiProvider {
+                    snapshot: ci_provider_snapshot("owner/repo", Some(9), &head_sha),
+                    queries: Mutex::new(Vec::new()),
+                    hosts: Mutex::new(Vec::new()),
+                };
+                let service = OperationService::new(
+                    ledger,
+                    workspace,
+                    &providers,
+                    3,
+                    Duration::from_secs(30),
+                )
+                .unwrap()
+                .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
+                .unwrap();
+                let result = service.accept_ci_wait("caller-a", &request);
+                *queries.lock().unwrap() = provider.queries.lock().unwrap().clone();
+                result
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            tx.commit().unwrap();
+            assert!(matches!(
+                acceptance.join().unwrap(),
+                Err(ServiceError::StaleRevision {
+                    expected: 4,
+                    actual: 5
+                })
+            ));
+        });
+        assert!(queries.lock().unwrap().is_empty());
+        drop(ledger);
+        let _ = std::fs::remove_file(&path);
         cleanup_fixture_worktree(
             &fixture.repo,
             &fixture.workspace,

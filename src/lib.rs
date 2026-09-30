@@ -62,7 +62,8 @@ pub use operation_ledger::{
 pub use operation_service::{
     ArtifactInput, ArtifactPublicationAcceptance, ArtifactPublicationPhase,
     ArtifactPublicationRequest, ArtifactPublicationSnapshot, AttemptInput, AttemptRunRequest,
-    BaseInput, CiServiceTarget, OperationAcceptance, OperationService, OperationSnapshot,
+    BaseInput, CiServiceTarget, CiWaitAcceptance, CiWaitCancelTargetState, CiWaitOperationSnapshot,
+    CiWaitRequest, OperationAcceptance, OperationGetResult, OperationService, OperationSnapshot,
     PublicationId, ServiceError, ServiceOperationStatus, TaskCreateRequest, TaskCreationResult,
     TaskIssueSnapshot, TaskRequestSnapshot, TaskSource,
 };

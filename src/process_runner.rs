@@ -117,6 +117,9 @@ impl CancellationToken {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+    pub(crate) fn is_same_signal(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
 }
 
 /// Failure categories are distinct so callers can choose a retry policy.
