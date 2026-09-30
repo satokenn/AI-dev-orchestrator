@@ -558,8 +558,16 @@ mod tests {
             .success()
     }
 
-    fn git_with_input(directory: &Path, args: &[&str], input: &[u8]) -> String {
+    fn git_with_input(
+        directory: &Path,
+        args: &[&str],
+        input: &[u8],
+        inherited_environment: &[(&str, &str)],
+    ) -> String {
         let mut command = Command::new("git");
+        for (name, value) in inherited_environment {
+            command.env(name, value);
+        }
         crate::process_runner::clear_git_location_environment(&mut command);
         let mut child = command
             .args(args)
@@ -595,6 +603,34 @@ mod tests {
         git(&path, &["add", ".gitignore", "source.txt"]);
         git(&path, &["commit", "-m", "initial"]);
         path
+    }
+
+    #[test]
+    fn git_with_input_ignores_injected_repository_environment() {
+        let repository = repository();
+        let input = b"100644 blob 0000000000000000000000000000000000000000\tstdin.txt\n";
+        let expected = git_with_input(&repository, &["mktree", "--missing"], input, &[]);
+        let invalid_git_dir = repository
+            .join(".git.missing")
+            .to_string_lossy()
+            .into_owned();
+        let invalid_work_tree = repository
+            .join("missing-worktree")
+            .to_string_lossy()
+            .into_owned();
+
+        let actual = git_with_input(
+            &repository,
+            &["mktree", "--missing"],
+            input,
+            &[
+                ("GIT_DIR", &invalid_git_dir),
+                ("GIT_WORK_TREE", &invalid_work_tree),
+            ],
+        );
+
+        assert_eq!(actual, expected);
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]
@@ -985,6 +1021,7 @@ mod tests {
             source.path(),
             &["mktree", "--missing"],
             format!("100644 blob {missing_blob}\tbroken.txt\n").as_bytes(),
+            &[],
         );
         let artifact = ArtifactRecord::new(
             "artifact-unreadable-tree",
