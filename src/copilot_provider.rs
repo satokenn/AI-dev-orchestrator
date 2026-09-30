@@ -225,9 +225,11 @@ impl CopilotProvider {
             ProcessError::NonZeroExit(output) => {
                 let diagnostic =
                     output_diagnostic(&output.stdout, &output.stderr, output.exit_code());
-                if let Some(error) =
-                    crate::provider::unsupported_model_error(&self.reference, model, &diagnostic)
-                {
+                if let Some(error) = crate::provider::unsupported_model_error(
+                    &self.reference,
+                    model,
+                    &String::from_utf8_lossy(&output.stderr),
+                ) {
                     error
                 } else if looks_like_authentication_failure(&diagnostic) {
                     ProviderError::Unavailable(format!(
@@ -372,6 +374,13 @@ mod tests {
         assert!(matches!(
             provider.execute(&request),
             Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "claude-haiku-test"
+        ));
+
+        let provider = CopilotProvider::with_executable("sh")
+            .with_command_prefix("printf 'unsupported model'; exit 1");
+        assert!(matches!(
+            provider.execute(&request),
+            Err(ProviderError::ExecutionFailed(_))
         ));
     }
 
