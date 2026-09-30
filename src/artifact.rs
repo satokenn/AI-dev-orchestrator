@@ -80,6 +80,16 @@ impl CodexDecisionKind {
             Self::ChangesRequested => "changes_requested",
         }
     }
+    fn parse(value: &str) -> Result<Self, ArtifactError> {
+        match value {
+            "accepted" => Ok(Self::Accepted),
+            "rejected" => Ok(Self::Rejected),
+            "changes_requested" => Ok(Self::ChangesRequested),
+            _ => Err(ArtifactError::Invalid(
+                "invalid saved decision response".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,6 +206,7 @@ pub enum ArtifactError {
         actual: u64,
     },
     Invalid(String),
+    IdempotencyConflict,
     RecoveryRequired,
     IgnoredFiles,
     WorkspaceChanged {
@@ -224,6 +235,7 @@ impl fmt::Display for ArtifactError {
                 )
             }
             Self::Invalid(e) => write!(f, "invalid artifact: {e}"),
+            Self::IdempotencyConflict => f.write_str("request id has a different payload"),
             Self::RecoveryRequired => f.write_str("artifact requires recovery"),
             Self::IgnoredFiles => {
                 f.write_str("ignored workspace files cannot be captured as an artifact")
@@ -484,7 +496,7 @@ impl<'a> ArtifactManager<'a> {
         for (sequence, check) in result.checks().iter().enumerate() {
             tx.execute(
                 "INSERT INTO artifact_validation_checks(validation_id,sequence,name,passed,exit_status,diagnostics) VALUES(?1,?2,?3,?4,?5,?6)",
-                params![id, i64::try_from(sequence).map_err(|_| ArtifactError::Invalid("too many validation checks".into()))?, format!("check-{}", sequence + 1), i64::from(check.passed()), check.exit_status(), "raw diagnostics withheld until redaction is configured"],
+                params![id, i64::try_from(sequence).map_err(|_| ArtifactError::Invalid("too many validation checks".into()))?, check.name(), i64::from(check.passed()), check.exit_status(), "raw diagnostics withheld until redaction is configured"],
             )?;
         }
         let next_revision = expected_revision
@@ -516,18 +528,102 @@ impl<'a> ArtifactManager<'a> {
         reason: &str,
         evidence: &[(String, String)],
     ) -> Result<ArtifactCodexDecisionRecord, ArtifactError> {
+        self.record_decision_scoped(
+            None,
+            task,
+            artifact_id,
+            expected_revision,
+            decision,
+            reason,
+            evidence,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mirrors the decision record's atomic ledger fields.
+    pub(crate) fn record_decision_scoped(
+        &self,
+        scope: Option<(&str, &str, &str)>,
+        task: &TaskId,
+        artifact_id: &str,
+        expected_revision: u64,
+        decision: CodexDecisionKind,
+        reason: &str,
+        evidence: &[(String, String)],
+    ) -> Result<ArtifactCodexDecisionRecord, ArtifactError> {
         if reason.trim().is_empty() {
             return Err(ArtifactError::Invalid(
                 "decision reason must not be empty".into(),
             ));
         }
-        self.check_revision(task, expected_revision)?;
+        let request_json = serde_json::to_string(&(
+            task.as_str(),
+            artifact_id,
+            expected_revision,
+            decision.as_str(),
+            reason,
+            evidence,
+        ))
+        .map_err(|error| ArtifactError::Invalid(error.to_string()))?;
         let artifact = self.read(task, artifact_id)?;
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((caller, tool_name, request_id)) = scope {
+            let existing: Option<(String, String)> = tx.query_row(
+                "SELECT request_json,response_json FROM service_mcp_idempotency WHERE caller=?1 AND tool_name=?2 AND request_id=?3",
+                params![caller, tool_name, request_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            if let Some((stored_request, response)) = existing {
+                if stored_request != request_json {
+                    return Err(ArtifactError::IdempotencyConflict);
+                }
+                let value: serde_json::Value = serde_json::from_str(&response)
+                    .map_err(|error| ArtifactError::Invalid(error.to_string()))?;
+                let evidence: Vec<(String, String)> =
+                    serde_json::from_value(value["evidence"].clone())
+                        .map_err(|error| ArtifactError::Invalid(error.to_string()))?;
+                let record = ArtifactCodexDecisionRecord {
+                    id: value["id"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            ArtifactError::Invalid("invalid saved decision response".into())
+                        })?
+                        .to_owned(),
+                    task_id: TaskId::new(value["task_id"].as_str().ok_or_else(|| {
+                        ArtifactError::Invalid("invalid saved decision response".into())
+                    })?),
+                    artifact_id: value["artifact_id"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            ArtifactError::Invalid("invalid saved decision response".into())
+                        })?
+                        .to_owned(),
+                    tree_oid: value["tree_oid"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            ArtifactError::Invalid("invalid saved decision response".into())
+                        })?
+                        .to_owned(),
+                    decision: CodexDecisionKind::parse(value["decision"].as_str().ok_or_else(
+                        || ArtifactError::Invalid("invalid saved decision response".into()),
+                    )?)?,
+                    reason: value["reason"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            ArtifactError::Invalid("invalid saved decision response".into())
+                        })?
+                        .to_owned(),
+                    evidence,
+                    revision: value["revision"].as_u64().ok_or_else(|| {
+                        ArtifactError::Invalid("invalid saved decision response".into())
+                    })?,
+                };
+                tx.commit()?;
+                return Ok(record);
+            }
+        }
         let id = format!("decision-{}", new_id());
         let evidence_json = serde_json::to_string(evidence)
             .map_err(|error| ArtifactError::Invalid(error.to_string()))?;
-        let mut connection = self.ledger.lock_connection()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let revision: Option<i64> = tx
             .query_row(
                 "SELECT revision FROM service_task_revisions WHERE task_id=?1",
@@ -580,8 +676,7 @@ impl<'a> ArtifactManager<'a> {
             "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
             params![task.as_str(), next_revision as i64],
         )?;
-        tx.commit()?;
-        Ok(ArtifactCodexDecisionRecord {
+        let record = ArtifactCodexDecisionRecord {
             id,
             task_id: task.clone(),
             artifact_id: artifact_id.to_owned(),
@@ -590,7 +685,13 @@ impl<'a> ArtifactManager<'a> {
             reason: reason.to_owned(),
             evidence: evidence.to_vec(),
             revision: next_revision,
-        })
+        };
+        if let Some((caller, tool_name, request_id)) = scope {
+            let response = serde_json::json!({"id":record.id,"task_id":record.task_id.as_str(),"artifact_id":record.artifact_id,"tree_oid":record.tree_oid,"decision":record.decision.as_str(),"reason":record.reason,"evidence":record.evidence,"revision":record.revision}).to_string();
+            tx.execute("INSERT INTO service_mcp_idempotency(caller,tool_name,request_id,request_json,response_json) VALUES(?1,?2,?3,?4,?5)", params![caller,tool_name,request_id,request_json,response])?;
+        }
+        tx.commit()?;
+        Ok(record)
     }
 
     pub(crate) fn publication_permit(

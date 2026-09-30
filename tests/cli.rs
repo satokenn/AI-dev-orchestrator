@@ -34,6 +34,34 @@ fn installed_binary_rejects_unknown_command() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown command"));
 }
 
+#[test]
+fn installed_binary_accepts_mcp_stdio_option_values_and_exits_after_eof() {
+    let ledger = std::env::temp_dir().join(format!(
+        "ai-dev-orchestrator-mcp-cli-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let output = binary()
+        .args([
+            "mcp-stdio",
+            "--repository-root",
+            env!("CARGO_MANIFEST_DIR"),
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--caller",
+            "cli-test",
+        ])
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(ledger);
+
+    assert_eq!(output.status.code(), Some(SUCCESS));
+    assert!(output.stdout.is_empty());
+}
+
 #[derive(Clone, Default)]
 struct RecordingRuntime(Arc<Mutex<Vec<&'static str>>>);
 impl CliRuntime for RecordingRuntime {

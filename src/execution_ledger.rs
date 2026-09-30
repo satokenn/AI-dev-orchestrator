@@ -157,7 +157,7 @@ type PublicationTaskRow = (
 
 // Version 10 was independently used by the parent Attempt-history migration and
 // the Artifact migration. Version 11 reconciles both layouts and is idempotent.
-const LATEST_SCHEMA_VERSION: u32 = 17;
+const LATEST_SCHEMA_VERSION: u32 = 21;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -319,6 +319,10 @@ impl SqliteExecutionLedger {
         create_ci_observation_schema(&transaction)?;
         create_publication_identity_schema(&transaction)?;
         create_ci_wait_schema(&transaction)?;
+        create_mcp_idempotency_schema(&transaction)?;
+        create_validation_operation_schema(&transaction)?;
+        create_context_cursor_schema(&transaction)?;
+        create_cancellation_operation_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -1110,7 +1114,7 @@ fn create_ci_wait_schema(connection: &Connection) -> Result<(), rusqlite::Error>
          CREATE INDEX IF NOT EXISTS service_ci_wait_task_status
              ON service_ci_wait_operations(task_id,status);",
     )?;
-    set_schema_version(connection, 17)
+    Ok(())
 }
 
 fn set_schema_version(connection: &Connection, version: u32) -> Result<(), rusqlite::Error> {
@@ -1224,11 +1228,89 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
             15 => create_ci_observation_schema(connection)?,
             16 => create_publication_identity_schema(connection)?,
             17 => create_ci_wait_schema(connection)?,
+            18 => create_mcp_idempotency_schema(connection)?,
+            19 => create_validation_operation_schema(connection)?,
+            20 => create_context_cursor_schema(connection)?,
+            21 => create_cancellation_operation_schema(connection)?,
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
     }
     Ok(())
+}
+
+fn create_mcp_idempotency_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_mcp_idempotency (
+             caller TEXT NOT NULL,
+             tool_name TEXT NOT NULL,
+             request_id TEXT NOT NULL,
+             request_json TEXT NOT NULL,
+             response_json TEXT NOT NULL,
+             PRIMARY KEY(caller, tool_name, request_id)
+         );",
+    )
+}
+
+fn create_validation_operation_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_validation_operations (
+             id TEXT PRIMARY KEY NOT NULL,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             request_id TEXT NOT NULL,
+             expected_revision INTEGER NOT NULL,
+             accepted_revision INTEGER NOT NULL,
+             revision INTEGER NOT NULL,
+             artifact_id TEXT NOT NULL,
+             profile_id TEXT,
+             checks_json TEXT NOT NULL,
+             status TEXT NOT NULL CHECK(status IN ('accepted','running','completed','failed','recovery_required')),
+             validation_id TEXT,
+             result_json TEXT,
+             error_code TEXT,
+             accepted_at INTEGER NOT NULL,
+             started_at INTEGER,
+             finished_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS service_validation_operations_task_status
+             ON service_validation_operations(task_id,status);",
+    )
+}
+
+fn create_context_cursor_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_context_cursors (
+             cursor TEXT PRIMARY KEY NOT NULL,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             section TEXT NOT NULL,
+             page_size INTEGER NOT NULL,
+             revision INTEGER NOT NULL,
+             offset INTEGER NOT NULL
+         );",
+    )
+}
+
+fn create_cancellation_operation_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_cancellation_operations (
+             id TEXT PRIMARY KEY NOT NULL,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             kind TEXT NOT NULL CHECK(kind IN ('operation.cancel','task.cancel')),
+             target_operation_id TEXT,
+             target_ids_json TEXT NOT NULL,
+             status TEXT NOT NULL CHECK(status IN ('accepted','running','completed','failed','cancelled','recovery_required')),
+             target_states_json TEXT,
+             reason TEXT,
+             error_code TEXT,
+             accepted_revision INTEGER NOT NULL,
+             revision INTEGER NOT NULL,
+             accepted_at INTEGER NOT NULL,
+             started_at INTEGER,
+             finished_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS service_cancellation_operations_task_status
+             ON service_cancellation_operations(task_id,status);",
+    )
 }
 
 fn create_publication_identity_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -2064,7 +2146,7 @@ mod tests {
         let version: u32 = migrated
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         let has_publication_table: bool = migrated
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifact_publication_operations')",
@@ -2211,7 +2293,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         let ci_table_after_migration: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_observations')",
@@ -2265,7 +2347,7 @@ mod tests {
             let version: u32 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 17);
+            assert_eq!(version, LATEST_SCHEMA_VERSION);
             let retained: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM service_artifact_publication_operations
@@ -2308,11 +2390,11 @@ mod tests {
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 18;")
+            .execute_batch("PRAGMA user_version = 22;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(18))
+            Err(LedgerError::UnsupportedSchemaVersion(22))
         ));
     }
 
@@ -2335,7 +2417,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(version, 17);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         assert!(has_wait_table);
     }
 
@@ -2381,7 +2463,7 @@ mod tests {
             let version: u32 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 17);
+            assert_eq!(version, LATEST_SCHEMA_VERSION);
             let history: (String, i64, Option<String>) = connection.query_row(
                 "SELECT relation_kind, sequence, role FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
                 [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -2437,7 +2519,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         let history: (Option<String>, String) = connection
             .query_row(
                 "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
