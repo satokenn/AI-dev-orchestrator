@@ -243,6 +243,8 @@ pub struct ValidationResult {
     summary: String,
     passed: bool,
     checks: Vec<ValidationCheckResult>,
+    config_id: Option<String>,
+    config_version: Option<String>,
 }
 
 impl ValidationResult {
@@ -253,6 +255,8 @@ impl ValidationResult {
             summary: summary.into(),
             passed,
             checks: Vec::new(),
+            config_id: None,
+            config_version: None,
         }
     }
 
@@ -268,6 +272,8 @@ impl ValidationResult {
             summary: summary.into(),
             passed,
             checks,
+            config_id: None,
+            config_version: None,
         }
     }
 
@@ -289,7 +295,31 @@ impl ValidationResult {
                 exit_status,
                 diagnostics,
             )],
+            config_id: None,
+            config_version: None,
         }
+    }
+
+    /// Records the configuration identity used to select and run these checks.
+    #[must_use]
+    pub fn with_config_identity(
+        mut self,
+        config_id: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Self {
+        self.config_id = Some(config_id.into());
+        self.config_version = Some(version.into());
+        self
+    }
+
+    #[must_use]
+    pub fn config_id(&self) -> Option<&str> {
+        self.config_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn config_version(&self) -> Option<&str> {
+        self.config_version.as_deref()
     }
     #[must_use]
     pub fn summary(&self) -> &str {
@@ -333,11 +363,15 @@ impl ValidationResult {
         summary: String,
         passed: bool,
         checks: Vec<ValidationCheckResult>,
+        config_id: Option<String>,
+        config_version: Option<String>,
     ) -> Self {
         Self {
             summary,
             passed,
             checks,
+            config_id,
+            config_version,
         }
     }
 }
@@ -547,6 +581,20 @@ impl Attempt {
             });
         }
         self.transition(AttemptState::Validating)
+    }
+
+    /// Keeps a successful provider call successful when its legacy validation
+    /// step is cancelled before producing a ValidationResult.
+    pub fn complete_provider_call_after_validation_cancel(&mut self) -> Result<(), DomainError> {
+        if self.semantics != AttemptSemantics::LegacyValidationCoupled
+            || self.state != AttemptState::Validating
+        {
+            return Err(DomainError::InvalidAttemptTransition {
+                from: self.state,
+                to: AttemptState::Succeeded,
+            });
+        }
+        self.transition(AttemptState::Succeeded)
     }
 
     /// Marks a provider-call-v2 Attempt successful without coupling success to validation.

@@ -192,10 +192,13 @@ fn passes_named_model_and_types_invalid_model_selection() {
             Duration::from_secs(15),
         ))
         .unwrap_err();
-    assert!(matches!(
-        error.kind(),
-        ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
-    ));
+    assert!(
+        matches!(
+            error.kind(),
+            ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
+        ),
+        "unexpected error: {error:?}"
+    );
 }
 
 #[test]
@@ -281,6 +284,10 @@ fn maps_timeout_to_provider_error() {
     };
     assert!(
         matches!(error.kind(), ProviderError::TimedOutWithOutput { timeout } if *timeout == Duration::from_secs(15))
+    );
+    assert!(
+        !error.to_string().contains("partial"),
+        "ordinary provider diagnostics must not expose captured output"
     );
     assert_eq!(
         error

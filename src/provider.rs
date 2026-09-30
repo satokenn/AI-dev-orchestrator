@@ -104,6 +104,14 @@ pub struct ProviderRequest {
     prompt: String,
     timeout: Duration,
     model: ModelChoice,
+    workspace_access: WorkspaceAccess,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WorkspaceAccess {
+    ReadOnly,
+    #[default]
+    ReadWrite,
 }
 
 impl ProviderRequest {
@@ -119,6 +127,7 @@ impl ProviderRequest {
             prompt: prompt.into(),
             timeout,
             model,
+            workspace_access: WorkspaceAccess::ReadWrite,
         }
     }
     #[must_use]
@@ -136,6 +145,15 @@ impl ProviderRequest {
     #[must_use]
     pub const fn model(&self) -> &ModelChoice {
         &self.model
+    }
+    #[must_use]
+    pub const fn workspace_access(&self) -> WorkspaceAccess {
+        self.workspace_access
+    }
+    #[must_use]
+    pub fn with_workspace_access(mut self, access: WorkspaceAccess) -> Self {
+        self.workspace_access = access;
+        self
     }
     pub(crate) fn validate_model_selection(&self) -> Result<(), ProviderError> {
         if matches!(&self.model, ModelChoice::Named(model) if model.as_str().is_empty()) {
@@ -437,6 +455,17 @@ pub trait AgentProvider {
 
     /// Checks provider availability before an attempt is created.
     fn check_availability(&self) -> Result<(), ProviderError>;
+
+    /// True only when the adapter can enforce read-only access to the supplied workspace.
+    fn supports_read_only_workspace(&self) -> bool {
+        false
+    }
+
+    /// Captures current, non-sensitive Provider facts for read-only Task context.
+    /// Implementations without an authoritative probe report unknown values.
+    fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        crate::ProviderObservation::unsupported_adapter(self.provider_ref().clone(), observed_at_ms)
+    }
 
     /// Executes a request while observing a caller-owned cancellation signal.
     ///

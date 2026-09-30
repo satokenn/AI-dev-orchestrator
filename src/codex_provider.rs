@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::{
     AgentProvider, AgentResult, CancellationToken, CapturedOutput, ModelChoice, ProcessError,
     ProcessRequest, ProcessRunner, ProviderError, ProviderRef, ProviderRequest, ProviderResult,
-    UsageCost, UsageMetric,
+    UsageCost, UsageMetric, WorkspaceAccess,
 };
 
 const CODEX_COMMAND: &str = "codex";
@@ -59,6 +59,27 @@ impl CodexProvider {
         &self.executable
     }
 
+    /// Collects current local CLI facts without treating CLI launchability as
+    /// proof of account authentication or model access.
+    #[must_use]
+    pub fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        crate::ProviderObservation::probe_cli_at(
+            self.reference.clone(),
+            &self.executable,
+            observed_at_ms,
+            &self.runner,
+        )
+    }
+
+    #[must_use]
+    pub fn observe_current(&self) -> crate::ProviderObservation {
+        crate::ProviderObservation::probe_cli(
+            self.reference.clone(),
+            &self.executable,
+            &self.runner,
+        )
+    }
+
     /// Checks whether the Codex CLI can be started.
     ///
     /// Authentication is intentionally checked by the first headless
@@ -72,9 +93,11 @@ impl CodexProvider {
                     "failed to start {}: {error}",
                     self.executable.to_string_lossy()
                 )),
-                ProcessError::Io(_) | ProcessError::NonZeroExit(_) => ProviderError::Unavailable(
-                    "Codex CLI availability check failed; process output is withheld".into(),
-                ),
+                ProcessError::Io(_) | ProcessError::Stdin(_) | ProcessError::NonZeroExit(_) => {
+                    ProviderError::Unavailable(
+                        "Codex CLI availability check failed; process output is withheld".into(),
+                    )
+                }
                 ProcessError::TimedOut(_)
                 | ProcessError::Cancelled(_)
                 | ProcessError::CancelledBeforeStart
@@ -103,7 +126,10 @@ impl CodexProvider {
                 OsString::from("exec"),
                 OsString::from("--json"),
                 OsString::from("--sandbox"),
-                OsString::from("workspace-write"),
+                OsString::from(match request.workspace_access() {
+                    WorkspaceAccess::ReadOnly => "read-only",
+                    WorkspaceAccess::ReadWrite => "workspace-write",
+                }),
                 OsString::from("--ephemeral"),
             ]);
         if let ModelChoice::Named(model) = request.model() {
@@ -184,7 +210,7 @@ impl CodexProvider {
             ProcessError::Spawn(error) => {
                 ProviderError::Unavailable(format!("Codex CLI could not be started: {error}"))
             }
-            ProcessError::Io(error) => {
+            ProcessError::Io(error) | ProcessError::Stdin(error) => {
                 ProviderError::ExecutionFailed(format!("Codex process I/O failed: {error}"))
             }
             ProcessError::TimedOut(output) => {
@@ -373,12 +399,20 @@ impl AgentProvider for CodexProvider {
         &self.reference
     }
 
+    fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        CodexProvider::observe_current_at(self, observed_at_ms)
+    }
+
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {
         self.execute_process(request, CancellationToken::new())
     }
 
     fn check_availability(&self) -> Result<(), ProviderError> {
         CodexProvider::check_availability(self)
+    }
+
+    fn supports_read_only_workspace(&self) -> bool {
+        true
     }
 
     fn execute_with_cancellation(

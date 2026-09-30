@@ -50,6 +50,9 @@ impl ArtifactRecord {
     pub fn tree_oid(&self) -> &str {
         &self.tree_oid
     }
+    pub fn repository_root(&self) -> &Path {
+        &self.repository_root
+    }
     pub fn state(&self) -> ArtifactState {
         self.state
     }
@@ -88,6 +91,8 @@ pub struct ArtifactValidationRecord {
     passed: bool,
     check_count: usize,
     revision: u64,
+    config_id: Option<String>,
+    config_version: Option<String>,
 }
 
 impl ArtifactValidationRecord {
@@ -111,6 +116,12 @@ impl ArtifactValidationRecord {
     }
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+    pub fn config_id(&self) -> Option<&str> {
+        self.config_id.as_deref()
+    }
+    pub fn config_version(&self) -> Option<&str> {
+        self.config_version.as_deref()
     }
 }
 
@@ -410,6 +421,54 @@ impl<'a> ArtifactManager<'a> {
         self.read(task, id)
     }
 
+    pub(crate) fn review_diff(
+        &self,
+        task: &TaskId,
+        id: &str,
+    ) -> Result<(ArtifactRecord, String), ArtifactError> {
+        let artifact = self.read(task, id)?;
+        let output = self.run_git(
+            artifact.repository_root(),
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--binary",
+                artifact.base_commit(),
+                artifact.tree_oid(),
+            ],
+            &[],
+        )?;
+        if output.output_truncated {
+            return Err(ArtifactError::Git(
+                "Artifact diff output was truncated".into(),
+            ));
+        }
+        let diff = String::from_utf8(output.stdout)
+            .map_err(|_| ArtifactError::Invalid("Artifact diff is not UTF-8".into()))?;
+        Ok((artifact, diff))
+    }
+
+    pub(crate) fn verify_review_workspace(
+        &self,
+        workspace: &Workspace,
+        task: &TaskId,
+        attempt: &AttemptId,
+        artifact_id: &str,
+    ) -> Result<(), ArtifactError> {
+        let artifact = self.read(task, artifact_id)?;
+        self.workspaces
+            .validate_artifact_workspace(workspace, task, attempt)?;
+        let actual = self.snapshot(workspace.path())?;
+        if actual != artifact.tree_oid() {
+            return Err(ArtifactError::WorkspaceChanged {
+                expected: artifact.tree_oid().to_owned(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_revision(
         &self,
         task: &TaskId,
@@ -465,6 +524,7 @@ impl<'a> ArtifactManager<'a> {
                 actual: u64::try_from(revision).unwrap_or_default(),
             });
         }
+        Self::ensure_no_active_publication(&tx, task)?;
         let still_available: Option<String> = tx.query_row(
             "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
             params![task.as_str(), artifact_id],
@@ -474,8 +534,8 @@ impl<'a> ArtifactManager<'a> {
             return Err(ArtifactError::RecoveryRequired);
         }
         tx.execute(
-            "INSERT INTO artifact_validations(id,task_id,artifact_id,tree_oid,summary,passed,created_at) VALUES(?1,?2,?3,?4,'validation outcome recorded; raw diagnostics withheld',?5,?6)",
-            params![id, task.as_str(), artifact_id, artifact.tree_oid(), i64::from(result.passed()), now_ms()],
+            "INSERT INTO artifact_validations(id,task_id,artifact_id,tree_oid,summary,passed,created_at,config_id,config_version) VALUES(?1,?2,?3,?4,'validation outcome recorded; raw diagnostics withheld',?5,?6,?7,?8)",
+            params![id, task.as_str(), artifact_id, artifact.tree_oid(), i64::from(result.passed()), now_ms(), result.config_id(), result.config_version()],
         )?;
         for (sequence, check) in result.checks().iter().enumerate() {
             tx.execute(
@@ -500,6 +560,8 @@ impl<'a> ArtifactManager<'a> {
             passed: result.passed(),
             check_count: result.checks().len(),
             revision: next_revision,
+            config_id: result.config_id().map(str::to_owned),
+            config_version: result.config_version().map(str::to_owned),
         })
     }
 
@@ -538,6 +600,7 @@ impl<'a> ArtifactManager<'a> {
                 actual: u64::try_from(revision).unwrap_or_default(),
             });
         }
+        Self::ensure_no_active_publication(&tx, task)?;
         let still_available: Option<String> = tx.query_row(
             "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
             params![task.as_str(), artifact_id],
@@ -647,6 +710,23 @@ impl<'a> ArtifactManager<'a> {
             validation_id: validation_id.to_owned(),
             decision_id: decision_id.to_owned(),
         })
+    }
+
+    fn ensure_no_active_publication(
+        tx: &rusqlite::Transaction<'_>,
+        task: &TaskId,
+    ) -> Result<(), ArtifactError> {
+        let active: Option<String> = tx.query_row(
+            "SELECT id FROM service_artifact_publication_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
+            params![task.as_str()],
+            |row| row.get(0),
+        ).optional()?;
+        if active.is_some() {
+            return Err(ArtifactError::Invalid(
+                "Task has an active publication operation".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn cleanup_validation_workspace(
@@ -949,7 +1029,7 @@ impl<'a> ArtifactManager<'a> {
         if !is_oid(&record.tree_oid) {
             return Err(ArtifactError::Invalid("invalid Git tree object ID".into()));
         }
-        let output = match self.runner.run(
+        let output = match self.runner.run_git(
             ProcessRequest::new(self.git_executable.clone())
                 .args(["cat-file", "-t", &record.tree_oid])
                 .cwd(&record.repository_root),
@@ -1018,7 +1098,7 @@ impl<'a> ArtifactManager<'a> {
             request = request.env(*key, value.clone());
         }
         self.runner
-            .run(request)
+            .run_git(request)
             .map_err(|e| ArtifactError::Git(process_error(e)))
     }
 }
@@ -1302,6 +1382,57 @@ mod tests {
             b"fatal: cannot open .git/objects: I/O error"
         ));
         assert!(!is_missing_git_object_diagnostic(b""));
+    }
+
+    #[test]
+    fn review_diff_rejects_truncated_git_output() {
+        let root = std::env::temp_dir().join(format!("artifact-review-diff-{}", new_id()));
+        let repository = root.join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        git(
+            &repository,
+            &["config", "user.email", "artifact-test@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Artifact Test"]);
+        fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let base = git(&repository, &["rev-parse", "HEAD"]);
+        fs::write(repository.join("large.bin"), vec![b'x'; 1_100_000]).unwrap();
+        git(&repository, &["add", "large.bin"]);
+        let tree = git(&repository, &["write-tree"]);
+        let repository = fs::canonicalize(repository).unwrap();
+        let task = TaskId::new("review-diff-truncated-task");
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        ledger
+            .save_task(&Task::new(
+                task.clone(),
+                "diff",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let artifact_id = "large-review-diff";
+        let ref_name = format!("{REF_PREFIX}{artifact_id}");
+        git(&repository, &["update-ref", &ref_name, &tree]);
+        ledger.lock_connection().unwrap().execute(
+            "INSERT INTO service_artifacts(id,task_id,base_commit,tree_oid,repository_root,ref_name,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,'available',0)",
+            rusqlite::params![artifact_id, task.as_str(), base, tree, repository.to_string_lossy().as_ref(), ref_name],
+        ).unwrap();
+        let workspaces = WorkspaceManager::new(&repository).unwrap();
+        let manager = ArtifactManager::new(&workspaces, &ledger);
+        assert!(matches!(
+            manager.review_diff(&task, artifact_id),
+            Err(ArtifactError::Git(message)) if message.contains("truncated")
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

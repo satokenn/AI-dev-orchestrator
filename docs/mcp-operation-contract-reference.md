@@ -23,7 +23,7 @@ MCP toolsでは`inputSchema`が入力schemaを定め、任意の`outputSchema`�
 
 副作用を伴うrequestは`request_id: string`を必須とする。既存Taskを変更する場合はさらに`task_id: string`と`expected_revision: integer`を必須とする。読取requestは`request_id`と`expected_revision`を持たない。
 
-冪等性keyの範囲は`caller + tool name + request_id`。`task.create`を含む全副作用requestに適用する。同じkey・同じnormalized payloadの再送は保存済みresponseを返し、副作用を繰り返さない。同じkeyでpayloadが異なる場合は`idempotency_conflict`。
+冪等性keyの範囲は`caller + tool name + request_id`。`task.create`を含む全副作用requestに適用する。同じkey・同じnormalized payloadの再送は保存済みresponseを返し、副作用を繰り返さない。同じkeyでpayloadが異なる場合は`idempotency_conflict`。Task作成のnormalized payloadは、設定済みSecretScannerが全ての要求テキストfieldをredactした後の値である。redaction結果は再適用で変化しない固定点でなければならず、Serviceはこれを確認し、固定点でない場合は保存・返却を拒否する。
 
 IDはすべて不透明なstringとし、呼出側はIDの形式・連番・内部構造を解釈しない。RFC 3339日時は`string`として送受信し、UTC (`Z`) を使う。fieldがoptionalなら省略し、nullを使うのは型に`| null`と明記された場合だけ。
 
@@ -89,7 +89,7 @@ evidenceは結果を申告するfieldではなく、保存済みrecordへの参�
 | `id` | `string` | 必須 | 履歴record ID |
 | `kind` | `string` | 必須 | record種別 |
 | `state` | `string \| null` | 必須 | record種別に定義されたstate。stateを持たないrecordはnull |
-| `occurred_at` | `string (format: date-time)` | 必須 | record時刻（RFC 3339 UTC） |
+| `occurred_at` | `string (format: date-time) \| null` | 必須 | record時刻（RFC 3339 UTC）。記録されていない場合はnull |
 | `summary` | `string` | 必須 | 人が読める短い要約 |
 | `references` | `array<Reference>` | 必須 | 関連record |
 | `details` | `object` | 必須 | section固有の追加情報 |
@@ -99,10 +99,15 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 | Section | kind | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- | --- | --- |
 | `providers` | `provider` | `provider_id` | `string` | 必須 | Provider ID |
-|  |  | `model_ids` | `array<string>` | 必須 | 利用可能なModel ID |
+|  |  | `model_ids` | `array<string>` | 必須 | authoritativeなsourceで列挙できたModel ID |
 |  |  | `availability` | `enum(available, unavailable, unknown)` | 必須 | 観測した利用可否 |
 |  |  | `observed_at` | `string (format: date-time)` | 必須 | Provider状態の観測時刻 |
 |  |  | `diagnostic_ref` | `string \| null` | 必須 | 診断参照。なければnull |
+|  |  | `availability_evidence` | `AvailabilityEvidence` | 必須 | 状態、unknown理由、観測時刻、情報源 |
+|  |  | `authentication` | `AvailabilityEvidence` | 必須 | 認証状態。CLI確認だけではknownにならない |
+|  |  | `cli_present` | `Evidence<boolean>` | 必須 | 設定CLIの存在観測 |
+|  |  | `cli_version_check` | `Evidence<boolean>` | 必須 | `--version`確認。認証やModel利用権を示さない |
+|  |  | `models` | `array<ModelAvailabilityObservation>` | 必須 | Modelごとの利用可否と根拠。未取得はunknown |
 | `usage` | `usage` | `name` | `string` | 必須 | 使用量指標名 |
 |  |  | `value` | `number \| null` | 必須 | 観測値。不明ならnull |
 |  |  | `unit` | `string` | 必須 | 値の単位 |
@@ -112,11 +117,16 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 |  |  | `requested_model` | `ModelChoice \| null` | 必須 | 要求Model。旧記録等で確認できなければnull |
 |  |  | `observed_provider_id` | `string \| null` | 必須 | 実行されたと観測できたProvider。未知ならnull |
 |  |  | `observed_model_id` | `string \| null` | 必須 | 実際に使用したと観測できたModel。未知ならnull |
-|  |  | `role` | `enum(implementer, reviewer, explorer)` | 必須 | Attemptの役割 |
+|  |  | `role` | `enum(implementer, reviewer, explorer) \| null` | 必須 | Attemptの役割。旧記録等で取得できなければnull |
 |  |  | `input_artifact_id` | `string \| null` | 必須 | 入力Artifact。初期baseから開始した場合はnull |
 |  |  | `base_commit` | `string \| null` | 必須 | 開始時commit。なければnull |
 |  |  | `output_artifact_id` | `string \| null` | 必須 | 出力Artifact。未作成ならnull |
 |  |  | `diagnostic_ref` | `string \| null` | 必須 | 診断参照。なければnull |
+|  |  | `requested_provider_evidence` | `Evidence<string>` | 必須 | 要求Providerの値またはunknown理由、根拠、時刻 |
+|  |  | `requested_model_evidence` | `Evidence<ModelChoice>` | 必須 | 要求Modelの値またはunknown理由、根拠、時刻 |
+|  |  | `observed_provider_evidence` | `Evidence<string>` | 必須 | 観測Providerの値またはunknown理由、根拠、時刻 |
+|  |  | `observed_model_evidence` | `Evidence<string>` | 必須 | 観測Modelの値またはunknown理由、根拠、時刻 |
+|  |  | `timestamp_basis` | `enum(persisted, unknown)` | 必須 | occurred_atの元記録があるか |
 | `artifacts` | `artifact` | `artifact_id` | `string` | 必須 | Artifact ID |
 |  |  | `digest` | `string` | 必須 | Artifact内容のdigest |
 |  |  | `source_attempt_id` | `string \| null` | 必須 | 作成元Attempt。なければnull |
@@ -149,6 +159,10 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 |  |  | `checks` | `array<CiCheck>` | 必須 | 個別check結果 |
 
 `ContextItem.state`の値は次のとおり。sectionごとに別のenumであり、一覧にないstateを使わない。
+
+`Evidence<T>`は`status`で判別する。knownは`value`、`basis` (`measured`, `configured`, `computed`, `estimated`)、`assessed_at_ms`、`source`を持ち、unknownは`reason`、`assessed_at_ms`、`source`を持つ。`source`は`kind` (`provider_api`, `provider_cli`, `provider_adapter`, `execution_ledger`, `repository_config`) と`reference`を含む。`provider_adapter`はProvider adapter自身が返した観測を表す。`AvailabilityEvidence`は`status` enum (`available`、`unavailable`、`unknown`)、`observed_at_ms`、`source`を同じobjectに持つ。unavailable / unknownではnon-empty `reason`も同じobjectに置き、statusを入れ子にしない。`ModelAvailabilityObservation`は`model: ModelChoice`と`availability: AvailabilityEvidence`を持つ。Attempt itemで`occurred_at`を特定できない場合はnull、`timestamp_basis: unknown`を返す。旧roleを特定できない場合は`role: null`とする。
+
+`model_ids`には権威あるModel catalogで確認できたnamed Modelだけを含める。CLI起動状態からModel一覧・認証・利用権・quota・利用量・料金を推定しない。観測できない値はevidenceの`unknown`として理由・時刻・sourceを残す。Task Attemptのrequested値とobserved値は別々に保持し、unknown observed値をrequested値で埋めない。
 
 | Section | `state` type |
 | --- | --- |
@@ -255,6 +269,7 @@ Taskを作成する。`request_id`は冪等性keyに含まれる。
 | `issue` | `IssueSnapshot` | 条件付き | sourceが`issue`なら必須、`manual`なら省略 |
 
 `issue`は前述の`IssueSnapshot`型を使う。title/bodyは作成時点のsnapshot。
+OperationServiceは`task.create`の前にtitle、description、各constraint、IssueのURL/title/bodyをSecretScannerでredactし、再適用で変化しない固定点であることを確認してからredacted canonical payloadだけを冪等性記録とTask snapshotに保存する。同じ入力の再送も同じredacted payloadで照合する。SecretScannerが未設定、失敗、または固定点を作れない場合は`policy_denied`で拒否し、raw textを保存・返却しない。
 
 成功output:
 
@@ -286,6 +301,11 @@ Taskを作成する。`request_id`は冪等性keyに含まれる。
 
 Taskと選択したsectionのsnapshotを読む。読取専用。
 
+このRust `OperationService` sliceは`providers`、`usage`、`attempts`、`reviews`のContextPageを生成する。ここでいうsliceはRust APIであり、MCP toolやtransportの実装ではない。MCP `task.get_context`への接続はIssue #45の対象として別途行う。
+保存済みTask snapshotの要求textはcontext返却前にもSecretScannerでredactし、固定点であることを確認する。これにより既存の未redacted snapshotもraw textを返さない。SecretScannerが未設定、redactionが失敗、または固定点を作れない場合はProvider probeより前に`policy_denied`とし、raw snapshotを含む応答を返さない。
+`providers` sectionではprovider observationsを同一snapshot内で一括返し、件数がpage_sizeを超える場合はrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化し、cursorはTask、section、page size、Task revisionに束縛する。Review verdict historyも同じ順序でpage化する。
+Provider観測sourceがProvider一覧を列挙できない場合は、空配列として成功したように見せずcontext取得を失敗させる。
+
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v2"` | 必須 | 契約version |
@@ -303,6 +323,32 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
 | `sections` | `object<string, ContextPage>` | 必須 | 要求されたsectionごとのpage |
 | `observed_at` | `string (format: date-time)` | 必須 | snapshot観測時刻 |
 
+#### 現在実装済みのRust section
+
+契約全体ではsection enumに将来の項目も含むが、このRust sliceが現在生成するsectionは`providers`、`usage`、`attempts`、`reviews`である。`reviews` itemの`details`は`review_verdict_id`、`reviewer_attempt_id`、`artifact_id`、`verdict`を含み、`verdict`は`approved`、`changes_requested`、`inconclusive`のいずれか。これはRust APIの実装状況を示し、MCP tool / transportは未実装である。
+
+例（`sections.reviews.items`）:
+
+~~~json
+{
+  "id": "review-17",
+  "kind": "review_verdict",
+  "state": "approved",
+  "occurred_at": "2026-09-28T04:05:06.000Z",
+  "summary": "The requested behavior is present.",
+  "references": [
+    {"kind": "attempt", "id": "service-attempt-17"},
+    {"kind": "artifact", "id": "artifact-12"}
+  ],
+  "details": {
+    "review_verdict_id": "review-17",
+    "reviewer_attempt_id": "service-attempt-17",
+    "artifact_id": "artifact-12",
+    "verdict": "approved"
+  }
+}
+~~~
+
 例（`sections.attempts.items`の一部）:
 
 ~~~json
@@ -313,7 +359,22 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
   "occurred_at": "2026-09-23T01:02:03Z",
   "summary": "Provider call completed",
   "references": [{"kind": "artifact", "id": "artifact-01"}],
-  "details": {"requested_provider_id": "provider-a", "requested_model": {"kind": "named", "model": "model-a"}, "observed_provider_id": "provider-a", "observed_model_id": null, "role": "implementer", "input_artifact_id": null, "base_commit": "abc123", "output_artifact_id": "artifact-01", "diagnostic_ref": null}
+  "details": {
+    "requested_provider_id": "provider-a",
+    "requested_model": {"kind": "named", "model": "model-a"},
+    "observed_provider_id": "provider-a",
+    "observed_model_id": null,
+    "role": "implementer",
+    "input_artifact_id": null,
+    "base_commit": "abc123",
+    "output_artifact_id": "artifact-01",
+    "diagnostic_ref": null,
+    "requested_provider_evidence": {"status":"known","value":"provider-a","basis":"configured","assessed_at_ms":1790115723000,"source":{"kind":"execution_ledger","reference":"attempt:attempt-01"}},
+    "requested_model_evidence": {"status":"known","value":{"kind":"named","model":"model-a"},"basis":"configured","assessed_at_ms":1790115723000,"source":{"kind":"execution_ledger","reference":"attempt:attempt-01"}},
+    "observed_provider_evidence": {"status":"known","value":"provider-a","basis":"measured","assessed_at_ms":1790115783000,"source":{"kind":"execution_ledger","reference":"attempt:attempt-01"}},
+    "observed_model_evidence": {"status":"unknown","reason":"the Provider result did not record an observed Model","assessed_at_ms":1790115783000,"source":{"kind":"execution_ledger","reference":"attempt:attempt-01"}},
+    "timestamp_basis": "persisted"
+  }
 }
 ~~~
 
@@ -345,6 +406,40 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
 入力Artifactは同じTaskに属する必要がある。branch/pathだけのbase指定は認めない。
 
 成功outputは`OperationAcceptance`。`attempt_id`を必須とする。受付時の`operation.state`は`accepted`。
+
+#### 任意の意味レビューを依頼するRust API
+
+現在のRust serviceは、監督側が明示的に呼び出す`OperationService::submit_artifact_review`を提供する。これは仕様にあるreviewer Attemptの契約を実装するが、MCP toolやtransportではない（MCP Issue #45は別作業）。入力は`ArtifactReviewRequest::new(request_id, task_id, expected_revision, provider_id, model_id, artifact_id, validation_ids, criteria)`で組み立てる。すべてのvalidation IDは重複不可で、少なくとも1件を指定する。criteriaも空文字を含まない1件以上を指定する。
+
+Rust呼び出し例:
+
+~~~rust,ignore
+let accepted = service.submit_artifact_review(&ArtifactReviewRequest::new(
+    "review-request-17",
+    task_id.clone(),
+    current_revision,
+    ProviderRef::new("codex"),
+    ModelChoice::ProviderDefault,
+    artifact_id,
+    vec![validation_id],
+    vec!["Check the requested behavior".into()],
+))?;
+let operation = service.run(accepted.operation_id(), CancellationToken::new())?;
+~~~
+
+依頼時にTask revisionが一致し、対象Artifactが同一Taskの現在の最新available Artifactであり、Artifactの作成元が成功した`implementer` Attemptであることを検証する。指定された各Validationは同じArtifact IDとtreeに属さなければならない。Task要求、Artifact差分、Validationの結果、criteriaはProviderへ渡す前にSecretScannerでredactし、redaction固定点を確認する。Scannerがない・失敗する場合は受付を拒否する。Provider adapterがread-only workspaceを強制できない場合は起動前に拒否し、実行後にもworkspace treeがArtifactと一致することを確認する。受付後に別Artifactが最新になった場合、workspaceが変わった場合、Providerが有効なJSON verdictを返さない場合はOperationを固定診断code付きで`failed`にし、ReviewVerdictを保存しない。Provider summaryのredactionに失敗した場合も、raw summaryを永続化せずOperationを`failed`にする。
+
+Provider終了後、verdict保存直前に、reviewer Attempt開始後に記録したTask revisionと現在revisionを照合する。review中にValidationなど別操作がrevisionを進めていた場合は、Provider呼出しが成功していてもReviewVerdictを保存せず、`stale_task_revision`を診断codeとしてreviewer AttemptとOperationを`failed`終端にする。正常なreview自身による開始時・終端時のrevision更新は、この比較でstale扱いしない。
+
+レビュー依頼はredacted後のpromptが16 KiBを超えると受付前に`policy_denied`で拒否する。これは各OSのprocess argument上限を越えてProviderを起動できなくなる事態を避けるためである。同一request IDの再送は保存済みのTask、revision、Provider/Model、Artifact、Validation、redacted criteriaが一致すれば、Artifactが後から古くなっていても元のOperationAcceptanceを返す。不一致や通常のAttemptが同じrequest IDを使用していた場合は`idempotency_conflict`とする。
+
+Providerが返す`AgentResult.summary`は次の構造化JSONでなければならない:
+
+~~~json
+{"verdict":"changes_requested","summary":"The parser still rejects escaped delimiters."}
+~~~
+
+有効なverdictでProvider実行が成功した場合、Operationは`completed`、reviewer Attemptは`succeeded`となり、`ReviewVerdict`を1件保存する。`changes_requested`もreview処理の失敗ではない。Verdictはレビュー担当の意見であり、Taskを完了・再作業へ自動遷移させたり、監督Codexの採否を決めたりしない。
 
 ### `operation.get`
 

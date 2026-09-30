@@ -57,6 +57,27 @@ impl AntigravityProvider {
         &self.executable
     }
 
+    /// Collects current local CLI facts without treating CLI launchability as
+    /// proof of account authentication or model access.
+    #[must_use]
+    pub fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        crate::ProviderObservation::probe_cli_at(
+            self.provider_ref.clone(),
+            &self.executable,
+            observed_at_ms,
+            &self.runner,
+        )
+    }
+
+    #[must_use]
+    pub fn observe_current(&self) -> crate::ProviderObservation {
+        crate::ProviderObservation::probe_cli(
+            self.provider_ref.clone(),
+            &self.executable,
+            &self.runner,
+        )
+    }
+
     /// Checks that the CLI can be started and reports installation problems.
     ///
     /// Authentication is checked by the first headless execution because the
@@ -156,7 +177,9 @@ impl AntigravityProvider {
             ProcessError::Spawn(error) => {
                 ProviderError::Unavailable(format_spawn_error(self.executable.as_os_str(), error))
             }
-            ProcessError::Io(error) => ProviderError::ExecutionFailed(error.to_string()),
+            ProcessError::Io(error) | ProcessError::Stdin(error) => {
+                ProviderError::ExecutionFailed(error.to_string())
+            }
             ProcessError::NonZeroExit(output) => {
                 let captured = CapturedOutput::from_process_output(&output);
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -236,6 +259,10 @@ impl AntigravityProvider {
 impl AgentProvider for AntigravityProvider {
     fn provider_ref(&self) -> &ProviderRef {
         &self.provider_ref
+    }
+
+    fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        AntigravityProvider::observe_current_at(self, observed_at_ms)
     }
 
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {
@@ -328,7 +355,9 @@ fn format_spawn_error(executable: &OsStr, error: std::io::Error) -> String {
 
 fn process_error_message(error: ProcessError) -> String {
     match error {
-        ProcessError::Spawn(error) | ProcessError::Io(error) => error.to_string(),
+        ProcessError::Spawn(error) | ProcessError::Io(error) | ProcessError::Stdin(error) => {
+            error.to_string()
+        }
         ProcessError::NonZeroExit(_) => {
             "process exited unsuccessfully; captured bytes are withheld".into()
         }

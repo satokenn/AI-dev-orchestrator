@@ -29,6 +29,8 @@ install <target>/ai-dev-orchestrator "$HOME/.local/bin/ai-dev-orchestrator"
 
 外部 CLI は `ProcessRequest` に command、引数配列、作業ディレクトリ、環境変数、タイムアウトを指定し、`ProcessRunner` で実行できます。引数は shell 文字列へ連結されず、stdout / stderr と終了状態が `ProcessOutput` に集約されます。長時間実行を停止する場合は `CancellationToken` を渡して `cancel()` を呼び出してください。
 
+`OperationService`のread-only `get_context` Rust APIはTaskの要求snapshotと、`providers`、`usage`、`attempts`、`reviews`のv2 ContextPageを返します。Provider観測の取得不能理由、source、時刻を含め、CLI起動成功から認証やModel利用権を推定しません。このAPIはMCP tool / transportには未接続です。詳細は[Providerの現在状態を観測する](docs/current-provider-observations.md)を参照してください。
+
 timeout / cancel時のprocess group停止、停止確認結果、部分ログと出力上限は、[ProcessRunner の停止と出力回収](docs/process-runner.md)を参照してください。
 
 ## AgentProvider 契約
@@ -36,6 +38,10 @@ timeout / cancel時のprocess group停止、停止確認結果、部分ログと
 Agent 実行先の違いは `AgentProvider` に閉じ込めます。`ProviderRequest` は workspace、prompt、timeout と必須の `ModelChoice`（named Modelまたは明示したProvider既定値）を受け取り、`ProviderResult` は stdout、stderr、終了状態、任意の `AgentResult` と `UsageCost`、観測できたProvider / Modelを返します。stdout / stderr本文は `expose_stdout_for_trusted_processing` / `expose_stderr_for_trusted_processing` で明示して取得します。これらはsecretを含む可能性があるため、信頼された呼び出し側に限り、redactionなしに保存・返却してはいけません。Provider出力から実Modelを確定できない場合、observed Modelはunknownのままです。実行に失敗した場合は `ProviderError`（不正な要求、未対応Model、実行失敗、タイムアウト、利用不能）を返します。error本文とDebug表示にはraw stdout / stderrを含めません。
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
+
+## Providerの現在状態を観測する
+
+`CodexProvider`、`CopilotProvider`、`AntigravityProvider` の `observe_current()` は、3秒のtimeoutを設定した `--version` probeでCLIの起動有無を観測し、情報源と時刻を付けて返します。CLIの起動成功だけでは認証済みやModel利用可能とは判断せず、それらは `unknown` のままです。この部分実装はquota、API利用量・料金、budgetを取得しません。Provider観測は`task.get_context`にも接続されています。詳細は[Providerの現在状態を観測する](docs/current-provider-observations.md)を参照してください。
 
 ## Operation Ledger
 
@@ -63,13 +69,56 @@ Provider APIでは成功・失敗結果にUTF-8変換前のstdout/stderr byte列
 
 `RustValidator` は明示された workspace を cwd として、`cargo fmt`、`cargo clippy`、`cargo test` の機械的なチェックを順番に実行します。全チェックを内包した aggregate の `ValidationResult` を1件返し、各コマンドの終了状態と stdout / stderr の診断は `ValidationResult::checks()` から参照できます。1つでも失敗した場合は aggregate を成功として扱いません。`CommandValidator` と `ValidationCheck` を使えば、同じ `Validator` API で決定的なチェック列も構成できます。
 
+Repository-local の構造化checkは `.ai-dev-orchestrator/config.toml` に置き、`init_repository` で上書きしないtemplateを作成できます。通常のIssue実行はPlannerやProviderを起動する前に設定を読み込み、同じ設定snapshotでValidatorを選びます。config未設定やcheck空集合は成功扱いにならず、実行を開始しません。設定IDとファイル内容のSHA-256はValidationResultに保存されます。設定形式と使用例は[repository-local config](docs/repository-config.md)を参照してください。
+
 ## Orchestrator Service
 
 ### MCP Operation Service（中核実装）
 
-`OperationService` は監督側が明示した `attempt.run` を単一のExecution Ledger DBで受け付け、request ID・Task revision・busy状態を検査してOperation、Attempt、`BaseInput`または同じTaskの`ArtifactInput`を原子的に保存します。`ArtifactInput`の場合は保存済みtree/ref/baseをProvider起動前に照合し、Artifactを新しい管理worktreeへ展開します。Provider終了後は、tracked変更とignoredでない新規ファイルをGit treeと専用refに保存し、入力・出力Artifactのlineageを同じLedger DBへ記録します。review verdictはArtifactInputの前提条件ではありません。永続LedgerではService生成時にベースLedgerとOperation sidecarのcanonical identityに結び付いたプロセス排他ロックを取得し、未完了Operationの復旧を完了してからServiceを返します。ロックはService破棄まで保持されるため、同じLedgerへの別プロセス実行は拒否されます。復旧はService構築時だけに行い、Provider実行中に再度呼び出す公開APIはありません。`SqliteOperationLedger::recover` も同じ `LedgerRunLock` を要求し、既存ロックを共有する呼出元は `new_with_run_lock` に同じLedger identityのguardを渡します。in-memory Ledgerはプロセス間で生存する中断状態を持たないため、構築時の自動復旧を行いません。named Modelは信頼できるcatalogが用意されるまで実行前に拒否します。成功・timeout・cancel・中断状態と汎用usageを保存し、Providerのstdout/stderr、AgentResult、秘密を含む診断本文は保存・返却しません。
+`OperationService` はRust API `create_task` で `task.create` を受け付け、Task要求snapshot、revision 0、caller・tool・request ID単位の冪等記録を一つのSQLite transactionで保存します。同じ要求の再送には元の作成結果を返し、異なる要求は拒否します。既存Task列にない情報を推測せず、新しいTaskのrole欄には中立値 `unspecified` を設定します。MCP wire adapterはまだ接続していません。
 
-Provider起動前にworkspaceのHEADが指定base commitと一致し、tracked・untracked・ignored fileが空であることを確認します。hook等が内容を作った場合はProviderを起動せず、workspaceと内容を保持します。Artifactはtracked変更とignoredでない新規ファイルを含み、ignoredファイルは意図的に除外します。Providerがignoredファイルを作った場合は、欠落を隠して成功Artifactを作らず、Operationを `recovery_required` としてworkspaceを保持します。Operationはworkspace pathとbranchを参照として記録し、成果物保存前にworkspaceを自動削除しません。Git refの保存中断はArtifactを `pending_ref` として残します。Service構築時に永続Ledgerのロック下でpending Artifactのtree/refを照合し、ref未作成でtreeが残っていればrefを復元します。tree欠落・ref不一致の場合は `recovery_required` として利用を拒否します。同時に残存するrunning Operationも `recovery_required` として閉じてから依頼受付を始めます。中断結果を推測せず、同じOperationを再実行しません。同一Artifactに対するValidation・Codex採否・公開証拠の照合はこのPRで実装します。MCP transport、configured secret scan、GitHubへのcommit / push / PR公開、AI review / CI evidence接続は後続作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
+`OperationService` は監督側が明示した `attempt.run` を単一のExecution Ledger DBで受け付け、request ID・Task revision・busy状態を検査してOperation、Attempt、初回の`BaseInput`を原子的に保存します。Provider終了後は、tracked変更とignoredでない新規ファイルをGit treeと専用refに保存し、Attemptの出力Artifactとして同じLedger DBへ記録します。失敗または再試行可能な取消になった実装AttemptのArtifactを入力にする場合、要求ProviderとModelが元Attemptと同じなら`retry_of`、どちらかを変更するなら`escalation_of`でそのAttemptを参照します。成功済み実装AttemptのArtifactを修正入力にする場合は、同一Task・Artifact・treeに`changes_requested`を返した成功済みreviewer AttemptとReviewVerdictが必要で、`rework_from`はそのreviewer Attemptを参照します。証拠がない、別Task・Artifact・treeの証拠、失敗したreviewer Attemptの場合はProvider起動やAttempt記録の前に拒否します。AI review自体は任意で、reviewなしのArtifactInputは失敗Attemptのretryに限り利用できます。永続LedgerではService生成時にベースLedgerとOperation sidecarのcanonical identityに結び付いたプロセス排他ロックを取得し、未完了Operationの復旧を完了してからServiceを返します。ロックはService破棄まで保持されるため、同じLedgerへの別プロセス実行は拒否されます。復旧はService構築時だけに行い、Provider実行中に再度呼び出す公開APIはありません。`SqliteOperationLedger::recover` も同じ `LedgerRunLock` を要求し、既存ロックを共有する呼出元は `new_with_run_lock` に同じLedger identityのguardを渡します。in-memory Ledgerはプロセス間で生存する中断状態を持たないため、構築時の自動復旧を行いません。named Modelは、Serviceへ明示注入したread-only `ModelCatalog` がsourceと観測時刻付きでfreshかつsupportedと確認した場合だけ受け付けます。catalog未設定、lookup error、欠落、unknown / unsupported、古い・未来の記録は、Task / Attemptの記録やProvider起動より前に拒否し、実行時にもProvider準備前とAttempt開始直前に再確認します。Provider defaultはcatalog照会を必要としません。実Provider用catalog adapter / data sourceは後続Issue #60 / #91です。成功・timeout・cancel・中断状態と汎用usageを保存し、Providerのstdout/stderr、AgentResult、秘密を含む診断本文は保存・返却しません。
+
+
+`task.create`では設定済み`SecretScanner`で要求とIssue snapshotのtextをredactし、再redactして変化しない固定点を確認してからredacted payloadをsnapshotと冪等性記録へ保存します。scanner未設定・失敗・固定点不成立ならraw textを保存せず拒否します。read-only `get_context` Rust APIはredacted Task snapshotと、`providers`、`usage`、`attempts`、`reviews`のContextPageを返します。Contextを返す前にsnapshotを再redactし、page cursorを検証してからProvider observationを取得します。Provider observationはsource・時刻付きで、CLI起動から認証やModel利用権を推定しません。`usage`にはLedger上のProvider報告metricだけを載せ、quotaやbudgetは作りません。Provider一覧の取得失敗や、全Provider observationが一ページへ収まらない場合はContext requestを失敗させます。MCP tool / transportは未接続です。詳細は[Providerの現在状態を観測する](docs/current-provider-observations.md)を参照してください。
+
+Provider起動前にworkspaceのHEADが指定base commitと一致し、tracked・untracked・ignored fileが空であることも確認します。ArtifactInputでは新しいworktreeがcleanであることを確認してから成果物treeを展開し、tree一致を再検証します。hook等が内容を作った場合はProviderを起動せず、workspaceと内容を保持します。Artifactはtracked変更とignoredでない新規ファイルを含み、ignoredファイルは意図的に除外します。Providerがignoredファイルを作った場合は、欠落を隠して成功Artifactを作らず、Operationを `recovery_required` としてworkspaceを保持します。Operationはworkspace pathとbranchを参照として記録し、成果物保存前にworkspaceを自動削除しません。Git refの保存中断はArtifactを `pending_ref` として残します。Service構築時に永続Ledgerのロック下でpending Artifactのtree/refを照合し、ref未作成でtreeが残っていればrefを復元します。tree欠落・ref不一致の場合は `recovery_required` として利用を拒否します。同時に残存するrunning Operationも `recovery_required` として閉じてから依頼受付を始めます。中断結果を推測せず、同じOperationを再実行しません。ValidationとCodex採否はArtifact IDとtree OIDへ結び付き、Publicationは同じ成果物の検証・採否記録に基づいて実行します。任意のAI reviewは`submit_artifact_review`から明示依頼でき、read-only reviewer AttemptとArtifact単位のverdictをRust Service APIで記録します。これはTask完了や修正を自動決定しません。MCP transport、CI evidence接続、redacted log保存、CLIへの配線は別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
+
+同一Artifact公開MVPはRust API `publish_artifact`（証拠/secret scanと原子的受付）、`run_artifact_publication`（受付済み操作の実行）、専用 `get_artifact_publication_operation`（最終結果取得）から利用できます。呼び出し側が`SecretScanner`とGitHub publication gatewayを明示注入しない場合、公開は拒否されます。Artifactの全treeとPR title/body等のpayloadを受付前と実行直前の両方でscanし、検出・失敗・利用不能なら拒否します。設定済みGit実行ファイルでcommit objectのraw tree/parent headerをreplacement refs無効のもと検証し、tree、親commit、Draft PRのhead SHA・base/head branch・title/body一致を確認し、tree・commit SHA・PR番号・Draft状態と検証/採否IDを専用Ledgerに記録します。raw title/bodyはLedgerに保存せず、digestで冪等性を照合します。Git/gh subprocessはProcessRunnerの有限timeoutと上限付き出力を使い、timeout後にpush/PRの成否が不明な場合は`recovery_required`へ進み再実行しません。GitHub CLIの対象repositoryはGitの`origin` fetch URLから決め、push前にorigin URLはHTTPSまたはSSH形式（SCP-like SSHを含む）だけを受け付け、全ての有効なpush URLが同じhost/owner/repoを指すことを確認します。`gh pr list --repo`とliteralな`repos/<owner>/<repo>/pulls` endpointを使い、CLIの継承環境から`GH_REPO`と`GH_HOST`を除去します。title/bodyはProcessRunnerのstdinから`gh api --input -`へ直接渡し、argv、Ledger、OS一時ファイルへ書きません。Unix系以外ではcancellableなraw stdin送信に未対応です。GitHub gatewayは実行claimやGit commit/pushより前にこの能力を検査し、非対応環境での公開を副作用なしで拒否します。gateway実装の`supports_sensitive_stdin_payload`はService稼働中に値を変えず、安定して返す必要があります。受付時と実行時の両方で能力を確認するため、受付後に値が変わると操作が実行できず、起動時復旧まで受付済み状態に残る場合があります。SQLite schema v13はPublication専用operation tableを追加し、v14はTask要求snapshotとcaller単位の冪等記録を追加します。v15/v16はRepository設定に基づくValidationResultの設定IDとSHA-256 versionを既存Attempt validationとArtifact validationへ記録する列を追加します。旧Ledgerからv16へのmigrationは既存recordを保持します。再起動時は未claimの`accepted` publicationを`failed`（`interrupted_before_start`）、実行claim後の`running` publicationを`recovery_required`として記録し、どちらも自動再実行しません。MCP `publication.publish` と既存`operation.get`への統合、publication用cancel APIは未接続であり、公開操作の取得には専用Rust APIを使います。
+
+Task作成のRust Service APIは実装済みで、MCP transportからの呼び出しは未実装です。たとえばmanual Task要求は次のように渡します。
+
+```rust,ignore
+let request = TaskCreateRequest::new(
+    "request-01",
+    TaskSource::Manual,
+    "Update parser",
+    "Support escaped delimiters",
+    vec![],
+    None,
+);
+let created = service.create_task("supervisor", &request)?;
+```
+
+応答には初期 `task_id`、revision `0`、`pending` 状態、および保存した要求snapshotが含まれます。このAPIをMCP transportから利用する配線、redacted log保存、CLIへの配線は別作業です。ArtifactInputは同じServiceで成果物treeを指定する入力として利用できます。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
+
+manual Task要求に対する応答例:
+
+```json
+{
+  "request_id": "request-01",
+  "task_id": "task-create-1",
+  "revision": 0,
+  "state": "pending",
+  "request": {
+    "source": "manual",
+    "title": "Update parser",
+    "description": "Support escaped delimiters",
+    "constraints": [],
+    "issue": null
+  }
+}
+```
 
 Service利用側は明示したbase commitで受付し、返されたIDで同期実行または後から状態取得を行います。
 

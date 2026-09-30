@@ -1,7 +1,8 @@
 use ai_dev_orchestrator::{
-    AgentProvider, AgentResult, AttemptId, OperationLedger, Orchestrator, OrchestratorError,
-    ProviderError, ProviderRef, ProviderRequest, ProviderResult, SqliteOperationLedger, Task,
-    TaskId, TaskRole, UsageCost, ValidationResult, Validator, ValidatorError, WorkspaceManager,
+    AgentProvider, AgentResult, AttemptId, AttemptState, CancellationToken, CommandValidator,
+    OperationLedger, Orchestrator, OrchestratorError, ProviderError, ProviderRef, ProviderRequest,
+    ProviderResult, SqliteExecutionLedger, SqliteOperationLedger, Task, TaskId, TaskRole,
+    UsageCost, ValidationCheck, ValidationResult, Validator, ValidatorError, WorkspaceManager,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -175,6 +176,108 @@ fn successful_attempt_records_agent_result_and_validation_once() {
         .cleanup(report.workspace())
         .expect("clean workspace");
     fs::remove_dir_all(repository).expect("remove repository");
+}
+
+#[test]
+fn orchestrator_passes_caller_cancellation_to_validator() {
+    let repository = temporary_repository();
+    let manager = WorkspaceManager::new(&repository).expect("resolve repository");
+    let provider = FakeProvider {
+        reference: ProviderRef::new("fake-provider"),
+        calls: Arc::new(Mutex::new(Vec::new())),
+        result: Ok(ProviderResult::new(
+            "provider stdout",
+            "",
+            Some(0),
+            Some(AgentResult::new("implemented", true)),
+            Some(UsageCost::default()),
+        )),
+    };
+    let validator = CommandValidator::new([ValidationCheck::new("cancelled-check", "true")]);
+    let service = Orchestrator::new(manager, provider, validator);
+    let mut task = task();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = service
+        .execute_with_cancellation(
+            &mut task,
+            AttemptId::new("attempt-cancelled-validation"),
+            Duration::from_secs(1),
+            cancellation,
+        )
+        .expect_err("cancellation must remain distinct from invalid output");
+    match error {
+        OrchestratorError::Validator { error, attempt, .. } => {
+            assert_eq!(error, ValidatorError::Cancelled);
+            assert_eq!(attempt.state(), AttemptState::Succeeded);
+            assert!(attempt.validation_results().is_empty());
+        }
+        other => panic!("expected validator cancellation, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn command_output_is_not_returned_or_persisted_in_validation_diagnostics() {
+    const SENTINEL: &str = "VALIDATOR_SENTINEL_SECRET";
+    let repository = temporary_repository();
+    let manager = WorkspaceManager::new(&repository).expect("resolve repository");
+    let provider = FakeProvider {
+        reference: ProviderRef::new("fake-provider"),
+        calls: Arc::new(Mutex::new(Vec::new())),
+        result: Ok(ProviderResult::new(
+            "provider stdout",
+            "",
+            Some(0),
+            Some(AgentResult::new("implemented", true)),
+            Some(UsageCost::default()),
+        )),
+    };
+    let validator = CommandValidator::new([ValidationCheck::new("secret-output", "sh").args([
+        "-c",
+        &format!("printf '{SENTINEL}'; printf '{SENTINEL}' >&2; exit 17"),
+    ])]);
+    let service = Orchestrator::new(manager.clone(), provider, validator);
+    let mut task = task();
+    let report = service
+        .execute(
+            &mut task,
+            AttemptId::new("attempt-secret-output"),
+            Duration::from_secs(1),
+        )
+        .expect("non-zero validation result is recorded safely");
+    let validation = report.validation_result();
+    assert!(!validation.passed());
+    assert_eq!(validation.checks()[0].exit_status(), Some(17));
+    assert_eq!(
+        validation.checks()[0].diagnostics(),
+        "process exited with a non-zero status"
+    );
+    assert!(!validation.summary().contains(SENTINEL));
+    assert!(!validation.checks()[0].diagnostics().contains(SENTINEL));
+    assert!(
+        !report.attempt().validation_results()[0].checks()[0]
+            .diagnostics()
+            .contains(SENTINEL)
+    );
+
+    let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+    ledger.save_task(&task).unwrap();
+    ledger
+        .save_attempt(task.id(), report.attempt(), None, None)
+        .unwrap();
+    let loaded = ledger
+        .get_attempt(task.id(), report.attempt().id())
+        .unwrap()
+        .unwrap();
+    let persisted = &loaded.attempt().validation_results()[0];
+    assert!(!persisted.summary().contains(SENTINEL));
+    assert!(!persisted.checks()[0].diagnostics().contains(SENTINEL));
+    manager
+        .cleanup(report.workspace())
+        .expect("cleanup workspace");
+    fs::remove_dir_all(repository).expect("cleanup repository");
 }
 
 #[test]

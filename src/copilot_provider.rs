@@ -76,6 +76,27 @@ impl CopilotProvider {
         &self.executable
     }
 
+    /// Collects current local CLI facts without treating CLI launchability as
+    /// proof of account authentication or model access.
+    #[must_use]
+    pub fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        crate::ProviderObservation::probe_cli_at(
+            self.reference.clone(),
+            &self.executable,
+            observed_at_ms,
+            &self.runner,
+        )
+    }
+
+    #[must_use]
+    pub fn observe_current(&self) -> crate::ProviderObservation {
+        crate::ProviderObservation::probe_cli(
+            self.reference.clone(),
+            &self.executable,
+            &self.runner,
+        )
+    }
+
     #[must_use]
     pub fn allowed_tools(&self) -> &[String] {
         &self.allowed_tools
@@ -101,9 +122,9 @@ impl CopilotProvider {
                     "GitHub Copilot CLI '{}' was not found or could not be started: {error}",
                     self.executable.to_string_lossy()
                 )),
-                ProcessError::Io(error) => ProviderError::Unavailable(format!(
-                    "GitHub Copilot CLI availability check failed: {error}"
-                )),
+                ProcessError::Io(error) | ProcessError::Stdin(error) => ProviderError::Unavailable(
+                    format!("GitHub Copilot CLI availability check failed: {error}"),
+                ),
                 ProcessError::NonZeroExit(_) => ProviderError::Unavailable(
                     "GitHub Copilot CLI availability check failed; process output is withheld"
                         .to_owned(),
@@ -198,7 +219,7 @@ impl CopilotProvider {
             ProcessError::Spawn(error) => ProviderError::Unavailable(format!(
                 "GitHub Copilot CLI could not be started: {error}"
             )),
-            ProcessError::Io(error) => {
+            ProcessError::Io(error) | ProcessError::Stdin(error) => {
                 ProviderError::ExecutionFailed(format!("Copilot process I/O failed: {error}"))
             }
             ProcessError::TimedOut(output) => {
@@ -264,6 +285,10 @@ impl CopilotProvider {
 impl AgentProvider for CopilotProvider {
     fn provider_ref(&self) -> &ProviderRef {
         &self.reference
+    }
+
+    fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        CopilotProvider::observe_current_at(self, observed_at_ms)
     }
 
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {

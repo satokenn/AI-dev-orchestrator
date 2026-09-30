@@ -1,6 +1,6 @@
 use ai_dev_orchestrator::*;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::{
     collections::HashMap,
     fs,
@@ -21,26 +21,35 @@ fn temp_name(prefix: &str, suffix: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn fake_gh(mode: &str) -> (PathBuf, PathBuf, PathBuf) {
-    let script = temp_name("fake-gh", ".sh");
-    // Publish the executable atomically. On macOS, spawning a path while it
-    // is still being created or chmod'd can fail with ETXTBSY ("Text file
-    // busy") when this integration test runs in parallel with other tests.
-    let script_tmp = temp_name("fake-gh", ".sh.tmp");
-    let log = temp_name("fake-gh", ".log");
-    let created = temp_name("fake-gh", ".created");
-    let body = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$2\" = list ]; then\n  if [ '{}' = existing ]; then printf '%s' '[{{\"url\":\"https://github/pr/99\"}}]'; elif [ '{}' = invalid ]; then printf '%s' '{{'; elif [ '{}' = nonzero ]; then printf '%s' 'list failed' >&2; exit 17; else printf '%s' '[]'; fi\nelse\n  touch '{}'\n  printf '%s' 'https://github/pr/new'\nfi\n",
-        log.display(),
-        mode,
-        mode,
-        mode,
-        created.display()
-    );
-    fs::write(&script_tmp, body).unwrap();
-    fs::set_permissions(&script_tmp, fs::Permissions::from_mode(0o755)).unwrap();
-    fs::rename(&script_tmp, &script).unwrap();
-    (script, log, created)
+struct FakeGh {
+    script: PathBuf,
+    log: PathBuf,
+    created: PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeGh {
+    fn new(mode: &str) -> Self {
+        let script = temp_name(&format!("fake-gh-{mode}"), ".sh");
+        let log = PathBuf::from(format!("{}.log", script.display()));
+        let created = PathBuf::from(format!("{}.created", script.display()));
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-gh.sh");
+        symlink(fixture, &script).unwrap();
+        Self {
+            script,
+            log,
+            created,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FakeGh {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.created);
+        let _ = fs::remove_file(&self.log);
+        let _ = fs::remove_file(&self.script);
+    }
 }
 
 fn payload() -> PullRequestPayload {
@@ -579,37 +588,37 @@ fn resume_requires_workspace_and_base_data() {
 #[cfg(unix)]
 #[test]
 fn gh_gateway_gets_existing_pr_without_create_and_creates_when_missing() {
-    let (existing_script, existing_log, existing_created) = fake_gh("existing");
-    let existing = GhPullRequestGateway::with_executable(&existing_script)
+    let existing = FakeGh::new("existing");
+    let existing_result = GhPullRequestGateway::with_executable(&existing.script)
         .create(&payload())
         .unwrap();
-    assert_eq!(existing, "https://github/pr/99");
-    assert!(!existing_created.exists());
+    assert_eq!(existing_result, "https://github/pr/99");
+    assert!(!existing.created.exists());
     assert!(
-        fs::read_to_string(existing_log)
+        fs::read_to_string(&existing.log)
             .unwrap()
             .contains("pr list")
     );
 
-    let (new_script, _, new_created) = fake_gh("new");
-    let created = GhPullRequestGateway::with_executable(&new_script)
+    let new = FakeGh::new("new");
+    let created = GhPullRequestGateway::with_executable(&new.script)
         .create(&payload())
         .unwrap();
     assert_eq!(created, "https://github/pr/new");
-    assert!(new_created.exists());
+    assert!(new.created.exists());
 }
 
 #[cfg(unix)]
 #[test]
 fn gh_gateway_reports_invalid_json_and_nonzero_as_typed_errors() {
-    let (invalid_script, _, _) = fake_gh("invalid");
+    let invalid = FakeGh::new("invalid");
     assert!(matches!(
-        GhPullRequestGateway::with_executable(invalid_script).create(&payload()),
+        GhPullRequestGateway::with_executable(&invalid.script).create(&payload()),
         Err(WorkflowError::PublicationCommand(_))
     ));
-    let (failed_script, _, _) = fake_gh("nonzero");
+    let failed = FakeGh::new("nonzero");
     assert!(matches!(
-        GhPullRequestGateway::with_executable(failed_script).create(&payload()),
+        GhPullRequestGateway::with_executable(&failed.script).create(&payload()),
         Err(WorkflowError::PublicationCommand(_))
     ));
 }

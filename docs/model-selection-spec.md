@@ -294,6 +294,7 @@ struct EvidenceSource {
 enum EvidenceSourceKind {
     ProviderApi,
     ProviderCli,
+    ProviderAdapter,
     ExecutionLedger,
     RepositoryConfig,
 }
@@ -645,7 +646,7 @@ Planner 結果を Task / Attempt へ適用する前に、Rust は少なくとも
 5. Provider と Model の availability がともに `available` である。
 6. Model が role の required capability をすべて持つ。
 7. Rust が所有する予算、利用枠、retry 上限、安全 policy に反しない。
-8. 実行直前に availability と `hard` constraint を再取得し、snapshot 後に変化した事実に反しない。
+8. 実行直前に availability と `hard` constraint を再取得し、snapshot 後に変化した事実に反しない。named Modelでは、Operation受付後にも信頼済みModelCatalogを照会し、Provider準備前とAttempt開始直前に対象Provider / Modelがfreshかつsupportedであることを確認する。照会不能・欠落・unknown・unsupported・staleならProviderを開始せず、Operationを失敗で終端する。
 
 1〜6は選定結果の構造と snapshot に対する検証、7〜8は現在事実に対する実行許可である。
 `ValidatedPlannerDecision` 相当の値は両方を通過して初めて Provider 実行へ渡せる。検証失敗は
@@ -687,7 +688,7 @@ Issue #59、snapshot の収集・集計は Issue #60 で実装する。
 
 1. Issue #58 で role / review を Domain と Ledger のどこへ保持するか決める。
 2. Issue #59 で `ModelChoice` と実際に使用した Model を Provider / Attempt / Ledger へ接続する。
-3. Issue #60 で source と時刻を持つ observation、usage、performance、Attempt summary を収集する。
+3. Issue #60 でsourceと時刻を持つProvider observation、requested/observed Attempt target、およびLedgerに保存済みのProvider報告Usage metricをread-only `task.get_context` v2へ接続する。取得不能な値はunknownのまま渡す。このUsage pageはAPI usage / budget snapshotや過去実績の集計を行わず、Attempt / Provider / Modelの履歴実績を選定に使うsummaryはIssue #67で扱う。
 4. Issue #61 で既存 `PlannerRequest` / `PlannerDecision` をこの入力／出力へ拡張し、Rust 側検証を実装する。
 
 各 Issue はこの仕様の field を Provider 固有形式へ置き換えず、取得不能な field は `unknown` として

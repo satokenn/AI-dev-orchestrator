@@ -11,9 +11,9 @@ use crate::{
     CopilotProvider, ExecutionPolicy, GhIssueSource, GhPullRequestGateway, GhRepositoryEffects,
     GitHubWorkflow, IssueExecutor, IssueRef, IssueSnapshot, IssueSource, Orchestrator,
     PlannerRequest, PlannerService, ProviderAvailability, ProviderRef, ProviderRegistry,
-    ProviderResolver, PublicationRecord, PublishResult, RustValidator, SqliteExecutionLedger,
+    ProviderResolver, PublicationRecord, PublishResult, SqliteExecutionLedger,
     SqliteOperationLedger, Task, TaskId, TaskRole, ValidationResult, WorkflowError,
-    WorkspaceManager, prepare_issue_publication,
+    WorkspaceManager, load_repository_config, prepare_issue_publication,
 };
 
 pub const SUCCESS: i32 = 0;
@@ -123,6 +123,13 @@ impl IssueExecutor for ProductionIssueExecutor {
         task: &mut Task,
         _issue: &IssueSnapshot,
     ) -> Result<crate::OrchestrationReport, WorkflowError> {
+        // Pin the validation policy before planning or invoking any provider. The same loaded
+        // snapshot is used later even if the generated workspace changes its config file.
+        let validation_config = load_repository_config(&self.root)
+            .map_err(|error| WorkflowError::Validation(error.to_string()))?;
+        let validator = validation_config
+            .validator()
+            .map_err(|error| WorkflowError::Validation(error.to_string()))?;
         let mut registry = ProviderRegistry::new();
         registry.register(CodexProvider::new());
         registry.register(CopilotProvider::new());
@@ -151,7 +158,7 @@ impl IssueExecutor for ProductionIssueExecutor {
             .map_err(|e| WorkflowError::Validation(e.to_string()))?;
         let manager = WorkspaceManager::new(&self.root)
             .map_err(|e| WorkflowError::Repository(e.to_string()))?;
-        let orchestrator = Orchestrator::new(manager, registry, RustValidator::new())
+        let orchestrator = Orchestrator::new(manager, registry, validator)
             .with_operation_ledger(self.operation_ledger.clone());
         let report = orchestrator
             .execute_validated_decision_with_policy(

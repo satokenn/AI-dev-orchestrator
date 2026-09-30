@@ -88,9 +88,13 @@ reviewerが修正を求めても、reviewの呼び出し自体が正常ならrev
 
 ## 成果物に結び付ける事実
 
-`ValidationResult`はAttemptの状態ではない。対象Artifact、check定義、各checkの終了結果、診断、実行時刻を持つ。passは監督Codexの受入やTask完了を自動発生させず、failはAttemptを失敗へ書き換えない。成果物が変われば、古いValidationを新しい成果物のpublish gateに使えない。
+`ValidationResult`はAttemptの状態ではない。対象Artifact、check定義、各checkの終了結果、固定診断、実行時刻を持つ。組み込みCommandValidatorはstdout/stderr本文をValidationResultへ返さず、check名・exit status・固定診断だけを保持する。Repository設定から作ったValidatorの結果は、設定IDと設定本文のSHA-256 versionも記録する。passは監督Codexの受入やTask完了を自動発生させず、failはAttemptを失敗へ書き換えない。成果物が変われば、古いValidationを新しい成果物のpublish gateに使えない。
+
+ValidatorのcancelはValidation failureや`invalid_output`ではない。Providerがすでに正常終了している場合、OrchestratorはAttemptを`Succeeded`として記録し、ValidationResultを追加せず、cancelをOrchestrator errorとoperation状態に表す。Artifact ServiceのValidation APIは`ValidationCancelled`を返し、Validation recordを作らない。停止を確認できない場合は結果を推測せず、Orchestratorはoperationを`recovery_required`として記録し、Artifact Serviceはvalidation worktreeを保持する。
 
 reviewはreviewer roleの通常のAttemptとして実行し、正常なreviewer Attemptは対象ArtifactへのReviewVerdictを1件持てる。`approved` はreviewerの見解であり、`changes_requested` はreview処理の失敗ではない。
+
+ReviewVerdictの保存直前に、reviewer Attemptの開始時点で記録したTask revisionと現在revisionを照合する。Provider呼出し後でも、review中に別の操作がTask revisionを進めていれば、そのverdictは保存せず、診断code `stale_task_revision` でreviewer AttemptとOperationを`failed`終端にする。Artifactやworkspaceの既存整合性gateも別に維持する。
 
 監督Codexは差分、Validation、review、CI等を評価し、対象Artifactに次のCodexDecisionを残す。
 
@@ -120,13 +124,34 @@ Codex自身が編集した場合はAttemptを作らない。管理済みArtifact
 
 監督Codexは目的の解釈、Provider / Model選択、実行・review・再試行の要否、成果物の採否、Task完了を判断する。Operation ServiceはTask ID、expected revision、request ID、workspace / Artifactの所属を検証し、操作受付・各事実・公開/CI参照を永続化する。Provider / Model、Validator、GitHub adapterを実行し、stale revision、busy、未知Provider / Model、policy違反、異なるArtifactへの証拠流用を外部副作用前に拒否する。永続LedgerではServiceがベースLedgerとOperation sidecarのcanonical identityに結び付いたプロセス排他ロックを保持し、同じLedgerへの別プロセス実行を拒否する。Service構築時はそのロックを得た後、残存する実行中Operationを `recovery_required` にしてからServiceを返す。復旧をProvider実行中に再呼出しする公開操作は設けない。in-memory LedgerはService構築時の自動復旧を行わない。これが #66 のOperation Service契約である。
 
+named Modelは、Service構築時にtrusted composition rootが明示注入するread-only `ModelCatalog` が、対象Provider / Modelを `Supported` とし、sourceと観測時刻がありfreshness内の場合だけ受付ける。catalog未設定、lookup error、欠落、unknown / unsupported、未来時刻、古い記録、source欠落はTask / Attempt / Operation記録やProvider起動より前にfail closedする。受付後もOperation実行時にcatalogを再照会し、まずOperation claimやProvider準備処理より前に確認し、続いてworkspace準備後・Attempt開始直前にもう一度確認する。実行前の照会で失敗した要求はOperationを`failed`で終端し、Providerを開始していないことを示すためAttemptは`queued`のままにする。同じrequest IDの再送はこの終端結果を返し、再実行しない。現在この最終照会まで進めるのは`BaseInput`です。`BaseInput`の最終照会に失敗した場合、Providerを起動せず、workspaceのclean-only cleanupを試みます。cleanupに成功するとworkspace locatorを消し、失敗するとworkspaceを保持して`model_catalog_unavailable_workspace_retained`を記録します。`ArtifactInput`は現行Serviceが受付前に拒否するため、workspace準備後の照会と以下の保持動作には到達しません。将来`ArtifactInput`のService接続を実装する場合は、展開済みの保存成果物を失わないようworkspaceを保持してlocatorをLedgerに残す方針です。catalog lookupは外部CLIやnetworkを起動しない。ProviderDefaultはcatalogを使わない。ModelCatalogはpoint-in-time照会であり、照会後のcatalog変更をロックするleaseは提供しない。Provider-specific catalog adapter / data sourceは後続Issue #60 / #91の対象であり、既存の候補一覧を実行権限として扱わない。ProviderResultで実Modelを観測できない場合は、requested Modelから推定せずunknownのまま保持する。
+
 Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`か、同じTaskに属する既存`ArtifactInput { artifact_id }`のどちらかを受け取る。後者は保存tree/ref/baseをProvider起動前に照合し、検証済みbaseから新しい管理worktreeを作ってtreeを展開する。Provider停止後のArtifact snapshotはtracked変更とignoredでない新規ファイルを含み、ignoredファイルは意図的に除外する。Provider実行中にignoredファイルが作られた場合、Serviceはそれを黙って落として成功Artifactを作ることはせず、Operationを`recovery_required`にし、調査用workspaceを保持する。Task、Attempt、Operation、Artifactと入出力relationは同じSQLite Ledgerに保存する。Git refの作成はDB transactionと一括で原子化できないため、Artifact rowを`pending_ref`で先に記録する。プロセス再起動時はService構築中にLedger lockを保持したままpending ArtifactのGit tree/refを照合し、treeが存在してrefが未作成ならrefを再作成して利用可能にする。tree欠落やref不一致は`recovery_required`として使用を拒否する。この接続だけではValidation、review、CodexDecision、publicationの公開ゲートまでは実装されない。
+
+<a id="named-model-workspace-cleanup"></a>
+
+### named Modelの実行前再確認後に残るworkspace
+
+workspace準備後・Attempt開始直前のCatalog再確認に失敗したOperationはProviderを起動せず、`failed`で終端する。現行Serviceでこの段階に到達するのは`BaseInput`であり、通常のnon-force cleanupを試みる。cleanupに成功したときはworkspace locatorを消し、失敗したときはworkspaceを保持して`model_catalog_unavailable_workspace_retained`を記録する。現行Serviceに残存workspaceを自動削除する処理やcleanup APIはない。`ArtifactInput`は現在受付前に拒否されるため、この失敗経路には到達しない。将来Serviceが`ArtifactInput`を受け付ける場合は、展開した保存済み内容を保護するためworkspaceを自動削除せず、locatorを残す方針である。
+
+現在、named Modelの最終Catalog再確認に失敗してlocatorが残り得るのは、BaseInput workspaceのcleanupに失敗した場合である。運用者が手動整理するには`OperationService::get_operation`のsnapshotから`workspace_path()`と`workspace_branch()`を記録する。pathがある場合は、`git -C <workspace-path> rev-parse --path-format=absolute --git-common-dir`で共有Git directoryを確認し、その親directoryを元repository rootとして次を行う。
+
+1. `git -C <repository-root> worktree list --porcelain`で対象pathとbranchが記録値に一致することを確認する。
+2. workspace内の変更、未追跡file、ignored fileとその内容を確認する。例えば`git -C <workspace-path> status --short --ignored=matching`を使う。状態がdirty、unknown、または内容を安全に確認できない場合は削除せず、必要な内容を退避して調査する。
+3. cleanでignored内容も存在しないと確認できた場合だけ、`git -C <repository-root> worktree remove <workspace-path>`を実行する。`--force`は使わない。削除に失敗した場合はworkspaceを保持する。
+4. Worktree削除後もbranchは自動削除されない。branch名はOperation snapshotの`workspace_branch()`で確認でき、`git -C <repository-root> branch --list <workspace-branch>`で存在を照合できる。branch自体の削除は、内容と他の参照を別途確認した後に運用者が判断する。
+
+worktree managerの`cleanup`はdirty workspaceを保持するnon-force操作である。この手動手順は、BaseInputのcleanupが失敗した場合に適用する。
 
 ### 同一Artifact証拠ゲートのMVP
 
 `validate_artifact`はArtifactを新しい管理worktreeへ展開し、検査の前後でGit treeが変わっていないことを確認してValidationの成功状態をArtifact ID・tree OIDへ結び付ける。検査後も保存済みArtifactとGit treeが完全一致し、Artifactに含まれないignoredファイルがなく、submoduleが含まれない場合は、validation専用Attempt ID、Task / Attemptから導いたworktree path / branch、manager ownershipを照合した後、その一時worktreeを強制削除する。Artifact treeとの照合、ignored-file / submodule走査、所属確認、削除のいずれかに失敗した場合はworktree path付きでエラーを返し、Validation成功recordを作らない。treeが変わった場合、ignoredファイルがある場合、submoduleがある場合はValidationを記録せず、worktreeを管理下に残す。組み込みの`CommandValidator`は`ProcessRunner`で管理プロセス群の終了を待つ。独自`Validator`を注入する呼出側は、戻る前にworktreeを書き換え得る子プロセスを終了させる必要がある。Serviceは最終tree照合からworktree削除までの間に、独立した外部プロセスが同じpathを書き換える競合を完全には排除しない。validation summary、check名、diagnostic本文にはsecretが含まれる可能性があるため、redaction設定がないMVPではLedgerに保存しない。`record_artifact_decision`は監督Codexの判断を別recordとして保存し、機械検証から採否を自動生成しない。現在のMVPで判断に添付できる`EvidenceRef`は同一Task・Artifactに属するValidationだけで、review・publication・CI証拠は未対応のため拒否する。
 
-`require_artifact_publication_evidence`は、指定IDのpassed Validationとaccepted CodexDecisionが同じTask、Artifact、tree OIDを指す場合だけ`ArtifactPublicationPermit`を返す。permitにはArtifact ID、tree OID、base commit、両証拠IDが含まれる。MVPではこのpermitをcommit / push / Pull Request作成へ接続していない。MCP tool、configured secret scan、公開用tree/SHA記録も未実装なので、permitだけでは公開を許可しない。
+`require_artifact_publication_evidence`は、指定IDのpassed Validationと、同じTask・Artifactの最新CodexDecisionであるaccepted判断が、同じtree OIDを指す場合だけ`ArtifactPublicationPermit`を返す。後続のrejectedまたはchanges_requested判断があれば、以前のaccepted判断は公開根拠として使えない。permitにはArtifact ID、tree OID、base commit、両証拠IDが含まれる。Publication MVPでは、Rust `OperationService` に呼び出し側が明示注入した`SecretScanner`とpublication gatewayがなければ公開を拒否する。両者が設定されている場合も、Artifactのtree全体とPR title/body等のpayloadを外部効果前に走査し、検出・失敗・利用不能は`policy_denied`となる。
+
+公開操作はProvider Attemptを偽装せず、専用の受付・phase・結果Ledgerへ保存する。作成commitは設定済みGit実行ファイルの`cat-file commit`が返すraw object headerでtreeとsole parentを確認し、replacement refsを無効にする。呼び出し側は`publish_artifact`で受付を行い、返されたoperationと同じrequest/payloadで`run_artifact_publication`を起動し、`get_artifact_publication_operation`で結果を読む。LedgerにはArtifact tree、validation/decision ID、作成commit SHA、Draft PR番号・URL・状態を保存し、title/body等のraw payloadは保存しない。冪等照合には長さ付きfield列から計算したSHA-256 digestを使う。Artifact treeと完全なpublication payloadは受付前と外部効果直前の両方でscanする。後段で検出・失敗した場合は副作用前に`failed`で閉じる。GitHub CLIにはtitle/bodyをargvや一時ファイルに渡さず、ProcessRunnerが提供するstdin bytesで`gh api --input -`へ直接渡す。公開repositoryはGit `origin` fetch URLから決定する。push前に`git remote get-url --push --all origin`で全ての有効なpush destinationを取得し、各URLが同じhost/owner/repoを指すことを検証する。URLはHTTPSまたはSSH形式（SCP-like SSHを含む）に限り、HTTPとGit protocol URLは拒否する。不一致または解釈不能ならpushを拒否する。PR一覧は`gh pr list --repo`で絞り、作成APIには正規化したowner/repoを含むliteral endpointと明示hostを使う。継承された`GH_REPO`と`GH_HOST`はCLI起動前に除去し、環境設定による別repositoryへのPR作成を防ぐ。stdinは`write_all`相当で全byteを送り、stdout/stderr captureへ混ぜない。Unix系では非blocking socketをProcessRunnerの監視loopから書き込むため、timeout/cancel時にwriter threadやpayloadを残さずsenderを閉じる。入力を送り切る前に子が終了してreaderが残った場合はprocess groupを停止し、固定diagnostic付き`Interrupted`を返す。
+
+このMVPはMCP/CLIの`publication.publish`・`operation.get`にはまだ接続されておらず、Rust Serviceに専用の`publish_artifact` / `get_artifact_publication_operation` APIを提供する段階である。既存の`operation.get`はProvider Attempt操作用のまま。公開用cancel APIは未接続である。起動時に未claimの`accepted` publicationは外部効果が始まっていないため`failed`（`interrupted_before_start`）へ移し、実行claim後の`running` publicationは外部効果の有無を断定できないため`recovery_required`へ移す。どちらも外部操作を再実行しない。SQLite schema v13はPublication専用Ledger tableを追加し、v14ではTask要求snapshotとcaller単位の冪等記録を追加する。schema v11ではArtifactとAttempt historyの分岐を統合し、v12でArtifact Validation / CodexDecision tablesを追加する。v15/v16はValidationResultにRepository設定IDとSHA-256 versionを保存する列を追加し、schema v12 Ledgerからv16へのmigrationも既存recordを保持する。したがって、MCP wire契約全体を実装済みとは扱わない。
 
 ## 旧データとの互換性
 
