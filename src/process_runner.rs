@@ -581,6 +581,56 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn run_git_with_stdin_clears_inherited_repository_environment() {
+        let directory = std::env::temp_dir().join(format!(
+            "process-runner-git-stdin-env-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let mut init = Command::new("git");
+        clear_git_location_environment(&mut init);
+        assert!(
+            init.args(["init", "-q"])
+                .current_dir(&directory)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let input = b"100644 blob 0000000000000000000000000000000000000000\tstdin.txt\n";
+        let request = || {
+            ProcessRequest::new("git")
+                .args(["mktree", "--missing"])
+                .cwd(directory.clone())
+        };
+        let expected = ProcessRunner
+            .run_git_with_stdin(request(), input)
+            .expect("Git receives stdin using the requested repository");
+
+        let invalid = directory.join("missing-git-location").into_os_string();
+        let actual = ProcessRunner
+            .run_git_with_stdin(
+                request()
+                    .test_inherited_env("GIT_DIR", invalid.clone())
+                    .test_inherited_env("GIT_WORK_TREE", invalid.clone())
+                    .test_inherited_env("GIT_COMMON_DIR", invalid.clone())
+                    .test_inherited_env("GIT_OBJECT_DIRECTORY", invalid.clone())
+                    .test_inherited_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", invalid.clone())
+                    .test_inherited_env("GIT_INDEX_FILE", invalid),
+                input,
+            )
+            .expect("run_git_with_stdin clears inherited Git location overrides");
+
+        assert_eq!(actual.stdout, expected.stdout);
+        assert_eq!(actual.status.success(), expected.status.success());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn writes_bounded_stdin_and_closes_it_before_waiting() {
