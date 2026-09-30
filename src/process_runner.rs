@@ -581,6 +581,7 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn writes_bounded_stdin_and_closes_it_before_waiting() {
         let output = ProcessRunner
