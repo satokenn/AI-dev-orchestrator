@@ -21,14 +21,29 @@ fn temp_name(prefix: &str, suffix: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
+fn temp_dir(prefix: &str) -> PathBuf {
+    loop {
+        let path = temp_name(prefix, "");
+        match fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create temporary test directory: {error}"),
+        }
+    }
+}
+
+#[cfg(unix)]
 fn fake_gh(mode: &str) -> (PathBuf, PathBuf, PathBuf) {
-    let script = temp_name("fake-gh", ".sh");
+    // Keep each fixture in a newly created directory so stale files from a
+    // reused process ID cannot be mistaken for this test's executable.
+    let directory = temp_dir("fake-gh");
+    let script = directory.join("gh.sh");
     // Publish the executable atomically. On macOS, spawning a path while it
     // is still being created or chmod'd can fail with ETXTBSY ("Text file
     // busy") when this integration test runs in parallel with other tests.
-    let script_tmp = temp_name("fake-gh", ".sh.tmp");
-    let log = temp_name("fake-gh", ".log");
-    let created = temp_name("fake-gh", ".created");
+    let script_tmp = directory.join("gh.sh.tmp");
+    let log = directory.join("gh.log");
+    let created = directory.join("gh.created");
     let body = format!(
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$2\" = list ]; then\n  if [ '{}' = existing ]; then printf '%s' '[{{\"url\":\"https://github/pr/99\"}}]'; elif [ '{}' = invalid ]; then printf '%s' '{{'; elif [ '{}' = nonzero ]; then printf '%s' 'list failed' >&2; exit 17; else printf '%s' '[]'; fi\nelse\n  touch '{}'\n  printf '%s' 'https://github/pr/new'\nfi\n",
         log.display(),

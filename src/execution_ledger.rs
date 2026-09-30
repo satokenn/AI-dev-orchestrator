@@ -154,7 +154,7 @@ type PublicationTaskRow = (
 
 // Version 10 was independently used by the parent Attempt-history migration and
 // the Artifact migration. Version 11 reconciles both layouts and is idempotent.
-const LATEST_SCHEMA_VERSION: u32 = 15;
+const LATEST_SCHEMA_VERSION: u32 = 16;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -314,6 +314,7 @@ impl SqliteExecutionLedger {
         create_artifact_publication_schema(&transaction)?;
         create_task_creation_schema(&transaction)?;
         create_ci_observation_schema(&transaction)?;
+        create_publication_identity_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -1104,11 +1105,29 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
             13 => create_artifact_publication_schema(connection)?,
             14 => create_task_creation_schema(connection)?,
             15 => create_ci_observation_schema(connection)?,
+            16 => create_publication_identity_schema(connection)?,
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
     }
     Ok(())
+}
+
+fn create_publication_identity_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_publication_ids (
+             publication_id TEXT PRIMARY KEY NOT NULL,
+             operation_id TEXT NOT NULL UNIQUE
+                 REFERENCES service_artifact_publication_operations(id) ON DELETE CASCADE
+         );
+         INSERT INTO service_publication_ids(publication_id, operation_id)
+             SELECT 'legacy-publication-v1-' || publication.id, publication.id
+             FROM service_artifact_publication_operations publication
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM service_publication_ids identity
+                 WHERE identity.operation_id=publication.id
+             );",
+    )
 }
 
 fn backfill_legacy_attempt_history(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -1891,7 +1910,7 @@ mod tests {
         let version: u32 = migrated
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         let has_publication_table: bool = migrated
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifact_publication_operations')",
@@ -2038,7 +2057,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         let ci_table_after_migration: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_observations')",
@@ -2050,14 +2069,96 @@ mod tests {
     }
 
     #[test]
+    fn schema_v16_migration_assigns_a_stable_distinct_id_to_existing_publications() {
+        let path = std::env::temp_dir().join(format!(
+            "ai-dev-orchestrator-publication-id-migration-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let connection = Connection::open(&path).unwrap();
+            create_latest_schema(&connection).unwrap();
+            create_service_schema(&connection).unwrap();
+            create_artifact_service_schema(&connection).unwrap();
+            create_artifact_evidence_schema(&connection).unwrap();
+            create_artifact_publication_schema(&connection).unwrap();
+            create_task_creation_schema(&connection).unwrap();
+            create_ci_observation_schema(&connection).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO tasks(id,description,role,state) VALUES ('legacy-task','existing','developer','active')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO service_artifact_publication_operations(
+                        id,request_id,task_id,request_digest,artifact_id,tree_oid,base_commit,
+                        validation_id,decision_id,base_branch,head_branch,status,phase,
+                        accepted_revision,revision,accepted_at)
+                     VALUES ('service-publication-legacy','legacy-request','legacy-task','digest',
+                        'artifact','tree','base','validation','decision','main','feature',
+                        'failed','failed',0,1,123)",
+                    [],
+                )
+                .unwrap();
+            set_schema_version(&connection, 15).unwrap();
+        }
+
+        let publication_id = {
+            let ledger = SqliteExecutionLedger::open(&path).unwrap();
+            let connection = ledger.lock_connection().unwrap();
+            let version: u32 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 16);
+            let retained: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM service_artifact_publication_operations
+                     WHERE id='service-publication-legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, 1);
+            let id: String = connection
+                .query_row(
+                    "SELECT publication_id FROM service_publication_ids
+                     WHERE operation_id='service-publication-legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(id, "legacy-publication-v1-service-publication-legacy");
+            assert_ne!(id, "service-publication-legacy");
+            id
+        };
+
+        let reopened = SqliteExecutionLedger::open(&path).unwrap();
+        let connection = reopened.lock_connection().unwrap();
+        let after_reopen: String = connection
+            .query_row(
+                "SELECT publication_id FROM service_publication_ids
+                 WHERE operation_id='service-publication-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_reopen, publication_id);
+        drop(connection);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 16;")
+            .execute_batch("PRAGMA user_version = 17;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(16))
+            Err(LedgerError::UnsupportedSchemaVersion(17))
         ));
     }
 
@@ -2103,7 +2204,7 @@ mod tests {
             let version: u32 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 15);
+            assert_eq!(version, 16);
             let history: (String, i64, Option<String>) = connection.query_row(
                 "SELECT relation_kind, sequence, role FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
                 [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -2159,7 +2260,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         let history: (Option<String>, String) = connection
             .query_row(
                 "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
