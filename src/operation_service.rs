@@ -6356,6 +6356,9 @@ mod tests {
             )
             .unwrap();
         let revision = task_revision(&ledger, &task_id);
+        // The fixture models a completed prior process. Release its exclusive
+        // run lock before the caller constructs a fresh Service over this Ledger.
+        drop(service);
         ArtifactPublicationFixture {
             repo,
             ledger,
@@ -8510,6 +8513,9 @@ mod tests {
     #[test]
     fn startup_recovery_marks_a_claimed_publication_as_recovery_required() {
         let fixture = artifact_publication_fixture_with_persistent_ledger(true);
+        let lock_probe =
+            crate::LedgerRunLock::acquire(fixture.ledger.ledger_path().unwrap()).unwrap();
+        drop(lock_probe);
         let events = Arc::new(Mutex::new(Vec::new()));
         let scanner = FakeSecretScanner {
             artifact_result: Ok(SecretScanResult::Clean),
