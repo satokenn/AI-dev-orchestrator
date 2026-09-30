@@ -1624,6 +1624,18 @@ mod tests {
         );
         history_fixture_attempt(
             &ledger,
+            "legacy-failed",
+            "failed",
+            Some(400),
+            Some("named"),
+            Some("requested-a"),
+            None,
+            None,
+            "legacy_validation_coupled",
+            &[(0, 0)],
+        );
+        history_fixture_attempt(
+            &ledger,
             "untimed",
             "failed",
             None,
@@ -1685,7 +1697,7 @@ mod tests {
         let legacy = ledger
             .query_historical_performance(PerformanceWindow::new(400, 401).unwrap())
             .unwrap();
-        assert_eq!(legacy.window_attempts(), 1);
+        assert_eq!(legacy.window_attempts(), 2);
         let legacy_entry = &legacy.entries()[0];
         assert_eq!(legacy_entry.provider_call_succeeded(), None);
         assert_eq!(legacy_entry.provider_call_failed(), None);
@@ -1697,8 +1709,9 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("legacy Attempt terminal states"))
         );
-        assert_eq!(legacy_entry.validation_observations(), Some(1));
+        assert_eq!(legacy_entry.validation_observations(), Some(2));
         assert_eq!(legacy_entry.validation_passed(), Some(1));
+        assert_eq!(legacy_entry.validation_failed(), Some(1));
     }
 
     #[test]
