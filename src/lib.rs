@@ -47,8 +47,9 @@ pub use operation_ledger::{
     SqliteExecutionLedger as SqliteOperationLedger, UsageRecord, ValidationRecord,
 };
 pub use operation_service::{
-    ArtifactInput, AttemptInput, AttemptRunRequest, BaseInput, OperationAcceptance,
-    OperationService, OperationSnapshot, ServiceError, ServiceOperationStatus,
+    ArtifactInput, AttemptInput, AttemptRunRequest, BaseInput, EvidenceKind, EvidenceRef,
+    OperationAcceptance, OperationService, OperationSnapshot, ServiceError, ServiceOperationStatus,
+    TaskFinishRequest, TaskFinishResult,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,

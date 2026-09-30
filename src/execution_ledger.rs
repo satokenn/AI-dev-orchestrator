@@ -138,7 +138,7 @@ type PublicationTaskRow = (
 
 // Version 10 was independently used by the parent Attempt-history migration and
 // the Artifact migration. Version 11 reconciles both layouts and is idempotent.
-const LATEST_SCHEMA_VERSION: u32 = 12;
+const LATEST_SCHEMA_VERSION: u32 = 13;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -295,6 +295,7 @@ impl SqliteExecutionLedger {
         create_service_schema(&transaction)?;
         create_artifact_service_schema(&transaction)?;
         create_artifact_evidence_schema(&transaction)?;
+        create_task_finish_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -950,6 +951,7 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
                 backfill_legacy_attempt_history(connection)?;
             }
             12 => create_artifact_evidence_schema(connection)?,
+            13 => create_task_finish_schema(connection)?,
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
@@ -1024,6 +1026,25 @@ fn create_artifact_evidence_schema(connection: &Connection) -> Result<(), rusqli
          CREATE INDEX IF NOT EXISTS artifact_decisions_by_artifact
              ON artifact_codex_decisions(task_id, artifact_id, decision);
         ",
+    )
+}
+
+fn create_task_finish_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_finishes (
+             caller TEXT NOT NULL,
+             tool_name TEXT NOT NULL CHECK(tool_name='task.finish'),
+             request_id TEXT NOT NULL,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             expected_revision INTEGER NOT NULL,
+             artifact_id TEXT NOT NULL,
+             decision_id TEXT NOT NULL,
+             evidence_json TEXT NOT NULL,
+             revision INTEGER NOT NULL,
+             created_at INTEGER NOT NULL,
+             PRIMARY KEY(caller,tool_name,request_id)
+         );
+         CREATE INDEX IF NOT EXISTS task_finishes_by_task ON task_finishes(task_id, revision);",
     )
 }
 
@@ -1551,6 +1572,8 @@ mod tests {
         assert!(artifact_validation_table);
         let artifact_decision_table: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_codex_decisions')", [], |row| row.get(0)).unwrap();
         assert!(artifact_decision_table);
+        let task_finish_table: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_finishes')", [], |row| row.get(0)).unwrap();
+        assert!(task_finish_table);
         type MigratedAttemptRow = (String, i64, Option<String>, String, Option<String>);
         let migrated: Vec<MigratedAttemptRow> = {
             let mut statement = connection.prepare(
@@ -1615,11 +1638,11 @@ mod tests {
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 13;")
+            .execute_batch("PRAGMA user_version = 14;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(13))
+            Err(LedgerError::UnsupportedSchemaVersion(14))
         ));
     }
 
@@ -1665,7 +1688,7 @@ mod tests {
             let version: u32 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 12);
+            assert_eq!(version, LATEST_SCHEMA_VERSION);
             let history: (String, i64, Option<String>) = connection.query_row(
                 "SELECT relation_kind, sequence, role FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
                 [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1721,7 +1744,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         let history: (Option<String>, String) = connection
             .query_row(
                 "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
