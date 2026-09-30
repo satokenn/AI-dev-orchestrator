@@ -127,10 +127,13 @@ fn reports_authentication_failure_as_unavailable() {
         Duration::from_secs(10),
     ));
 
-    assert!(matches!(
-        result,
-        Err(ProviderError::Unavailable(message)) if message.contains("authentication required")
-    ));
+    assert!(
+        matches!(
+            &result,
+            Err(ProviderError::Unavailable(message)) if message.contains("authentication required")
+        ),
+        "unexpected result: {result:?}"
+    );
 }
 
 #[test]
