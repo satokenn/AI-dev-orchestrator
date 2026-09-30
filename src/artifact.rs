@@ -1029,7 +1029,7 @@ impl<'a> ArtifactManager<'a> {
         if !is_oid(&record.tree_oid) {
             return Err(ArtifactError::Invalid("invalid Git tree object ID".into()));
         }
-        let output = match self.runner.run(
+        let output = match self.runner.run_git(
             ProcessRequest::new(self.git_executable.clone())
                 .args(["cat-file", "-t", &record.tree_oid])
                 .cwd(&record.repository_root),
@@ -1098,7 +1098,7 @@ impl<'a> ArtifactManager<'a> {
             request = request.env(*key, value.clone());
         }
         self.runner
-            .run(request)
+            .run_git(request)
             .map_err(|e| ArtifactError::Git(process_error(e)))
     }
 }
