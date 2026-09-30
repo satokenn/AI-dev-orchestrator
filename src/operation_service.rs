@@ -4,10 +4,7 @@
 //! It does not select a target or expose Provider output and raw diagnostics.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -1918,7 +1915,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             }
         };
         if !valid_git_oid(&commit_sha)
-            || !commit_matches_tree_and_base(
+            || !gateway.verify_commit_tree_and_base(
                 artifact.repository_root(),
                 &commit_sha,
                 permit.tree_oid(),
@@ -2523,35 +2520,6 @@ fn valid_git_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn commit_matches_tree_and_base(
-    repository: &Path,
-    commit_sha: &str,
-    expected_tree: &str,
-    expected_base: &str,
-    timeout: Duration,
-) -> bool {
-    if !valid_git_oid(commit_sha) {
-        return false;
-    }
-    let output = match crate::process_runner::ProcessRunner.run_git(
-        crate::process_runner::ProcessRequest::new("git")
-            .arg("-C")
-            .arg(repository.as_os_str().to_owned())
-            .args(["show", "--no-patch", "--format=%T%n%P", commit_sha])
-            .timeout(timeout),
-    ) {
-        Ok(output) if !output.output_truncated => output,
-        _ => return false,
-    };
-    let Ok(text) = String::from_utf8(output.stdout) else {
-        return false;
-    };
-    let mut lines = text.lines();
-    lines.next() == Some(expected_tree)
-        && lines.next() == Some(expected_base)
-        && lines.next().is_none()
-}
-
 fn parse_attempt_state(value: &str) -> Result<AttemptState, ServiceError> {
     match value {
         "queued" => Ok(AttemptState::Queued),
@@ -2576,6 +2544,7 @@ fn now_ms() -> i64 {
 mod tests {
     use std::{
         fs,
+        path::Path,
         process::{Child, Command},
         sync::{
             Arc, Barrier, Condvar, Mutex,
@@ -2881,6 +2850,28 @@ mod tests {
                 &self.repository,
                 &["commit-tree", tree_oid, "-p", base_commit, "-m", message],
             ))
+        }
+
+        fn verify_commit_tree_and_base(
+            &self,
+            _repository: &Path,
+            commit_sha: &str,
+            tree_oid: &str,
+            base_commit: &str,
+            _timeout: Duration,
+        ) -> bool {
+            git(&self.repository, &["cat-file", "commit", commit_sha])
+                .split_once("\n\n")
+                .is_some_and(|(headers, _)| {
+                    let mut lines = headers.lines();
+                    lines.next() == Some(&format!("tree {tree_oid}"))
+                        && lines.next() == Some(&format!("parent {base_commit}"))
+                        && lines.next().is_some_and(|line| {
+                            line.starts_with("author ")
+                                || line.starts_with("committer ")
+                                || line.starts_with("encoding ")
+                        })
+                })
         }
 
         fn push_commit(

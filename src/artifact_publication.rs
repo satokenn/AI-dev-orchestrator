@@ -169,6 +169,19 @@ pub trait ArtifactPublicationGateway: Send + Sync {
         timeout: Duration,
     ) -> Result<String, PublicationGatewayError>;
 
+    /// Verifies a commit's raw tree and sole parent headers using the same Git executable
+    /// that created it. Implementations that cannot provide this check fail closed.
+    fn verify_commit_tree_and_base(
+        &self,
+        _repository: &Path,
+        _commit_sha: &str,
+        _tree_oid: &str,
+        _base_commit: &str,
+        _timeout: Duration,
+    ) -> bool {
+        false
+    }
+
     fn push_commit(
         &self,
         repository: &Path,
@@ -326,6 +339,50 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
         )
     }
 
+    fn verify_commit_tree_and_base(
+        &self,
+        repository: &Path,
+        commit_sha: &str,
+        tree_oid: &str,
+        base_commit: &str,
+        timeout: Duration,
+    ) -> bool {
+        if !valid_git_oid(commit_sha) {
+            return false;
+        }
+        let mut request = ProcessRequest::new(self.git_executable.clone())
+            .arg("-C")
+            .arg(repository.as_os_str().to_owned())
+            .args(["cat-file", "commit", commit_sha])
+            .timeout(timeout);
+        request.env.push((
+            std::ffi::OsString::from("GIT_NO_REPLACE_OBJECTS"),
+            std::ffi::OsString::from("1"),
+        ));
+        let output = match ProcessRunner.run_git(request) {
+            Ok(output) if !output.output_truncated => output,
+            _ => return false,
+        };
+        let Ok(text) = String::from_utf8(output.stdout) else {
+            return false;
+        };
+        let Some(headers) = text.split_once("\n\n").map(|(headers, _)| headers) else {
+            return false;
+        };
+        let mut tree = None;
+        let mut parents = Vec::new();
+        for line in headers.lines() {
+            if let Some(value) = line.strip_prefix("tree ") {
+                if tree.replace(value).is_some() {
+                    return false;
+                }
+            } else if let Some(value) = line.strip_prefix("parent ") {
+                parents.push(value);
+            }
+        }
+        tree == Some(tree_oid) && parents.as_slice() == [base_commit]
+    }
+
     fn push_commit(
         &self,
         repository: &Path,
@@ -456,6 +513,10 @@ fn map_process_error(error: crate::process_runner::ProcessError) -> PublicationG
     }
 }
 
+fn valid_git_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct GitHubRemoteRepository {
     hostname: String,
@@ -466,7 +527,7 @@ struct GitHubRemoteRepository {
 fn github_repository_from_remote_url(remote: &str) -> Option<GitHubRemoteRepository> {
     let remote = remote.trim();
     let (host, path) = if let Some((scheme, remainder)) = remote.split_once("://") {
-        if !matches!(scheme, "https" | "http" | "ssh" | "git") {
+        if !matches!(scheme, "https" | "ssh") {
             return None;
         }
         let (authority, path) = remainder.split_once('/')?;
@@ -642,6 +703,12 @@ mod tests {
             })
         );
         assert!(github_repository_from_remote_url("not-a-github-remote").is_none());
+        assert!(
+            github_repository_from_remote_url("http://github.com/example/project.git").is_none()
+        );
+        assert!(
+            github_repository_from_remote_url("git://github.com/example/project.git").is_none()
+        );
     }
 
     #[test]
@@ -670,6 +737,115 @@ mod tests {
             ),
             Err(PublicationGatewayError::InvalidResponse)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mismatched_pushurl_is_rejected_before_git_push_is_invoked() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "artifact-pushurl-gateway-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fake repository directory");
+        let repository = root.join("repository");
+        std::fs::create_dir(&repository).expect("create repository");
+        let invocations = root.join("invocations");
+        let fake_git = root.join("git");
+        std::fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$3:$5\" >> '{}'\ncase \"$3:$5\" in\n  remote:origin) printf '%s\\n' 'https://github.com/example/project.git' ;;\n  remote:--push) printf '%s\\n' 'https://github.com/other/project.git' ;;\n  push:*) printf '%s\\n' 'push' >> '{}' ;;\n  *) exit 90 ;;\nesac\n",
+                invocations.display(),
+                invocations.display(),
+            ),
+        )
+        .expect("write fake git executable");
+        let mut permissions = std::fs::metadata(&fake_git)
+            .expect("stat fake git executable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_git, permissions).expect("make fake git executable");
+
+        let gateway = GitHubArtifactPublicationGateway::with_executables(&fake_git, "gh");
+        assert_eq!(
+            gateway.push_commit(
+                &repository,
+                "0123456789012345678901234567890123456789",
+                "feature",
+                Duration::from_secs(2),
+            ),
+            Err(PublicationGatewayError::InvalidResponse)
+        );
+        let calls = std::fs::read_to_string(&invocations).expect("read fake git invocations");
+        assert!(calls.contains("remote:origin"));
+        assert!(calls.contains("remote:--push"));
+        assert!(
+            !calls.lines().any(|call| call.starts_with("push:")),
+            "git push must not be invoked: {calls}"
+        );
+        std::fs::remove_dir_all(root).expect("remove fake repository");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_verification_uses_configured_git_and_raw_headers_without_replacements() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "artifact-commit-verify-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fake repository directory");
+        let repository = root.join("repository");
+        std::fs::create_dir(&repository).expect("create repository");
+        let invocations = root.join("invocations");
+        let fake_git = root.join("custom-git");
+        let tree_oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let base_commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let commit_sha = "cccccccccccccccccccccccccccccccccccccccc";
+        std::fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\nprintf '%s:%s:%s:%s\\n' \"${{GIT_NO_REPLACE_OBJECTS-unset}}\" \"$3\" \"$4\" \"$5\" > '{}'\nprintf '%s\\n' 'tree {tree_oid}' 'parent {base_commit}' 'author Test <test@example.invalid> 0 +0000' '' 'message'\n",
+                invocations.display(),
+            ),
+        )
+        .expect("write custom git executable");
+        let mut permissions = std::fs::metadata(&fake_git)
+            .expect("stat custom git executable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_git, permissions).expect("make custom git executable");
+
+        let gateway = GitHubArtifactPublicationGateway::with_executables(&fake_git, "gh");
+        assert!(gateway.verify_commit_tree_and_base(
+            &repository,
+            commit_sha,
+            tree_oid,
+            base_commit,
+            Duration::from_secs(2),
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&invocations).expect("read custom git invocation"),
+            format!("1:cat-file:commit:{commit_sha}\n")
+        );
+        std::fs::remove_dir_all(root).expect("remove fake repository");
     }
 
     #[test]
