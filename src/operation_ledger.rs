@@ -1,8 +1,9 @@
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Mutex, OnceLock},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use fs2::FileExt;
@@ -13,6 +14,10 @@ use crate::{ModelChoice, ModelRef, ProviderRef, TaskId, UsageCost, UsageMetric};
 
 const SCHEMA_VERSION: u32 = 3;
 const DEFAULT_LOG_LIMIT: usize = 1024 * 1024;
+const FILE_LOCK_RETRY_LIMIT: Duration = Duration::from_millis(100);
+const FILE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+static PROCESS_LOCKS: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
 
 /// Exclusive process lock shared by services using the same base and operation ledgers.
 pub struct LedgerRunLock {
@@ -20,6 +25,35 @@ pub struct LedgerRunLock {
     _operation_file: std::fs::File,
     ledger_path: PathBuf,
     operation_path: PathBuf,
+    _process_lock: ProcessLockReservation,
+}
+
+struct ProcessLockReservation(Vec<PathBuf>);
+
+impl ProcessLockReservation {
+    fn reserve(paths: Vec<PathBuf>) -> Result<Self, LedgerError> {
+        let locks = PROCESS_LOCKS.get_or_init(Default::default);
+        let mut held = locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if paths.iter().any(|path| held.contains(path)) {
+            return Err(LedgerError::LockBusy);
+        }
+        held.extend(paths.iter().cloned());
+        Ok(Self(paths))
+    }
+}
+
+impl Drop for ProcessLockReservation {
+    fn drop(&mut self) {
+        let locks = PROCESS_LOCKS.get_or_init(Default::default);
+        let mut held = locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for path in &self.0 {
+            held.remove(path);
+        }
+    }
 }
 
 impl LedgerRunLock {
@@ -33,13 +67,20 @@ impl LedgerRunLock {
         base_lock_name.push(".operations.lock");
         let mut operation_lock_name = operation_path.as_os_str().to_os_string();
         operation_lock_name.push(".recovery.lock");
-        let base_file = open_exclusive_lock(&ledger_path.with_file_name(base_lock_name))?;
-        let operation_file = open_exclusive_lock(&PathBuf::from(operation_lock_name))?;
+        let base_lock_path = ledger_path.with_file_name(base_lock_name);
+        let operation_lock_path = PathBuf::from(operation_lock_name);
+        let process_lock = ProcessLockReservation::reserve(vec![
+            base_lock_path.clone(),
+            operation_lock_path.clone(),
+        ])?;
+        let base_file = open_exclusive_lock(&base_lock_path)?;
+        let operation_file = open_exclusive_lock(&operation_lock_path)?;
         Ok(Self {
             _base_file: base_file,
             _operation_file: operation_file,
             ledger_path,
             operation_path,
+            _process_lock: process_lock,
         })
     }
 
@@ -59,13 +100,19 @@ fn open_exclusive_lock(path: &Path) -> Result<std::fs::File, LedgerError> {
     }
     let file = options.open(path)?;
     reject_lock_file_metadata(&file.metadata()?)?;
-    file.try_lock_exclusive().map_err(|error| {
-        if error.kind() == io::ErrorKind::WouldBlock {
-            LedgerError::LockBusy
-        } else {
-            LedgerError::Io(error)
+    let deadline = Instant::now() + FILE_LOCK_RETRY_LIMIT;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(LedgerError::LockBusy);
+                }
+                thread::sleep(FILE_LOCK_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(LedgerError::Io(error)),
         }
-    })?;
+    }
     Ok(file)
 }
 
@@ -1078,6 +1125,9 @@ fn operation_column_exists(connection: &Connection, column: &str) -> Result<bool
 mod tests {
     use super::*;
 
+    const CHILD_LOCK_PATH: &str = "AI_DEV_ORCHESTRATOR_CHILD_LOCK_PATH";
+    const CHILD_LOCK_MARKER: &str = "AI_DEV_ORCHESTRATOR_CHILD_LOCK_MARKER";
+
     fn lock_test_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "operation-ledger-lock-{name}-{}-{}",
@@ -1086,6 +1136,50 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn child_holds_ledger_lock_for_contention_test() {
+        let (Some(lock_path), Some(marker)) = (
+            std::env::var_os(CHILD_LOCK_PATH),
+            std::env::var_os(CHILD_LOCK_MARKER),
+        ) else {
+            return;
+        };
+        let _lock = LedgerRunLock::acquire(lock_path).unwrap();
+        fs::write(marker, "locked").unwrap();
+        thread::sleep(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cross_process_file_lock_contention_retries_then_returns_busy() {
+        let root = lock_test_root("cross-process-busy");
+        let ledger_path = root.join("ledger.sqlite3");
+        let marker = root.join("child-locked");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("operation_ledger::tests::child_holds_ledger_lock_for_contention_test")
+            .arg("--nocapture")
+            .env(CHILD_LOCK_PATH, &ledger_path)
+            .env(CHILD_LOCK_MARKER, &marker)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "child did not acquire the lock in time");
+
+        let started = Instant::now();
+        assert!(matches!(
+            LedgerRunLock::acquire(&ledger_path),
+            Err(LedgerError::LockBusy)
+        ));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= FILE_LOCK_RETRY_LIMIT);
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(child.wait().unwrap().success());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
