@@ -290,7 +290,6 @@ impl SqliteExecutionLedger {
             )?;
             create_service_schema(&transaction)?;
             migrate_schema(&transaction, version)?;
-            backfill_legacy_attempt_history(&transaction)?;
         }
         create_service_schema(&transaction)?;
         create_artifact_service_schema(&transaction)?;
@@ -945,12 +944,14 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
             }
             11 => {
                 // Existing v10 databases may have been produced by either stacked
-                // branch, so ensure both schemas and the legacy history backfill.
+                // branch, so ensure both schemas exist before the next migration.
                 create_artifact_service_schema(connection)?;
                 create_service_schema(connection)?;
-                backfill_legacy_attempt_history(connection)?;
             }
-            12 => create_artifact_evidence_schema(connection)?,
+            12 => {
+                backfill_legacy_attempt_history(connection)?;
+                create_artifact_evidence_schema(connection)?;
+            }
             13 => create_task_finish_schema(connection)?,
             _ => unreachable!(),
         }
@@ -1761,6 +1762,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(summary, "passed");
+    }
+
+    #[test]
+    fn latest_schema_open_does_not_backfill_new_cli_attempts() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-dev-orchestrator-v12-attempt-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("execution.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        create_latest_schema(&connection).unwrap();
+        create_service_schema(&connection).unwrap();
+        create_artifact_service_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks VALUES('legacy-task','legacy request','implementer','active')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO attempts(task_id,id,provider,state,semantics_version)
+             VALUES('legacy-task','before-v12','codex','failed','legacy_validation_coupled')",
+                [],
+            )
+            .unwrap();
+        set_schema_version(&connection, 11).unwrap();
+        drop(connection);
+
+        let ledger = SqliteExecutionLedger::open(&path).unwrap();
+        {
+            let connection = ledger.lock_connection().unwrap();
+            let version: u32 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, LATEST_SCHEMA_VERSION);
+            let migrated: (Option<String>, String) = connection
+                .query_row(
+                    "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='before-v12'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(migrated, (Some("implementer".into()), "initial".into()));
+        }
+        drop(ledger);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO attempts(task_id,id,provider,state,semantics_version)
+             VALUES('legacy-task','after-v12','codex','failed','legacy_validation_coupled')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteExecutionLedger::open(&path).unwrap();
+        let connection = reopened.lock_connection().unwrap();
+        let migrated_history_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='before-v12'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let post_migration_history_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='after-v12'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_history_count, 1);
+        assert_eq!(post_migration_history_count, 0);
+        drop(connection);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

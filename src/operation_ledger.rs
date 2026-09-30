@@ -891,6 +891,14 @@ fn safe_log_component(value: &str) -> Result<&str, LedgerError> {
 
 impl ExecutionLedger for SqliteExecutionLedger {
     fn accept_operation(&self, request: &OperationRequest) -> Result<OperationRecord, LedgerError> {
+        if matches!(
+            request.requested_model(),
+            Some(ModelChoice::Named(model)) if model.as_str().is_empty()
+        ) {
+            return Err(LedgerError::InvalidValue(
+                "named model identifier must not be empty".into(),
+            ));
+        }
         let mut connection = self.connection.lock().expect("ledger mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing) = transaction.query_row("SELECT id, request_id, task_id, task_revision, payload, instruction, status, requested_provider, requested_model, requested_model_encoding, accepted_at, started_at, finished_at, observed_provider, observed_model, diagnostic, artifact_ref FROM operations WHERE request_id=?1", params![request.request_id()], OperationRecord::from_row).optional()? {
@@ -1223,6 +1231,40 @@ mod tests {
             ledger.accept_operation(&request("r1", "b")),
             Err(LedgerError::RequestConflict { .. })
         ));
+    }
+
+    #[test]
+    fn empty_named_model_is_rejected_before_operation_acceptance() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let empty_model_request = OperationRequest::new(
+            "r-empty-model",
+            TaskId::new("task-1"),
+            3,
+            "payload",
+            "implement",
+            ProviderRef::new("codex"),
+            ModelChoice::Named(ModelRef::new("")),
+        );
+
+        assert!(matches!(
+            ledger.accept_operation(&empty_model_request),
+            Err(LedgerError::InvalidValue(message))
+                if message.contains("named model identifier")
+        ));
+        let accepted_count: i64 = ledger
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(accepted_count, 0);
+
+        // A valid request for the same task is still accepted, proving that the
+        // rejected request did not leave an active operation that keeps it busy.
+        let accepted = ledger
+            .accept_operation(&request("r-valid", "payload"))
+            .unwrap();
+        assert_eq!(accepted.status(), OperationStatus::Accepted);
     }
     #[test]
     fn operation_usage_metrics_round_trip_without_collapsing_names_or_values() {
