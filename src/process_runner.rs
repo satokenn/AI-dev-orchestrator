@@ -14,6 +14,14 @@ use std::time::{Duration, Instant};
 const MAX_CAPTURE_BYTES_PER_STREAM: usize = 1024 * 1024;
 const STOP_GRACE_PERIOD: Duration = Duration::from_millis(200);
 const PIPE_DRAIN_PERIOD: Duration = Duration::from_millis(200);
+const GIT_LOCATION_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+];
 
 /// A command invocation independent of a shell.
 #[derive(Debug, Clone)]
@@ -26,6 +34,8 @@ pub struct ProcessRequest {
     /// Optional stdin payload, written in full without being captured as output.
     /// Payloads are accepted only where the runner can cancel the writer synchronously.
     pub stdin_bytes: Option<Vec<u8>>,
+    #[cfg(test)]
+    test_inherited_env: Vec<(OsString, OsString)>,
 }
 
 impl ProcessRequest {
@@ -38,6 +48,8 @@ impl ProcessRequest {
             env: Vec::new(),
             timeout: None,
             stdin_bytes: None,
+            #[cfg(test)]
+            test_inherited_env: Vec::new(),
         }
     }
     #[must_use]
@@ -70,6 +82,15 @@ impl ProcessRequest {
     /// Targets without that support return `ProcessError::Stdin(Unsupported)` before spawning.
     pub fn stdin_bytes(mut self, bytes: Vec<u8>) -> Self {
         self.stdin_bytes = Some(bytes);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn test_inherited_env(
+        mut self,
+        key: impl Into<OsString>,
+        value: impl Into<OsString>,
+    ) -> Self {
+        self.test_inherited_env.push((key.into(), value.into()));
         self
     }
 }
@@ -153,11 +174,34 @@ impl ProcessRunner {
         self.run_with_cancellation(request, CancellationToken::new())
     }
 
+    /// Runs Git without inheriting environment variables that can redirect its repository.
+    pub(crate) fn run_git(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
+        self.run_inner(request, CancellationToken::new(), GIT_LOCATION_ENV)
+    }
+
+    /// Runs a command after removing selected inherited environment variables.
+    pub(crate) fn run_with_env_removed(
+        &self,
+        request: ProcessRequest,
+        env_vars: &[&str],
+    ) -> Result<ProcessOutput, ProcessError> {
+        self.run_inner(request, CancellationToken::new(), env_vars)
+    }
+
     /// Runs a command, stopping it when cancelled or when its timeout elapses.
     pub fn run_with_cancellation(
         &self,
         request: ProcessRequest,
         token: CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        self.run_inner(request, token, &[])
+    }
+
+    fn run_inner(
+        &self,
+        request: ProcessRequest,
+        token: CancellationToken,
+        env_vars_to_remove: &[&str],
     ) -> Result<ProcessOutput, ProcessError> {
         let timeout = request.timeout;
         let stdin_bytes = request.stdin_bytes;
@@ -168,6 +212,10 @@ impl ProcessRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(test)]
+        for (key, value) in &request.test_inherited_env {
+            command.env(key, value);
+        }
         #[cfg(unix)]
         let mut stdin_writer = stdin_bytes
             .map(|bytes| NonblockingStdin::attach(&mut command, bytes))
@@ -177,6 +225,9 @@ impl ProcessRunner {
         command.stdin(Stdio::null());
         if let Some(cwd) = request.cwd {
             command.current_dir(cwd);
+        }
+        for key in env_vars_to_remove {
+            command.env_remove(key);
         }
         for (key, value) in request.env {
             command.env(key, value);
@@ -590,6 +641,93 @@ mod tests {
         } else {
             vec!["-c".into(), script.into()]
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_runner_ignores_inherited_repository_location_environment() {
+        use std::fs;
+        use std::process::Command as SetupCommand;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-dev-orchestrator-git-isolation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        let actual = root.join("actual");
+        let foreign = root.join("foreign");
+        fs::create_dir_all(&actual).expect("create actual repository directory");
+        fs::create_dir_all(&foreign).expect("create foreign repository directory");
+        for repository in [&actual, &foreign] {
+            let output = SetupCommand::new("git")
+                .args(["init", "--quiet"])
+                .arg(repository)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .expect("git init starts");
+            assert!(
+                output.status.success(),
+                "git init: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let mut request = ProcessRequest::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .cwd(&actual);
+        let injected = [
+            ("GIT_DIR", foreign.join(".git")),
+            ("GIT_WORK_TREE", foreign.clone()),
+            ("GIT_COMMON_DIR", foreign.join(".git")),
+            ("GIT_OBJECT_DIRECTORY", foreign.join(".git/objects")),
+            (
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                foreign.join(".git/objects"),
+            ),
+            ("GIT_INDEX_FILE", foreign.join("index")),
+        ];
+        for (key, value) in injected {
+            request
+                .test_inherited_env
+                .push((key.into(), value.into_os_string()));
+        }
+        let output = ProcessRunner
+            .run_git(request)
+            .expect("git uses requested repository");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            fs::canonicalize(&actual)
+                .expect("canonicalize actual repository")
+                .to_string_lossy()
+        );
+        fs::remove_dir_all(root).expect("remove temporary repositories");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_can_remove_a_selected_inherited_environment_variable() {
+        let mut request = ProcessRequest::new("sh").args([
+            "-c",
+            "if [ \"${GH_REPO+x}${GH_HOST+x}\" = xx ]; then printf 'set'; else printf 'repo:%s host:%s' \"${GH_REPO-unset}\" \"${GH_HOST-unset}\"; fi",
+        ]);
+        request
+            .test_inherited_env
+            .push(("GH_REPO".into(), "wrong/target".into()));
+        request
+            .test_inherited_env
+            .push(("GH_HOST".into(), "wrong.host".into()));
+        let output = ProcessRunner
+            .run_with_env_removed(request, &["GH_REPO", "GH_HOST"])
+            .expect("shell process succeeds");
+        assert_eq!(output.stdout, b"repo:unset host:unset");
     }
 
     #[test]
