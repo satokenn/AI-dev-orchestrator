@@ -440,6 +440,7 @@ pub trait CiProvider {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CiProviderError {
     Unavailable(String),
+    HeadChanged { expected: String, actual: String },
     InvalidResponse(String),
 }
 
@@ -447,6 +448,12 @@ impl fmt::Display for CiProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable(message) => write!(f, "CI observation unavailable: {message}"),
+            Self::HeadChanged { expected, actual } => {
+                write!(
+                    f,
+                    "PR head changed from {expected} to {actual} while CI checks were collected"
+                )
+            }
             Self::InvalidResponse(message) => write!(f, "invalid GitHub CI response: {message}"),
         }
     }
@@ -711,6 +718,21 @@ impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
                     return Err(CiError::Unavailable {
                         reason,
                         last_observation_id,
+                    });
+                }
+                Err(CiError::Provider(CiProviderError::HeadChanged { expected, actual })) => {
+                    if let Some(observation) = last {
+                        return Err(CiError::HeadChanged {
+                            expected,
+                            actual,
+                            last_observation_id: observation.id,
+                        });
+                    }
+                    return Err(CiError::Unavailable {
+                        reason: format!(
+                            "PR head changed from {expected} to {actual} during CI observation"
+                        ),
+                        last_observation_id: None,
                     });
                 }
                 Err(error) => return Err(error),
@@ -1045,9 +1067,10 @@ impl CiProvider for GhCiProvider {
             })?;
             let current_sha = pull_request_head_sha(&current_pr)?;
             if current_sha != sha {
-                return Err(CiProviderError::Unavailable(
-                    "pull request head changed while CI checks were collected".into(),
-                ));
+                return Err(CiProviderError::HeadChanged {
+                    expected: sha,
+                    actual: current_sha,
+                });
             }
         }
         Ok(CiProviderSnapshot {
@@ -1682,8 +1705,8 @@ if [ "$mode" = 'head_recheck_unavailable' ] && [ "$endpoint" = 'repos/owner/repo
 
         assert!(matches!(
             runtime.observe(None, &target),
-            Err(CiError::Provider(CiProviderError::Unavailable(reason)))
-                if reason.contains("head changed")
+            Err(CiError::Provider(CiProviderError::HeadChanged { expected, actual }))
+                if expected == "a".repeat(40) && actual == "b".repeat(40)
         ));
         let count: i64 = ledger
             .lock_connection()
@@ -1760,6 +1783,53 @@ if [ "$mode" = 'head_recheck_unavailable' ] && [ "$endpoint" = 'repos/owner/repo
             .query_row("SELECT COUNT(*) FROM ci_observations", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn wait_preserves_confirmed_head_change_after_prior_observation() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = save_task(&ledger, "ci-gh-head-change-after-observation-task");
+        let provider = FakeProvider::unavailable_after(
+            snapshot(&"a".repeat(40), CiCheckDetailState::Pending),
+            CiProviderError::HeadChanged {
+                expected: "a".repeat(40),
+                actual: "b".repeat(40),
+            },
+        );
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(10),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let error = runtime
+            .wait(
+                &task_id,
+                &CiQueryTarget::PullRequest {
+                    repository: "owner/repo".into(),
+                    number: 4,
+                    expected_head_sha: None,
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+        let CiError::HeadChanged {
+            expected,
+            actual,
+            last_observation_id,
+        } = error
+        else {
+            panic!("expected confirmed head change, got {error:?}");
+        };
+        assert_eq!(expected, "a".repeat(40));
+        assert_eq!(actual, "b".repeat(40));
+        let last = ledger
+            .get_ci_observation(&last_observation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.target().head_sha(), "a".repeat(40));
+        assert_eq!(last.state(), CiAggregateState::Pending);
     }
 
     #[test]
