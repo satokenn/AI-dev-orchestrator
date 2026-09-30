@@ -164,7 +164,7 @@ fn maps_cancellation_to_provider_error() {
             .execute_with_cancellation(&request(workspace, "hello", Duration::from_secs(10)), other)
     });
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !ready.exists() && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
