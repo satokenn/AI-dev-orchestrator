@@ -253,7 +253,7 @@ impl GitHubArtifactPublicationGateway {
         request
             .args
             .extend(args.iter().map(std::ffi::OsString::from));
-        let output = ProcessRunner.run(request).map_err(map_process_error)?;
+        let output = ProcessRunner.run_git(request).map_err(map_process_error)?;
         if output.output_truncated {
             return Err(PublicationGatewayError::InvalidResponse);
         }

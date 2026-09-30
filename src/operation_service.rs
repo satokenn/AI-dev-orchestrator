@@ -2533,7 +2533,7 @@ fn commit_matches_tree_and_base(
     if !valid_git_oid(commit_sha) {
         return false;
     }
-    let output = match crate::process_runner::ProcessRunner.run(
+    let output = match crate::process_runner::ProcessRunner.run_git(
         crate::process_runner::ProcessRequest::new("git")
             .arg("-C")
             .arg(repository.as_os_str().to_owned())
