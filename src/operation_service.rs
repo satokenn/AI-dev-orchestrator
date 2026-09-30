@@ -1337,7 +1337,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         }
         let result: ValidationResult = match validator.validate(workspace.path()) {
             Ok(result) => result,
-            Err(error) => {
+            Err(_error) => {
                 return match artifacts.cleanup_unchanged_artifact_validation_workspace(
                     task_id,
                     &attempt_id,
@@ -1345,10 +1345,10 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                     &workspace,
                 ) {
                     Ok(()) => Err(ServiceError::ValidationFailed),
-                    Err(cleanup_error) => Err(ServiceError::Artifact(
+                    Err(_cleanup_error) => Err(ServiceError::Artifact(
                         ArtifactManager::retained_workspace_error(
                             &workspace,
-                            format!("validation failed ({error}); {cleanup_error}"),
+                            "validator failed; cleanup failed and the validation workspace was retained",
                         ),
                     )),
                 };
@@ -3145,6 +3145,11 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct MutatingFailingValidator {
+        workspace: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    #[derive(Default)]
     struct TrackingValidator {
         workspace: std::sync::Mutex<Option<PathBuf>>,
     }
@@ -3199,6 +3204,21 @@ mod tests {
         ) -> Result<ValidationResult, crate::ValidatorError> {
             *self.workspace.lock().unwrap() = Some(workspace.to_owned());
             Err(crate::ValidatorError::NoChecksConfigured)
+        }
+    }
+
+    impl crate::Validator for MutatingFailingValidator {
+        fn validate(
+            &self,
+            workspace: &std::path::Path,
+        ) -> Result<ValidationResult, crate::ValidatorError> {
+            *self.workspace.lock().unwrap() = Some(workspace.to_owned());
+            fs::write(workspace.join("README.md"), "validator mutation\n")
+                .expect("modify validation worktree");
+            Err(crate::ValidatorError::InvalidWorkspace {
+                workspace: workspace.to_owned(),
+                reason: "SECRET_SENTINEL_VALIDATOR_RAW_DIAGNOSTIC".into(),
+            })
         }
     }
 
@@ -4384,6 +4404,44 @@ mod tests {
         ));
         let failed_workspace = failing_validator.workspace.lock().unwrap().clone().unwrap();
         assert!(!failed_workspace.exists());
+        let validation_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_validations WHERE task_id=?1 AND artifact_id=?2",
+                params![task_id.as_str(), artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(validation_count, 0);
+        let mutating_validator = MutatingFailingValidator::default();
+        let returned_error = service
+            .validate_artifact(&task_id, &artifact_id, revision(), &mutating_validator)
+            .unwrap_err();
+        let debug_output = format!("{returned_error:?}");
+        let display_output = format!("{returned_error}");
+        assert!(!debug_output.contains("SECRET_SENTINEL_VALIDATOR_RAW_DIAGNOSTIC"));
+        assert!(!display_output.contains("SECRET_SENTINEL_VALIDATOR_RAW_DIAGNOSTIC"));
+        let retained_path = match returned_error {
+            ServiceError::Artifact(ArtifactError::WorkspaceRetained { path, reason }) => {
+                assert_eq!(
+                    reason,
+                    "validator failed; cleanup failed and the validation workspace was retained"
+                );
+                path
+            }
+            other => panic!("failed cleanup must retain the validation worktree: {other:?}"),
+        };
+        assert!(retained_path.exists());
+        assert_eq!(
+            fs::read_to_string(retained_path.join("README.md")).unwrap(),
+            "validator mutation\n"
+        );
+        let retained_path_text = retained_path.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &["worktree", "remove", "--force", &retained_path_text],
+        );
         let validation_count: i64 = ledger
             .lock_connection()
             .unwrap()
