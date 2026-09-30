@@ -61,6 +61,8 @@ pub enum SecretScanResult {
 }
 
 /// A scanner must inspect every file in the supplied Git tree and every field in the payload.
+/// Git subprocesses used by an implementation must set `GIT_NO_REPLACE_OBJECTS=1`, so a
+/// repository's replace refs cannot change which bytes the scanner sees for the supplied OID.
 /// Implementations should return only a typed failure; diagnostics may contain secret material.
 pub trait SecretScanner: Send + Sync {
     /// Returns `text` with every known secret replaced. Implementations must be
@@ -275,6 +277,7 @@ impl GitHubArtifactPublicationGateway {
         request
             .args
             .extend(args.iter().map(std::ffi::OsString::from));
+        request = request.env("GIT_NO_REPLACE_OBJECTS", "1");
         let output = ProcessRunner.run_git(request).map_err(map_process_error)?;
         if output.output_truncated {
             return Err(PublicationGatewayError::InvalidResponse);

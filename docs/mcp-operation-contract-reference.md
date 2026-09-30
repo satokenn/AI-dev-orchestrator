@@ -162,6 +162,8 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 
 `Evidence<T>`は`status`で判別する。knownは`value`、`basis` (`measured`, `configured`, `computed`, `estimated`)、`assessed_at_ms`、`source`を持ち、unknownは`reason`、`assessed_at_ms`、`source`を持つ。`source`は`kind` (`provider_api`, `provider_cli`, `provider_adapter`, `execution_ledger`, `repository_config`) と`reference`を含む。`provider_adapter`はProvider adapter自身が返した観測を表す。`AvailabilityEvidence`は`status` enum (`available`、`unavailable`、`unknown`)、`observed_at_ms`、`source`を同じobjectに持つ。unavailable / unknownではnon-empty `reason`も同じobjectに置き、statusを入れ子にしない。`ModelAvailabilityObservation`は`model: ModelChoice`と`availability: AvailabilityEvidence`を持つ。Attempt itemで`occurred_at`を特定できない場合はnull、`timestamp_basis: unknown`を返す。旧roleを特定できない場合は`role: null`とする。
 
+例えば未確認状態は`{"status":"unknown","reason":"authentication was not checked","observed_at_ms":1790115723000,"source":{"kind":"provider_cli","reference":"codex"}}`の形で返す。`status`自体を`{"status":"unknown"}`のようなobjectにしない。
+
 `model_ids`には権威あるModel catalogで確認できたnamed Modelだけを含める。CLI起動状態からModel一覧・認証・利用権・quota・利用量・料金を推定しない。観測できない値はevidenceの`unknown`として理由・時刻・sourceを残す。Task Attemptのrequested値とobserved値は別々に保持し、unknown observed値をrequested値で埋めない。
 
 | Section | `state` type |
@@ -301,9 +303,10 @@ OperationServiceは`task.create`の前にtitle、description、各constraint、I
 
 Taskと選択したsectionのsnapshotを読む。読取専用。
 
-このService sliceは`providers`、`usage`、`attempts`のContextPageを生成する。`usage`はOperation Service Ledgerに保存されたProvider報告metricだけを返し、budgetやquotaは作らない。保存値をJSON numberとして保持できない場合は`value:null`、`basis:"unknown"`とし、元の文字列値は返さない。観測時刻にはOperationの完了時刻を使い、未保存ならnullとする。MCP transportは#45の対象であり、ここでは未実装。
+このService sliceは`providers`、`usage`、`attempts`のContextPageを生成する。`usage`はOperation Service Ledgerに保存されたProvider報告metricだけを返し、budgetやquotaは作らない。metricの`name`、`value`、`unit`は、Task snapshotと同じSecretScannerによるredactionと固定点検査を通してから保存する。scanner未設定・失敗・固定点不成立の場合、そのoperation自体はProvider結果どおり完了するがusage metricは一件も保存せず、固定diagnostic code `usage_redaction_unavailable`を記録する。既存Ledgerのmetricはcontext返却前にも再redactし、検査に失敗した場合は`policy_denied`とし、raw metricを返さない。保存値をJSON numberとして保持できない場合は`value:null`、`basis:"unknown"`とし、元の文字列値は返さない。redactionで値が変更された場合も数値を推定せず`value:null`、`basis:"unknown"`とする。観測時刻にはOperationの完了時刻を使い、未保存ならnullとする。MCP transportは#45の対象であり、ここでは未実装。
+内部の`ExecutionLedger::get_task` / `SqliteExecutionLedger::get_task`は保存内容を復元するだけで、redactionしないためMCP response sourceには使わない。`task.get_context`を含む外部応答はServiceのSecretScanner境界を通したデータだけから組み立てる。scanner未設定・失敗・redaction固定点不成立ならraw Task、Attempt、Usageを返さず、固定の業務errorでfail closedする。将来別のTask / Attempt直列化経路を追加する場合もscanner境界を通す。
 保存済みTask snapshotの要求textはcontext返却前にもSecretScannerでredactし、固定点であることを確認する。これにより既存の未redacted snapshotもraw textを返さない。SecretScannerが未設定、redactionが失敗、または固定点を作れない場合はProvider probeより前に`policy_denied`とし、raw snapshotを含む応答を返さない。
-`providers` sectionではprovider observationsを同一snapshot内で一括返し、件数がpage_sizeを超える場合はrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化し、cursorはTask、section、page size、Task revisionに束縛する。
+`providers` sectionではprovider observationsの件数がpage_size以内なら同一snapshot内で全件を返し、page_sizeを超える場合はrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化し、cursorはTask、section、page size、Task revisionに束縛する。
 Provider観測sourceがProvider一覧を列挙できない場合は、空配列として成功したように見せずcontext取得を失敗させる。
 
 | Request field | JSON type | Required | 意味 |
@@ -443,7 +446,7 @@ operation状態・結果を読む。読取専用。
 |  | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約結果 |
 |  | `checks` | `array<CiCheck>` | 必須 | 個別check結果 |
 
-`UsageMetric`と`CiTarget`のfieldはすべて必須。
+`UsageMetric`と`CiTarget`のfieldはすべて必須。`attempt.run`が返すusage配列も同じredaction済み値だけを含む。usageを安全にredactできなければ配列を空にし、診断コード`usage_redaction_unavailable`を返す。`task.get_context`の`attempts` sectionはusage文字列を複製しないが、Attemptの他の履歴も含め、Serviceが`TaskSnapshot`、Usage、Attempt全体を組み立てる間にraw metricをcontextへ混入させない。
 
 要求Modelはoperationの受理時点で保存し、observed targetはProvider結果を受け取った後に別fieldへ保存する。Provider出力からModelを確定できない場合は`observed_model_id: null`とし、`model_id`をコピーしない。既知のProvider error `unknown_model`は、選択ModelをProviderが受け付けない場合にも使う。
 
@@ -686,7 +689,7 @@ Task完了を要求する。指定されたArtifact、accepted decision、policy
 
 ## Artifact・diff・diagnostic・logの秘匿
 
-secret、認証token、環境変数値、Provider認証情報をcontextやlogに返さない。既知secretは保存前と返却前にredactする。規則はArtifact本文、full diff、diagnostic本文、publication payloadにも適用する。redactできない本文は返さず、`forbidden` errorと必要な場合の権限付き参照を返す。redactionできない本文を空文字、`unknown`値、成功として偽装しない。log末尾やArtifact本文の取得量は要求範囲に限定する。
+secret、認証token、環境変数値、Provider認証情報をcontextやlogに返さない。既知secretは保存前と返却前にredactする。Usage metricのname/value/unitもこの規則の対象であり、redact済みfieldはredact結果で返す。valueがredactで変更された場合は数値へ推測変換せず`value:null`、`basis:"unknown"`とする。Usage metric全体を保存しないのはscanner未設定・失敗・固定点不成立の場合であり、その場合は安全な固定diagnostic codeを残す。規則はArtifact本文、full diff、diagnostic本文、publication payloadにも適用する。redactできない本文は返さず、`forbidden` errorと必要な場合の権限付き参照を返す。redactionできない本文を空文字、`unknown`値、成功として偽装しない。log末尾やArtifact本文の取得量は要求範囲に限定する。
 
 業務errorのmessageへProviderのstdout / stderrやdiagnostic本文を埋め込まない。診断はtyped referenceで返し、本文を取得する場合は同じredaction規則と権限境界を適用する。redaction機能が利用できない実装はraw本文を返却・永続化せず、本文を含まない固定errorを返す。
 
