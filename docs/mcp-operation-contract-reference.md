@@ -21,6 +21,8 @@ MCP toolsでは`inputSchema`が入力schemaを定め、任意の`outputSchema`�
 
 すべてのtool requestの`params.arguments`は`schema_version: "v2"`を必須とする。未対応versionは`unsupported_schema_version`。不明なrequest fieldは`invalid_request`とし、副作用前に拒否する。成功するtool outputの`structuredContent`はすべて`schema_version: "v2"`を含む。業務errorはMCP tool execution error（`isError: true`）として返し、`content`に下記のtyped errorを含める。MCP request metadataやprotocol errorはこのアプリケーション契約の対象外。
 
+CI observationでは、v2既存outputの必須fieldとenumを維持したまま、任意の詳細fieldを追加できる。これらはRequired Check集合や個別check状態の説明に使う。旧v2 consumerは未知のresponse fieldを無視できる。consumerは任意fieldがない場合、または値が`unknown`の場合にCI成功を推測してはならない。CI成功は、Required Check集合が既知かつ空でなく、その集合内の全checkが成功したときだけ表す。Required Check集合がunknownまたは既知の空集合なら、観測したcheckがすべて成功していても集約stateは`unknown`とする。
+
 副作用を伴うrequestは`request_id: string`を必須とする。既存Taskを変更する場合はさらに`task_id: string`と`expected_revision: integer`を必須とする。読取requestは`request_id`と`expected_revision`を持たない。
 
 冪等性keyの範囲は`caller + tool name + request_id`。`task.create`を含む全副作用requestに適用する。同じkey・同じnormalized payloadの再送は保存済みresponseを返し、副作用を繰り返さない。同じkeyでpayloadが異なる場合は`idempotency_conflict`。
@@ -94,7 +96,7 @@ evidenceは結果を申告するfieldではなく、保存済みrecordへの参�
 | `references` | `array<Reference>` | 必須 | 関連record |
 | `details` | `object` | 必須 | section固有の追加情報 |
 
-section固有の`details`は次のfieldで構成する。列挙したfieldはすべて必須であり、null可能なfieldはその型に明記する。
+section固有の`details`は次のfieldで構成する。省略可否は`Required`欄に従い、null可能なfieldはその型に明記する。
 
 | Section | kind | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- | --- | --- |
@@ -147,6 +149,8 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 |  |  | `head_sha` | `string` | 必須 | 観測対象commit |
 |  |  | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約state |
 |  |  | `checks` | `array<CiCheck>` | 必須 | 個別check結果 |
+|  |  | `observed_at` | `string (format: date-time)` | 任意 | check状態の観測時刻。未対応の旧producerでは省略 |
+|  |  | `required_checks` | `RequiredCheckSet` | 任意 | Required Check集合。fieldがなければunknownとして読む |
 
 `ContextItem.state`の値は次のとおり。sectionごとに別のenumであり、一覧にないstateを使わない。
 
@@ -162,7 +166,7 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 | `publication` | `null` |
 | `ci` | `enum(pending, passed, failed, unknown)` |
 
-次のobject型を使用する。記載したfieldはすべて必須。
+次のobject型を使用する。fieldの省略可否は`Required`欄に従う。
 
 | Object | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- | --- |
@@ -171,10 +175,134 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 | `ValidationCheckResult` | `name` | `string` | 必須 | check名 |
 |  | `state` | `enum(passed, failed, unknown)` | 必須 | check結果 |
 |  | `diagnostic_ref` | `string \| null` | 必須 | 診断参照。なければnull |
-| `CiCheck` | `name` | `string` | 必須 | CI check名 |
+| `CiCheck` | `name` | `string` | 必須 | CI check名またはstatus context |
 |  | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 観測した状態 |
 |  | `url` | `string \| null` | 必須 | check URL。なければnull |
 |  | `completed_at` | `string \| null` | 必須 | 完了時刻。非nullならRFC 3339 UTC |
+|  | `required` | `boolean` | 任意 | 既知のRequired Check集合に含まれるか。不明なら省略 |
+|  | `detail_state` | `enum(not_registered, pending, passed, failed, cancelled, unavailable, unknown)` | 任意 | 個別checkの詳細状態。省略時は`state`だけから細分を推測しない |
+|  | `app_id` | `integer` | 任意 | GitHub App由来checkを区別する識別子。情報源にない場合は省略 |
+|  | `source` | `enum(github_check_runs, github_commit_statuses, unknown)` | 任意 | 個別状態を観測した情報源 |
+| `RequiredCheck` | `name` | `string` | 必須 | Ruleset / 設定に宣言されたcheck名またはcontext |
+|  | `app_id` | `integer` | 任意 | 宣言に含まれる場合のGitHub App ID |
+| `RequiredCheckSet` | `state` | `enum(known, unknown)` | 必須 | Required Check集合を確定できたか |
+|  | `checks` | `array<RequiredCheck>` | 必須 | 既知なら集合の全要素。不明なら空配列（空集合を意味しない） |
+|  | `source` | `enum(github_ruleset, trusted_configuration, unknown)` | 必須 | 集合の根拠となる情報源 |
+|  | `observed_at` | `string (format: date-time) \| null` | 必須 | 集合を取得した時刻。不明または取得不能ならnull |
+
+`CiCheck`の既存`state`は互換性のため残し、`detail_state`は次の意味で使う。`not_registered`は既知のRequired Checkに対応するstatus/check runが対象SHAで見つからない状態、`unavailable`はGitHub API等からそのcheck状態を取得できない状態、`cancelled`はGitHubがcheckを取消済みと報告した状態である。`unknown`は取得情報だけではcheck状態を確定できない状態を表す。`cancelled`は既存`state`上では`failed`へ写像し、`not_registered`と`unavailable`は`unknown`へ写像する。新consumerは詳細を`detail_state`で読む。
+
+`RequiredCheckSet.state=unknown`では`checks: []`は未知の集合を意味し、空のRequired Check集合ではない。この場合、取得できたcheckがすべて成功でもaggregate stateは`unknown`とする。逆に`state=known`かつ`checks: []`は、Required Checkが存在しないと確認できた空集合を意味する。空集合では成功を証明するcheckがないため、aggregate stateは同じく`unknown`とする。空集合に対して「全checkが成功」を空虚に真として`passed`にしてはならない。
+
+集約stateは既存enumを保ち、次の順に判定する。
+
+| 条件 | 集約`state` |
+| --- | --- |
+| Required Check集合が欠落 / `unknown`、または`known`だが空 | `unknown` |
+| 非空の既知集合で、required checkに`failed`または`cancelled`がある | `failed` |
+| 失敗がなく、required checkが`unavailable` / `unknown`、または対応を一意に確定できない | `unknown` |
+| 上記がなく、required checkが`pending` / `not_registered` | `pending` |
+| 非空の既知集合の全required checkが一意に対応し、すべて`passed` | `passed` |
+
+この優先順により、既知の必須checkの失敗は他checkの未完了や観測不能より優先する。任意check（`required: false`）の状態は記録するが、集約stateの判定には使わない。
+
+`not_registered`は既知のRequired Checkに対応するstatus/check runが対象SHAでまだ見つからない状態である。個別の互換`state`では`unknown`、`detail_state`では`not_registered`とし、集約では未完了のrequired checkとして`pending`に扱う。`unavailable`はcheckを照会できなかった状態であり、集約を成功または失敗と断定しない。失敗または取消済みのrequired checkが別に観測されている場合は`failed`を優先する。
+
+`source`は集合の取得元であり、取得できない場合も試行した元を返す。元を特定できない場合は`unknown`とする。`source=github_ruleset`は対象PRのbase branchに適用されるactive RulesetのRequired Checkを表す。`app_id`がRequired Check宣言と観測checkの両方にある場合は照合に用いる。宣言と観測を一意に対応づけられないcheckは成功扱いせず、詳細stateを`unknown`とする。
+
+外側のresponseにある`required_checks`自体は任意である。objectを返す場合は`state`、`checks`、`source`、`observed_at`をすべて含める。`state=known`なら`observed_at`はnullにせず、取得時刻を記録する。
+
+個別checkの`source`はcheck状態の取得元、`RequiredCheckSet.source`は必須集合の取得元であり、両者を混同しない。GitHub API / CLIの取得失敗はArtifactやProvider実行の失敗ではなく、集合またはcheckを`unknown` / `unavailable`として記録する。各観測の`observed_at`はAPI応答を取得した時刻で、`CiCheck.completed_at`はGitHubが報告したcheck完了時刻である。
+
+既存v2 producerとの互換性のため、これらのresponse fieldは任意である。#79準拠の新producerは`required_checks` object、`detail_state`、check状態の`source`を返す。context recordには`observed_at`も返す。Required Check集合が既知なら各`CiCheck.required`へtrue / falseを設定し、集合がunknownならこのfieldを省略する。GitHub App IDを取得できない場合は`app_id`を省略する。取得不能や情報不足はfieldの欠落や成功値で表さず、定義した`unknown` / `unavailable` stateで返す。consumerは旧producerから任意fieldが省略されていてもunknownとして扱える。この追加はresponseへのoptional fieldだけで、request、既存必須field、既存enum、`schema_version`を変更しない。
+
+代表例: 既知で非空のRequired Checkがすべて成功した場合だけ`passed`となる。
+
+~~~json
+{
+  "schema_version": "v2",
+  "observation_id": "ci-001",
+  "target": {
+    "repository": "owner/repo",
+    "pull_request_number": 42,
+    "head_sha": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "observed_at": "2026-09-25T03:00:00Z",
+  "checks": [
+    {
+      "name": "build",
+      "state": "passed",
+      "url": null,
+      "completed_at": "2026-09-25T02:59:00Z",
+      "required": true,
+      "detail_state": "passed",
+      "app_id": 1234,
+      "source": "github_check_runs"
+    }
+  ],
+  "state": "passed",
+  "required_checks": {
+    "state": "known",
+    "checks": [{"name": "build", "app_id": 1234}],
+    "source": "github_ruleset",
+    "observed_at": "2026-09-25T03:00:00Z"
+  }
+}
+~~~
+
+Rulesetを確認できた結果、Required Checkが一つもない場合は`state=known`と空の`checks`を返す。この空集合では`passed`と判断できないため、CI集約は`unknown`である。観測された任意checkが成功していても同じ規則を適用する。
+
+~~~json
+{
+  "schema_version": "v2",
+  "observation_id": "ci-002",
+  "target": {
+    "repository": "owner/repo",
+    "pull_request_number": 42,
+    "head_sha": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "observed_at": "2026-09-25T03:00:00Z",
+  "checks": [],
+  "state": "unknown",
+  "required_checks": {
+    "state": "known",
+    "checks": [],
+    "source": "github_ruleset",
+    "observed_at": "2026-09-25T03:00:00Z"
+  }
+}
+~~~
+
+Required Check集合そのものを取得できない場合も、観測されたcheckの状態から集合を推測しない。Required Checkであることが確認できない成功checkがあっても、aggregate stateは`unknown`である。
+
+~~~json
+{
+  "schema_version": "v2",
+  "observation_id": "ci-003",
+  "target": {
+    "repository": "owner/repo",
+    "pull_request_number": 42,
+    "head_sha": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "observed_at": "2026-09-25T03:00:00Z",
+  "checks": [
+    {
+      "name": "build",
+      "state": "passed",
+      "url": null,
+      "completed_at": "2026-09-25T02:59:00Z",
+      "source": "github_check_runs"
+    }
+  ],
+  "state": "unknown",
+  "required_checks": {
+    "state": "unknown",
+    "checks": [],
+    "source": "github_ruleset",
+    "observed_at": null
+  }
+}
+~~~
 
 ### `ContextPage`
 
@@ -407,6 +535,7 @@ operation状態・結果を読む。読取専用。
 |  | `observed_at` | `string (format: date-time)` | 必須 | 観測時刻 |
 |  | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約結果 |
 |  | `checks` | `array<CiCheck>` | 必須 | 個別check結果 |
+|  | `required_checks` | `RequiredCheckSet` | 任意 | Required Check集合。fieldがなければunknownとして読む |
 
 `UsageMetric`と`CiTarget`のfieldはすべて必須。
 
@@ -590,7 +719,7 @@ PR / commitのcheck状態を一度観測する。読取専用。
 | `CommitTarget` | `repository` | `string` | 必須 | repository |
 |  | `sha` | `string` | 必須 | commit SHA |
 
-成功outputは次のfieldをすべて含む。`passed`は観測対象SHAに限る。
+成功outputは次のfieldを含み、省略可否は表の`Required`欄に従う。`passed`は観測対象SHAに限る。
 
 | Field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
@@ -600,6 +729,7 @@ PR / commitのcheck状態を一度観測する。読取専用。
 | `observed_at` | `string (format: date-time)` | 必須 | 観測時刻 |
 | `checks` | `array<CiCheck>` | 必須 | 個別check結果 |
 | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約結果 |
+| `required_checks` | `RequiredCheckSet` | 任意 | Required Check集合。fieldがなければunknownとして読む |
 
 ### `ci.wait`
 
