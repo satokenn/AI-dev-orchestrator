@@ -559,7 +559,9 @@ mod tests {
     }
 
     fn git_with_input(directory: &Path, args: &[&str], input: &[u8]) -> String {
-        let mut child = Command::new("git")
+        let mut command = Command::new("git");
+        crate::process_runner::clear_git_location_environment(&mut command);
+        let mut child = command
             .args(args)
             .current_dir(directory)
             .stdin(Stdio::piped())
