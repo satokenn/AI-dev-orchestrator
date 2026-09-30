@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::{
-    AgentProvider, AgentResult, CancellationToken, ModelChoice, ProcessError, ProcessRequest,
-    ProcessRunner, ProviderError, ProviderRef, ProviderRequest, ProviderResult,
+    AgentProvider, AgentResult, CancellationToken, CapturedOutput, ModelChoice, ProcessError,
+    ProcessRequest, ProcessRunner, ProviderError, ProviderRef, ProviderRequest, ProviderResult,
 };
 
 const COPILOT_COMMAND: &str = "copilot";
@@ -104,18 +104,18 @@ impl CopilotProvider {
                 ProcessError::Io(error) => ProviderError::Unavailable(format!(
                     "GitHub Copilot CLI availability check failed: {error}"
                 )),
-                ProcessError::NonZeroExit(output) => ProviderError::Unavailable(format!(
-                    "GitHub Copilot CLI availability check failed: {}",
-                    output_diagnostic(&output.stdout, &output.stderr, output.exit_code())
-                )),
+                ProcessError::NonZeroExit(_) => ProviderError::Unavailable(
+                    "GitHub Copilot CLI availability check failed; process output is withheld"
+                        .to_owned(),
+                ),
                 ProcessError::TimedOut(_)
                 | ProcessError::Cancelled(_)
                 | ProcessError::CancelledBeforeStart => ProviderError::Unavailable(
                     "GitHub Copilot CLI availability check did not complete".to_owned(),
                 ),
-                ProcessError::Interrupted { diagnostic, .. } => {
-                    ProviderError::Unavailable(diagnostic)
-                }
+                ProcessError::Interrupted { .. } => ProviderError::Unavailable(
+                    "GitHub Copilot CLI availability check was interrupted".to_owned(),
+                ),
             })
     }
 
@@ -171,12 +171,14 @@ impl CopilotProvider {
             .run_with_cancellation(self.process_request(request), cancellation)
             .map_err(|error| self.map_process_error(error, request.timeout(), request.model()))?;
 
+        let captured = CapturedOutput::from_process_output(&output);
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let agent_result = Some(AgentResult::new(stdout.clone(), output.status.success()));
         Ok(
             ProviderResult::new(stdout, stderr, output.exit_code(), agent_result, None)
-                .with_observed_target(Some(self.reference.clone()), None),
+                .with_observed_target(Some(self.reference.clone()), None)
+                .with_captured_output(captured),
         )
     }
 
@@ -199,46 +201,60 @@ impl CopilotProvider {
             ProcessError::Io(error) => {
                 ProviderError::ExecutionFailed(format!("Copilot process I/O failed: {error}"))
             }
-            ProcessError::TimedOut(output) => ProviderError::TimedOutWithOutput {
-                timeout,
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            },
-            ProcessError::Cancelled(output) => ProviderError::CancelledWithOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            },
+            ProcessError::TimedOut(output) => {
+                let captured = CapturedOutput::from_process_output(&output);
+                ProviderError::TimedOutWithOutput { timeout }.with_captured_output(captured)
+            }
+            ProcessError::Cancelled(output) => {
+                let captured = CapturedOutput::from_process_output(&output);
+                ProviderError::CancelledWithOutput.with_captured_output(captured)
+            }
             ProcessError::CancelledBeforeStart => ProviderError::Cancelled,
             ProcessError::Interrupted {
                 reason,
                 stopped,
                 stdout,
                 stderr,
-                diagnostic,
+                output_truncated: _,
+                stdout_truncated,
+                stderr_truncated,
+                diagnostic: _,
             } => ProviderError::Interrupted {
                 reason,
                 confirmed_stopped: stopped,
-                stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                diagnostic,
-            },
+            }
+            .with_captured_output(CapturedOutput::with_stream_truncation(
+                stdout,
+                stderr,
+                None,
+                stdout_truncated,
+                stderr_truncated,
+            )),
             ProcessError::NonZeroExit(output) => {
-                let diagnostic =
-                    output_diagnostic(&output.stdout, &output.stderr, output.exit_code());
+                let classification_text = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let captured = CapturedOutput::from_process_output(&output);
                 if let Some(error) = crate::provider::unsupported_model_error(
                     &self.reference,
                     model,
                     &String::from_utf8_lossy(&output.stderr),
                 ) {
-                    error
-                } else if looks_like_authentication_failure(&diagnostic) {
-                    ProviderError::Unavailable(format!(
-                        "GitHub Copilot CLI authentication failed; run `copilot` and use `/login`: {diagnostic}"
-                    ))
+                    error.with_captured_output(captured)
+                } else if looks_like_authentication_failure(&classification_text) {
+                    ProviderError::Unavailable(
+                        "GitHub Copilot CLI authentication failed; run `copilot` and use `/login`"
+                            .into(),
+                    )
+                    .with_captured_output(captured)
                 } else {
-                    ProviderError::ExecutionFailed(format!(
-                        "GitHub Copilot CLI exited unsuccessfully: {diagnostic}"
-                    ))
+                    ProviderError::ExecutionFailed(
+                        "GitHub Copilot CLI exited unsuccessfully; captured bytes are withheld"
+                            .into(),
+                    )
+                    .with_captured_output(captured)
                 }
             }
         }
@@ -265,18 +281,6 @@ impl AgentProvider for CopilotProvider {
     ) -> Result<ProviderResult, ProviderError> {
         self.execute_process(request, cancellation)
     }
-}
-
-fn output_diagnostic(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> String {
-    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
-    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
-    let output = match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => String::from("no diagnostic output"),
-        (false, true) => format!("stdout: {stdout}"),
-        (true, false) => format!("stderr: {stderr}"),
-        (false, false) => format!("stdout: {stdout}; stderr: {stderr}"),
-    };
-    format!("exit status {exit_code:?}; {output}")
 }
 
 fn looks_like_authentication_failure(diagnostic: &str) -> bool {
@@ -332,13 +336,17 @@ mod tests {
         let result = provider.execute(&request(Duration::from_secs(1))).unwrap();
         let expected_workspace = std::fs::canonicalize(std::env::temp_dir()).unwrap();
 
-        assert!(result.stdout().starts_with("out:"));
         assert!(
             result
-                .stdout()
+                .expose_stdout_for_trusted_processing()
+                .starts_with("out:")
+        );
+        assert!(
+            result
+                .expose_stdout_for_trusted_processing()
                 .contains(expected_workspace.to_string_lossy().as_ref())
         );
-        assert_eq!(result.stderr(), "err");
+        assert_eq!(result.expose_stderr_for_trusted_processing(), "err");
         assert_eq!(result.exit_status(), Some(0));
         assert!(result.agent_result().unwrap().reported_success());
         assert_eq!(result.observed_provider().unwrap().as_str(), "copilot");
@@ -371,17 +379,16 @@ mod tests {
 
         let provider = CopilotProvider::with_executable("sh")
             .with_command_prefix("printf 'unsupported model' >&2; exit 1");
+        let error = provider.execute(&request).unwrap_err();
         assert!(matches!(
-            provider.execute(&request),
-            Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "claude-haiku-test"
+            error.kind(),
+            ProviderError::UnsupportedModel { model, .. } if model.as_str() == "claude-haiku-test"
         ));
 
         let provider = CopilotProvider::with_executable("sh")
             .with_command_prefix("printf 'unsupported model'; exit 1");
-        assert!(matches!(
-            provider.execute(&request),
-            Err(ProviderError::ExecutionFailed(_))
-        ));
+        let error = provider.execute(&request).unwrap_err();
+        assert!(matches!(error.kind(), ProviderError::ExecutionFailed(_)));
     }
 
     #[test]
@@ -417,10 +424,9 @@ mod tests {
             .execute(&request(Duration::from_secs(1)))
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            ProviderError::Unavailable(message) if message.contains("/login")
-        ));
+        assert!(
+            matches!(error.kind(), ProviderError::Unavailable(message) if message.contains("/login"))
+        );
     }
 
     #[cfg(unix)]
@@ -433,11 +439,10 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(
-            error,
+            error.kind(),
             ProviderError::ExecutionFailed(message)
-                if message.contains("exit status Some(7)")
-                    && message.contains("partial stdout")
-                    && message.contains("details")
+                if !message.contains("partial stdout")
+                    && !message.contains("details")
         ));
     }
 
@@ -450,7 +455,14 @@ mod tests {
             .execute(&request(Duration::from_secs(1)))
             .unwrap_err();
         assert!(
-            matches!(timeout, ProviderError::TimedOutWithOutput { stdout, .. } if stdout == "partial")
+            matches!(timeout.kind(), ProviderError::TimedOutWithOutput { timeout } if *timeout == Duration::from_secs(1))
+        );
+        assert_eq!(
+            timeout
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stdout_bytes_for_trusted_processing(),
+            b"partial"
         );
 
         let cancellation = CancellationToken::new();
@@ -461,10 +473,18 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         cancellation.cancel();
 
+        let cancelled = thread.join().unwrap().unwrap_err();
         assert!(matches!(
-            thread.join().unwrap(),
-            Err(ProviderError::CancelledWithOutput { .. })
+            cancelled.kind(),
+            ProviderError::CancelledWithOutput
         ));
+        assert_eq!(
+            cancelled
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stdout_bytes_for_trusted_processing(),
+            b"partial"
+        );
     }
 
     #[test]

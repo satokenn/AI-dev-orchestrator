@@ -7,9 +7,12 @@ use std::{
     time::Duration,
 };
 
+use serde_json::Value;
+
 use crate::{
-    AgentProvider, AgentResult, CancellationToken, ModelChoice, ProcessError, ProcessRequest,
-    ProcessRunner, ProviderError, ProviderRef, ProviderRequest, ProviderResult,
+    AgentProvider, AgentResult, CancellationToken, CapturedOutput, ModelChoice, ProcessError,
+    ProcessRequest, ProcessRunner, ProviderError, ProviderRef, ProviderRequest, ProviderResult,
+    UsageCost, UsageMetric,
 };
 
 const CODEX_COMMAND: &str = "codex";
@@ -69,7 +72,15 @@ impl CodexProvider {
                     "failed to start {}: {error}",
                     self.executable.to_string_lossy()
                 )),
-                other => ProviderError::Unavailable(format!("Codex CLI unavailable: {other:?}")),
+                ProcessError::Io(_) | ProcessError::NonZeroExit(_) => ProviderError::Unavailable(
+                    "Codex CLI availability check failed; process output is withheld".into(),
+                ),
+                ProcessError::TimedOut(_)
+                | ProcessError::Cancelled(_)
+                | ProcessError::CancelledBeforeStart
+                | ProcessError::Interrupted { .. } => ProviderError::Unavailable(
+                    "Codex CLI availability check did not complete".into(),
+                ),
             })
     }
 
@@ -137,14 +148,35 @@ impl CodexProvider {
             .run_with_cancellation(self.process_request(request), cancellation)
             .map_err(|error| self.map_process_error(error, request.timeout(), request.model()))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stdout = match std::str::from_utf8(&output.stdout) {
+            Ok(stdout) => stdout.to_owned(),
+            Err(_) => {
+                let captured_output = CapturedOutput::from_process_output(&output);
+                return Err(ProviderError::ExecutionFailed(
+                    "Codex CLI emitted invalid UTF-8 in JSONL stdout".into(),
+                )
+                .with_captured_output(captured_output));
+            }
+        };
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let exit_status = output.exit_code();
-        let agent_result = Some(AgentResult::new(stdout.clone(), output.status.success()));
-        Ok(
-            ProviderResult::new(stdout, stderr, exit_status, agent_result, None)
-                .with_observed_target(Some(self.reference.clone()), None),
+        let captured_output = CapturedOutput::from_process_output(&output);
+        let parsed =
+            parse_codex_jsonl(stdout.as_bytes(), output.stdout_truncated).map_err(|message| {
+                ProviderError::ExecutionFailed(message)
+                    .with_captured_output(captured_output.clone())
+            })?;
+        let result = ProviderResult::new(
+            stdout,
+            stderr,
+            exit_status,
+            parsed.agent_result,
+            parsed.usage,
         )
+        .with_observed_target(Some(self.reference.clone()), None)
+        .with_captured_output(captured_output)
+        .with_diagnostics(parsed.diagnostics);
+        Ok(result)
     }
 
     fn map_process_error(
@@ -166,50 +198,188 @@ impl CodexProvider {
             ProcessError::Io(error) => {
                 ProviderError::ExecutionFailed(format!("Codex process I/O failed: {error}"))
             }
-            ProcessError::TimedOut(output) => ProviderError::TimedOutWithOutput {
-                timeout,
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            },
-            ProcessError::Cancelled(output) => ProviderError::CancelledWithOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            },
+            ProcessError::TimedOut(output) => {
+                let captured = CapturedOutput::from_process_output(&output);
+                ProviderError::TimedOutWithOutput { timeout }.with_captured_output(captured)
+            }
+            ProcessError::Cancelled(output) => {
+                let captured = CapturedOutput::from_process_output(&output);
+                ProviderError::CancelledWithOutput.with_captured_output(captured)
+            }
             ProcessError::CancelledBeforeStart => ProviderError::Cancelled,
             ProcessError::Interrupted {
                 reason,
                 stopped,
                 stdout,
                 stderr,
-                diagnostic,
+                output_truncated: _,
+                stdout_truncated,
+                stderr_truncated,
+                diagnostic: _,
             } => ProviderError::Interrupted {
                 reason,
                 confirmed_stopped: stopped,
-                stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                diagnostic,
-            },
+            }
+            .with_captured_output(CapturedOutput::with_stream_truncation(
+                stdout,
+                stderr,
+                None,
+                stdout_truncated,
+                stderr_truncated,
+            )),
             ProcessError::NonZeroExit(output) => {
-                let diagnostic =
-                    output_diagnostic(&output.stdout, &output.stderr, output.exit_code());
+                let classification_text = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let captured = CapturedOutput::from_process_output(&output);
                 if let Some(error) = crate::provider::unsupported_model_error(
                     &self.reference,
                     model,
                     &String::from_utf8_lossy(&output.stderr),
                 ) {
-                    error
-                } else if looks_like_authentication_failure(&diagnostic) {
-                    ProviderError::Unavailable(format!(
-                        "Codex CLI authentication failed; run `codex login`: {diagnostic}"
-                    ))
+                    error.with_captured_output(captured)
+                } else if looks_like_authentication_failure(&classification_text) {
+                    ProviderError::Unavailable(
+                        "Codex CLI authentication failed; run `codex login`".into(),
+                    )
+                    .with_captured_output(captured)
                 } else {
-                    ProviderError::ExecutionFailed(format!(
-                        "Codex CLI exited unsuccessfully: {diagnostic}"
-                    ))
+                    ProviderError::ExecutionFailed("Codex CLI exited unsuccessfully".into())
+                        .with_captured_output(captured)
                 }
             }
         }
     }
+}
+
+struct ParsedCodexJsonl {
+    agent_result: Option<AgentResult>,
+    usage: Option<UsageCost>,
+    diagnostics: Vec<String>,
+}
+
+/// Parses the stable Codex JSONL events needed by the provider contract.
+/// Unknown event types are ignored, and the caller retains the original stream.
+fn parse_codex_jsonl(stdout: &[u8], truncated: bool) -> Result<ParsedCodexJsonl, String> {
+    if truncated {
+        return Err("Codex JSONL stdout was truncated before parsing".into());
+    }
+    let stdout = std::str::from_utf8(stdout)
+        .map_err(|_| "Codex CLI emitted invalid UTF-8 in JSONL stdout".to_owned())?;
+    let mut final_message = None;
+    let mut usage_events = Vec::new();
+    let mut completed_turn_without_usage = false;
+    let mut diagnostics = Vec::new();
+    let mut fatal_errors = Vec::new();
+
+    for (index, line) in stdout.lines().enumerate() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: Value = serde_json::from_str(line)
+            .map_err(|_| format!("Codex CLI emitted malformed JSONL at line {}", index + 1))?;
+        let Some(event) = event.as_object() else {
+            return Err(format!(
+                "Codex JSONL event at line {} is not an object",
+                index + 1
+            ));
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("item.completed") => {
+                let Some(item) = event.get("item").and_then(Value::as_object) else {
+                    return Err(format!(
+                        "Codex item.completed event at line {} has no item object",
+                        index + 1
+                    ));
+                };
+                match item.get("type").and_then(Value::as_str) {
+                    Some("agent_message") => {
+                        let Some(text) = item.get("text").and_then(Value::as_str) else {
+                            return Err(format!(
+                                "Codex agent_message at line {} has no text",
+                                index + 1
+                            ));
+                        };
+                        final_message = Some(text.to_owned());
+                    }
+                    Some("error") => {
+                        if item.get("message").and_then(Value::as_str).is_some() {
+                            diagnostics.push("Codex CLI emitted an item error event".into());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("turn.completed") => {
+                if let Some(usage) = event.get("usage") {
+                    let Some(usage) = usage.as_object() else {
+                        return Err(format!(
+                            "Codex turn.completed usage at line {} is not an object",
+                            index + 1
+                        ));
+                    };
+                    usage_events.push(usage.clone());
+                } else {
+                    completed_turn_without_usage = true;
+                }
+            }
+            Some("turn.failed") => {
+                fatal_errors.push("Codex CLI reported a failed turn".to_owned());
+            }
+            Some("error") => {
+                fatal_errors.push("Codex CLI reported an unrecoverable stream error".to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    if !fatal_errors.is_empty() {
+        return Err(fatal_errors.join("; "));
+    }
+
+    const FIELDS: [&str; 5] = [
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    ];
+    let mut metrics = Vec::new();
+    if !usage_events.is_empty() && !completed_turn_without_usage {
+        for name in FIELDS {
+            let mut total = 0_u64;
+            let mut known = true;
+            for event in &usage_events {
+                let Some(value) = event.get(name).and_then(Value::as_i64) else {
+                    known = false;
+                    break;
+                };
+                let Ok(value) = u64::try_from(value) else {
+                    known = false;
+                    break;
+                };
+                let Some(sum) = total.checked_add(value) else {
+                    known = false;
+                    break;
+                };
+                total = sum;
+            }
+            if known {
+                metrics.push(UsageMetric::new(name, total.to_string(), "tokens"));
+            }
+        }
+    }
+    let usage = (!metrics.is_empty()).then(|| UsageCost::new(metrics));
+    let agent_result =
+        final_message.map(|message| AgentResult::new(message, diagnostics.is_empty()));
+    Ok(ParsedCodexJsonl {
+        agent_result,
+        usage,
+        diagnostics,
+    })
 }
 
 impl AgentProvider for CodexProvider {
@@ -232,18 +402,6 @@ impl AgentProvider for CodexProvider {
     ) -> Result<ProviderResult, ProviderError> {
         self.execute_process(request, cancellation)
     }
-}
-
-fn output_diagnostic(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> String {
-    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
-    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
-    let output = match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => String::from("no diagnostic output"),
-        (false, true) => format!("stdout: {stdout}"),
-        (true, false) => format!("stderr: {stderr}"),
-        (false, false) => format!("stdout: {stdout}; stderr: {stderr}"),
-    };
-    format!("exit status {exit_code:?}; {output}")
 }
 
 fn looks_like_authentication_failure(diagnostic: &str) -> bool {
@@ -290,16 +448,49 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn executes_non_interactively_in_the_requested_workspace() {
-        let provider = shell_provider("printf 'out:%s:%s' \"$PWD\" \"$6\"; printf err >&2");
+        let provider = shell_provider(
+            "printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"%s:%s\"}}\\n' \"$PWD\" \"$6\"; printf err >&2",
+        );
         let result = provider.execute(&request(Duration::from_secs(1))).unwrap();
 
-        assert!(result.stdout().starts_with("out:"));
-        assert!(result.stdout().contains("do the task"));
-        assert_eq!(result.stderr(), "err");
+        assert!(result.agent_result().unwrap().summary().starts_with('/'));
+        assert!(
+            result
+                .agent_result()
+                .unwrap()
+                .summary()
+                .contains("do the task")
+        );
+        assert_eq!(result.expose_stderr_for_trusted_processing(), "err");
         assert_eq!(result.exit_status(), Some(0));
         assert!(result.agent_result().unwrap().reported_success());
         assert_eq!(result.observed_provider().unwrap().as_str(), "codex");
         assert!(result.observed_model().is_none());
+        assert_eq!(
+            result
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stdout_bytes_for_trusted_processing(),
+            result.expose_stdout_for_trusted_processing().as_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_truncation_does_not_reject_complete_jsonl_stdout() {
+        let provider = shell_provider(
+            "head -c 1048577 /dev/zero >&2; printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"complete\"}}'",
+        );
+
+        let result = provider.execute(&request(Duration::from_secs(5))).unwrap();
+
+        assert_eq!(result.agent_result().unwrap().summary(), "complete");
+        let captured = result
+            .expose_captured_output_for_trusted_processing()
+            .unwrap();
+        assert!(!captured.stdout_truncated());
+        assert!(captured.stderr_truncated());
+        assert!(captured.truncated());
     }
 
     #[cfg(unix)]
@@ -311,7 +502,9 @@ mod tests {
             Duration::from_secs(1),
             ModelChoice::Named(crate::ModelRef::new("gpt-test")),
         );
-        let provider = shell_provider("test \"$6\" = --model; test \"$7\" = gpt-test; printf ok");
+        let provider = shell_provider(
+            "test \"$6\" = --model; test \"$7\" = gpt-test; printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}'",
+        );
         assert!(provider.execute(&request).is_ok());
         let empty_model_request = ProviderRequest::new(
             std::env::temp_dir(),
@@ -325,16 +518,22 @@ mod tests {
         ));
 
         let provider = shell_provider("printf 'unknown model' >&2; exit 1");
+        let error = provider.execute(&request).unwrap_err();
         assert!(matches!(
-            provider.execute(&request),
-            Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "gpt-test"
+            error.kind(),
+            ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gpt-test"
         ));
+        assert_eq!(
+            error
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stderr_bytes_for_trusted_processing(),
+            b"unknown model"
+        );
 
         let provider = shell_provider("printf 'unsupported model'; exit 1");
-        assert!(matches!(
-            provider.execute(&request),
-            Err(ProviderError::ExecutionFailed(_))
-        ));
+        let error = provider.execute(&request).unwrap_err();
+        assert!(matches!(error.kind(), ProviderError::ExecutionFailed(_)));
     }
 
     #[test]
@@ -368,7 +567,14 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(error, ProviderError::Unavailable(message) if message.contains("codex login"))
+            matches!(error.kind(), ProviderError::Unavailable(message) if message.contains("codex login"))
+        );
+        assert_eq!(
+            error
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stderr_bytes_for_trusted_processing(),
+            b"Not logged in"
         );
     }
 
@@ -381,12 +587,24 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(
-            error,
+            error.kind(),
             ProviderError::ExecutionFailed(message)
-                if message.contains("exit status Some(7)")
-                    && message.contains("partial stdout")
-                    && message.contains("details")
+                if !message.contains("partial stdout")
+                    && !message.contains("details")
         ));
+        let output = error
+            .expose_captured_output_for_trusted_processing()
+            .unwrap();
+        assert_eq!(
+            output.expose_stdout_bytes_for_trusted_processing(),
+            b"partial stdout"
+        );
+        assert_eq!(
+            output.expose_stderr_bytes_for_trusted_processing(),
+            b"details"
+        );
+        assert_eq!(output.exit_status(), Some(7));
+        assert!(!output.truncated());
     }
 
     #[cfg(unix)]
@@ -397,7 +615,14 @@ mod tests {
             .execute(&request(Duration::from_secs(1)))
             .unwrap_err();
         assert!(
-            matches!(timeout, ProviderError::TimedOutWithOutput { stdout, .. } if stdout == "partial")
+            matches!(timeout.kind(), ProviderError::TimedOutWithOutput { timeout } if *timeout == Duration::from_secs(1))
+        );
+        assert_eq!(
+            timeout
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stdout_bytes_for_trusted_processing(),
+            b"partial"
         );
 
         let cancellation = CancellationToken::new();
@@ -408,10 +633,152 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         cancellation.cancel();
 
+        let cancelled = thread.join().unwrap().unwrap_err();
         assert!(matches!(
-            thread.join().unwrap(),
-            Err(ProviderError::CancelledWithOutput { .. })
+            cancelled.kind(),
+            ProviderError::CancelledWithOutput
         ));
+        assert_eq!(
+            cancelled
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stdout_bytes_for_trusted_processing(),
+            b"partial"
+        );
+    }
+
+    #[test]
+    fn fixture_extracts_final_message_and_all_reported_token_metrics() {
+        let parsed = parse_codex_jsonl(
+            include_bytes!("../tests/fixtures/codex/success.jsonl"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(parsed.agent_result.unwrap().summary(), "task complete");
+        let metrics = parsed.usage.unwrap();
+        let values = metrics
+            .metrics()
+            .iter()
+            .map(|metric| (metric.name(), metric.value(), metric.unit()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                ("input_tokens", "12", "tokens"),
+                ("cached_input_tokens", "3", "tokens"),
+                ("cache_write_input_tokens", "2", "tokens"),
+                ("output_tokens", "5", "tokens"),
+                ("reasoning_output_tokens", "1", "tokens"),
+            ]
+        );
+    }
+
+    #[test]
+    fn latest_agent_message_wins_and_unknown_events_are_ignored() {
+        let parsed = parse_codex_jsonl(
+            b"{\"type\":\"future.event\",\"payload\":{}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"first\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"last\"}}\n",
+            false,
+        ).unwrap();
+        assert_eq!(parsed.agent_result.unwrap().summary(), "last");
+        assert!(parsed.usage.is_none());
+    }
+
+    #[test]
+    fn item_error_marks_reported_success_false_and_preserves_final_message() {
+        let parsed = parse_codex_jsonl(
+            b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"partial result\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":\"tool failed\"}}\n",
+            false,
+        )
+        .unwrap();
+
+        let result = parsed.agent_result.unwrap();
+        assert_eq!(result.summary(), "partial result");
+        assert!(!result.reported_success());
+        assert_eq!(
+            parsed.diagnostics,
+            vec!["Codex CLI emitted an item error event"]
+        );
+    }
+
+    #[test]
+    fn empty_output_and_unknown_usage_remain_unknown() {
+        let empty = parse_codex_jsonl(b"", false).unwrap();
+        assert!(empty.agent_result.is_none());
+        assert!(empty.usage.is_none());
+
+        let parsed = parse_codex_jsonl(
+            b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":-1}}\n",
+            false,
+        )
+        .unwrap();
+        let usage = parsed.usage.unwrap();
+        let metrics = usage.metrics();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name(), "input_tokens");
+        assert_eq!(metrics[0].value(), "12");
+        assert!(parse_codex_jsonl(b"{broken\n", false).is_err());
+        assert!(parse_codex_jsonl(b"{}", true).is_err());
+    }
+
+    #[test]
+    fn jsonl_rejects_invalid_utf8_without_replacing_captured_bytes() {
+        let raw_stdout = b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"\xff\"}}\n";
+        assert!(matches!(
+            parse_codex_jsonl(raw_stdout, false),
+            Err(message) if message.contains("invalid UTF-8")
+        ));
+        let lossy = String::from_utf8_lossy(raw_stdout);
+        assert!(parse_codex_jsonl(lossy.as_bytes(), false).is_ok());
+
+        let captured = CapturedOutput::new(raw_stdout.to_vec(), Vec::new(), Some(0), false);
+        assert_eq!(
+            captured.expose_stdout_bytes_for_trusted_processing(),
+            raw_stdout
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_rejects_invalid_utf8_and_keeps_original_capture() {
+        let provider = shell_provider(
+            "printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"\\377\"}}\\n'",
+        );
+        let error = provider
+            .execute(&request(Duration::from_secs(1)))
+            .unwrap_err();
+        assert!(
+            matches!(error.kind(), ProviderError::ExecutionFailed(message) if message.contains("invalid UTF-8"))
+        );
+        assert_eq!(
+            error
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stdout_bytes_for_trusted_processing(),
+            b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"\xff\"}}\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fatal_jsonl_events_use_safe_error_text_and_preserve_trusted_capture() {
+        let provider = shell_provider(
+            "printf '%s\\n' '{\"type\":\"turn.failed\",\"error\":{\"message\":\"model failed\"}}'",
+        );
+        let error = provider
+            .execute(&request(Duration::from_secs(1)))
+            .unwrap_err();
+        assert!(
+            matches!(error.kind(), ProviderError::ExecutionFailed(message) if message == "Codex CLI reported a failed turn")
+        );
+        assert!(
+            String::from_utf8_lossy(
+                error
+                    .expose_captured_output_for_trusted_processing()
+                    .unwrap()
+                    .expose_stdout_bytes_for_trusted_processing()
+            )
+            .contains("model failed")
+        );
     }
 
     #[test]

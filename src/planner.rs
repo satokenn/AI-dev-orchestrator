@@ -455,7 +455,9 @@ impl CodexPlanner {
                 stopped,
                 stdout,
                 stderr,
+                output_truncated: _,
                 diagnostic: stop_diagnostic,
+                ..
             } => PlannerError::CodexExecutionFailed {
                 message: format!(
                     "Codex process interrupted ({reason:?}, stopped={stopped}): {stop_diagnostic}; {}",

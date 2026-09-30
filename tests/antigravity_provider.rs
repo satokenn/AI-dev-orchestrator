@@ -6,7 +6,6 @@ use ai_dev_orchestrator::{
 };
 use std::{
     fs,
-    io::Write,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
@@ -33,13 +32,11 @@ impl FakeCli {
         ));
         fs::create_dir(&unique_directory).expect("create fake CLI directory");
         let executable = unique_directory.join("agy");
-        let mut script = fs::File::create(&executable).expect("create fake CLI");
-        script
-            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
-            .expect("write fake CLI");
-        drop(script);
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+        let temporary_script = unique_directory.join("agy.tmp");
+        fs::write(&temporary_script, format!("#!/bin/sh\n{body}\n")).expect("write fake CLI");
+        fs::set_permissions(&temporary_script, fs::Permissions::from_mode(0o755))
             .expect("make fake CLI executable");
+        fs::rename(&temporary_script, &executable).expect("publish fake CLI atomically");
         Self {
             directory: unique_directory,
             executable,
@@ -94,11 +91,19 @@ fn executes_headless_cli_in_workspace_and_maps_json_result() {
     assert_eq!(result.exit_status(), Some(0));
     assert_eq!(result.observed_provider().unwrap().as_str(), "antigravity");
     assert!(result.observed_model().is_none());
-    assert!(result.stdout().contains("\"status\":\"SUCCESS\""));
-    assert!(result.stderr().starts_with("fake diagnostic:"));
     assert!(
         result
-            .stderr()
+            .expose_stdout_for_trusted_processing()
+            .contains("\"status\":\"SUCCESS\"")
+    );
+    assert!(
+        result
+            .expose_stderr_for_trusted_processing()
+            .starts_with("fake diagnostic:")
+    );
+    assert!(
+        result
+            .expose_stderr_for_trusted_processing()
             .contains(workspace.to_string_lossy().as_ref())
     );
     assert_eq!(
@@ -144,19 +149,38 @@ fn passes_named_model_and_types_invalid_model_selection() {
     );
     let workspace = cli.directory.join("workspace");
     fs::create_dir(&workspace).expect("create workspace");
-    assert!(matches!(
-        cli.provider().execute(&named_model_request(workspace, "hello", Duration::from_secs(1))),
-        Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "gemini-test"
-    ));
+    let error = cli
+        .provider()
+        .execute(&named_model_request(
+            workspace,
+            "hello",
+            Duration::from_secs(1),
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.kind(),
+            ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
+        ),
+        "unexpected safe error: {error:?}"
+    );
 
     let cli = FakeCli::new(
         r#"if [ "$1" = "--version" ]; then exit 0; fi; printf '{"status":"ERROR","error":"invalid model selection: unknown model"}\n'"#,
     );
     let workspace = cli.directory.join("workspace");
     fs::create_dir(&workspace).expect("create workspace");
+    let error = cli
+        .provider()
+        .execute(&named_model_request(
+            workspace,
+            "hello",
+            Duration::from_secs(1),
+        ))
+        .unwrap_err();
     assert!(matches!(
-        cli.provider().execute(&named_model_request(workspace, "hello", Duration::from_secs(1))),
-        Err(ProviderError::UnsupportedModel { model, .. }) if model.as_str() == "gemini-test"
+        error.kind(),
+        ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
     ));
 }
 
@@ -194,10 +218,11 @@ fn reports_authentication_failure_as_unavailable() {
         Duration::from_secs(10),
     ));
 
-    assert!(matches!(
-        result,
-        Err(ProviderError::Unavailable(message)) if message.contains("authentication required")
-    ));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error.kind(), ProviderError::Unavailable(message) if message.contains("authentication failed")),
+        "unexpected safe error: {error:?}"
+    );
 }
 
 #[test]
@@ -209,10 +234,17 @@ fn maps_timeout_to_provider_error() {
         Duration::from_secs(1),
     ));
 
-    assert!(matches!(
-        result,
-        Err(ProviderError::TimedOutWithOutput { timeout, stdout, .. }) if timeout == Duration::from_secs(1) && stdout == "partial"
-    ));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error.kind(), ProviderError::TimedOutWithOutput { timeout } if *timeout == Duration::from_secs(1))
+    );
+    assert_eq!(
+        error
+            .expose_captured_output_for_trusted_processing()
+            .unwrap()
+            .expose_stdout_bytes_for_trusted_processing(),
+        b"partial"
+    );
 }
 
 #[test]
@@ -242,7 +274,8 @@ fn maps_cancellation_to_provider_error() {
     assert!(
         matches!(
             &result,
-            Err(ProviderError::CancelledWithOutput { stdout, .. }) if stdout == "partial"
+            Err(error) if matches!(error.kind(), ProviderError::CancelledWithOutput)
+                && error.expose_captured_output_for_trusted_processing().is_some_and(|output| output.expose_stdout_bytes_for_trusted_processing() == b"partial")
         ),
         "unexpected cancellation result: {result:?}"
     );

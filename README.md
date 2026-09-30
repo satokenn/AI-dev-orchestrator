@@ -33,13 +33,13 @@ timeout / cancel時のprocess group停止、停止確認結果、部分ログと
 
 ## AgentProvider 契約
 
-Agent 実行先の違いは `AgentProvider` に閉じ込めます。`ProviderRequest` は workspace、prompt、timeout と必須の `ModelChoice`（named Modelまたは明示したProvider既定値）を受け取り、`ProviderResult` は stdout、stderr、終了状態、任意の `AgentResult` と `UsageCost`、観測できたProvider / Modelを返します。Provider出力から実Modelを確定できない場合、observed Modelはunknownのままです。実行に失敗した場合は `ProviderError`（不正な要求、未対応Model、実行失敗、タイムアウト、利用不能）を返します。
+Agent 実行先の違いは `AgentProvider` に閉じ込めます。`ProviderRequest` は workspace、prompt、timeout と必須の `ModelChoice`（named Modelまたは明示したProvider既定値）を受け取り、`ProviderResult` は stdout、stderr、終了状態、任意の `AgentResult` と `UsageCost`、観測できたProvider / Modelを返します。stdout / stderr本文は `expose_stdout_for_trusted_processing` / `expose_stderr_for_trusted_processing` で明示して取得します。これらはsecretを含む可能性があるため、信頼された呼び出し側に限り、redactionなしに保存・返却してはいけません。Provider出力から実Modelを確定できない場合、observed Modelはunknownのままです。実行に失敗した場合は `ProviderError`（不正な要求、未対応Model、実行失敗、タイムアウト、利用不能）を返します。error本文とDebug表示にはraw stdout / stderrを含めません。
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
 ## Operation Ledger
 
-`Orchestrator` は、設定された `SqliteOperationLedger` に外部 Provider の起動前の受理・開始を記録し、workspace 準備、Provider実行、validation の結果を終了状態として保存します。CLI は指定された実行Ledgerのサイドカーへ自動的にOperation Ledgerを保存します。`SqliteOperationLedger` は同じ request ID の再送を同じ operation として返し、異なる payload、古い Task revision、同一 Task の実行中操作を拒否します。終了事実、event、validation、review、usage / budget、publication 参照、上限付き raw log、再起動時の `recovery_required` 診断を保存します。
+`Orchestrator` は、設定された `SqliteOperationLedger` に外部 Provider の起動前の受理・開始を記録し、workspace 準備、Provider実行、validation の結果を終了状態として保存します。CLI は指定された実行Ledgerのサイドカーへ自動的にOperation Ledgerを保存します。`SqliteOperationLedger` は同じ request ID の再送を同じ operation として返し、異なる payload、古い Task revision、同一 Task の実行中操作を拒否します。終了事実、event、validation、review、汎用usage metric、budget、publication参照、明示的に保存された上限付きredacted log、再起動時の`recovery_required`診断を保存します。`save_log` / `save_log_with_truncation`へ渡すbyte列は、呼び出し側が既知のsecretと認証tokenをredact済みである必要があります。usage metricは名前・値・単位を個別に保持し、入力/出力の2値へ集約しません。
 
 ## WorkspaceManager
 
@@ -49,7 +49,11 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 ## Codex CLI Provider
 
-`CodexProvider` は `codex exec` を非対話モードで起動し、`ProviderRequest` の workspace を cwd として使用します。named Modelなら `--model <model>` を渡し、`ProviderDefault`ならModel引数を渡さずCodex CLI設定を使います。Codex CLI は `PATH` から解決され、workspaceへの書き込みを許可する `--sandbox workspace-write`、JSONL 出力の `--json`、実行状態を永続化しない `--ephemeral` も付けます。現在のJSONL処理では実Modelを確認しないため、observed Modelはunknownです。長時間実行は `execute_with_cancellation` に `CancellationToken` を渡して停止できます。
+`CodexProvider` は `codex exec` を非対話モードで起動し、`ProviderRequest` の workspace を cwd として使用します。named Modelなら `--model <model>` を渡し、`ProviderDefault`ならModel引数を渡さずCodex CLI設定を使います。Codex CLI は `PATH` から解決され、workspaceへの書き込みを許可する `--sandbox workspace-write`、JSONL 出力の `--json`、実行状態を永続化しない `--ephemeral` も付けます。
+
+JSONLの最後の`item.completed` / `agent_message.text`を`AgentResult`へ、各`turn.completed.usage`の明示済みtoken値を名前と`tokens`単位を保った`UsageMetric`へ変換します。usageの欠落、不正値、負数、または集計不能な値はunknownとしてmetricに追加しません。金額はJSONLに含まれないため推定しません。`error`と`turn.failed`イベント、壊れたJSONL、stdoutの切り詰めはraw本文を含めない実行エラーとして返し、空出力は`AgentResult`なしで返します。stderrだけの切り詰めはJSONL解析を妨げず、raw captureの切り詰め情報で確認できます。未知のイベントは無視しraw出力に残します。公式JSONLイベントは実Modelを示さないため、observed Modelはunknownです。
+
+Provider APIでは成功・失敗結果にUTF-8変換前のstdout/stderr byte列、終了状態、capture切り詰め状態を保持します。raw byte列は`expose_captured_output_for_trusted_processing` / `expose_*_bytes_for_trusted_processing`を呼んだ信頼された処理だけが参照します。ProviderErrorは`kind()`で意味上のエラーを確認できますが、timeout / cancel / interrupted errorのフィールド、通常のerror本文、Debug表示にはraw診断を含めません。raw captureはsecretや認証tokenを含む可能性があり、redactionなしに永続化・返却してはいけません。正規化usageは`save_usage_metrics`へ渡せます。Codex JSONL解析はfixture unit testで検証し、実Codex CLIは通常のPR testで起動しません。AgentResultを含むAttemptの保存は既存Execution Ledgerの責務です。両LedgerとOperationを自動で結び付けるServiceは#66の対象であり、ここでは未実装です。長時間実行は `execute_with_cancellation` に `CancellationToken` を渡して停止できます。
 
 ## Codex Planner
 

@@ -51,7 +51,7 @@ pub use planner::{
 pub use process_runner::{
     CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner, StopReason,
 };
-pub use provider::{AgentProvider, ProviderError, ProviderRequest, ProviderResult};
+pub use provider::{AgentProvider, CapturedOutput, ProviderError, ProviderRequest, ProviderResult};
 pub use retry::{
     ExecutionPolicy, PolicyError, ProviderRegistry, ProviderResolutionError, ProviderResolver,
     RetryPolicy,
