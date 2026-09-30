@@ -333,6 +333,18 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
         head_branch: &str,
         timeout: Duration,
     ) -> Result<(), PublicationGatewayError> {
+        // `git push origin` follows pushurl entries, which can target repositories
+        // different from the fetch URL used below to select the Pull Request target.
+        // Resolve and validate every effective push destination before any push effect.
+        let fetch_url = self.git_output(repository, &["remote", "get-url", "origin"], timeout)?;
+        let push_urls = self.git_output(
+            repository,
+            &["remote", "get-url", "--push", "--all", "origin"],
+            timeout,
+        )?;
+        let expected = github_repository_from_remote_url(&fetch_url)
+            .ok_or(PublicationGatewayError::InvalidResponse)?;
+        validate_push_destinations(&expected, &push_urls)?;
         let refspec = format!("{commit_sha}:refs/heads/{head_branch}");
         self.git_output(
             repository,
@@ -414,6 +426,27 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
         verify_pull_request_content(&created_value, payload)?;
         verify_pull_request(parse_api_pull_request(&created)?, payload, commit_sha)
     }
+}
+
+fn validate_push_destinations(
+    expected: &GitHubRemoteRepository,
+    push_urls: &str,
+) -> Result<(), PublicationGatewayError> {
+    let mut destinations = push_urls
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = destinations
+        .next()
+        .ok_or(PublicationGatewayError::InvalidResponse)?;
+    for destination in std::iter::once(first).chain(destinations) {
+        let parsed = github_repository_from_remote_url(destination)
+            .ok_or(PublicationGatewayError::InvalidResponse)?;
+        if parsed != *expected {
+            return Err(PublicationGatewayError::InvalidResponse);
+        }
+    }
+    Ok(())
 }
 
 fn map_process_error(error: crate::process_runner::ProcessError) -> PublicationGatewayError {
@@ -609,6 +642,34 @@ mod tests {
             })
         );
         assert!(github_repository_from_remote_url("not-a-github-remote").is_none());
+    }
+
+    #[test]
+    fn push_destinations_must_match_origin_repository() {
+        let expected = github_repository_from_remote_url("https://github.com/example/project.git")
+            .expect("valid origin URL");
+
+        // With no configured pushurl, Git reports the fetch URL as the effective destination.
+        validate_push_destinations(&expected, "https://github.com/example/project.git\n")
+            .expect("unset pushurl falls back to origin");
+        validate_push_destinations(&expected, "git@github.com:example/project.git\n")
+            .expect("equivalent SSH URL targets same repository");
+        validate_push_destinations(
+            &expected,
+            "https://github.com/example/project.git\ngit@github.com:example/project.git\n",
+        )
+        .expect("all configured pushurls target same repository");
+        assert_eq!(
+            validate_push_destinations(&expected, "https://github.com/other/project.git\n"),
+            Err(PublicationGatewayError::InvalidResponse)
+        );
+        assert_eq!(
+            validate_push_destinations(
+                &expected,
+                "https://github.com/example/project.git\nhttps://github.com/other/project.git\n",
+            ),
+            Err(PublicationGatewayError::InvalidResponse)
+        );
     }
 
     #[test]
