@@ -1783,12 +1783,18 @@ pub struct OperationService<'a, P> {
 struct ActiveCancellationGuard<'a> {
     registry: &'a std::sync::Mutex<std::collections::HashMap<String, CancellationToken>>,
     operation_id: String,
+    token: CancellationToken,
 }
 
 impl Drop for ActiveCancellationGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut active) = self.registry.lock() {
-            active.remove(&self.operation_id);
+            if active
+                .get(&self.operation_id)
+                .is_some_and(|registered| registered.is_same_signal(&self.token))
+            {
+                active.remove(&self.operation_id);
+            }
         }
     }
 }
@@ -2513,21 +2519,27 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         operation_id: &OperationId,
         cancellation: CancellationToken,
     ) -> Result<OperationSnapshot, ServiceError> {
-        self.active_cancel_tokens
-            .lock()
-            .map_err(|_| ServiceError::InvalidStoredState)?
-            .insert(operation_id.as_str().to_owned(), cancellation.clone());
-        let _active_guard = ActiveCancellationGuard {
-            registry: &self.active_cancel_tokens,
-            operation_id: operation_id.as_str().to_owned(),
-        };
         let stored = self.load_request(operation_id)?;
         if stored.status != ServiceOperationStatus::Accepted {
+            return self.get_operation(operation_id);
+        }
+        let mut active = self
+            .active_cancel_tokens
+            .lock()
+            .map_err(|_| ServiceError::InvalidStoredState)?;
+        if active.contains_key(operation_id.as_str()) {
             return self.get_operation(operation_id);
         }
         if !self.claim_operation(operation_id)? {
             return self.get_operation(operation_id);
         }
+        active.insert(operation_id.as_str().to_owned(), cancellation.clone());
+        drop(active);
+        let _active_guard = ActiveCancellationGuard {
+            registry: &self.active_cancel_tokens,
+            operation_id: operation_id.as_str().to_owned(),
+            token: cancellation.clone(),
+        };
         if stored.input_artifact_id.is_some() {
             self.finish_without_start(
                 operation_id,
@@ -3704,14 +3716,6 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         operation_id: &OperationId,
     ) -> Result<CiWaitOperationSnapshot, ServiceError> {
         let token = CancellationToken::new();
-        self.active_cancel_tokens
-            .lock()
-            .map_err(|_| ServiceError::InvalidStoredState)?
-            .insert(operation_id.as_str().to_owned(), token.clone());
-        let _active_guard = ActiveCancellationGuard {
-            registry: &self.active_cancel_tokens,
-            operation_id: operation_id.as_str().to_owned(),
-        };
         self.run_ci_wait_operation_inner(operation_id, &token)
     }
 
@@ -4138,7 +4142,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         }
         {
             let connection = self.ledger.lock_connection()?;
-            connection.execute("UPDATE service_cancellation_operations SET status='running',started_at=?2 WHERE id=?1 AND status='accepted'",params![id.as_str(),now_ms()])?;
+            let changed = connection.execute("UPDATE service_cancellation_operations SET status='running',started_at=?2 WHERE id=?1 AND status='accepted'",params![id.as_str(),now_ms()])?;
+            if changed != 1 {
+                drop(connection);
+                return self.get_cancellation_operation(id);
+            }
         }
         let connection = self.ledger.lock_connection()?;
         let (task_id, kind, target_json): (String, String, String) = connection.query_row(
@@ -5604,6 +5612,31 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn active_cancellation_guard_preserves_a_registration_it_does_not_own() {
+        let registry = Mutex::new(std::collections::HashMap::new());
+        let registered = CancellationToken::new();
+        registry
+            .lock()
+            .unwrap()
+            .insert("operation-1".to_owned(), registered.clone());
+        let guard = ActiveCancellationGuard {
+            registry: &registry,
+            operation_id: "operation-1".to_owned(),
+            token: CancellationToken::new(),
+        };
+
+        drop(guard);
+
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .get("operation-1")
+                .is_some_and(|token| token.is_same_signal(&registered))
+        );
+    }
     use crate::{
         AgentProvider, AgentResult, CiAggregateState, CiCheckDetailState, CiCheckSource,
         CiProviderError, CiProviderSnapshot, CiTarget, ProviderError, ProviderRegistry,
@@ -9692,6 +9725,56 @@ mod tests {
             .unwrap();
         assert_eq!(task_state, "active");
     }
+
+    #[test]
+    fn cancellation_runner_returns_stored_snapshot_when_accepted_claim_is_lost() {
+        let fixture = artifact_publication_fixture();
+        let cancellation_id = OperationId::new("cancel-claim-lost");
+        let revision = task_revision(&fixture.ledger, &fixture.task_id);
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        {
+            let connection = fixture.ledger.lock_connection().unwrap();
+            connection.execute(
+                "INSERT INTO service_cancellation_operations(id,task_id,kind,target_operation_id,target_ids_json,status,accepted_revision,revision,accepted_at) VALUES(?1,?2,'task.cancel',NULL,'[]','accepted',?3,?3,?4)",
+                params![cancellation_id.as_str(), fixture.task_id.as_str(), revision as i64, now_ms()],
+            ).unwrap();
+            connection.execute_batch(&format!(
+                "CREATE TRIGGER simulate_lost_cancellation_claim BEFORE UPDATE OF status ON service_cancellation_operations
+                 WHEN OLD.id='{}' AND OLD.status='accepted'
+                 BEGIN
+                   UPDATE service_cancellation_operations SET status='running',started_at=1 WHERE id=OLD.id;
+                   SELECT RAISE(IGNORE);
+                 END;",
+                cancellation_id.as_str()
+            )).unwrap();
+        }
+
+        let result = service
+            .run_cancellation_operation(&cancellation_id)
+            .unwrap();
+
+        assert_eq!(result.status(), ServiceOperationStatus::Running);
+        assert_eq!(result.finished_at_ms(), None);
+        let state: String = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM tasks WHERE id=?1",
+                params![fixture.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "active");
+    }
+
     #[test]
     fn restart_never_completes_cancellation_of_unsupported_targets() {
         let fixture = artifact_publication_fixture_with_persistent_ledger(true);

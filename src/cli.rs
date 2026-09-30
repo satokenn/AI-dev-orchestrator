@@ -516,7 +516,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 }
 
 fn mcp_stdio_command(args: &[String]) -> i32 {
-    if !has_only(args, &["--repository-root", "--ledger", "--caller"]) {
+    if !validate_options(args, &["--repository-root", "--ledger", "--caller"]) {
         eprintln!("mcp-stdio requires --repository-root PATH and --ledger PATH");
         return USAGE_ERROR;
     }
@@ -556,8 +556,8 @@ fn mcp_stdio_command(args: &[String]) -> i32 {
         Duration::from_secs(3600),
     ) {
         Ok(service) => Box::leak(Box::new(service)),
-        Err(_) => {
-            eprintln!("cannot initialize Operation Service safely");
+        Err(error) => {
+            eprintln!("cannot initialize Operation Service safely: {error}");
             return OPERATION_ERROR;
         }
     };

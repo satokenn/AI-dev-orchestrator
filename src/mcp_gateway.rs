@@ -6,6 +6,8 @@
 
 use std::{
     io::{self, BufRead, Write},
+    sync::Mutex,
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -23,6 +25,11 @@ const PROTOCOL_VERSION: &str = "2026-07-28";
 pub trait McpToolHandler {
     /// Dispatches a tool call to the Operation Service adapter.
     fn call_tool(&self, name: &str, arguments: &Value) -> Result<Value, ToolError>;
+
+    /// Stops and joins work started by this handler before its transport exits.
+    fn shutdown(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Thin adapter from MCP tool arguments to the existing Operation Service.
@@ -31,6 +38,25 @@ pub trait McpToolHandler {
 pub struct OperationServiceHandler<P: 'static> {
     service: &'static OperationService<'static, P>,
     caller: String,
+    workers: Mutex<WorkerRegistry>,
+}
+
+#[derive(Default)]
+struct WorkerRegistry {
+    stopping: bool,
+    worker_panicked: bool,
+    workers: std::collections::HashMap<String, OperationWorker>,
+}
+
+struct OperationWorker {
+    stop: WorkerStop,
+    handle: JoinHandle<()>,
+}
+
+enum WorkerStop {
+    Token(CancellationToken),
+    CiWait(OperationId),
+    WaitForCompletion,
 }
 
 impl<P> OperationServiceHandler<P> {
@@ -39,6 +65,7 @@ impl<P> OperationServiceHandler<P> {
         Self {
             service,
             caller: caller.into(),
+            workers: Mutex::new(WorkerRegistry::default()),
         }
     }
 }
@@ -69,9 +96,123 @@ impl<P: ProviderResolver + Sync + 'static> McpToolHandler for OperationServiceHa
             }),
         }
     }
+
+    fn shutdown(&self) -> io::Result<()> {
+        self.shutdown_workers()
+    }
 }
 
 impl<P: ProviderResolver + Sync + 'static> OperationServiceHandler<P> {
+    fn reap_finished_workers(registry: &mut WorkerRegistry) {
+        let finished = registry
+            .workers
+            .iter()
+            .filter(|(_, worker)| worker.handle.is_finished())
+            .map(|(operation_id, _)| operation_id.clone())
+            .collect::<Vec<_>>();
+        for operation_id in finished {
+            if let Some(worker) = registry.workers.remove(&operation_id)
+                && worker.handle.join().is_err()
+            {
+                registry.worker_panicked = true;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn registered_worker_count(&self) -> usize {
+        self.workers
+            .lock()
+            .map(|registry| registry.workers.len())
+            .unwrap_or(0)
+    }
+
+    fn spawn_worker<F>(
+        &self,
+        operation_id: &OperationId,
+        stop: WorkerStop,
+        run: F,
+    ) -> Result<(), ToolError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let mut registry = self.workers.lock().map_err(|_| ToolError::internal())?;
+        if registry.stopping {
+            return Err(ToolError::internal());
+        }
+        Self::reap_finished_workers(&mut registry);
+        if registry.workers.contains_key(operation_id.as_str()) {
+            return Ok(());
+        }
+        let handle = std::thread::Builder::new()
+            .name(format!("mcp-{}", operation_id.as_str()))
+            .spawn(run)
+            .map_err(|_| ToolError {
+                code: "internal_error".into(),
+                message: "The accepted operation could not be scheduled.".into(),
+                retryable: false,
+                current_task_revision: None,
+                operation_id: Some(operation_id.as_str().to_owned()),
+                details_ref: None,
+            })?;
+        registry.workers.insert(
+            operation_id.as_str().to_owned(),
+            OperationWorker { stop, handle },
+        );
+        Ok(())
+    }
+
+    fn shutdown_workers(&self) -> io::Result<()> {
+        let (workers, worker_panicked) = {
+            let mut registry = self
+                .workers
+                .lock()
+                .map_err(|_| io::Error::other("MCP worker registry is unavailable"))?;
+            if registry.stopping {
+                return Ok(());
+            }
+            registry.stopping = true;
+            (
+                std::mem::take(&mut registry.workers)
+                    .into_values()
+                    .collect::<Vec<_>>(),
+                registry.worker_panicked,
+            )
+        };
+
+        let mut shutdown_error = worker_panicked
+            .then(|| io::Error::other("an MCP operation worker panicked before shutdown"));
+        for worker in &workers {
+            match &worker.stop {
+                WorkerStop::Token(token) => token.cancel(),
+                WorkerStop::CiWait(operation_id) => {
+                    if let Err(error) = self.service.request_ci_wait_cancellation(operation_id) {
+                        if matches!(
+                            error,
+                            ServiceError::PolicyDenied("CI wait operation is already terminal")
+                        ) {
+                            continue;
+                        }
+                        shutdown_error.get_or_insert_with(|| {
+                            io::Error::other(format!(
+                                "could not request CI wait cancellation: {error}"
+                            ))
+                        });
+                    }
+                }
+                WorkerStop::WaitForCompletion => {}
+            }
+        }
+        for worker in workers {
+            if worker.handle.join().is_err() {
+                shutdown_error.get_or_insert_with(|| {
+                    io::Error::other("an MCP operation worker panicked before shutdown")
+                });
+            }
+        }
+        shutdown_error.map_or(Ok(()), Err)
+    }
+
     fn create_task(&self, args: &Value) -> Result<Value, ToolError> {
         let source = match string(args, "source")? {
             "issue" => TaskSource::Issue,
@@ -190,26 +331,23 @@ impl<P: ProviderResolver + Sync + 'static> OperationServiceHandler<P> {
             .service
             .submit_attempt(&request)
             .map_err(map_service_error)?;
-        let accepted_at_ms = self
+        let snapshot = self
             .service
             .get_operation(accepted.operation_id())
-            .map_err(map_service_error)?
-            .accepted_at_ms();
-        let service = self.service;
-        let operation_id = accepted.operation_id().clone();
-        std::thread::Builder::new()
-            .name(format!("mcp-{}", operation_id.as_str()))
-            .spawn(move || {
-                let _ = service.run(&operation_id, CancellationToken::new());
-            })
-            .map_err(|_| ToolError {
-                code: "internal_error".into(),
-                message: "The accepted operation could not be scheduled.".into(),
-                retryable: false,
-                current_task_revision: None,
-                operation_id: Some(accepted.operation_id().as_str().to_owned()),
-                details_ref: None,
-            })?;
+            .map_err(map_service_error)?;
+        if snapshot.status() == crate::ServiceOperationStatus::Accepted {
+            let service = self.service;
+            let operation_id = accepted.operation_id().clone();
+            let worker_operation_id = operation_id.clone();
+            let cancellation = CancellationToken::new();
+            self.spawn_worker(
+                &operation_id,
+                WorkerStop::Token(cancellation.clone()),
+                move || {
+                    let _ = service.run(&worker_operation_id, cancellation);
+                },
+            )?;
+        }
         Ok(acceptance_json(
             accepted.operation_id().as_str(),
             "attempt.run",
@@ -218,7 +356,7 @@ impl<P: ProviderResolver + Sync + 'static> OperationServiceHandler<P> {
             Some(accepted.attempt_id().as_str()),
             string(args, "request_id")?,
             string(args, "task_id")?,
-            accepted_at_ms,
+            snapshot.accepted_at_ms(),
         ))
     }
 
@@ -406,19 +544,16 @@ impl<P: ProviderResolver + Sync + 'static> OperationServiceHandler<P> {
             .map_err(map_service_error)?;
         let service = self.service;
         let operation_id = accepted.operation_id().clone();
-        std::thread::Builder::new()
-            .name(format!("mcp-{}", operation_id.as_str()))
-            .spawn(move || {
-                let _ = service.run_cancellation_operation(&operation_id);
-            })
-            .map_err(|_| ToolError {
-                code: "internal_error".into(),
-                message: "The accepted cancellation could not be scheduled.".into(),
-                retryable: false,
-                current_task_revision: None,
-                operation_id: Some(accepted.operation_id().as_str().to_owned()),
-                details_ref: None,
+        let snapshot = self
+            .service
+            .get_cancellation_operation(&operation_id)
+            .map_err(map_service_error)?;
+        if snapshot.status() == crate::ServiceOperationStatus::Accepted {
+            let worker_operation_id = operation_id.clone();
+            self.spawn_worker(&operation_id, WorkerStop::WaitForCompletion, move || {
+                let _ = service.run_cancellation_operation(&worker_operation_id);
             })?;
+        }
         Ok(acceptance_json(
             accepted.operation_id().as_str(),
             kind,
@@ -463,21 +598,18 @@ impl<P: ProviderResolver + Sync + 'static> OperationServiceHandler<P> {
             .service
             .get_ci_wait_operation(accepted.operation_id())
             .map_err(map_service_error)?;
-        let service = self.service;
-        let operation_id = accepted.operation_id().clone();
-        std::thread::Builder::new()
-            .name(format!("mcp-{}", operation_id.as_str()))
-            .spawn(move || {
-                let _ = service.run_ci_wait_operation(&operation_id);
-            })
-            .map_err(|_| ToolError {
-                code: "internal_error".into(),
-                message: "The accepted operation could not be scheduled.".into(),
-                retryable: false,
-                current_task_revision: None,
-                operation_id: Some(accepted.operation_id().as_str().to_owned()),
-                details_ref: None,
-            })?;
+        if snapshot.status() == crate::ServiceOperationStatus::Accepted {
+            let service = self.service;
+            let operation_id = accepted.operation_id().clone();
+            let worker_operation_id = operation_id.clone();
+            self.spawn_worker(
+                &operation_id,
+                WorkerStop::CiWait(operation_id.clone()),
+                move || {
+                    let _ = service.run_ci_wait_operation(&worker_operation_id);
+                },
+            )?;
+        }
         Ok(acceptance_json(
             accepted.operation_id().as_str(),
             "ci.wait",
@@ -510,21 +642,18 @@ impl<P: ProviderResolver + Sync + 'static> OperationServiceHandler<P> {
             .service
             .accept_validation(&self.caller, &request)
             .map_err(map_service_error)?;
-        let service = self.service;
-        let operation_id = accepted.operation_id().clone();
-        std::thread::Builder::new()
-            .name(format!("mcp-{}", operation_id.as_str()))
-            .spawn(move || {
-                let _ = service.run_validation_operation(&operation_id);
-            })
-            .map_err(|_| ToolError {
-                code: "internal_error".into(),
-                message: "The accepted validation could not be scheduled.".into(),
-                retryable: false,
-                current_task_revision: None,
-                operation_id: Some(accepted.operation_id().as_str().to_owned()),
-                details_ref: None,
+        let snapshot = self
+            .service
+            .get_validation_operation(accepted.operation_id())
+            .map_err(map_service_error)?;
+        if snapshot.status() == crate::ServiceOperationStatus::Accepted {
+            let service = self.service;
+            let operation_id = accepted.operation_id().clone();
+            let worker_operation_id = operation_id.clone();
+            self.spawn_worker(&operation_id, WorkerStop::WaitForCompletion, move || {
+                let _ = service.run_validation_operation(&worker_operation_id);
             })?;
+        }
         let mut output = acceptance_json(
             accepted.operation_id().as_str(),
             "validation.run",
@@ -626,23 +755,15 @@ impl<P: ProviderResolver + Sync + 'static> OperationServiceHandler<P> {
         let operation_id = accepted.operation_id().clone();
         let run_request = request.clone();
         let run_acceptance = accepted.clone();
-        std::thread::Builder::new()
-            .name(format!("mcp-{}", operation_id.as_str()))
-            .spawn(move || {
+        if snapshot.state() == crate::ServiceOperationStatus::Accepted {
+            self.spawn_worker(&operation_id, WorkerStop::WaitForCompletion, move || {
                 let _ = service.run_artifact_publication(&run_acceptance, &run_request);
-            })
-            .map_err(|_| ToolError {
-                code: "internal_error".into(),
-                message: "The accepted operation could not be scheduled.".into(),
-                retryable: false,
-                current_task_revision: None,
-                operation_id: Some(operation_id.as_str().to_owned()),
-                details_ref: None,
             })?;
+        }
         let mut output = acceptance_json(
             accepted.operation_id().as_str(),
             "publication.publish",
-            snapshot.state(),
+            accepted.status(),
             accepted.revision(),
             None,
             accepted.request_id(),
@@ -1057,26 +1178,38 @@ pub fn serve_stdio<H: McpToolHandler>(handler: &H) -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
+    serve_stdio_with_io(stdin.lock(), &mut output, handler)
+}
+
+fn serve_stdio_with_io<R: BufRead, W: Write, H: McpToolHandler>(
+    input: R,
+    output: &mut W,
+    handler: &H,
+) -> io::Result<()> {
+    let serving = (|| {
+        for line in input.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let response = match serde_json::from_str::<Value>(&line) {
+                Ok(message) => handle_message(handler, &message),
+                Err(_) => Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": -32700, "message": "Parse error" }
+                })),
+            };
+            if let Some(response) = response {
+                serde_json::to_writer(&mut *output, &response)?;
+                output.write_all(b"\n")?;
+                output.flush()?;
+            }
         }
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => handle_message(handler, &message),
-            Err(_) => Some(json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": { "code": -32700, "message": "Parse error" }
-            })),
-        };
-        if let Some(response) = response {
-            serde_json::to_writer(&mut output, &response)?;
-            output.write_all(b"\n")?;
-            output.flush()?;
-        }
-    }
-    Ok(())
+        Ok(())
+    })();
+    let shutdown = handler.shutdown();
+    serving.and(shutdown)
 }
 
 fn handle_message<H: McpToolHandler>(handler: &H, message: &Value) -> Option<Value> {
@@ -1648,6 +1781,56 @@ mod tests {
         }
     }
 
+    struct RepeatedPendingCiProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::CiProvider for RepeatedPendingCiProvider {
+        fn observe(
+            &self,
+            target: &crate::CiQueryTarget,
+            _timeout: Duration,
+        ) -> Result<crate::CiProviderSnapshot, crate::CiProviderError> {
+            use std::sync::atomic::Ordering;
+
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(5));
+            let (repository, pull_request_number, head_sha) = match target {
+                crate::CiQueryTarget::PullRequest {
+                    repository,
+                    number,
+                    expected_head_sha,
+                } => (
+                    repository.clone(),
+                    Some(*number),
+                    expected_head_sha.clone().unwrap_or_else(|| "a".repeat(40)),
+                ),
+                crate::CiQueryTarget::Commit { repository, sha } => {
+                    (repository.clone(), None, sha.clone())
+                }
+            };
+            Ok(crate::CiProviderSnapshot {
+                target: crate::CiTarget::new(repository, pull_request_number, head_sha),
+                required_checks: crate::RequiredCheckSet::known_from(
+                    vec![crate::RequiredCheck::new("build", None)],
+                    crate::RequiredCheckSetSource::TrustedConfiguration,
+                    1,
+                ),
+                checks: vec![crate::RawCiCheck {
+                    name: "build".into(),
+                    detail_state: crate::CiCheckDetailState::Pending,
+                    url: None,
+                    completed_at: None,
+                    app_id: None,
+                    source: crate::CiCheckSource::GithubCheckRuns,
+                }],
+                check_runs_available: true,
+                commit_statuses_available: true,
+                observed_at_ms: 1,
+            })
+        }
+    }
+
     #[test]
     fn advertises_contract_tools_and_protocol_capabilities() {
         let response = handle_message(&FakeHandler,&json!({ "jsonrpc":"2.0", "id":1, "method":"server/discover", "params":{"_meta":request_meta()} })).unwrap();
@@ -1699,6 +1882,268 @@ mod tests {
         let mut line = String::new();
         cursor.read_line(&mut line).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 7);
+    }
+
+    #[test]
+    fn stdio_eof_cancels_and_joins_registered_workers_before_returning() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "mcp-shutdown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let ledger: &'static crate::SqliteExecutionLedger = Box::leak(Box::new(
+            crate::SqliteExecutionLedger::open_in_memory().unwrap(),
+        ));
+        let workspaces = Box::leak(Box::new(crate::WorkspaceManager::new(&root).unwrap()));
+        let providers = Box::leak(Box::new(crate::ProviderRegistry::new()));
+        let service = Box::leak(Box::new(
+            OperationService::new(ledger, workspaces, providers, 1, Duration::from_secs(30))
+                .unwrap(),
+        ));
+        let handler = OperationServiceHandler::new(service, "trusted-host");
+        let task = handler
+            .call_tool(
+                "task.create",
+                &json!({"schema_version":"v2","request_id":"shutdown-task","source":"manual","title":"Task","description":"Description","constraints":[]}),
+            )
+            .unwrap();
+        let terminal_ci_wait_id = OperationId::new("shutdown-terminal-ci-wait");
+        let registered_ci_wait_id = terminal_ci_wait_id.clone();
+        ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO service_ci_wait_operations(id,caller,tool_name,request_id,task_id,expected_revision,target_json,deadline_seconds,deadline_nanos,status,accepted_at,finished_at) VALUES(?1,'trusted-host','ci.wait','shutdown-ci',?2,0,'{}',0,0,'completed',1,2)",
+                rusqlite::params![terminal_ci_wait_id.as_str(), task["task_id"].as_str().unwrap()],
+            )
+            .unwrap();
+        handler
+            .spawn_worker(
+                &terminal_ci_wait_id,
+                WorkerStop::CiWait(registered_ci_wait_id),
+                || {},
+            )
+            .unwrap();
+        let active_ci_wait_id = OperationId::new("shutdown-active-ci-wait");
+        ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO service_ci_wait_operations(id,caller,tool_name,request_id,task_id,expected_revision,target_json,deadline_seconds,deadline_nanos,status,accepted_at,started_at) VALUES(?1,'trusted-host','ci.wait','shutdown-active-ci',?2,0,'{}',0,0,'running',1,2)",
+                rusqlite::params![active_ci_wait_id.as_str(), task["task_id"].as_str().unwrap()],
+            )
+            .unwrap();
+        let active_ci_token = CancellationToken::new();
+        ledger
+            .register_ci_wait_cancellation(active_ci_wait_id.as_str(), active_ci_token.clone())
+            .unwrap();
+        let worker_ci_token = active_ci_token.clone();
+        let worker_ci_wait_id = active_ci_wait_id.clone();
+        let worker_ledger = ledger;
+        handler
+            .spawn_worker(
+                &active_ci_wait_id,
+                WorkerStop::CiWait(active_ci_wait_id.clone()),
+                move || {
+                    while !worker_ci_token.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    worker_ledger
+                        .lock_connection()
+                        .unwrap()
+                        .execute(
+                            "UPDATE service_ci_wait_operations SET status='cancelled',error_code='cancelled',finished_at=3 WHERE id=?1 AND status='cancelling'",
+                            rusqlite::params![worker_ci_wait_id.as_str()],
+                        )
+                        .unwrap();
+                },
+            )
+            .unwrap();
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        handler
+            .spawn_worker(
+                &OperationId::new("shutdown-worker"),
+                WorkerStop::Token(token),
+                move || {
+                    while !worker_token.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    worker_finished.store(true, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+
+        let mut output = Vec::new();
+        serve_stdio_with_io(Cursor::new(Vec::<u8>::new()), &mut output, &handler).unwrap();
+
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(active_ci_token.is_cancelled());
+        assert!(output.is_empty());
+        let ci_status: String = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM service_ci_wait_operations WHERE id=?1",
+                rusqlite::params![active_ci_wait_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ci_status, "cancelled");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn idempotent_ci_wait_replay_does_not_register_a_second_worker() {
+        use std::sync::atomic::Ordering;
+
+        let root = std::env::temp_dir().join(format!(
+            "mcp-worker-replay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let ledger: &'static crate::SqliteExecutionLedger = Box::leak(Box::new(
+            crate::SqliteExecutionLedger::open_in_memory().unwrap(),
+        ));
+        let workspaces = Box::leak(Box::new(crate::WorkspaceManager::new(&root).unwrap()));
+        let providers = Box::leak(Box::new(crate::ProviderRegistry::new()));
+        let ci_provider = Box::leak(Box::new(RepeatedPendingCiProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let service = Box::leak(Box::new(
+            OperationService::new(ledger, workspaces, providers, 1, Duration::from_secs(30))
+                .unwrap()
+                .with_ci_provider(
+                    ci_provider,
+                    Duration::from_millis(1),
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+        ));
+        let handler = OperationServiceHandler::new(service, "trusted-host");
+        let task = handler
+            .call_tool(
+                "task.create",
+                &json!({"schema_version":"v2","request_id":"worker-replay-task","source":"manual","title":"Task","description":"Description","constraints":[]}),
+            )
+            .unwrap();
+        let deadline_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 10_000;
+        let arguments = json!({
+            "schema_version":"v2",
+            "request_id":"worker-replay-ci",
+            "task_id":task["task_id"],
+            "expected_revision":0,
+            "deadline":rfc3339_from_millis(deadline_ms),
+            "target":{"repository":"owner/repo","sha":"a".repeat(40)}
+        });
+
+        let first = handler.call_tool("ci.wait", &arguments).unwrap();
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while ci_provider.calls.load(Ordering::SeqCst) == 0
+            && std::time::Instant::now() < wait_deadline
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(ci_provider.calls.load(Ordering::SeqCst) > 0);
+        let replay = handler.call_tool("ci.wait", &arguments).unwrap();
+
+        assert_eq!(
+            first["operation"]["operation_id"],
+            replay["operation"]["operation_id"]
+        );
+        assert_eq!(first["operation"]["state"], "accepted");
+        assert_eq!(replay["operation"]["state"], "running");
+        assert_eq!(
+            service
+                .get_ci_wait_operation(&OperationId::new(
+                    first["operation"]["operation_id"].as_str().unwrap()
+                ))
+                .unwrap()
+                .status(),
+            crate::ServiceOperationStatus::Running
+        );
+        assert_eq!(handler.registered_worker_count(), 1);
+
+        let completed_worker = OperationId::new("completed-before-next-schedule");
+        handler
+            .spawn_worker(&completed_worker, WorkerStop::WaitForCompletion, || {})
+            .unwrap();
+        let completion_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !handler
+            .workers
+            .lock()
+            .unwrap()
+            .workers
+            .get(completed_worker.as_str())
+            .is_some_and(|worker| worker.handle.is_finished())
+            && std::time::Instant::now() < completion_deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            handler
+                .workers
+                .lock()
+                .unwrap()
+                .workers
+                .get(completed_worker.as_str())
+                .is_some_and(|worker| worker.handle.is_finished())
+        );
+        let next_worker = OperationId::new("next-after-reap");
+        handler
+            .spawn_worker(&next_worker, WorkerStop::WaitForCompletion, || {})
+            .unwrap();
+        let workers = handler.workers.lock().unwrap();
+        assert!(!workers.workers.contains_key(completed_worker.as_str()));
+        assert!(workers.workers.contains_key(next_worker.as_str()));
+        drop(workers);
+
+        handler.shutdown().unwrap();
+        assert_eq!(
+            service
+                .get_ci_wait_operation(&OperationId::new(
+                    first["operation"]["operation_id"].as_str().unwrap()
+                ))
+                .unwrap()
+                .status(),
+            crate::ServiceOperationStatus::Cancelled
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
