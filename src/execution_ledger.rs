@@ -645,6 +645,7 @@ impl SqliteExecutionLedger {
 
     /// Inserts or updates one attempt record.
     pub fn save_attempt_record(&self, record: &AttemptRecord) -> Result<(), LedgerError> {
+        validate_attempt_semantics_state(record.attempt().semantics(), record.attempt().state())?;
         let connection = self.lock_connection()?;
         let transaction = connection.unchecked_transaction()?;
         transaction.execute(
@@ -862,8 +863,13 @@ impl SqliteExecutionLedger {
                     a.observed_provider, a.observed_model, a.semantics_version, a.state,
                     (SELECT COUNT(*) FROM validation_results v
                      WHERE v.task_id=a.task_id AND v.attempt_id=a.id),
-                    (SELECT COALESCE(SUM(v.passed),0) FROM validation_results v
-                     WHERE v.task_id=a.task_id AND v.attempt_id=a.id)
+                    (SELECT COALESCE(SUM(CASE
+                         WHEN typeof(v.passed)='integer' AND v.passed IN (0, 1)
+                         THEN v.passed ELSE 0 END),0) FROM validation_results v
+                     WHERE v.task_id=a.task_id AND v.attempt_id=a.id),
+                    (SELECT COUNT(*) FROM validation_results v
+                     WHERE v.task_id=a.task_id AND v.attempt_id=a.id
+                       AND (typeof(v.passed) != 'integer' OR v.passed NOT IN (0, 1)))
              FROM attempts a
              WHERE a.started_at >= ?1 AND a.started_at < ?2
              ORDER BY a.rowid",
@@ -879,7 +885,8 @@ impl SqliteExecutionLedger {
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, u64>(7)?,
-                    row.get::<_, u64>(8)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, u64>(9)?,
                 ))
             })?;
         let mut groups = BTreeMap::<PerformanceGroupKey, PerformanceCounts>::new();
@@ -894,7 +901,18 @@ impl SqliteExecutionLedger {
                 state,
                 validation_observations,
                 validation_passed,
+                invalid_validation_values,
             ) = row?;
+            if invalid_validation_values != 0 {
+                return Err(LedgerError::InvalidStoredValue(
+                    "validation result passed value must be 0 or 1".into(),
+                ));
+            }
+            let validation_passed = u64::try_from(validation_passed).map_err(|_| {
+                LedgerError::InvalidStoredValue(
+                    "validation result passed aggregate must be non-negative".into(),
+                )
+            })?;
             let requested_model = match requested_model_kind.as_deref() {
                 Some("named") => requested_model_name
                     .map(PerformanceRequestedModel::Named)
@@ -1075,6 +1093,7 @@ impl SqliteExecutionLedger {
         failure_reason: Option<AttemptFailureReason>,
         semantics: AttemptSemantics,
     ) -> Result<Attempt, LedgerError> {
+        validate_attempt_semantics_state(semantics, state)?;
         let agent_result = connection
             .query_row(
                 "SELECT summary, reported_success FROM agent_results
@@ -1179,6 +1198,18 @@ impl SqliteExecutionLedger {
 
 fn set_schema_version(connection: &Connection, version: u32) -> Result<(), rusqlite::Error> {
     connection.execute_batch(&format!("PRAGMA user_version = {version};"))
+}
+
+fn validate_attempt_semantics_state(
+    semantics: AttemptSemantics,
+    state: AttemptState,
+) -> Result<(), LedgerError> {
+    if semantics == AttemptSemantics::ProviderCallV2 && state == AttemptState::Validating {
+        return Err(LedgerError::InvalidStoredValue(
+            "provider_call_v2 Attempt cannot be in validating state".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn create_latest_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -1727,6 +1758,40 @@ mod tests {
     }
 
     #[test]
+    fn history_query_rejects_non_boolean_stored_validation_result() {
+        for passed in ["2", "-1", "0.5", "'bad'"] {
+            let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+            ledger.save_task(&task()).unwrap();
+            history_fixture_attempt(
+                &ledger,
+                "invalid-validation",
+                "failed",
+                Some(100),
+                None,
+                None,
+                None,
+                None,
+                "legacy_validation_coupled",
+                &[],
+            );
+            ledger
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(&format!(
+                    "INSERT INTO validation_results(task_id,attempt_id,sequence,summary,passed)
+                     VALUES('task-1','invalid-validation',0,'fixture',{passed})"
+                ))
+                .unwrap();
+
+            assert!(matches!(
+                ledger.query_historical_performance(PerformanceWindow::new(100, 101).unwrap()),
+                Err(LedgerError::InvalidStoredValue(_))
+            ));
+        }
+    }
+
+    #[test]
     fn schema_is_initialized_and_task_round_trips() {
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
         let task = task();
@@ -1783,6 +1848,74 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ledger.load_publication("missing-pr"),
+            Err(LedgerError::InvalidStoredValue(_))
+        ));
+    }
+
+    #[test]
+    fn provider_call_v2_validating_attempt_is_rejected_before_persistence() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task = task();
+        ledger.save_task(&task).unwrap();
+        let attempt_id = AttemptId::new("invalid-v2-validating");
+        let invalid = Attempt::restore(
+            attempt_id.clone(),
+            ProviderRef::new("codex"),
+            AttemptTargets {
+                requested_model: Some(ModelChoice::ProviderDefault),
+                observed_provider: None,
+                observed_model: None,
+            },
+            AttemptState::Validating,
+            None,
+            Vec::new(),
+            None,
+            None,
+            AttemptSemantics::ProviderCallV2,
+        );
+        let record = AttemptRecord::new(task.id().clone(), invalid, Some(10), None);
+
+        assert!(matches!(
+            ledger.save_attempt_record(&record),
+            Err(LedgerError::InvalidStoredValue(_))
+        ));
+        assert!(
+            ledger
+                .get_attempt(task.id(), &attempt_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn provider_call_v2_validating_attempt_is_rejected_when_loaded() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task = task();
+        ledger.save_task(&task).unwrap();
+        let attempt = Attempt::new_provider_call_v2(
+            AttemptId::new("invalid-v2-validating"),
+            ProviderRef::new("codex"),
+            ModelChoice::ProviderDefault,
+        );
+        ledger
+            .save_attempt(task.id(), &attempt, Some(10), None)
+            .unwrap();
+        ledger
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE attempts SET state='validating' WHERE task_id=?1 AND id=?2",
+                params![task.id().as_str(), attempt.id().as_str()],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            ledger.get_attempt(task.id(), attempt.id()),
+            Err(LedgerError::InvalidStoredValue(_))
+        ));
+        assert!(matches!(
+            ledger.query_historical_performance(PerformanceWindow::new(10, 11).unwrap()),
             Err(LedgerError::InvalidStoredValue(_))
         ));
     }
