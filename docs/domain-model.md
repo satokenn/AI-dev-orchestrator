@@ -29,7 +29,7 @@ Rust型、SQLite migration、MCP transport、ProviderやAI reviewの実装は扱
 | 作業 | `Task` | 利用者の目的を完了まで追跡する単位 |
 | モデル実行 | `Attempt` | 指定したProvider / Modelへの1回の呼び出し |
 | Model選択 | `ModelChoice` | `Named`の識別子、または明示的な`ProviderDefault` |
-| 成果物 | `Artifact` | 管理対象workspaceの特定時点の内容。未コミット変更・新規ファイルを含む |
+| 成果物 | `Artifact` | 管理対象workspaceの特定時点の内容。tracked変更とignoredでない新規ファイルを含み、ignoredファイルは意図的に除外する |
 | 機械検証 | `ValidationResult` | 指定した成果物に対するtest、lint、build等の結果 |
 | review結果 | `ReviewVerdict` | reviewerが対象成果物へ返した `approved`、`changes_requested`、`inconclusive` |
 | 監督判断 | `CodexDecision` | 監督Codexが対象成果物へ残す `accepted`、`rejected`、`changes_requested` |
@@ -119,6 +119,18 @@ Codex自身が編集した場合はAttemptを作らない。管理済みArtifact
 ## Operation Serviceとの境界
 
 監督Codexは目的の解釈、Provider / Model選択、実行・review・再試行の要否、成果物の採否、Task完了を判断する。Operation ServiceはTask ID、expected revision、request ID、workspace / Artifactの所属を検証し、操作受付・各事実・公開/CI参照を永続化する。Provider / Model、Validator、GitHub adapterを実行し、stale revision、busy、未知Provider / Model、policy違反、異なるArtifactへの証拠流用を外部副作用前に拒否する。永続LedgerではServiceがベースLedgerとOperation sidecarのcanonical identityに結び付いたプロセス排他ロックを保持し、同じLedgerへの別プロセス実行を拒否する。Service構築時はそのロックを得た後、残存する実行中Operationを `recovery_required` にしてからServiceを返す。復旧をProvider実行中に再呼出しする公開操作は設けない。in-memory LedgerはService構築時の自動復旧を行わない。これが #66 のOperation Service契約である。
+
+Service経由の`attempt.run`は、初回の`BaseInput { repository, commit }`か、同じTaskに属する既存`ArtifactInput { artifact_id }`のどちらかを受け取る。後者は保存tree/ref/baseをProvider起動前に照合し、検証済みbaseから新しい管理worktreeを作ってtreeを展開する。Provider停止後のArtifact snapshotはtracked変更とignoredでない新規ファイルを含み、ignoredファイルは意図的に除外する。Provider実行中にignoredファイルが作られた場合、Serviceはそれを黙って落として成功Artifactを作ることはせず、Operationを`recovery_required`にし、調査用workspaceを保持する。Task、Attempt、Operation、Artifactと入出力relationは同じSQLite Ledgerに保存する。Git refの作成はDB transactionと一括で原子化できないため、Artifact rowを`pending_ref`で先に記録する。プロセス再起動時はService構築中にLedger lockを保持したままpending ArtifactのGit tree/refを照合し、treeが存在してrefが未作成ならrefを再作成して利用可能にする。tree欠落やref不一致は`recovery_required`として使用を拒否する。この接続だけではValidation、review、CodexDecision、publicationの公開ゲートまでは実装されない。
+
+### 同一Artifact証拠ゲートのMVP
+
+`validate_artifact`はArtifactを新しい管理worktreeへ展開し、検査の前後でGit treeが変わっていないことを確認してValidationの成功状態をArtifact ID・tree OIDへ結び付ける。検査後も保存済みArtifactとGit treeが完全一致し、Artifactに含まれないignoredファイルがなく、submoduleが含まれない場合は、validation専用Attempt ID、Task / Attemptから導いたworktree path / branch、manager ownershipを照合した後、その一時worktreeを強制削除する。Artifact treeとの照合、ignored-file / submodule走査、所属確認、削除のいずれかに失敗した場合はworktree path付きでエラーを返し、Validation成功recordを作らない。treeが変わった場合、ignoredファイルがある場合、submoduleがある場合はValidationを記録せず、worktreeを管理下に残す。組み込みの`CommandValidator`は`ProcessRunner`で管理プロセス群の終了を待つ。独自`Validator`を注入する呼出側は、戻る前にworktreeを書き換え得る子プロセスを終了させる必要がある。Serviceは最終tree照合からworktree削除までの間に、独立した外部プロセスが同じpathを書き換える競合を完全には排除しない。validation summary、check名、diagnostic本文にはsecretが含まれる可能性があるため、redaction設定がないMVPではLedgerに保存しない。`record_artifact_decision`は監督Codexの判断を別recordとして保存し、機械検証から採否を自動生成しない。現在のMVPで判断に添付できる`EvidenceRef`は同一Task・Artifactに属するValidationだけで、review・publication・CI証拠は未対応のため拒否する。
+
+`require_artifact_publication_evidence`は、指定IDのpassed Validationと、同じTask・Artifactの最新CodexDecisionであるaccepted判断が、同じtree OIDを指す場合だけ`ArtifactPublicationPermit`を返す。後続のrejectedまたはchanges_requested判断があれば、以前のaccepted判断は公開根拠として使えない。permitにはArtifact ID、tree OID、base commit、両証拠IDが含まれる。Publication MVPでは、Rust `OperationService` に呼び出し側が明示注入した`SecretScanner`とpublication gatewayがなければ公開を拒否する。両者が設定されている場合も、Artifactのtree全体とPR title/body等のpayloadを外部効果前に走査し、検出・失敗・利用不能は`policy_denied`となる。
+
+公開操作はProvider Attemptを偽装せず、専用の受付・phase・結果Ledgerへ保存する。作成commitは設定済みGit実行ファイルの`cat-file commit`が返すraw object headerでtreeとsole parentを確認し、replacement refsを無効にする。呼び出し側は`publish_artifact`で受付を行い、返されたoperationと同じrequest/payloadで`run_artifact_publication`を起動し、`get_artifact_publication_operation`で結果を読む。LedgerにはArtifact tree、validation/decision ID、作成commit SHA、Draft PR番号・URL・状態を保存し、title/body等のraw payloadは保存しない。冪等照合には長さ付きfield列から計算したSHA-256 digestを使う。Artifact treeと完全なpublication payloadは受付前と外部効果直前の両方でscanする。後段で検出・失敗した場合は副作用前に`failed`で閉じる。GitHub CLIにはtitle/bodyをargvや一時ファイルに渡さず、ProcessRunnerが提供するstdin bytesで`gh api --input -`へ直接渡す。公開repositoryはGit `origin` fetch URLから決定する。push前に`git remote get-url --push --all origin`で全ての有効なpush destinationを取得し、各URLが同じhost/owner/repoを指すことを検証する。URLはHTTPSまたはSSH形式（SCP-like SSHを含む）に限り、HTTPとGit protocol URLは拒否する。不一致または解釈不能ならpushを拒否する。PR一覧は`gh pr list --repo`で絞り、作成APIには正規化したowner/repoを含むliteral endpointと明示hostを使う。継承された`GH_REPO`と`GH_HOST`はCLI起動前に除去し、環境設定による別repositoryへのPR作成を防ぐ。stdinは`write_all`相当で全byteを送り、stdout/stderr captureへ混ぜない。Unix系では非blocking socketをProcessRunnerの監視loopから書き込むため、timeout/cancel時にwriter threadやpayloadを残さずsenderを閉じる。入力を送り切る前に子が終了してreaderが残った場合はprocess groupを停止し、固定diagnostic付き`Interrupted`を返す。
+
+このMVPはMCP/CLIの`publication.publish`・`operation.get`にはまだ接続されておらず、Rust Serviceに専用の`publish_artifact` / `get_artifact_publication_operation` APIを提供する段階である。既存の`operation.get`はProvider Attempt操作用のまま。公開用cancel APIは未接続である。起動時に未claimの`accepted` publicationは外部効果が始まっていないため`failed`（`interrupted_before_start`）へ移し、実行claim後の`running` publicationは外部効果の有無を断定できないため`recovery_required`へ移す。どちらも外部操作を再実行しない。SQLite schema v13はPublication専用Ledger tableを追加する。schema v11ではArtifactとAttempt historyの分岐を統合し、v12でArtifact Validation / CodexDecision tablesを追加する。schema v12 Ledgerからv13へのmigrationも既存recordを保持する。したがって、MCP wire契約全体を実装済みとは扱わない。
 
 ## 旧データとの互換性
 

@@ -211,7 +211,7 @@ impl WorkspaceManager {
             });
         }
         let output = ProcessRunner
-            .run(ProcessRequest::new("git").args([
+            .run_git(ProcessRequest::new("git").args([
                 "-C",
                 path.to_string_lossy().as_ref(),
                 "rev-parse",
@@ -480,6 +480,38 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// Confirms that a workspace is the exact managed worktree for this Task and Attempt.
+    /// Sanitized paths are compared to the manager's canonical path derivation; callers
+    /// must not infer ownership from a path prefix alone.
+    pub(crate) fn validate_artifact_workspace(
+        &self,
+        workspace: &Workspace,
+        task: &TaskId,
+        attempt: &AttemptId,
+    ) -> Result<(), WorkspaceError> {
+        if workspace.repository_root != self.repository_root
+            || workspace.path != self.worktree_path(task, attempt)
+            || workspace.branch != self.branch_name(task, attempt)
+        {
+            return Err(WorkspaceError::WorkspaceNotManaged {
+                path: workspace.path.clone(),
+            });
+        }
+        self.validate_provider_workspace(&workspace.path)
+    }
+
+    /// Ensures a new ArtifactInput worktree is still clean and pinned to its recorded base.
+    pub(crate) fn ensure_fresh_artifact_workspace(
+        &self,
+        workspace: &Workspace,
+        task: &TaskId,
+        attempt: &AttemptId,
+        base: &str,
+    ) -> Result<(), WorkspaceError> {
+        self.validate_artifact_workspace(workspace, task, attempt)?;
+        self.validate_provider_workspace_at_base(&workspace.path, base)
+    }
+
     /// Alias emphasizing that this check is a precondition for Provider use.
     pub fn ensure_provider_workspace(&self, path: impl AsRef<Path>) -> Result<(), WorkspaceError> {
         self.validate_provider_workspace(path)
@@ -512,7 +544,7 @@ impl WorkspaceManager {
                 "--quiet",
             ])
             .arg(format!("refs/heads/{branch}"));
-        match self.runner.run(request) {
+        match self.runner.run_git(request) {
             Ok(_) => Ok(true),
             Err(ProcessError::NonZeroExit(_)) => Ok(false),
             Err(error) => Err(git_error(
@@ -538,7 +570,7 @@ impl WorkspaceManager {
         args: &[&str],
     ) -> Result<crate::ProcessOutput, WorkspaceError> {
         self.runner
-            .run(
+            .run_git(
                 ProcessRequest::new("git")
                     .args(args.iter().copied())
                     .cwd(&self.repository_root),
@@ -553,7 +585,7 @@ impl WorkspaceManager {
         args: &[&str],
     ) -> Result<crate::ProcessOutput, WorkspaceError> {
         self.runner
-            .run(
+            .run_git(
                 ProcessRequest::new("git")
                     .args(args.iter().copied())
                     .cwd(cwd),
@@ -603,7 +635,7 @@ fn git_error(
     error: ProcessError,
 ) -> WorkspaceError {
     let (status, stdout, stderr) = match error {
-        ProcessError::Spawn(error) | ProcessError::Io(error) => {
+        ProcessError::Spawn(error) | ProcessError::Io(error) | ProcessError::Stdin(error) => {
             (None, Vec::new(), error.to_string())
         }
         ProcessError::NonZeroExit(output)

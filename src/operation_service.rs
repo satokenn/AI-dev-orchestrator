@@ -3,15 +3,26 @@
 //! This core service accepts explicit Provider / Model and BaseInput requests.
 //! It does not select a target or expose Provider output and raw diagnostics.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{path::PathBuf, time::Duration};
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
 use crate::{
     Attempt, AttemptFailureReason, AttemptId, AttemptSemantics, AttemptState, CancellationToken,
     DomainError, LedgerError, ModelChoice, ModelRef, OperationId, ProviderError, ProviderRef,
     ProviderRequest, ProviderResolver, SqliteExecutionLedger, TaskId, TaskRole, TaskState,
-    UsageCost, UsageMetric, WorkspaceError, WorkspaceManager,
+    UsageCost, UsageMetric, ValidationResult, Validator, WorkspaceError, WorkspaceManager,
+    artifact::{
+        ArtifactCodexDecisionRecord, ArtifactPublicationPermit, ArtifactValidationRecord,
+        CodexDecisionKind,
+    },
+    artifact::{ArtifactError, ArtifactManager},
+    artifact_publication::{
+        ArtifactPublicationGateway, ArtifactPublicationPayload, DraftPullRequest, SecretScanResult,
+        SecretScanner,
+    },
     execution_ledger::{
         attempt_state_to_str, failure_reason_to_str, model_choice_kind, model_choice_name,
         task_state_to_str,
@@ -167,6 +178,33 @@ pub struct BaseInput {
     commit: String,
 }
 
+/// A previously captured Task artifact selected as this Attempt's input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactInput {
+    artifact_id: String,
+}
+
+impl ArtifactInput {
+    #[must_use]
+    pub fn new(artifact_id: impl Into<String>) -> Self {
+        Self {
+            artifact_id: artifact_id.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+}
+
+/// Explicitly chooses an initial commit or a prior Artifact as Attempt input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttemptInput {
+    Base(BaseInput),
+    Artifact(ArtifactInput),
+}
+
 impl BaseInput {
     #[must_use]
     pub fn new(repository: impl Into<PathBuf>, commit: impl Into<String>) -> Self {
@@ -196,7 +234,7 @@ pub struct AttemptRunRequest {
     model_id: ModelChoice,
     instruction: String,
     role: TaskRole,
-    input: BaseInput,
+    input: AttemptInput,
     timeout: Option<Duration>,
 }
 
@@ -221,15 +259,80 @@ impl AttemptRunRequest {
             model_id,
             instruction: instruction.into(),
             role,
-            input,
+            input: AttemptInput::Base(input),
             timeout: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn with_artifact(
+        request_id: impl Into<String>,
+        task_id: TaskId,
+        expected_revision: u64,
+        provider_id: ProviderRef,
+        model_id: ModelChoice,
+        instruction: impl Into<String>,
+        role: TaskRole,
+        input: ArtifactInput,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            task_id,
+            expected_revision,
+            provider_id,
+            model_id,
+            instruction: instruction.into(),
+            role,
+            input: AttemptInput::Artifact(input),
+            timeout: None,
+        }
+    }
+
+    #[must_use]
+    pub fn input(&self) -> &AttemptInput {
+        &self.input
     }
 
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
+    }
+}
+
+/// A request to publish one exact Artifact using its saved Validation and Codex acceptance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactPublicationRequest {
+    request_id: String,
+    task_id: TaskId,
+    expected_revision: u64,
+    artifact_id: String,
+    validation_id: String,
+    decision_id: String,
+    payload: ArtifactPublicationPayload,
+}
+
+impl ArtifactPublicationRequest {
+    #[must_use]
+    pub fn new(
+        request_id: impl Into<String>,
+        task_id: TaskId,
+        expected_revision: u64,
+        artifact_id: impl Into<String>,
+        validation_id: impl Into<String>,
+        decision_id: impl Into<String>,
+        payload: ArtifactPublicationPayload,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            task_id,
+            expected_revision,
+            artifact_id: artifact_id.into(),
+            validation_id: validation_id.into(),
+            decision_id: decision_id.into(),
+            payload,
+        }
     }
 }
 
@@ -241,6 +344,168 @@ pub enum ServiceOperationStatus {
     Failed,
     Cancelled,
     RecoveryRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactPublicationPhase {
+    Accepted,
+    Scanned,
+    Committing,
+    Committed,
+    Pushing,
+    Pushed,
+    CreatingDraft,
+    Published,
+    Failed,
+    RecoveryRequired,
+}
+
+impl ArtifactPublicationPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Scanned => "scanned",
+            Self::Committing => "committing",
+            Self::Committed => "committed",
+            Self::Pushing => "pushing",
+            Self::Pushed => "pushed",
+            Self::CreatingDraft => "creating_draft",
+            Self::Published => "published",
+            Self::Failed => "failed",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, ServiceError> {
+        match value {
+            "accepted" => Ok(Self::Accepted),
+            "scanned" => Ok(Self::Scanned),
+            "committing" => Ok(Self::Committing),
+            "committed" => Ok(Self::Committed),
+            "pushing" => Ok(Self::Pushing),
+            "pushed" => Ok(Self::Pushed),
+            "creating_draft" => Ok(Self::CreatingDraft),
+            "published" => Ok(Self::Published),
+            "failed" => Ok(Self::Failed),
+            "recovery_required" => Ok(Self::RecoveryRequired),
+            _ => Err(ServiceError::InvalidStoredState),
+        }
+    }
+}
+
+/// Acceptance for `publication.publish`; it intentionally has no Attempt ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactPublicationAcceptance {
+    operation_id: OperationId,
+    request_id: String,
+    task_id: TaskId,
+    revision: u64,
+    status: ServiceOperationStatus,
+}
+
+impl ArtifactPublicationAcceptance {
+    #[must_use]
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    #[must_use]
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    #[must_use]
+    pub const fn status(&self) -> ServiceOperationStatus {
+        self.status
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactPublicationSnapshot {
+    operation_id: OperationId,
+    request_id: String,
+    task_id: TaskId,
+    artifact_id: String,
+    tree_oid: String,
+    validation_id: String,
+    decision_id: String,
+    commit_sha: Option<String>,
+    pull_request: Option<DraftPullRequest>,
+    state: ServiceOperationStatus,
+    phase: ArtifactPublicationPhase,
+    revision: u64,
+    error_code: Option<String>,
+    accepted_at_ms: i64,
+    finished_at_ms: Option<i64>,
+}
+
+impl ArtifactPublicationSnapshot {
+    #[must_use]
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    #[must_use]
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    #[must_use]
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+    #[must_use]
+    pub fn tree_oid(&self) -> &str {
+        &self.tree_oid
+    }
+    #[must_use]
+    pub fn validation_id(&self) -> &str {
+        &self.validation_id
+    }
+    #[must_use]
+    pub fn decision_id(&self) -> &str {
+        &self.decision_id
+    }
+    #[must_use]
+    pub fn commit_sha(&self) -> Option<&str> {
+        self.commit_sha.as_deref()
+    }
+    #[must_use]
+    pub fn pull_request(&self) -> Option<&DraftPullRequest> {
+        self.pull_request.as_ref()
+    }
+    #[must_use]
+    pub const fn state(&self) -> ServiceOperationStatus {
+        self.state
+    }
+    #[must_use]
+    pub const fn phase(&self) -> ArtifactPublicationPhase {
+        self.phase
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    #[must_use]
+    pub fn error_code(&self) -> Option<&str> {
+        self.error_code.as_deref()
+    }
+    #[must_use]
+    pub const fn accepted_at_ms(&self) -> i64 {
+        self.accepted_at_ms
+    }
+    #[must_use]
+    pub const fn finished_at_ms(&self) -> Option<i64> {
+        self.finished_at_ms
+    }
 }
 
 impl ServiceOperationStatus {
@@ -300,6 +565,8 @@ pub struct OperationSnapshot {
     operation_id: OperationId,
     task_id: TaskId,
     attempt_id: AttemptId,
+    input_artifact_id: Option<String>,
+    output_artifact_id: Option<String>,
     status: ServiceOperationStatus,
     attempt_state: AttemptState,
     requested_provider: ProviderRef,
@@ -327,6 +594,14 @@ impl OperationSnapshot {
     #[must_use]
     pub fn attempt_id(&self) -> &AttemptId {
         &self.attempt_id
+    }
+    #[must_use]
+    pub fn input_artifact_id(&self) -> Option<&str> {
+        self.input_artifact_id.as_deref()
+    }
+    #[must_use]
+    pub fn output_artifact_id(&self) -> Option<&str> {
+        self.output_artifact_id.as_deref()
     }
     #[must_use]
     pub const fn status(&self) -> ServiceOperationStatus {
@@ -395,8 +670,12 @@ pub enum ServiceError {
     IdempotencyConflict,
     OperationNotFound,
     InvalidStoredState,
+    ValidationFailed,
+    PublicationFailed,
+    PublicationRecoveryRequired,
     InvalidStateTransition(DomainError),
     Workspace(WorkspaceError),
+    Artifact(ArtifactError),
     Ledger(LedgerError),
     OperationLedger(crate::operation_ledger::LedgerError),
     RecoveryLockRequired,
@@ -432,8 +711,18 @@ impl std::fmt::Display for ServiceError {
             Self::InvalidStoredState => {
                 formatter.write_str("invalid stored Operation Service state")
             }
+            Self::ValidationFailed => {
+                formatter.write_str("Artifact validation could not be completed safely")
+            }
+            Self::PublicationFailed => {
+                formatter.write_str("Artifact publication failed before remote effects")
+            }
+            Self::PublicationRecoveryRequired => {
+                formatter.write_str("Artifact publication requires recovery; it was not replayed")
+            }
             Self::InvalidStateTransition(error) => error.fmt(formatter),
             Self::Workspace(_) => formatter.write_str("workspace preparation failed"),
+            Self::Artifact(_) => formatter.write_str("artifact operation failed"),
             Self::Ledger(error) => error.fmt(formatter),
             Self::OperationLedger(error) => error.fmt(formatter),
             Self::RecoveryLockRequired => formatter
@@ -796,6 +1085,17 @@ impl From<WorkspaceError> for ServiceError {
         Self::Workspace(error)
     }
 }
+impl From<ArtifactError> for ServiceError {
+    fn from(error: ArtifactError) -> Self {
+        match error {
+            ArtifactError::TaskNotFound => Self::TaskNotFound,
+            ArtifactError::StaleRevision { expected, actual } => {
+                Self::StaleRevision { expected, actual }
+            }
+            other => Self::Artifact(other),
+        }
+    }
+}
 impl From<DomainError> for ServiceError {
     fn from(error: DomainError) -> Self {
         Self::InvalidStateTransition(error)
@@ -808,6 +1108,8 @@ pub struct OperationService<'a, P> {
     providers: &'a P,
     max_attempts: usize,
     default_timeout: Duration,
+    secret_scanner: Option<&'a dyn SecretScanner>,
+    publication_gateway: Option<&'a dyn ArtifactPublicationGateway>,
     run_lock: Option<crate::operation_ledger::LedgerRunLock>,
 }
 
@@ -868,9 +1170,14 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             providers,
             max_attempts,
             default_timeout,
+            secret_scanner: None,
+            publication_gateway: None,
             run_lock,
         };
         service.recover_incomplete_operations()?;
+        if ledger.ledger_path().is_some() {
+            ArtifactManager::new(workspaces, ledger).recover_pending()?;
+        }
         Ok(service)
     }
 
@@ -952,23 +1259,47 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         Ok(result)
     }
 
+    /// Injects the caller's secret scanning policy. Publication is denied when absent.
+    #[must_use]
+    pub fn with_secret_scanner(mut self, scanner: &'a dyn SecretScanner) -> Self {
+        self.secret_scanner = Some(scanner);
+        self
+    }
+
+    /// Injects the Git/GitHub publication adapter used after both scans pass.
+    #[must_use]
+    pub fn with_artifact_publication_gateway(
+        mut self,
+        gateway: &'a dyn ArtifactPublicationGateway,
+    ) -> Self {
+        self.publication_gateway = Some(gateway);
+        self
+    }
+
     fn idempotent_acceptance(
         &self,
         request: &AttemptRunRequest,
     ) -> Result<Option<OperationAcceptance>, ServiceError> {
         let connection = self.ledger.lock_connection()?;
-        Self::idempotent_acceptance_with_connection(&connection, request)
+        Self::idempotent_acceptance_with_connection(
+            &connection,
+            request,
+            self.workspaces.repository_root(),
+        )
     }
 
     fn idempotent_acceptance_with_connection(
         connection: &rusqlite::Connection,
         request: &AttemptRunRequest,
+        repository_root: &std::path::Path,
     ) -> Result<Option<OperationAcceptance>, ServiceError> {
         let existing = connection
             .query_row(
-                "SELECT id,attempt_id,expected_revision,task_id,provider,model_kind,model_name,
-                    instruction,role,repository,base_commit,timeout_override_ms
-             FROM service_operations WHERE request_id=?1",
+                "SELECT operation.id,operation.attempt_id,operation.expected_revision,operation.task_id,operation.provider,operation.model_kind,operation.model_name,
+                    operation.instruction,operation.role,operation.repository,operation.base_commit,operation.timeout_override_ms,relation.input_artifact_id
+             FROM service_operations operation LEFT JOIN service_attempt_artifacts relation
+               ON relation.task_id=operation.task_id AND relation.attempt_id=operation.attempt_id
+             WHERE operation.request_id=?1",
                 params![request.request_id],
                 |row| {
                     Ok((
@@ -984,6 +1315,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                         row.get::<_, String>(9)?,
                         row.get::<_, String>(10)?,
                         row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
                     ))
                 },
             )
@@ -1001,6 +1333,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             repository,
             commit,
             timeout_override,
+            input_artifact_id,
         )) = existing
         else {
             return Ok(None);
@@ -1008,6 +1341,20 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let request_override = request
             .timeout
             .map(|value| i64::try_from(value.as_millis()).unwrap_or(i64::MAX));
+        let input_matches = match &request.input {
+            AttemptInput::Base(input) => {
+                let requested_repository = std::fs::canonicalize(input.repository()).ok();
+                input_artifact_id.is_none()
+                    && requested_repository
+                        .as_ref()
+                        .is_some_and(|path| path.to_string_lossy() == repository)
+                    && commit == input.commit()
+            }
+            AttemptInput::Artifact(input) => {
+                input_artifact_id.as_deref() == Some(input.artifact_id())
+                    && repository == repository_root.to_string_lossy()
+            }
+        };
         if task != request.task_id.as_str()
             || revision as u64 != request.expected_revision
             || provider != request.provider_id.as_str()
@@ -1015,8 +1362,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             || name.as_deref() != model_choice_name(&request.model_id)
             || instruction != request.instruction
             || role != request.role.as_str()
-            || repository != request.input.repository().to_string_lossy()
-            || commit != request.input.commit()
+            || !input_matches
             || timeout_override != request_override
         {
             return Err(ServiceError::IdempotencyConflict);
@@ -1036,6 +1382,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
     ) -> Result<OperationAcceptance, ServiceError> {
         if request.request_id.trim().is_empty() {
             return Err(ServiceError::InvalidRequest("request_id must not be empty"));
+        }
+        if matches!(request.input, AttemptInput::Artifact(_)) {
+            return Err(ServiceError::PolicyDenied(
+                "ArtifactInput requires a successful changes_requested ReviewVerdict",
+            ));
         }
         if let Some(accepted) = self.idempotent_acceptance(request)? {
             return Ok(accepted);
@@ -1060,14 +1411,28 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ));
         }
 
-        let requested_repo = std::fs::canonicalize(request.input.repository())
-            .map_err(|_| ServiceError::InvalidRequest("repository is unavailable"))?;
-        if requested_repo != self.workspaces.repository_root() {
-            return Err(ServiceError::PolicyDenied(
-                "BaseInput repository does not match the configured workspace",
-            ));
-        }
-        self.workspaces.verify_base_commit(request.input.commit())?;
+        let (repository, base_commit, input_artifact_id) = match &request.input {
+            AttemptInput::Base(input) => {
+                let requested_repo = std::fs::canonicalize(input.repository())
+                    .map_err(|_| ServiceError::InvalidRequest("repository is unavailable"))?;
+                if requested_repo != self.workspaces.repository_root() {
+                    return Err(ServiceError::PolicyDenied(
+                        "BaseInput repository does not match the configured workspace",
+                    ));
+                }
+                self.workspaces.verify_base_commit(input.commit())?;
+                (requested_repo, input.commit().to_owned(), None)
+            }
+            AttemptInput::Artifact(input) => {
+                let artifact = ArtifactManager::new(self.workspaces, self.ledger)
+                    .verify_input(&request.task_id, input.artifact_id())?;
+                (
+                    self.workspaces.repository_root().to_owned(),
+                    artifact.base_commit().to_owned(),
+                    Some(input.artifact_id().to_owned()),
+                )
+            }
+        };
         let provider = self
             .providers
             .resolve(&request.provider_id)
@@ -1078,8 +1443,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
 
         let mut connection = self.ledger.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(accepted) = Self::idempotent_acceptance_with_connection(&transaction, request)?
-        {
+        if let Some(accepted) = Self::idempotent_acceptance_with_connection(
+            &transaction,
+            request,
+            self.workspaces.repository_root(),
+        )? {
             return Ok(accepted);
         }
 
@@ -1114,7 +1482,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         }
         if request.role.as_str() != "implementer" {
             return Err(ServiceError::PolicyDenied(
-                "only an initial implementer Attempt is currently representable",
+                "only implementer Attempts are currently representable",
             ));
         }
         let busy: Option<String> = transaction.query_row(
@@ -1123,6 +1491,33 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         ).optional()?;
         if let Some(id) = busy {
             return Err(ServiceError::Busy(OperationId::new(id)));
+        }
+        let active_publication: Option<String> = transaction.query_row(
+            "SELECT id FROM service_artifact_publication_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
+            params![request.task_id.as_str()],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(id) = active_publication {
+            return Err(ServiceError::Busy(OperationId::new(id)));
+        }
+
+        if let Some(artifact_id) = input_artifact_id.as_deref() {
+            let stored_artifact: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT base_commit,repository_root FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
+                    params![request.task_id.as_str(), artifact_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (stored_base, stored_repository) =
+                stored_artifact.ok_or(ServiceError::Artifact(ArtifactError::NotFound))?;
+            if stored_base != base_commit
+                || std::path::PathBuf::from(stored_repository) != repository
+            {
+                return Err(ServiceError::Artifact(ArtifactError::Invalid(
+                    "artifact input changed during request validation".into(),
+                )));
+            }
         }
         if !task.attempts().is_empty() {
             return Err(ServiceError::PolicyDenied(
@@ -1170,12 +1565,13 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             .timeout
             .map(|value| i64::try_from(value.as_millis()).unwrap_or(i64::MAX));
         transaction.execute(
-            "INSERT INTO service_operations(id,request_id,task_id,attempt_id,expected_revision,provider,model_kind,model_name,instruction,role,repository,base_commit,timeout_override_ms,timeout_ms,status,accepted_at)
+                "INSERT INTO service_operations(id,request_id,task_id,attempt_id,expected_revision,provider,model_kind,model_name,instruction,role,repository,base_commit,timeout_override_ms,timeout_ms,status,accepted_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'accepted',?15)",
             params![operation_id.as_str(), request.request_id, request.task_id.as_str(), attempt_id.as_str(), actual_revision as i64,
                 request.provider_id.as_str(), model_choice_kind(&request.model_id), model_choice_name(&request.model_id), request.instruction,
-                request.role.as_str(), request.input.repository().to_string_lossy().as_ref(), request.input.commit(), timeout_override_ms, timeout_ms as i64, accepted_at],
+                request.role.as_str(), repository.to_string_lossy().as_ref(), base_commit, timeout_override_ms, timeout_ms as i64, accepted_at],
         )?;
+        transaction.execute("INSERT INTO service_attempt_artifacts(task_id,attempt_id,input_artifact_id) VALUES(?1,?2,?3)", params![request.task_id.as_str(), attempt_id.as_str(), input_artifact_id])?;
         transaction.commit()?;
         Ok(OperationAcceptance {
             operation_id,
@@ -1196,6 +1592,14 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             return self.get_operation(operation_id);
         }
         if !self.claim_operation(operation_id)? {
+            return self.get_operation(operation_id);
+        }
+        if stored.input_artifact_id.is_some() {
+            self.finish_without_start(
+                operation_id,
+                "review_evidence_required",
+                ServiceOperationStatus::Failed,
+            )?;
             return self.get_operation(operation_id);
         }
         let provider = match self.providers.resolve(&stored.provider) {
@@ -1236,14 +1640,23 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 return self.get_operation(operation_id);
             }
         };
-        if self
-            .workspaces
-            .validate_provider_workspace_at_base(workspace.path(), &stored.base_commit)
-            .is_err()
-        {
+        let prepared = if let Some(input_id) = stored.input_artifact_id.as_deref() {
+            ArtifactManager::new(self.workspaces, self.ledger)
+                .materialize(&workspace, &stored.task_id, &stored.attempt_id, input_id)
+                .is_ok()
+        } else {
+            self.workspaces
+                .validate_provider_workspace_at_base(workspace.path(), &stored.base_commit)
+                .is_ok()
+        };
+        if !prepared {
             self.finish_without_start(
                 operation_id,
-                "workspace_unavailable",
+                if stored.input_artifact_id.is_some() {
+                    "artifact_unavailable"
+                } else {
+                    "workspace_unavailable"
+                },
                 ServiceOperationStatus::Failed,
             )?;
             return self.get_operation(operation_id);
@@ -1260,6 +1673,19 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         match provider_result {
             Ok(result) => {
                 let usage = result.usage().cloned();
+                match ArtifactManager::new(self.workspaces, self.ledger).capture(
+                    &workspace,
+                    &stored.task_id,
+                    &stored.attempt_id,
+                    stored.input_artifact_id.as_deref(),
+                    &stored.base_commit,
+                ) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        self.finish_recovery_required(operation_id, "artifact_capture_failed")?;
+                        return self.get_operation(operation_id);
+                    }
+                }
                 self.finish_attempt(
                     operation_id,
                     ServiceOperationStatus::Completed,
@@ -1279,6 +1705,19 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                     }
                 ) {
                     self.finish_recovery_required(operation_id, "provider_interrupted")?;
+                    return self.get_operation(operation_id);
+                }
+                if ArtifactManager::new(self.workspaces, self.ledger)
+                    .capture(
+                        &workspace,
+                        &stored.task_id,
+                        &stored.attempt_id,
+                        stored.input_artifact_id.as_deref(),
+                        &stored.base_commit,
+                    )
+                    .is_err()
+                {
+                    self.finish_recovery_required(operation_id, "artifact_capture_failed")?;
                     return self.get_operation(operation_id);
                 }
                 let (status, reason, code) = match error.kind() {
@@ -1366,10 +1805,16 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        let (input_artifact_id, output_artifact_id): (Option<String>, Option<String>) = connection.query_row(
+            "SELECT relation.input_artifact_id,relation.output_artifact_id FROM service_attempt_artifacts relation WHERE relation.task_id=?1 AND relation.attempt_id=?2",
+            params![task, attempt], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?.unwrap_or((None, None));
         Ok(OperationSnapshot {
             operation_id: operation_id.clone(),
             task_id: TaskId::new(task),
             attempt_id: AttemptId::new(attempt),
+            input_artifact_id,
+            output_artifact_id,
             status: ServiceOperationStatus::from_str(&status)?,
             attempt_state: parse_attempt_state(&attempt_status)?,
             requested_provider: ProviderRef::new(provider),
@@ -1384,6 +1829,842 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             started_at_ms: started,
             finished_at_ms: finished,
         })
+    }
+
+    /// Runs the configured validator on a fresh worktree restored from the immutable Artifact.
+    /// A result is recorded only if the same Git tree is present before and after validation.
+    pub fn validate_artifact(
+        &self,
+        task_id: &TaskId,
+        artifact_id: &str,
+        expected_revision: u64,
+        validator: &dyn Validator,
+    ) -> Result<ArtifactValidationRecord, ServiceError> {
+        static NEXT_VALIDATION: AtomicU64 = AtomicU64::new(0);
+        let artifacts = ArtifactManager::new(self.workspaces, self.ledger);
+        artifacts.check_revision(task_id, expected_revision)?;
+        let artifact = artifacts.verify_input(task_id, artifact_id)?;
+        let attempt_id = AttemptId::new(format!(
+            "validation-{}-{}",
+            now_ms(),
+            NEXT_VALIDATION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let workspace =
+            self.workspaces
+                .create_at_base(task_id, &attempt_id, artifact.base_commit())?;
+        let initial_tree = match artifacts.snapshot_workspace(workspace.path()) {
+            Ok(tree) => tree,
+            Err(error) => {
+                return Err(ServiceError::Artifact(
+                    ArtifactManager::retained_workspace_error(&workspace, error.to_string()),
+                ));
+            }
+        };
+        if let Err(error) = artifacts.materialize(&workspace, task_id, &attempt_id, artifact_id) {
+            return match artifacts.cleanup_validation_workspace(
+                task_id,
+                &attempt_id,
+                &workspace,
+                &initial_tree,
+            ) {
+                Ok(()) => Err(ServiceError::from(error)),
+                Err(cleanup_error) => Err(ServiceError::Artifact(
+                    ArtifactManager::retained_workspace_error(
+                        &workspace,
+                        format!("materialization failed ({error}); {cleanup_error}"),
+                    ),
+                )),
+            };
+        }
+        if let Err(error) = artifacts.verify_workspace_tree(workspace.path(), artifact.tree_oid()) {
+            return Err(ServiceError::Artifact(
+                ArtifactManager::retained_workspace_error(&workspace, error.to_string()),
+            ));
+        }
+        let result: ValidationResult = match validator.validate(workspace.path()) {
+            Ok(result) => result,
+            Err(error) => {
+                return match artifacts.cleanup_unchanged_artifact_validation_workspace(
+                    task_id,
+                    &attempt_id,
+                    artifact_id,
+                    &workspace,
+                ) {
+                    Ok(()) => Err(ServiceError::ValidationFailed),
+                    Err(cleanup_error) => Err(ServiceError::Artifact(
+                        ArtifactManager::retained_workspace_error(
+                            &workspace,
+                            format!("validation failed ({error}); {cleanup_error}"),
+                        ),
+                    )),
+                };
+            }
+        };
+        if let Err(error) = artifacts.verify_workspace_tree(workspace.path(), artifact.tree_oid()) {
+            return Err(ServiceError::Artifact(
+                ArtifactManager::retained_workspace_error(&workspace, error.to_string()),
+            ));
+        }
+        artifacts
+            .cleanup_unchanged_artifact_validation_workspace(
+                task_id,
+                &attempt_id,
+                artifact_id,
+                &workspace,
+            )
+            .map_err(ServiceError::from)?;
+        artifacts
+            .record_validation(task_id, artifact_id, expected_revision, result)
+            .map_err(ServiceError::from)
+    }
+
+    /// Records the supervisor Codex's decision without deriving it from mechanical evidence.
+    pub fn record_artifact_decision(
+        &self,
+        task_id: &TaskId,
+        artifact_id: &str,
+        expected_revision: u64,
+        decision: CodexDecisionKind,
+        reason: &str,
+        evidence: &[(String, String)],
+    ) -> Result<ArtifactCodexDecisionRecord, ServiceError> {
+        ArtifactManager::new(self.workspaces, self.ledger)
+            .record_decision(
+                task_id,
+                artifact_id,
+                expected_revision,
+                decision,
+                reason,
+                evidence,
+            )
+            .map_err(ServiceError::from)
+    }
+
+    /// Checks exact Artifact, passing Validation and accepted Codex decision identity.
+    /// This returns evidence only; it does not commit, push, scan, or create a Pull Request.
+    pub fn require_artifact_publication_evidence(
+        &self,
+        task_id: &TaskId,
+        artifact_id: &str,
+        validation_id: &str,
+        decision_id: &str,
+        expected_revision: u64,
+    ) -> Result<ArtifactPublicationPermit, ServiceError> {
+        ArtifactManager::new(self.workspaces, self.ledger)
+            .publication_permit(
+                task_id,
+                artifact_id,
+                validation_id,
+                decision_id,
+                expected_revision,
+            )
+            .map_err(ServiceError::from)
+    }
+
+    /// Scans and durably accepts publication of exactly this Artifact.
+    /// External effects are started separately by `run_artifact_publication`.
+    /// Raw title/body and Artifact text are never persisted; only a request digest is stored.
+    pub fn publish_artifact(
+        &self,
+        request: &ArtifactPublicationRequest,
+    ) -> Result<ArtifactPublicationAcceptance, ServiceError> {
+        if request.request_id.trim().is_empty() {
+            return Err(ServiceError::InvalidRequest("request_id must not be empty"));
+        }
+        if request.payload.base_branch() == request.payload.head_branch() {
+            return Err(ServiceError::InvalidRequest(
+                "publication base and head branches must differ",
+            ));
+        }
+        if !valid_git_branch(request.payload.base_branch())
+            || !valid_git_branch(request.payload.head_branch())
+        {
+            return Err(ServiceError::InvalidRequest(
+                "publication branch name is invalid",
+            ));
+        }
+        let gateway = self.publication_gateway.ok_or(ServiceError::PolicyDenied(
+            "Artifact publication gateway is not configured",
+        ))?;
+        if !gateway.supports_sensitive_stdin_payload() {
+            return Err(ServiceError::PolicyDenied(
+                "publication gateway cannot safely send title/body on this platform",
+            ));
+        }
+        let scanner = self.secret_scanner.ok_or(ServiceError::PolicyDenied(
+            "SecretScanner is not configured",
+        ))?;
+        let digest = publication_request_digest(request);
+        if let Some(acceptance) = self.find_publication_acceptance(&request.request_id, &digest)? {
+            return Ok(acceptance);
+        }
+
+        let artifacts = ArtifactManager::new(self.workspaces, self.ledger);
+        let permit = artifacts
+            .publication_permit(
+                &request.task_id,
+                &request.artifact_id,
+                &request.validation_id,
+                &request.decision_id,
+                request.expected_revision,
+            )
+            .map_err(ServiceError::from)?;
+        let artifact = artifacts
+            .verify_input(&request.task_id, &request.artifact_id)
+            .map_err(ServiceError::from)?;
+        if artifact.tree_oid() != permit.tree_oid()
+            || artifact.base_commit() != permit.base_commit()
+        {
+            return Err(ServiceError::PolicyDenied(
+                "Artifact changed after evidence was checked",
+            ));
+        }
+
+        let artifact_scan = scanner
+            .scan_artifact_tree(artifact.repository_root(), artifact.tree_oid())
+            .map_err(|_| ServiceError::PolicyDenied("secret scan could not complete safely"))?;
+        let payload_scan = scanner
+            .scan_publication_payload(&request.payload)
+            .map_err(|_| ServiceError::PolicyDenied("secret scan could not complete safely"))?;
+        if artifact_scan != SecretScanResult::Clean || payload_scan != SecretScanResult::Clean {
+            return Err(ServiceError::PolicyDenied(
+                "secret scan found sensitive content",
+            ));
+        }
+
+        let (acceptance, _) = self.accept_artifact_publication(request, &permit, &digest)?;
+        Ok(acceptance)
+    }
+
+    /// Executes an accepted publication with the exact request payload held by the caller.
+    /// It rechecks the digest, evidence, Artifact tree, and secret scans before any external effect.
+    pub fn run_artifact_publication(
+        &self,
+        acceptance: &ArtifactPublicationAcceptance,
+        request: &ArtifactPublicationRequest,
+    ) -> Result<ArtifactPublicationSnapshot, ServiceError> {
+        if acceptance.request_id != request.request_id || acceptance.task_id != request.task_id {
+            return Err(ServiceError::IdempotencyConflict);
+        }
+        let snapshot = self.get_artifact_publication_operation(&acceptance.operation_id)?;
+        if snapshot.request_id != request.request_id || snapshot.task_id != request.task_id {
+            return Err(ServiceError::IdempotencyConflict);
+        }
+        let digest = publication_request_digest(request);
+        let (stored_digest, current_revision, stored_status): (String, i64, String) = {
+            let connection = self.ledger.lock_connection()?;
+            connection.query_row(
+                "SELECT publication.request_digest,task_revision.revision,publication.status
+                 FROM service_artifact_publication_operations publication
+                 JOIN service_task_revisions task_revision ON task_revision.task_id=publication.task_id
+                 WHERE publication.id=?1",
+                params![acceptance.operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
+        };
+        if stored_digest != digest {
+            return Err(ServiceError::IdempotencyConflict);
+        }
+        if snapshot.state != ServiceOperationStatus::Accepted || stored_status != "accepted" {
+            return self.get_artifact_publication_operation(&acceptance.operation_id);
+        }
+        let scanner = self.secret_scanner.ok_or(ServiceError::PolicyDenied(
+            "SecretScanner is not configured",
+        ))?;
+        let gateway = self.publication_gateway.ok_or(ServiceError::PolicyDenied(
+            "Artifact publication gateway is not configured",
+        ))?;
+        if !gateway.supports_sensitive_stdin_payload() {
+            return Err(ServiceError::PolicyDenied(
+                "publication gateway cannot safely send title/body on this platform",
+            ));
+        }
+        let current_revision =
+            u64::try_from(current_revision).map_err(|_| ServiceError::InvalidStoredState)?;
+        if !self
+            .set_publication_running(&acceptance.operation_id, ArtifactPublicationPhase::Accepted)?
+        {
+            return self.get_artifact_publication_operation(&acceptance.operation_id);
+        }
+        if current_revision != acceptance.revision {
+            self.finish_publication(
+                &acceptance.operation_id,
+                ServiceOperationStatus::Failed,
+                "publication_stale_revision",
+                None,
+                None,
+            )?;
+            return Err(ServiceError::StaleRevision {
+                expected: acceptance.revision,
+                actual: current_revision,
+            });
+        }
+        let permit = match ArtifactManager::new(self.workspaces, self.ledger).publication_permit(
+            &request.task_id,
+            &request.artifact_id,
+            &request.validation_id,
+            &request.decision_id,
+            current_revision,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.finish_publication(
+                    &acceptance.operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_evidence_mismatch",
+                    None,
+                    None,
+                )?;
+                return Err(ServiceError::from(error));
+            }
+        };
+        if permit.tree_oid() != snapshot.tree_oid {
+            self.finish_publication(
+                &acceptance.operation_id,
+                ServiceOperationStatus::Failed,
+                "publication_artifact_mismatch",
+                None,
+                None,
+            )?;
+            return Err(ServiceError::PolicyDenied(
+                "Artifact changed after publication was accepted",
+            ));
+        }
+        let artifact = match ArtifactManager::new(self.workspaces, self.ledger)
+            .verify_input(&request.task_id, &request.artifact_id)
+        {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                self.finish_publication(
+                    &acceptance.operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_artifact_unavailable",
+                    None,
+                    None,
+                )?;
+                return Err(ServiceError::from(error));
+            }
+        };
+        let artifact_scan =
+            match scanner.scan_artifact_tree(artifact.repository_root(), artifact.tree_oid()) {
+                Ok(result) => result,
+                Err(_) => {
+                    self.finish_publication(
+                        &acceptance.operation_id,
+                        ServiceOperationStatus::Failed,
+                        "publication_scan_failed",
+                        None,
+                        None,
+                    )?;
+                    return Err(ServiceError::PolicyDenied(
+                        "secret scan could not complete safely",
+                    ));
+                }
+            };
+        let payload_scan = match scanner.scan_publication_payload(&request.payload) {
+            Ok(result) => result,
+            Err(_) => {
+                self.finish_publication(
+                    &acceptance.operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_scan_failed",
+                    None,
+                    None,
+                )?;
+                return Err(ServiceError::PolicyDenied(
+                    "secret scan could not complete safely",
+                ));
+            }
+        };
+        if artifact_scan != SecretScanResult::Clean || payload_scan != SecretScanResult::Clean {
+            self.finish_publication(
+                &acceptance.operation_id,
+                ServiceOperationStatus::Failed,
+                "publication_secret_detected",
+                None,
+                None,
+            )?;
+            return Err(ServiceError::PolicyDenied(
+                "secret scan found sensitive content",
+            ));
+        }
+        self.save_publication_phase(
+            &acceptance.operation_id,
+            ArtifactPublicationPhase::Scanned,
+            None,
+        )?;
+        self.execute_artifact_publication(
+            &acceptance.operation_id,
+            &artifact,
+            &permit,
+            &request.payload,
+            gateway,
+        )?;
+        self.get_artifact_publication_operation(&acceptance.operation_id)
+    }
+
+    /// Reads the durable result for a publication operation. This is separate from
+    /// `get_operation`, whose current contract is provider-Attempt-specific.
+    pub fn get_artifact_publication_operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<ArtifactPublicationSnapshot, ServiceError> {
+        let connection = self.ledger.lock_connection()?;
+        let row = connection.query_row(
+            "SELECT request_id,task_id,artifact_id,tree_oid,validation_id,decision_id,commit_sha,
+                    pull_request_number,pull_request_url,is_draft,status,phase,revision,error_code,
+                    accepted_at,finished_at,head_branch,base_branch
+             FROM service_artifact_publication_operations WHERE id=?1",
+            params![operation_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?, row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?, row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, String>(10)?, row.get::<_, String>(11)?,
+                    row.get::<_, i64>(12)?, row.get::<_, Option<String>>(13)?,
+                    row.get::<_, i64>(14)?, row.get::<_, Option<i64>>(15)?,
+                    row.get::<_, String>(16)?, row.get::<_, String>(17)?,
+                ))
+            },
+        ).optional()?.ok_or(ServiceError::OperationNotFound)?;
+        let pull_request = match (row.7, row.8, row.9) {
+            (Some(number), Some(url), Some(draft)) => Some(DraftPullRequest::new(
+                u64::try_from(number).map_err(|_| ServiceError::InvalidStoredState)?,
+                url,
+                draft != 0,
+                row.6.clone().ok_or(ServiceError::InvalidStoredState)?,
+                row.16.clone(),
+                row.17.clone(),
+            )),
+            (None, None, None) => None,
+            _ => return Err(ServiceError::InvalidStoredState),
+        };
+        Ok(ArtifactPublicationSnapshot {
+            operation_id: operation_id.clone(),
+            request_id: row.0,
+            task_id: TaskId::new(row.1),
+            artifact_id: row.2,
+            tree_oid: row.3,
+            validation_id: row.4,
+            decision_id: row.5,
+            commit_sha: row.6,
+            pull_request,
+            state: ServiceOperationStatus::from_str(&row.10)?,
+            phase: ArtifactPublicationPhase::from_str(&row.11)?,
+            revision: u64::try_from(row.12).map_err(|_| ServiceError::InvalidStoredState)?,
+            error_code: row.13,
+            accepted_at_ms: row.14,
+            finished_at_ms: row.15,
+        })
+    }
+
+    fn find_publication_acceptance(
+        &self,
+        request_id: &str,
+        digest: &str,
+    ) -> Result<Option<ArtifactPublicationAcceptance>, ServiceError> {
+        let connection = self.ledger.lock_connection()?;
+        let row: Option<(String, String, String, i64, String)> = connection
+            .query_row(
+                "SELECT id,task_id,request_digest,revision,status
+                 FROM service_artifact_publication_operations WHERE request_id=?1",
+                params![request_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(id, task_id, stored_digest, revision, status)| {
+            if stored_digest != digest {
+                return Err(ServiceError::IdempotencyConflict);
+            }
+            Ok(ArtifactPublicationAcceptance {
+                operation_id: OperationId::new(id),
+                request_id: request_id.to_owned(),
+                task_id: TaskId::new(task_id),
+                revision: u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?,
+                status: ServiceOperationStatus::from_str(&status)?,
+            })
+        })
+        .transpose()
+    }
+
+    fn accept_artifact_publication(
+        &self,
+        request: &ArtifactPublicationRequest,
+        permit: &ArtifactPublicationPermit,
+        digest: &str,
+    ) -> Result<(ArtifactPublicationAcceptance, bool), ServiceError> {
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((id, task, stored_digest, revision, status)) = tx
+            .query_row(
+                "SELECT id,task_id,request_digest,revision,status
+                 FROM service_artifact_publication_operations WHERE request_id=?1",
+                params![request.request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if stored_digest != digest {
+                return Err(ServiceError::IdempotencyConflict);
+            }
+            let acceptance = ArtifactPublicationAcceptance {
+                operation_id: OperationId::new(id),
+                request_id: request.request_id.clone(),
+                task_id: TaskId::new(task),
+                revision: u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?,
+                status: ServiceOperationStatus::from_str(&status)?,
+            };
+            tx.commit()?;
+            return Ok((acceptance, false));
+        }
+        let task_state: String = tx
+            .query_row(
+                "SELECT state FROM tasks WHERE id=?1",
+                params![request.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ServiceError::TaskNotFound)?;
+        if matches!(task_state.as_str(), "completed" | "failed" | "cancelled") {
+            return Err(ServiceError::PolicyDenied("Task is closed"));
+        }
+        let revision: i64 = tx
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![request.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ServiceError::TaskNotFound)?;
+        let revision = u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?;
+        if revision != request.expected_revision {
+            return Err(ServiceError::StaleRevision {
+                expected: request.expected_revision,
+                actual: revision,
+            });
+        }
+        let active_attempt: Option<String> = tx.query_row(
+            "SELECT id FROM service_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
+            params![request.task_id.as_str()], |row| row.get(0),
+        ).optional()?;
+        if let Some(id) = active_attempt {
+            return Err(ServiceError::Busy(OperationId::new(id)));
+        }
+        let active_publication: Option<String> = tx.query_row(
+            "SELECT id FROM service_artifact_publication_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
+            params![request.task_id.as_str()], |row| row.get(0),
+        ).optional()?;
+        if let Some(id) = active_publication {
+            return Err(ServiceError::Busy(OperationId::new(id)));
+        }
+        let artifact_tree: Option<String> = tx.query_row(
+            "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
+            params![request.task_id.as_str(), request.artifact_id], |row| row.get(0),
+        ).optional()?;
+        if artifact_tree.as_deref() != Some(permit.tree_oid()) {
+            return Err(ServiceError::Artifact(ArtifactError::RecoveryRequired));
+        }
+        let next_revision = revision
+            .checked_add(1)
+            .filter(|value| *value <= i64::MAX as u64)
+            .ok_or(ServiceError::InvalidStoredState)?;
+        tx.execute(
+            "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+            params![request.task_id.as_str(), next_revision as i64],
+        )?;
+        let row_id: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(rowid),0)+1 FROM service_artifact_publication_operations",
+            [],
+            |row| row.get(0),
+        )?;
+        let accepted_at = now_ms();
+        let operation_id = OperationId::new(format!("service-publication-{row_id}-{accepted_at}"));
+        let request_digest = digest;
+        tx.execute(
+            "INSERT INTO service_artifact_publication_operations(
+                id,request_id,task_id,request_digest,artifact_id,tree_oid,base_commit,
+                validation_id,decision_id,base_branch,head_branch,status,phase,
+                accepted_revision,revision,accepted_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'accepted','scanned',?12,?13,?14)",
+            params![
+                operation_id.as_str(),
+                request.request_id,
+                request.task_id.as_str(),
+                request_digest,
+                request.artifact_id,
+                permit.tree_oid(),
+                permit.base_commit(),
+                permit.validation_id(),
+                permit.decision_id(),
+                request.payload.base_branch(),
+                request.payload.head_branch(),
+                request.expected_revision as i64,
+                next_revision as i64,
+                accepted_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok((
+            ArtifactPublicationAcceptance {
+                operation_id,
+                request_id: request.request_id.clone(),
+                task_id: request.task_id.clone(),
+                revision: next_revision,
+                status: ServiceOperationStatus::Accepted,
+            },
+            true,
+        ))
+    }
+
+    fn execute_artifact_publication(
+        &self,
+        operation_id: &OperationId,
+        artifact: &crate::ArtifactRecord,
+        permit: &ArtifactPublicationPermit,
+        payload: &ArtifactPublicationPayload,
+        gateway: &dyn ArtifactPublicationGateway,
+    ) -> Result<(), ServiceError> {
+        self.save_publication_phase(operation_id, ArtifactPublicationPhase::Committing, None)?;
+        let commit_sha = match gateway.commit_tree(
+            artifact.repository_root(),
+            permit.tree_oid(),
+            permit.base_commit(),
+            "Publish validated Artifact",
+            self.default_timeout,
+        ) {
+            Ok(sha) => sha,
+            Err(_) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_commit_failed",
+                    None,
+                    None,
+                )?;
+                return Err(ServiceError::PublicationFailed);
+            }
+        };
+        if !valid_git_oid(&commit_sha)
+            || !gateway.verify_commit_tree_and_base(
+                artifact.repository_root(),
+                &commit_sha,
+                permit.tree_oid(),
+                permit.base_commit(),
+                self.default_timeout,
+            )
+        {
+            self.finish_publication(
+                operation_id,
+                ServiceOperationStatus::Failed,
+                "publication_commit_mismatch",
+                None,
+                None,
+            )?;
+            return Err(ServiceError::PublicationFailed);
+        }
+        self.save_publication_phase(
+            operation_id,
+            ArtifactPublicationPhase::Committed,
+            Some(&commit_sha),
+        )?;
+
+        self.save_publication_phase(
+            operation_id,
+            ArtifactPublicationPhase::Pushing,
+            Some(&commit_sha),
+        )?;
+        if gateway
+            .push_commit(
+                artifact.repository_root(),
+                &commit_sha,
+                payload.head_branch(),
+                self.default_timeout,
+            )
+            .is_err()
+        {
+            self.finish_publication(
+                operation_id,
+                ServiceOperationStatus::RecoveryRequired,
+                "publication_push_ambiguous",
+                Some(&commit_sha),
+                None,
+            )?;
+            return Err(ServiceError::PublicationRecoveryRequired);
+        }
+        self.save_publication_phase(
+            operation_id,
+            ArtifactPublicationPhase::Pushed,
+            Some(&commit_sha),
+        )?;
+
+        self.save_publication_phase(
+            operation_id,
+            ArtifactPublicationPhase::CreatingDraft,
+            Some(&commit_sha),
+        )?;
+        let pull_request = match gateway.create_or_find_draft_pull_request(
+            artifact.repository_root(),
+            payload,
+            &commit_sha,
+            self.default_timeout,
+        ) {
+            Ok(pull_request) => pull_request,
+            Err(_) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::RecoveryRequired,
+                    "publication_pr_ambiguous",
+                    Some(&commit_sha),
+                    None,
+                )?;
+                return Err(ServiceError::PublicationRecoveryRequired);
+            }
+        };
+        if !pull_request.is_draft()
+            || pull_request.head_sha() != commit_sha
+            || pull_request.head_branch() != payload.head_branch()
+            || pull_request.base_branch() != payload.base_branch()
+            || pull_request.number() == 0
+            || !pull_request.url().starts_with("https://")
+        {
+            self.finish_publication(
+                operation_id,
+                ServiceOperationStatus::RecoveryRequired,
+                "publication_pr_mismatch",
+                Some(&commit_sha),
+                None,
+            )?;
+            return Err(ServiceError::PublicationRecoveryRequired);
+        }
+        self.finish_publication(
+            operation_id,
+            ServiceOperationStatus::Completed,
+            "",
+            Some(&commit_sha),
+            Some(&pull_request),
+        )?;
+        Ok(())
+    }
+
+    fn set_publication_running(
+        &self,
+        operation_id: &OperationId,
+        phase: ArtifactPublicationPhase,
+    ) -> Result<bool, ServiceError> {
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE service_artifact_publication_operations SET status='running',phase=?2,started_at=?3
+             WHERE id=?1 AND status='accepted'",
+            params![operation_id.as_str(), phase.as_str(), now_ms()],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        if changed != 1 {
+            return Err(ServiceError::PublicationRecoveryRequired);
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn save_publication_phase(
+        &self,
+        operation_id: &OperationId,
+        phase: ArtifactPublicationPhase,
+        commit_sha: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let connection = self.ledger.lock_connection()?;
+        let changed = connection.execute(
+            "UPDATE service_artifact_publication_operations SET phase=?2,commit_sha=COALESCE(?3,commit_sha)
+             WHERE id=?1 AND status='running'",
+            params![operation_id.as_str(), phase.as_str(), commit_sha],
+        )?;
+        if changed != 1 {
+            return Err(ServiceError::PublicationRecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn finish_publication(
+        &self,
+        operation_id: &OperationId,
+        status: ServiceOperationStatus,
+        error_code: &str,
+        commit_sha: Option<&str>,
+        pull_request: Option<&DraftPullRequest>,
+    ) -> Result<(), ServiceError> {
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task: String = tx
+            .query_row(
+                "SELECT task_id FROM service_artifact_publication_operations WHERE id=?1",
+                params![operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ServiceError::OperationNotFound)?;
+        let phase = match status {
+            ServiceOperationStatus::Completed => ArtifactPublicationPhase::Published,
+            ServiceOperationStatus::Failed => ArtifactPublicationPhase::Failed,
+            ServiceOperationStatus::RecoveryRequired => ArtifactPublicationPhase::RecoveryRequired,
+            _ => return Err(ServiceError::InvalidStoredState),
+        };
+        let next_revision: i64 = tx
+            .query_row(
+                "SELECT revision+1 FROM service_task_revisions WHERE task_id=?1",
+                params![task],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ServiceError::TaskNotFound)?;
+        tx.execute(
+            "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+            params![task, next_revision],
+        )?;
+        tx.execute(
+            "UPDATE service_artifact_publication_operations SET status=?2,phase=?3,revision=?4,
+                error_code=?5,commit_sha=COALESCE(?6,commit_sha),pull_request_number=?7,
+                pull_request_url=?8,is_draft=?9,finished_at=?10 WHERE id=?1 AND status='running'",
+            params![
+                operation_id.as_str(),
+                status.as_str(),
+                phase.as_str(),
+                next_revision,
+                if error_code.is_empty() {
+                    None
+                } else {
+                    Some(error_code)
+                },
+                commit_sha,
+                pull_request.map(|pr| pr.number() as i64),
+                pull_request.map(DraftPullRequest::url),
+                pull_request.map(|pr| i64::from(pr.is_draft())),
+                now_ms(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn record_workspace_locator(
@@ -1488,13 +2769,54 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             bump_revision(&tx, &task_id)?;
             recovered.push(OperationId::new(operation_id));
         }
+        let pending_publications = {
+            let mut statement = tx.prepare(
+                "SELECT id,task_id,status FROM service_artifact_publication_operations
+                 WHERE status IN ('accepted','running') ORDER BY rowid",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (operation_id, task_text, status) in pending_publications {
+            let task_id = TaskId::new(task_text);
+            match status.as_str() {
+                "accepted" => {
+                    tx.execute(
+                        "UPDATE service_artifact_publication_operations
+                         SET status='failed',phase='failed',
+                             error_code='interrupted_before_start',finished_at=?2,revision=revision+1
+                         WHERE id=?1 AND status='accepted'",
+                        params![operation_id, now_ms()],
+                    )?;
+                }
+                "running" => {
+                    tx.execute(
+                        "UPDATE service_artifact_publication_operations
+                         SET status='recovery_required',phase='recovery_required',
+                             error_code='interrupted',finished_at=?2,revision=revision+1
+                         WHERE id=?1 AND status='running'",
+                        params![operation_id, now_ms()],
+                    )?;
+                }
+                _ => return Err(ServiceError::InvalidStoredState),
+            }
+            bump_revision(&tx, &task_id)?;
+            recovered.push(OperationId::new(operation_id));
+        }
         tx.commit()?;
         Ok(recovered)
     }
 
     fn load_request(&self, operation_id: &OperationId) -> Result<StoredRequest, ServiceError> {
         let connection = self.ledger.lock_connection()?;
-        connection.query_row("SELECT task_id,attempt_id,provider,instruction,base_commit,timeout_ms,status FROM service_operations WHERE id=?1",params![operation_id.as_str()],|row|Ok(StoredRequest{task_id:TaskId::new(row.get::<_,String>(0)?),attempt_id:AttemptId::new(row.get::<_,String>(1)?),provider:ProviderRef::new(row.get::<_,String>(2)?),instruction:row.get(3)?,base_commit:row.get(4)?,timeout_ms:row.get::<_,i64>(5)? as u64,status:ServiceOperationStatus::from_str(&row.get::<_,String>(6)?).map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?.ok_or(ServiceError::OperationNotFound)
+        connection.query_row("SELECT operation.task_id,operation.attempt_id,operation.provider,operation.instruction,operation.base_commit,operation.timeout_ms,operation.status,relation.input_artifact_id FROM service_operations operation LEFT JOIN service_attempt_artifacts relation ON relation.task_id=operation.task_id AND relation.attempt_id=operation.attempt_id WHERE operation.id=?1",params![operation_id.as_str()],|row|Ok(StoredRequest{task_id:TaskId::new(row.get::<_,String>(0)?),attempt_id:AttemptId::new(row.get::<_,String>(1)?),provider:ProviderRef::new(row.get::<_,String>(2)?),instruction:row.get(3)?,base_commit:row.get(4)?,timeout_ms:row.get::<_,i64>(5)? as u64,status:ServiceOperationStatus::from_str(&row.get::<_,String>(6)?).map_err(|_|rusqlite::Error::InvalidQuery)?,input_artifact_id:row.get(7)?})).optional()?.ok_or(ServiceError::OperationNotFound)
     }
 
     /// Claims an accepted operation before availability checks or workspace side effects.
@@ -1619,6 +2941,14 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if attempt.semantics() != AttemptSemantics::ProviderCallV2 {
             return Err(ServiceError::InvalidStoredState);
         }
+        let output_state: Option<String> = tx.query_row(
+            "SELECT artifact.state FROM service_attempt_artifacts relation JOIN service_artifacts artifact ON artifact.task_id=relation.task_id AND artifact.id=relation.output_artifact_id WHERE relation.task_id=?1 AND relation.attempt_id=?2",
+            params![task_id.as_str(), attempt_id.as_str()],
+            |row| row.get(0),
+        ).optional()?;
+        if output_state.as_deref() != Some("available") {
+            return Err(ServiceError::InvalidStoredState);
+        }
         if let Some(provider) = observed_provider.clone() {
             attempt.record_observed_target(Some(provider), observed_model.clone());
         }
@@ -1659,6 +2989,7 @@ struct StoredRequest {
     base_commit: String,
     timeout_ms: u64,
     status: ServiceOperationStatus,
+    input_artifact_id: Option<String>,
 }
 
 fn insert_queued_attempt(
@@ -1689,6 +3020,55 @@ fn bump_revision(tx: &rusqlite::Transaction<'_>, task_id: &TaskId) -> Result<(),
     Ok(())
 }
 
+fn publication_request_digest(request: &ArtifactPublicationRequest) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ai-dev-orchestrator-publication-v1\0");
+    let expected_revision = request.expected_revision.to_string();
+    for field in [
+        request.request_id.as_bytes(),
+        request.task_id.as_str().as_bytes(),
+        expected_revision.as_bytes(),
+        request.artifact_id.as_bytes(),
+        request.validation_id.as_bytes(),
+        request.decision_id.as_bytes(),
+        request.payload.base_branch().as_bytes(),
+        request.payload.head_branch().as_bytes(),
+        request.payload.title().as_bytes(),
+        request.payload.body().as_bytes(),
+    ] {
+        digest.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(field);
+    }
+    let bytes = digest.finalize();
+    let mut hex = String::with_capacity(7 + bytes.len() * 2);
+    hex.push_str("sha256:");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn valid_git_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.starts_with('-')
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.ends_with('.')
+        && !branch.contains("..")
+        && !branch.contains("@{")
+        && branch
+            .split('/')
+            .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+        && !branch
+            .bytes()
+            .any(|byte| byte <= b' ' || byte == 0x7f || b"~^:?*[\\".contains(&byte))
+}
+
+fn valid_git_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn parse_attempt_state(value: &str) -> Result<AttemptState, ServiceError> {
     match value {
         "queued" => Ok(AttemptState::Queued),
@@ -1713,10 +3093,11 @@ fn now_ms() -> i64 {
 mod tests {
     use std::{
         fs,
+        path::Path,
         process::{Child, Command},
         sync::{
-            Arc, Barrier,
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc, Barrier, Condvar, Mutex,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         thread,
         time::Instant,
@@ -1724,8 +3105,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AgentProvider, AgentResult, ProviderError, ProviderRegistry, ProviderResult, Task,
-        UsageCost,
+        AgentProvider, AgentResult, ProviderError, ProviderRegistry, ProviderResult,
+        PublicationGatewayError, SecretScanError, Task, UsageCost,
     };
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
@@ -1733,6 +3114,17 @@ mod tests {
     const CHILD_REPOSITORY_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_REPOSITORY";
     const CHILD_OPERATION_ID: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_OPERATION";
     const CHILD_MARKER_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_MARKER";
+
+    fn sqlite_open_is_busy(error: &crate::LedgerError) -> bool {
+        matches!(
+            error,
+            crate::LedgerError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
 
     struct Repo(PathBuf);
 
@@ -1998,6 +3390,10 @@ mod tests {
         provider_failure: Option<FakeProviderFailure>,
         execute_delay: Duration,
         reference: ProviderRef,
+        write_output: Option<(String, String)>,
+        write_ignored: Option<(String, String)>,
+        write_gitignore: Option<String>,
+        require_file: Option<(String, String)>,
     }
 
     #[derive(Clone, Copy)]
@@ -2015,6 +3411,21 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             thread::sleep(self.execute_delay);
             assert_eq!(request.model(), &ModelChoice::ProviderDefault);
+            if let Some((path, contents)) = &self.require_file {
+                assert_eq!(
+                    fs::read_to_string(request.workspace().join(path)).unwrap(),
+                    *contents
+                );
+            }
+            if let Some((path, contents)) = &self.write_output {
+                fs::write(request.workspace().join(path), contents).unwrap();
+            }
+            if let Some((path, contents)) = &self.write_ignored {
+                fs::write(request.workspace().join(path), contents).unwrap();
+            }
+            if let Some(contents) = &self.write_gitignore {
+                fs::write(request.workspace().join(".gitignore"), contents).unwrap();
+            }
             match self.provider_failure {
                 Some(FakeProviderFailure::ExecutionFailed) => {
                     return Err(ProviderError::ExecutionFailed(
@@ -2076,6 +3487,462 @@ mod tests {
         fn check_availability(&self) -> Result<(), ProviderError> {
             self.availability_checks.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    struct FakeSecretScanner {
+        artifact_result: Result<SecretScanResult, SecretScanError>,
+        payload_result: Result<SecretScanResult, SecretScanError>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl SecretScanner for FakeSecretScanner {
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_artifact");
+            self.artifact_result
+        }
+
+        fn scan_publication_payload(
+            &self,
+            _payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_payload");
+            self.payload_result
+        }
+    }
+
+    struct BlockingSecretScanner {
+        artifact_scans: AtomicUsize,
+        entered: Barrier,
+        release: Barrier,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl SecretScanner for BlockingSecretScanner {
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_artifact");
+            if self.artifact_scans.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.entered.wait();
+                self.release.wait();
+            }
+            Ok(SecretScanResult::Clean)
+        }
+
+        fn scan_publication_payload(
+            &self,
+            _payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_payload");
+            Ok(SecretScanResult::Clean)
+        }
+    }
+
+    struct CleanThenFindingScanner {
+        payload_scans: AtomicUsize,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl SecretScanner for CleanThenFindingScanner {
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_artifact");
+            Ok(SecretScanResult::Clean)
+        }
+
+        fn scan_publication_payload(
+            &self,
+            _payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            self.events.lock().unwrap().push("scan_payload");
+            if self.payload_scans.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(SecretScanResult::Clean)
+            } else {
+                Ok(SecretScanResult::Findings)
+            }
+        }
+    }
+
+    struct FakeArtifactPublicationGateway {
+        repository: PathBuf,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        fail_push: bool,
+        fail_pull_request: bool,
+    }
+
+    impl ArtifactPublicationGateway for FakeArtifactPublicationGateway {
+        fn supports_sensitive_stdin_payload(&self) -> bool {
+            true
+        }
+
+        fn commit_tree(
+            &self,
+            _repository: &Path,
+            tree_oid: &str,
+            base_commit: &str,
+            message: &str,
+            _timeout: Duration,
+        ) -> Result<String, PublicationGatewayError> {
+            self.events.lock().unwrap().push("commit");
+            Ok(git(
+                &self.repository,
+                &["commit-tree", tree_oid, "-p", base_commit, "-m", message],
+            ))
+        }
+
+        fn verify_commit_tree_and_base(
+            &self,
+            _repository: &Path,
+            commit_sha: &str,
+            tree_oid: &str,
+            base_commit: &str,
+            _timeout: Duration,
+        ) -> bool {
+            git(&self.repository, &["cat-file", "commit", commit_sha])
+                .split_once("\n\n")
+                .is_some_and(|(headers, _)| {
+                    let mut lines = headers.lines();
+                    lines.next() == Some(&format!("tree {tree_oid}"))
+                        && lines.next() == Some(&format!("parent {base_commit}"))
+                        && lines.next().is_some_and(|line| {
+                            line.starts_with("author ")
+                                || line.starts_with("committer ")
+                                || line.starts_with("encoding ")
+                        })
+                })
+        }
+
+        fn push_commit(
+            &self,
+            _repository: &Path,
+            _commit_sha: &str,
+            _head_branch: &str,
+            _timeout: Duration,
+        ) -> Result<(), PublicationGatewayError> {
+            self.events.lock().unwrap().push("push");
+            if self.fail_push {
+                Err(PublicationGatewayError::CommandFailed)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn create_or_find_draft_pull_request(
+            &self,
+            _repository: &Path,
+            payload: &ArtifactPublicationPayload,
+            commit_sha: &str,
+            _timeout: Duration,
+        ) -> Result<DraftPullRequest, PublicationGatewayError> {
+            self.events.lock().unwrap().push("draft_pr");
+            if self.fail_pull_request {
+                return Err(PublicationGatewayError::CommandFailed);
+            }
+            Ok(DraftPullRequest::new(
+                17,
+                "https://github.test/owner/repo/pull/17",
+                true,
+                commit_sha,
+                payload.head_branch(),
+                payload.base_branch(),
+            ))
+        }
+    }
+
+    struct UnsupportedStdinPublicationGateway {
+        calls: AtomicUsize,
+        supports_stdin: AtomicBool,
+    }
+
+    impl ArtifactPublicationGateway for UnsupportedStdinPublicationGateway {
+        fn supports_sensitive_stdin_payload(&self) -> bool {
+            self.supports_stdin.load(Ordering::SeqCst)
+        }
+
+        fn commit_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+            _base_commit: &str,
+            _message: &str,
+            _timeout: Duration,
+        ) -> Result<String, PublicationGatewayError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(PublicationGatewayError::CommandFailed)
+        }
+
+        fn push_commit(
+            &self,
+            _repository: &Path,
+            _commit_sha: &str,
+            _head_branch: &str,
+            _timeout: Duration,
+        ) -> Result<(), PublicationGatewayError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(PublicationGatewayError::CommandFailed)
+        }
+
+        fn create_or_find_draft_pull_request(
+            &self,
+            _repository: &Path,
+            _payload: &ArtifactPublicationPayload,
+            _commit_sha: &str,
+            _timeout: Duration,
+        ) -> Result<DraftPullRequest, PublicationGatewayError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(PublicationGatewayError::CommandFailed)
+        }
+    }
+
+    struct ArtifactPublicationFixture {
+        repo: Repo,
+        ledger: SqliteExecutionLedger,
+        workspace: WorkspaceManager,
+        providers: ProviderRegistry,
+        task_id: TaskId,
+        artifact_id: String,
+        validation_id: String,
+        decision_id: String,
+        revision: u64,
+        attempt_id: AttemptId,
+    }
+
+    fn artifact_publication_fixture() -> ArtifactPublicationFixture {
+        artifact_publication_fixture_with_persistent_ledger(false)
+    }
+
+    fn artifact_publication_fixture_with_persistent_ledger(
+        persistent_ledger: bool,
+    ) -> ArtifactPublicationFixture {
+        use crate::{CommandValidator, ValidationCheck};
+        let repo = Repo::new();
+        let ledger = if persistent_ledger {
+            SqliteExecutionLedger::open(repo.0.join("service-ledger.sqlite")).unwrap()
+        } else {
+            SqliteExecutionLedger::open_in_memory().unwrap()
+        };
+        let task_id = TaskId::new("publication-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "publication task",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            provider_failure: None,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let accepted = service
+            .submit_attempt(&request(&repo, &task_id, 0, "publication-source"))
+            .unwrap();
+        let completed = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        let artifact_id = completed.output_artifact_id().unwrap().to_owned();
+        let validation = service
+            .validate_artifact(
+                &task_id,
+                &artifact_id,
+                task_revision(&ledger, &task_id),
+                &CommandValidator::new([ValidationCheck::new("passes", "true")]),
+            )
+            .unwrap();
+        let decision = service
+            .record_artifact_decision(
+                &task_id,
+                &artifact_id,
+                task_revision(&ledger, &task_id),
+                CodexDecisionKind::Accepted,
+                "Accepted for publication",
+                &[("validation".into(), validation.id().into())],
+            )
+            .unwrap();
+        let revision = task_revision(&ledger, &task_id);
+        ArtifactPublicationFixture {
+            repo,
+            ledger,
+            workspace,
+            providers,
+            task_id,
+            artifact_id,
+            validation_id: validation.id().to_owned(),
+            decision_id: decision.id().to_owned(),
+            revision,
+            attempt_id: accepted.attempt_id().clone(),
+        }
+    }
+
+    fn task_revision(ledger: &SqliteExecutionLedger, task_id: &TaskId) -> u64 {
+        ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64
+    }
+
+    fn publication_request(
+        fixture: &ArtifactPublicationFixture,
+        request_id: &str,
+    ) -> ArtifactPublicationRequest {
+        ArtifactPublicationRequest::new(
+            request_id,
+            fixture.task_id.clone(),
+            fixture.revision,
+            fixture.artifact_id.clone(),
+            fixture.validation_id.clone(),
+            fixture.decision_id.clone(),
+            ArtifactPublicationPayload::new(
+                "main",
+                "codex/artifact-publication",
+                "payload-title-private-marker",
+                "payload-body-private-marker",
+            ),
+        )
+    }
+
+    #[derive(Default)]
+    struct FailingValidator {
+        workspace: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    #[derive(Default)]
+    struct TrackingValidator {
+        workspace: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    impl crate::Validator for TrackingValidator {
+        fn validate(
+            &self,
+            workspace: &std::path::Path,
+        ) -> Result<ValidationResult, crate::ValidatorError> {
+            *self.workspace.lock().unwrap() = Some(workspace.to_owned());
+            Ok(ValidationResult::from_checks(
+                "passed",
+                [crate::ValidationCheckResult::new(
+                    "passes",
+                    true,
+                    Some(0),
+                    "",
+                )],
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct IgnoredFileValidator {
+        workspace: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    impl crate::Validator for IgnoredFileValidator {
+        fn validate(
+            &self,
+            workspace: &std::path::Path,
+        ) -> Result<ValidationResult, crate::ValidatorError> {
+            *self.workspace.lock().unwrap() = Some(workspace.to_owned());
+            fs::write(workspace.join("ignored-validation.txt"), "not in Artifact")
+                .expect("write ignored validation output");
+            Ok(ValidationResult::from_checks(
+                "passed",
+                [crate::ValidationCheckResult::new(
+                    "passes",
+                    true,
+                    Some(0),
+                    "",
+                )],
+            ))
+        }
+    }
+
+    impl crate::Validator for FailingValidator {
+        fn validate(
+            &self,
+            workspace: &std::path::Path,
+        ) -> Result<ValidationResult, crate::ValidatorError> {
+            *self.workspace.lock().unwrap() = Some(workspace.to_owned());
+            Err(crate::ValidatorError::NoChecksConfigured)
+        }
+    }
+
+    struct BlockingProvider {
+        reference: ProviderRef,
+        calls: Arc<AtomicUsize>,
+        state: Arc<(Mutex<BlockingProviderState>, Condvar)>,
+    }
+
+    #[derive(Default)]
+    struct BlockingProviderState {
+        started: bool,
+        released: bool,
+    }
+
+    impl AgentProvider for BlockingProvider {
+        fn provider_ref(&self) -> &ProviderRef {
+            &self.reference
+        }
+
+        fn execute(&self, _request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().unwrap();
+            state.started = true;
+            changed.notify_all();
+            while !state.released {
+                state = changed.wait(state).unwrap();
+            }
+            Ok(
+                ProviderResult::new("", "", Some(0), Some(AgentResult::new("done", true)), None)
+                    .with_observed_target(Some(self.reference.clone()), None),
+            )
+        }
+
+        fn check_availability(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    struct BlockingResolver(BlockingProvider);
+
+    impl crate::ProviderResolver for BlockingResolver {
+        fn resolve(
+            &self,
+            provider: &ProviderRef,
+        ) -> Result<&dyn AgentProvider, crate::ProviderResolutionError> {
+            if provider == &self.0.reference {
+                Ok(&self.0)
+            } else {
+                Err(crate::ProviderResolutionError::UnknownProvider {
+                    provider: provider.clone(),
+                })
+            }
         }
     }
 
@@ -2166,6 +4033,10 @@ mod tests {
             provider_failure,
             execute_delay,
             reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
         });
         (repo, ledger, workspace, providers, calls, checks, task_id)
     }
@@ -2186,6 +4057,10 @@ mod tests {
             provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
@@ -2202,8 +4077,11 @@ mod tests {
             return;
         };
         let result = (|| -> Result<&'static str, String> {
-            let ledger =
-                SqliteExecutionLedger::open(ledger_path).map_err(|error| error.to_string())?;
+            let ledger = match SqliteExecutionLedger::open(ledger_path) {
+                Ok(ledger) => ledger,
+                Err(error) if sqlite_open_is_busy(&error) => return Ok("busy"),
+                Err(error) => return Err(error.to_string()),
+            };
             let repository = PathBuf::from(std::env::var_os(CHILD_REPOSITORY_PATH).unwrap());
             let workspace =
                 WorkspaceManager::new(&repository).map_err(|error| error.to_string())?;
@@ -2215,6 +4093,10 @@ mod tests {
                 provider_failure: None,
                 execute_delay: Duration::ZERO,
                 reference: ProviderRef::new("fake"),
+                write_output: None,
+                write_ignored: None,
+                write_gitignore: None,
+                require_file: None,
             });
             match OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
             {
@@ -2246,17 +4128,14 @@ mod tests {
             .unwrap();
         let workspace = WorkspaceManager::new(&repo.0).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let resolver = FakeResolver(FakeProvider {
-            calls: calls.clone(),
-            availability_checks: Arc::new(AtomicUsize::new(0)),
-            fail: false,
-            unknown_interrupt: false,
-            provider_failure: None,
-            execute_delay: Duration::from_millis(800),
+        let state = Arc::new((Mutex::new(BlockingProviderState::default()), Condvar::new()));
+        let providers = BlockingResolver(BlockingProvider {
             reference: ProviderRef::new("fake"),
+            calls: calls.clone(),
+            state: state.clone(),
         });
         let service =
-            OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
         let accepted = service
             .submit_attempt(&request(&repo, &task_id, 0, "process-lock"))
@@ -2270,6 +4149,22 @@ mod tests {
                     .run(accepted.operation_id(), CancellationToken::new())
                     .unwrap()
             });
+            let (provider_state, changed) = &*state;
+            let provider_state = provider_state.lock().unwrap();
+            let (mut provider_state, _) = changed
+                .wait_timeout_while(provider_state, Duration::from_secs(10), |state| {
+                    !state.started
+                })
+                .unwrap();
+            let provider_started = provider_state.started;
+            if !provider_started {
+                provider_state.released = true;
+                changed.notify_all();
+                drop(provider_state);
+                let _ = run.join();
+                panic!("provider did not start before the deadline");
+            }
+            drop(provider_state);
             let mut child = spawn_test_child(
                 "operation_service::tests::child_reports_lock_acquisition_during_active_service",
                 &[
@@ -2278,9 +4173,31 @@ mod tests {
                     (CHILD_MARKER_PATH, &marker_text),
                 ],
             );
-            assert_eq!(wait_for_file(&marker, Duration::from_secs(30)), "busy");
-            assert!(child.wait().unwrap().success());
+            let marker_deadline = Instant::now() + Duration::from_secs(30);
+            let mut marker_value = None;
+            while Instant::now() < marker_deadline {
+                if let Ok(value) = fs::read_to_string(&marker) {
+                    marker_value = Some(value);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let Some(marker_value) = marker_value else {
+                let _ = child.kill();
+                let _ = child.wait();
+                let (provider_state, changed) = &*state;
+                provider_state.lock().unwrap().released = true;
+                changed.notify_all();
+                let _ = run.join();
+                panic!("competing service did not report its lock result");
+            };
+            let child_success = child.wait().unwrap().success();
+            let (provider_state, changed) = &*state;
+            provider_state.lock().unwrap().released = true;
+            changed.notify_all();
             let result = run.join().unwrap();
+            assert_eq!(marker_value, "busy");
+            assert!(child_success);
             assert_eq!(result.status(), ServiceOperationStatus::Completed);
         });
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -2302,6 +4219,10 @@ mod tests {
             provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
         });
         assert!(matches!(
             OperationService::new_with_run_lock(
@@ -2338,6 +4259,10 @@ mod tests {
             provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
@@ -2413,7 +4338,7 @@ mod tests {
         assert!(matches!(
             service.submit_attempt(&req),
             Err(ServiceError::PolicyDenied(
-                "only an initial implementer Attempt is currently representable"
+                "only implementer Attempts are currently representable"
             ))
         ));
         let connection = ledger.lock_connection().unwrap();
@@ -2463,6 +4388,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.status(), ServiceOperationStatus::Completed);
         assert_eq!(result.attempt_state(), AttemptState::Succeeded);
+        assert!(result.output_artifact_id().is_some());
         assert_eq!(result.observed_model(), None);
         assert_eq!(
             result.usage(),
@@ -2544,6 +4470,132 @@ mod tests {
             )
         );
         assert!(result.workspace_branch().is_some());
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+    }
+
+    #[test]
+    fn ignored_provider_output_blocks_artifact_success_and_preserves_workspace() {
+        let repo = Repo::new();
+        fs::write(repo.0.join(".gitignore"), "*.excluded\n").unwrap();
+        git(&repo.0, &["add", ".gitignore"]);
+        git(&repo.0, &["commit", "-m", "ignore generated output"]);
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = TaskId::new("ignored-output-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "task with ignored output",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let providers = FakeResolver(FakeProvider {
+            calls: calls.clone(),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            provider_failure: None,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: Some(("secret.excluded".into(), "not in artifact".into())),
+            write_gitignore: None,
+            require_file: None,
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let accepted = service
+            .submit_attempt(&request(&repo, &task_id, 0, "ignored-output"))
+            .unwrap();
+        let result = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.status(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(result.diagnostic_code(), Some("artifact_capture_failed"));
+        assert_eq!(result.output_artifact_id(), None);
+        let workspace_path = result.workspace_path().unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace_path.join("secret.excluded")).unwrap(),
+            "not in artifact"
+        );
+        let artifact_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM service_artifacts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(artifact_count, 0);
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+    }
+
+    #[test]
+    fn artifact_input_requires_review_evidence_before_acceptance() {
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 4, Duration::from_secs(30))
+                .unwrap();
+        let first = service
+            .submit_attempt(&request(&repo, &task_id, 0, "artifact-evidence-first"))
+            .unwrap();
+        let result = service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(result.status(), ServiceOperationStatus::Completed);
+        let artifact_id = result.output_artifact_id().unwrap().to_owned();
+        let revision: u64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64;
+        let input = AttemptRunRequest::with_artifact(
+            "artifact-evidence-follow-up",
+            task_id.clone(),
+            revision,
+            ProviderRef::new("fake"),
+            ModelChoice::ProviderDefault,
+            "revise the reviewed Artifact",
+            TaskRole::new("implementer"),
+            ArtifactInput::new(artifact_id),
+        );
+        assert!(matches!(
+            service.submit_attempt(&input),
+            Err(ServiceError::PolicyDenied(
+                "ArtifactInput requires a successful changes_requested ReviewVerdict"
+            ))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let connection = ledger.lock_connection().unwrap();
+        let counts: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM attempts WHERE task_id=?1),\
+                        (SELECT COUNT(*) FROM service_operations WHERE task_id=?1),\
+                        (SELECT COUNT(*) FROM service_attempt_history WHERE task_id=?1)",
+                params![task_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap() as u64,
+            revision
+        );
+        drop(connection);
         cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
     }
 
@@ -2722,7 +4774,7 @@ mod tests {
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
                 .unwrap();
         let mut req = request(&repo, &task_id, 0, "post-checkout-hook");
-        req.input = BaseInput::new(&repo.0, base.clone());
+        req.input = AttemptInput::Base(BaseInput::new(&repo.0, base.clone()));
         let accepted = service.submit_attempt(&req).unwrap();
         let result = service
             .run(accepted.operation_id(), CancellationToken::new())
@@ -2816,6 +4868,10 @@ mod tests {
             provider_failure: None,
             execute_delay: Duration::from_millis(250),
             reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
@@ -2883,6 +4939,10 @@ mod tests {
             provider_failure: None,
             execute_delay: Duration::ZERO,
             reference: ProviderRef::new("fake"),
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
@@ -2923,6 +4983,969 @@ mod tests {
         assert_eq!(repeated.status(), ServiceOperationStatus::RecoveryRequired);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         cleanup_fixture_worktree(&repo, &workspace, &task_id, accepted.attempt_id());
+    }
+
+    #[test]
+    fn artifact_validation_gate_uses_an_immutable_snapshot_and_exact_decision() {
+        use crate::{CommandValidator, ValidationCheck};
+
+        let repo = Repo::new();
+        fs::write(repo.0.join(".gitignore"), "ignored-validation.txt\n").unwrap();
+        git(&repo.0, &["add", ".gitignore"]);
+        git(
+            &repo.0,
+            &["commit", "-m", "ignore validation fixture output"],
+        );
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = TaskId::new("artifact-evidence-task");
+        ledger
+            .save_task(&Task::new(
+                task_id.clone(),
+                "task description",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            provider_failure: None,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("fake"),
+            write_output: Some(("artifact-new-file.txt".into(), "artifact content".into())),
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        assert!(matches!(
+            service.validate_artifact(
+                &TaskId::new("missing-task"),
+                "missing-artifact",
+                0,
+                &CommandValidator::new([ValidationCheck::new("passes", "true")]),
+            ),
+            Err(ServiceError::TaskNotFound)
+        ));
+        assert!(matches!(
+            service.validate_artifact(
+                &task_id,
+                "missing-artifact",
+                99,
+                &CommandValidator::new([ValidationCheck::new("passes", "true")]),
+            ),
+            Err(ServiceError::StaleRevision {
+                expected: 99,
+                actual: 0
+            })
+        ));
+        let accepted = service
+            .submit_attempt(&request(&repo, &task_id, 0, "artifact-evidence-run"))
+            .unwrap();
+        let completed = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        let artifact_id = completed.output_artifact_id().unwrap().to_owned();
+        let artifact_tree = ArtifactManager::new(&workspace, &ledger)
+            .verify_input(&task_id, &artifact_id)
+            .unwrap()
+            .tree_oid()
+            .to_owned();
+        let revision = || -> u64 {
+            ledger
+                .lock_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap() as u64
+        };
+        let failing_validator = FailingValidator::default();
+        assert!(matches!(
+            service.validate_artifact(&task_id, &artifact_id, revision(), &failing_validator,),
+            Err(ServiceError::ValidationFailed)
+        ));
+        let failed_workspace = failing_validator.workspace.lock().unwrap().clone().unwrap();
+        assert!(!failed_workspace.exists());
+        let validation_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_validations WHERE task_id=?1 AND artifact_id=?2",
+                params![task_id.as_str(), artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(validation_count, 0);
+        assert!(
+            git(&repo.0, &["ls-tree", "-r", "--name-only", &artifact_tree])
+                .contains("artifact-new-file.txt")
+        );
+        let ignored_validator = IgnoredFileValidator::default();
+        let ignored_result =
+            service.validate_artifact(&task_id, &artifact_id, revision(), &ignored_validator);
+        let ignored_path = match ignored_result {
+            Err(ServiceError::Artifact(ArtifactError::WorkspaceRetained { path, .. })) => path,
+            other => panic!("ignored validation output must be retained: {other:?}"),
+        };
+        assert!(ignored_path.exists());
+        assert!(ignored_path.join("ignored-validation.txt").exists());
+        let validation_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_validations WHERE task_id=?1 AND artifact_id=?2",
+                params![task_id.as_str(), artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(validation_count, 0);
+        let ignored_path_text = ignored_path.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &["worktree", "remove", "--force", &ignored_path_text],
+        );
+        let tracking_validator = TrackingValidator::default();
+        let validation = service
+            .validate_artifact(&task_id, &artifact_id, revision(), &tracking_validator)
+            .unwrap();
+        let successful_workspace = tracking_validator
+            .workspace
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert!(!successful_workspace.exists());
+        assert!(validation.passed());
+        assert_eq!(validation.revision(), revision());
+        let other_validation = service
+            .validate_artifact(
+                &task_id,
+                &artifact_id,
+                revision(),
+                &CommandValidator::new([ValidationCheck::new("passes-again", "true")]),
+            )
+            .unwrap();
+        let decision_id = service
+            .record_artifact_decision(
+                &task_id,
+                &artifact_id,
+                revision(),
+                CodexDecisionKind::Accepted,
+                "The supervisor accepted this artifact.",
+                &[("validation".into(), validation.id().into())],
+            )
+            .unwrap();
+        assert_eq!(decision_id.artifact_id(), artifact_id);
+        assert_eq!(decision_id.tree_oid(), validation.tree_oid());
+        assert_eq!(decision_id.revision(), revision());
+        let permit = service
+            .require_artifact_publication_evidence(
+                &task_id,
+                &artifact_id,
+                validation.id(),
+                decision_id.id(),
+                revision(),
+            )
+            .unwrap();
+        assert_eq!(permit.artifact_id(), artifact_id);
+        assert_eq!(permit.tree_oid(), validation.tree_oid());
+        assert!(matches!(
+            service.require_artifact_publication_evidence(
+                &task_id,
+                &artifact_id,
+                other_validation.id(),
+                decision_id.id(),
+                revision(),
+            ),
+            Err(ServiceError::Artifact(ArtifactError::Invalid(_)))
+        ));
+
+        let rejected_decision = service
+            .record_artifact_decision(
+                &task_id,
+                &artifact_id,
+                revision(),
+                CodexDecisionKind::Rejected,
+                "The accepted decision was superseded.",
+                &[("validation".into(), validation.id().into())],
+            )
+            .unwrap();
+        assert!(matches!(
+            service.require_artifact_publication_evidence(
+                &task_id,
+                &artifact_id,
+                validation.id(),
+                decision_id.id(),
+                revision(),
+            ),
+            Err(ServiceError::Artifact(ArtifactError::Invalid(_)))
+        ));
+        assert_eq!(rejected_decision.revision(), revision());
+
+        let rejected = service.validate_artifact(
+            &task_id,
+            &artifact_id,
+            revision(),
+            &CommandValidator::new([
+                ValidationCheck::new("mutates", "sh").args(["-c", "printf changed >> README.md"])
+            ]),
+        );
+        let retained_path = match rejected {
+            Err(ServiceError::Artifact(ArtifactError::WorkspaceRetained { path, .. })) => path,
+            other => panic!("mutated validation worktree should be retained: {other:?}"),
+        };
+        assert!(retained_path.exists());
+        let validation_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_validations WHERE task_id=?1 AND artifact_id=?2",
+                params![task_id.as_str(), artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(validation_count, 2);
+        let retained_path_text = retained_path.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &["worktree", "remove", "--force", &retained_path_text],
+        );
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, completed.attempt_id());
+    }
+
+    #[test]
+    fn publication_rejects_unsupported_sensitive_stdin_before_recording_or_scanning() {
+        let fixture = artifact_publication_fixture();
+        let scanner_events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: scanner_events.clone(),
+        };
+        let gateway = UnsupportedStdinPublicationGateway {
+            calls: AtomicUsize::new(0),
+            supports_stdin: AtomicBool::new(false),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "unsupported-sensitive-stdin");
+        assert!(matches!(
+            service.publish_artifact(&request),
+            Err(ServiceError::PolicyDenied(
+                "publication gateway cannot safely send title/body on this platform"
+            ))
+        ));
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 0);
+        assert!(scanner_events.lock().unwrap().is_empty());
+        let operation_count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_artifact_publication_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation_count, 0);
+        assert!(
+            service
+                .require_artifact_publication_evidence(
+                    &fixture.task_id,
+                    &fixture.artifact_id,
+                    &fixture.validation_id,
+                    &fixture.decision_id,
+                    fixture.revision,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn publication_rechecks_stdin_capability_before_idempotent_return_and_run_claim() {
+        let fixture = artifact_publication_fixture();
+        let scanner_events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: scanner_events,
+        };
+        let gateway = UnsupportedStdinPublicationGateway {
+            calls: AtomicUsize::new(0),
+            supports_stdin: AtomicBool::new(true),
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "capability-changed-after-acceptance");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        gateway.supports_stdin.store(false, Ordering::SeqCst);
+
+        assert!(matches!(
+            service.publish_artifact(&request),
+            Err(ServiceError::PolicyDenied(
+                "publication gateway cannot safely send title/body on this platform"
+            ))
+        ));
+        assert!(matches!(
+            service.run_artifact_publication(&acceptance, &request),
+            Err(ServiceError::PolicyDenied(
+                "publication gateway cannot safely send title/body on this platform"
+            ))
+        ));
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 0);
+        let operation = service
+            .get_artifact_publication_operation(acceptance.operation_id())
+            .unwrap();
+        assert_eq!(operation.state(), ServiceOperationStatus::Accepted);
+        assert_eq!(operation.phase(), ArtifactPublicationPhase::Scanned);
+    }
+
+    #[test]
+    fn publication_requires_a_scanner_before_recording_or_gateway_effects() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let providers = ProviderRegistry::new();
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_artifact_publication_gateway(&gateway);
+        assert!(matches!(
+            service.publish_artifact(&publication_request(&fixture, "scanner-required")),
+            Err(ServiceError::PolicyDenied(
+                "SecretScanner is not configured"
+            ))
+        ));
+        assert!(events.lock().unwrap().is_empty());
+        let count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_artifact_publication_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_rejects_identical_base_and_head_branches_before_scanning_or_effects() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = ArtifactPublicationRequest::new(
+            "same-publication-branches",
+            fixture.task_id.clone(),
+            fixture.revision,
+            fixture.artifact_id.clone(),
+            fixture.validation_id.clone(),
+            fixture.decision_id.clone(),
+            ArtifactPublicationPayload::new("main", "main", "title", "body"),
+        );
+
+        assert!(matches!(
+            service.publish_artifact(&request),
+            Err(ServiceError::InvalidRequest(
+                "publication base and head branches must differ"
+            ))
+        ));
+        assert!(events.lock().unwrap().is_empty());
+        let count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_artifact_publication_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_scans_before_effects_and_persists_exact_draft_evidence_without_payload_text() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "publish-artifact-once");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        assert_eq!(acceptance.status(), ServiceOperationStatus::Accepted);
+        let accepted_snapshot = service
+            .get_artifact_publication_operation(acceptance.operation_id())
+            .unwrap();
+        assert_eq!(accepted_snapshot.state(), ServiceOperationStatus::Accepted);
+        assert_eq!(accepted_snapshot.phase(), ArtifactPublicationPhase::Scanned);
+        assert_eq!(*events.lock().unwrap(), ["scan_artifact", "scan_payload"]);
+        let snapshot = service
+            .run_artifact_publication(&acceptance, &request)
+            .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::Completed);
+        assert_eq!(snapshot.phase(), ArtifactPublicationPhase::Published);
+        assert_eq!(snapshot.artifact_id(), fixture.artifact_id);
+        assert!(valid_git_oid(snapshot.commit_sha().unwrap()));
+        let pull_request = snapshot.pull_request().unwrap();
+        assert_eq!(pull_request.number(), 17);
+        assert!(pull_request.is_draft());
+        assert_eq!(pull_request.head_sha(), snapshot.commit_sha().unwrap());
+        let commit_meta = git(
+            &fixture.repo.0,
+            &[
+                "show",
+                "--no-patch",
+                "--format=%T%n%P",
+                snapshot.commit_sha().unwrap(),
+            ],
+        );
+        assert_eq!(commit_meta.lines().next(), Some(snapshot.tree_oid()));
+        assert_eq!(
+            commit_meta.lines().nth(1),
+            Some(git(&fixture.repo.0, &["rev-parse", "HEAD"]).as_str())
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "scan_artifact",
+                "scan_payload",
+                "scan_artifact",
+                "scan_payload",
+                "commit",
+                "push",
+                "draft_pr"
+            ]
+        );
+
+        let duplicate = service.publish_artifact(&request).unwrap();
+        assert_eq!(duplicate.operation_id(), acceptance.operation_id());
+        assert_eq!(duplicate.status(), ServiceOperationStatus::Completed);
+        assert_eq!(events.lock().unwrap().len(), 7);
+        let mut changed = request.clone();
+        changed.payload = ArtifactPublicationPayload::new(
+            "main",
+            "codex/artifact-publication",
+            "payload-title-private-marker",
+            "different-body",
+        );
+        assert!(matches!(
+            service.publish_artifact(&changed),
+            Err(ServiceError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            service.run_artifact_publication(&acceptance, &changed),
+            Err(ServiceError::IdempotencyConflict)
+        ));
+
+        let connection = fixture.ledger.lock_connection().unwrap();
+        let columns = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(service_artifact_publication_operations)")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            !columns
+                .iter()
+                .any(|column| column == "title" || column == "body")
+        );
+        let digest: String = connection
+            .query_row(
+                "SELECT request_digest FROM service_artifact_publication_operations WHERE id=?1",
+                params![acceptance.operation_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(digest.starts_with("sha256:") && digest.len() == 71);
+        assert!(!digest.contains("payload-title-private-marker"));
+        drop(connection);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn concurrent_publication_runs_share_one_claim_and_one_effect_sequence() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = BlockingSecretScanner {
+            artifact_scans: AtomicUsize::new(0),
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "publication-parallel-run");
+        let acceptance = service.publish_artifact(&request).unwrap();
+
+        let ledger = &fixture.ledger;
+        let workspace = &fixture.workspace;
+        let scanner_ref = &scanner;
+        let gateway_ref = &gateway;
+        let first_acceptance = acceptance.clone();
+        let first_request = request.clone();
+        let (first, concurrent) = std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                let first_providers = ProviderRegistry::new();
+                let first_service = OperationService::new(
+                    ledger,
+                    workspace,
+                    &first_providers,
+                    3,
+                    Duration::from_secs(30),
+                )
+                .unwrap()
+                .with_secret_scanner(scanner_ref)
+                .with_artifact_publication_gateway(gateway_ref);
+                first_service.run_artifact_publication(&first_acceptance, &first_request)
+            });
+            scanner.entered.wait();
+            let concurrent = service.run_artifact_publication(&acceptance, &request);
+            scanner.release.wait();
+            (first.join().unwrap(), concurrent)
+        });
+        let first = first.unwrap();
+        let concurrent = concurrent.unwrap();
+        assert_eq!(first.state(), ServiceOperationStatus::Completed);
+        assert_eq!(concurrent.state(), ServiceOperationStatus::Running);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "scan_artifact",
+                "scan_payload",
+                "scan_artifact",
+                "scan_payload",
+                "commit",
+                "push",
+                "draft_pr"
+            ]
+        );
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_rescans_before_run_and_marks_changed_payload_rejected() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = CleanThenFindingScanner {
+            payload_scans: AtomicUsize::new(0),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "payload-changed-after-acceptance");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        assert_eq!(acceptance.status(), ServiceOperationStatus::Accepted);
+        assert!(matches!(
+            service.run_artifact_publication(&acceptance, &request),
+            Err(ServiceError::PolicyDenied(
+                "secret scan found sensitive content"
+            ))
+        ));
+        let snapshot = service
+            .get_artifact_publication_operation(acceptance.operation_id())
+            .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::Failed);
+        assert_eq!(snapshot.phase(), ArtifactPublicationPhase::Failed);
+        assert_eq!(snapshot.error_code(), Some("publication_secret_detected"));
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "scan_artifact",
+                "scan_payload",
+                "scan_artifact",
+                "scan_payload"
+            ]
+        );
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn startup_recovery_fails_an_unclaimed_publication_without_replay() {
+        let fixture = artifact_publication_fixture_with_persistent_ledger(true);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "publication-startup-recovery");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        assert_eq!(*events.lock().unwrap(), ["scan_artifact", "scan_payload"]);
+        let recovered = service.recover_incomplete_operations().unwrap();
+        assert_eq!(recovered, [acceptance.operation_id().clone()]);
+        let snapshot = service
+            .run_artifact_publication(&acceptance, &request)
+            .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::Failed);
+        assert_eq!(snapshot.phase(), ArtifactPublicationPhase::Failed);
+        assert_eq!(snapshot.error_code(), Some("interrupted_before_start"));
+        assert_eq!(events.lock().unwrap().len(), 2);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn startup_recovery_marks_a_claimed_publication_as_recovery_required() {
+        let fixture = artifact_publication_fixture_with_persistent_ledger(true);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "publication-running-recovery");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        {
+            let connection = fixture.ledger.lock_connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE service_artifact_publication_operations
+                     SET status='running',phase='committing'
+                     WHERE id=?1",
+                    params![acceptance.operation_id().as_str()],
+                )
+                .unwrap();
+        }
+
+        let recovered = service.recover_incomplete_operations().unwrap();
+        assert_eq!(recovered, [acceptance.operation_id().clone()]);
+        let snapshot = service
+            .get_artifact_publication_operation(acceptance.operation_id())
+            .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(snapshot.phase(), ArtifactPublicationPhase::RecoveryRequired);
+        assert_eq!(snapshot.error_code(), Some("interrupted"));
+        assert_eq!(*events.lock().unwrap(), ["scan_artifact", "scan_payload"]);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_runner_rejects_a_revision_change_after_acceptance() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "publication-stale-after-acceptance");
+        let acceptance = service.publish_artifact(&request).unwrap();
+        fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "UPDATE service_task_revisions SET revision=revision+1 WHERE task_id=?1",
+                params![fixture.task_id.as_str()],
+            )
+            .unwrap();
+        assert!(matches!(
+            service.run_artifact_publication(&acceptance, &request),
+            Err(ServiceError::StaleRevision { .. })
+        ));
+        let snapshot = service
+            .get_artifact_publication_operation(acceptance.operation_id())
+            .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::Failed);
+        assert_eq!(snapshot.error_code(), Some("publication_stale_revision"));
+        assert_eq!(*events.lock().unwrap(), ["scan_artifact", "scan_payload"]);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_scan_findings_and_ambiguous_push_fail_closed_without_replay() {
+        let fixture = artifact_publication_fixture();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Findings),
+            events: events.clone(),
+        };
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+        let request = publication_request(&fixture, "secret-denied");
+        assert!(matches!(
+            service.publish_artifact(&request),
+            Err(ServiceError::PolicyDenied(
+                "secret scan found sensitive content"
+            ))
+        ));
+        assert_eq!(*events.lock().unwrap(), ["scan_artifact", "scan_payload"]);
+        let count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_artifact_publication_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let clean_scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: events.clone(),
+        };
+        let uncertain_gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: events.clone(),
+            fail_push: true,
+            fail_pull_request: false,
+        };
+        let recovery_service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&clean_scanner)
+        .with_artifact_publication_gateway(&uncertain_gateway);
+        let request = publication_request(&fixture, "push-may-have-completed");
+        let acceptance = recovery_service.publish_artifact(&request).unwrap();
+        assert!(matches!(
+            recovery_service.run_artifact_publication(&acceptance, &request),
+            Err(ServiceError::PublicationRecoveryRequired)
+        ));
+        let operation_id: OperationId = {
+            let connection = fixture.ledger.lock_connection().unwrap();
+            OperationId::new(connection.query_row(
+                "SELECT id FROM service_artifact_publication_operations WHERE request_id=?1",
+                params![request.request_id],
+                |row| row.get::<_, String>(0),
+            ).unwrap())
+        };
+        let snapshot = recovery_service
+            .get_artifact_publication_operation(&operation_id)
+            .unwrap();
+        assert_eq!(snapshot.state(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(snapshot.phase(), ArtifactPublicationPhase::RecoveryRequired);
+        assert_eq!(snapshot.error_code(), Some("publication_push_ambiguous"));
+        assert!(snapshot.commit_sha().is_some());
+        assert!(snapshot.pull_request().is_none());
+        let events_before_retry = events.lock().unwrap().len();
+        let retry = recovery_service.publish_artifact(&request).unwrap();
+        assert_eq!(retry.operation_id(), &operation_id);
+        assert_eq!(retry.status(), ServiceOperationStatus::RecoveryRequired);
+        assert_eq!(events.lock().unwrap().len(), events_before_retry);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
     }
 
     #[test]

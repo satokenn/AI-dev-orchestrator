@@ -444,9 +444,11 @@ impl CodexPlanner {
             ProcessError::Spawn(error) => PlannerError::CodexUnavailable {
                 message: format!("failed to start Codex CLI: {error}"),
             },
-            ProcessError::Io(error) => PlannerError::CodexExecutionFailed {
-                message: format!("Codex process I/O failed: {error}"),
-            },
+            ProcessError::Io(error) | ProcessError::Stdin(error) => {
+                PlannerError::CodexExecutionFailed {
+                    message: format!("Codex process I/O failed: {error}"),
+                }
+            }
             ProcessError::TimedOut(_) => PlannerError::CodexTimedOut { timeout },
             ProcessError::Cancelled(_) => PlannerError::CodexCancelled,
             ProcessError::CancelledBeforeStart => PlannerError::CodexCancelled,

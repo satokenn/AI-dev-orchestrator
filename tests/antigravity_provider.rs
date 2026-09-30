@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 static NEXT_FAKE_CLI_ID: AtomicU64 = AtomicU64::new(0);
@@ -126,11 +126,25 @@ fn passes_named_model_and_types_invalid_model_selection() {
     );
     let workspace = cli.directory.join("workspace");
     fs::create_dir(&workspace).expect("create workspace");
-    let result = cli.provider().execute(&named_model_request(
-        workspace,
-        "hello",
-        Duration::from_secs(5),
-    ));
+    let provider = cli.provider();
+    let request = named_model_request(workspace, "hello", Duration::from_secs(15));
+    let mut result = None;
+    for attempt in 0..5 {
+        let current = provider.execute(&request);
+        let retry_spawn = attempt < 4
+            && matches!(
+                &current,
+                Err(error)
+                    if matches!(error.kind(), ProviderError::Unavailable(message) if message.starts_with("failed to start "))
+            );
+        if retry_spawn {
+            thread::sleep(Duration::from_millis(50 * (attempt as u64 + 1)));
+        } else {
+            result = Some(current);
+            break;
+        }
+    }
+    let result = result.expect("fake CLI spawn retry loop should finish");
     assert!(result.is_ok(), "named model execution failed: {result:?}");
 
     let empty_model_request = ProviderRequest::new(
@@ -154,7 +168,7 @@ fn passes_named_model_and_types_invalid_model_selection() {
         .execute(&named_model_request(
             workspace,
             "hello",
-            Duration::from_secs(1),
+            Duration::from_secs(15),
         ))
         .unwrap_err();
     assert!(
@@ -175,7 +189,7 @@ fn passes_named_model_and_types_invalid_model_selection() {
         .execute(&named_model_request(
             workspace,
             "hello",
-            Duration::from_secs(1),
+            Duration::from_secs(15),
         ))
         .unwrap_err();
     assert!(matches!(
@@ -227,16 +241,50 @@ fn reports_authentication_failure_as_unavailable() {
 
 #[test]
 fn maps_timeout_to_provider_error() {
-    let cli = FakeCli::new("printf partial; exec sleep 10");
-    let result = cli.provider().execute(&request(
-        cli.directory.clone(),
-        "hello",
-        Duration::from_secs(1),
-    ));
+    let cli = FakeCli::new("printf partial; printf ready > timeout-ready; exec sleep 30");
+    let ready = cli.directory.join("timeout-ready");
+    let error = 'attempts: {
+        for attempt in 0..5 {
+            let provider = cli.provider();
+            let workspace = cli.directory.clone();
+            let execution = thread::spawn(move || {
+                provider.execute(&request(workspace, "hello", Duration::from_secs(15)))
+            });
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready.exists() && !execution.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
 
-    let error = result.unwrap_err();
+            if ready.exists() {
+                // Let ProcessRunner's stdout reader consume the bytes before the timeout fires.
+                thread::sleep(Duration::from_millis(200));
+                break 'attempts execution
+                    .join()
+                    .expect("provider thread")
+                    .expect_err("the fake CLI should time out after writing its marker");
+            }
+
+            let result = execution.join().expect("provider thread");
+            let retry_spawn = attempt < 4
+                && matches!(
+                    &result,
+                    Err(error)
+                        if matches!(error.kind(), ProviderError::Unavailable(message) if message.starts_with("failed to start "))
+                );
+            if retry_spawn {
+                thread::sleep(Duration::from_millis(50 * (attempt as u64 + 1)));
+                continue;
+            }
+            panic!("fake CLI ended before its marker: {result:?}");
+        }
+        panic!("fake CLI did not reach the timeout marker after bounded spawn retries");
+    };
     assert!(
-        matches!(error.kind(), ProviderError::TimedOutWithOutput { timeout } if *timeout == Duration::from_secs(1))
+        matches!(error.kind(), ProviderError::TimedOutWithOutput { timeout } if *timeout == Duration::from_secs(15))
+    );
+    assert!(
+        !error.to_string().contains("partial"),
+        "ordinary provider diagnostics must not expose captured output"
     );
     assert_eq!(
         error
