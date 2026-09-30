@@ -380,18 +380,15 @@ impl<'a> ArtifactManager<'a> {
     }
 
     fn ref_target(&self, record: &ArtifactRecord) -> Result<Option<String>, ArtifactError> {
-        let output = self
-            .runner
-            .run(
-                ProcessRequest::new("git")
-                    .args([
-                        "for-each-ref",
-                        "--format=%(refname)%00%(objectname)",
-                        record.ref_name(),
-                    ])
-                    .cwd(record.repository_root()),
-            )
-            .map_err(|error| ArtifactError::Git(process_error(error)))?;
+        let output = self.run_git(
+            record.repository_root(),
+            &[
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)",
+                record.ref_name(),
+            ],
+            &[],
+        )?;
         if output.output_truncated {
             return Err(ArtifactError::Git(
                 "git ref lookup output was truncated".into(),
