@@ -1319,17 +1319,25 @@ fn availability_state(status: &crate::AvailabilityStatus) -> &'static str {
     }
 }
 fn availability_json(observation: &crate::AvailabilityObservation) -> serde_json::Value {
-    let mut value = serde_json::json!({
-        "status": availability_state(&observation.status),
-        "observed_at_ms": observation.observed_at_ms,
-        "source": evidence_source_json(&observation.source),
-    });
-    if let crate::AvailabilityStatus::Unavailable { reason }
-    | crate::AvailabilityStatus::Unknown { reason } = &observation.status
-    {
-        value["reason"] = serde_json::json!(reason);
+    match &observation.status {
+        crate::AvailabilityStatus::Available => serde_json::json!({
+            "status": "available",
+            "observed_at_ms": observation.observed_at_ms,
+            "source": evidence_source_json(&observation.source),
+        }),
+        crate::AvailabilityStatus::Unavailable { reason } => serde_json::json!({
+            "status": "unavailable",
+            "reason": reason,
+            "observed_at_ms": observation.observed_at_ms,
+            "source": evidence_source_json(&observation.source),
+        }),
+        crate::AvailabilityStatus::Unknown { reason } => serde_json::json!({
+            "status": "unknown",
+            "reason": reason,
+            "observed_at_ms": observation.observed_at_ms,
+            "source": evidence_source_json(&observation.source),
+        }),
     }
-    value
 }
 fn evidence_json<T: ContextEvidenceValue>(evidence: &Evidence<T>) -> serde_json::Value {
     match evidence {
@@ -1986,22 +1994,17 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             drop(usage_statement);
             let usage = usage
                 .into_iter()
-                .map(|mut metric| {
-                    metric.name = redact_fixed_point(self.secret_scanner, &metric.name)?;
-                    let redacted_value = redact_fixed_point(self.secret_scanner, &metric.value)?;
-                    metric.value = if redacted_value == metric.value {
-                        redacted_value
-                    } else {
-                        let marker = redact_fixed_point(self.secret_scanner, "[REDACTED]")?;
-                        if parse_usage_number(&marker).is_some() {
-                            return Err(ServiceError::PolicyDenied(
-                                "usage text redaction is unavailable",
-                            ));
-                        }
-                        marker
-                    };
-                    metric.unit = redact_fixed_point(self.secret_scanner, &metric.unit)?;
-                    Ok(metric)
+                .map(|metric| {
+                    let redacted = redact_usage_metric(
+                        &UsageMetric::new(&metric.name, &metric.value, &metric.unit),
+                        self.secret_scanner,
+                    )?;
+                    Ok(ContextUsageMetric {
+                        name: redacted.name().to_owned(),
+                        value: redacted.value().to_owned(),
+                        unit: redacted.unit().to_owned(),
+                        ..metric
+                    })
                 })
                 .collect::<Result<Vec<_>, ServiceError>>()?;
             let operation_details = attempts.iter().map(|record| {
@@ -4480,10 +4483,16 @@ mod tests {
         let provider = &json["sections"]["providers"]["items"][0]["details"];
         assert_eq!(provider["cli_present"]["status"], "known");
         assert_eq!(provider["cli_present"]["value"], true);
-        assert_eq!(provider["authentication"]["status"], "unknown");
+        assert_eq!(
+            provider["authentication"]["status"].as_str(),
+            Some("unknown")
+        );
         assert!(provider["authentication"]["reason"].as_str().is_some());
         assert_eq!(provider["availability"], "unknown");
-        assert_eq!(provider["availability_evidence"]["status"], "unknown");
+        assert_eq!(
+            provider["availability_evidence"]["status"].as_str(),
+            Some("unknown")
+        );
         assert!(
             provider["availability_evidence"]["reason"]
                 .as_str()
@@ -4523,6 +4532,44 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn availability_wire_shape_flattens_status_and_reason() {
+        let source = crate::EvidenceSource {
+            kind: crate::EvidenceSourceKind::ProviderCli,
+            reference: "fake".into(),
+        };
+        let observations = [
+            (crate::AvailabilityStatus::Available, "available", None),
+            (
+                crate::AvailabilityStatus::Unavailable {
+                    reason: "probe failed".into(),
+                },
+                "unavailable",
+                Some("probe failed"),
+            ),
+            (
+                crate::AvailabilityStatus::Unknown {
+                    reason: "not measured".into(),
+                },
+                "unknown",
+                Some("not measured"),
+            ),
+        ];
+        for (status, expected_status, expected_reason) in observations {
+            let value = availability_json(&crate::AvailabilityObservation {
+                status,
+                observed_at_ms: 17,
+                source: source.clone(),
+            });
+            assert_eq!(value["status"].as_str(), Some(expected_status));
+            assert_eq!(
+                value.get("reason").and_then(serde_json::Value::as_str),
+                expected_reason
+            );
+            assert!(value["status"].get("status").is_none());
+        }
     }
 
     #[test]
@@ -6573,7 +6620,9 @@ mod tests {
             let marker_deadline = Instant::now() + Duration::from_secs(30);
             let mut marker_value = None;
             while Instant::now() < marker_deadline {
-                if let Ok(value) = fs::read_to_string(&marker) {
+                if let Ok(value) = fs::read_to_string(&marker)
+                    && !value.is_empty()
+                {
                     marker_value = Some(value);
                     break;
                 }
@@ -8890,5 +8939,15 @@ mod tests {
             .submit_attempt(&request(&repo, &task_id, 0, "memory-live-operation"))
             .unwrap();
         assert!(first.claim_operation(accepted.operation_id()).unwrap());
+        let second =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        assert_eq!(
+            second
+                .get_operation(accepted.operation_id())
+                .unwrap()
+                .status(),
+            ServiceOperationStatus::Running
+        );
     }
 }

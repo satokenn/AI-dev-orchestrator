@@ -28,6 +28,17 @@ Model利用権を調べていないため、それらとProvider availabilityは
 `AttemptTargetObservation`はLedger上のrequested Provider / Modelとobserved Provider / Modelを別fieldとして読み、
 未記録のobserved値をrequested値で補完しない。
 
+Availability statusはenum objectを入れ子にせず、`status`文字列と、unknown / unavailable時の`reason`を同じobjectへflattenして返す。
+
+```json
+{
+  "status": "unknown",
+  "reason": "authentication was not checked",
+  "observed_at_ms": 1790115723000,
+  "source": {"kind": "provider_cli", "reference": "codex"}
+}
+```
+
 この観測はread-only contextを組み立てる時に取得し、観測履歴としてLedgerへ保存しない。別の`usage` ContextPageは既にLedgerに保存されたProvider報告metricだけを返し、quotaやbudgetを補わない。`providers` detailsには
 authentication、CLI状態、Modelごとの状態と、それぞれのsource・timestamp・unknown理由を保持する。
 `attempts` detailsもLedgerのrequested Provider / Modelとobserved Provider / Modelを別々のEvidenceとして返し、
