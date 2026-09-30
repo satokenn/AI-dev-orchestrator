@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -765,19 +765,183 @@ fn validate_task_create(request: &TaskCreateRequest) -> Result<(), ServiceError>
 }
 
 fn is_absolute_uri(value: &str) -> bool {
-    let Some((scheme, rest)) = value.split_once(':') else {
+    let Some(colon) = value.find(':') else {
         return false;
     };
+    let scheme = &value[..colon];
     if scheme.is_empty()
-        || !scheme.chars().enumerate().all(|(index, character)| {
-            character.is_ascii_alphabetic()
-                || (index > 0
-                    && (character.is_ascii_digit() || matches!(character, '+' | '-' | '.')))
-        })
+        || !scheme.as_bytes()[0].is_ascii_alphabetic()
+        || !scheme
+            .bytes()
+            .skip(1)
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
     {
         return false;
     }
-    let bytes = rest.as_bytes();
+    let rest = &value[colon + 1..];
+    let after_authority = if let Some(authority_and_path) = rest.strip_prefix("//") {
+        let authority_end = authority_and_path
+            .find(['/', '?', '#'])
+            .unwrap_or(authority_and_path.len());
+        if !valid_uri_authority(&authority_and_path[..authority_end]) {
+            return false;
+        }
+        &authority_and_path[authority_end..]
+    } else {
+        rest
+    };
+    let without_fragment = if let Some((head, fragment)) = after_authority.split_once('#') {
+        if !valid_uri_component(fragment, true) {
+            return false;
+        }
+        head
+    } else {
+        after_authority
+    };
+    let (path, query) = without_fragment
+        .split_once('?')
+        .map_or((without_fragment, None), |(path, query)| {
+            (path, Some(query))
+        });
+    if path.contains('#') || path.contains('?') || !valid_uri_component(path, false) {
+        return false;
+    }
+    if let Some(query) = query {
+        if !valid_uri_component(query, true) {
+            return false;
+        }
+    }
+    true
+}
+
+fn valid_uri_authority(authority: &str) -> bool {
+    let host_port = if let Some((userinfo, host)) = authority.rsplit_once('@') {
+        if userinfo.contains('@') || !valid_uri_userinfo(userinfo) {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+    let (host, port) = if let Some(bracketed) = host_port.strip_prefix('[') {
+        let Some(close) = bracketed.find(']') else {
+            return false;
+        };
+        let literal = &bracketed[..close];
+        if !valid_ip_literal(literal) {
+            return false;
+        }
+        let suffix = &bracketed[close + 1..];
+        if suffix.is_empty() {
+            ("", None)
+        } else if let Some(port) = suffix.strip_prefix(':') {
+            ("", Some(port))
+        } else {
+            return false;
+        }
+    } else {
+        if host_port.contains(['[', ']']) {
+            return false;
+        }
+        match host_port.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, Some(port)),
+            Some(_) => return false,
+            None => (host_port, None),
+        }
+    };
+    if !host.is_empty() && !valid_uri_reg_name(host) {
+        return false;
+    }
+    port.is_none_or(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn valid_ip_literal(literal: &str) -> bool {
+    if let Some(ipvfuture) = literal.strip_prefix(['v', 'V']) {
+        let Some((version, address)) = ipvfuture.split_once('.') else {
+            return false;
+        };
+        !version.is_empty()
+            && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && !address.is_empty()
+            && address.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'-' | b'.'
+                            | b'_'
+                            | b'~'
+                            | b'!'
+                            | b'$'
+                            | b'&'
+                            | b'\''
+                            | b'('
+                            | b')'
+                            | b'*'
+                            | b'+'
+                            | b','
+                            | b';'
+                            | b'='
+                            | b':'
+                    )
+            })
+    } else {
+        literal.parse::<std::net::Ipv6Addr>().is_ok()
+    }
+}
+
+fn valid_uri_reg_name(value: &str) -> bool {
+    valid_uri_component(value, false)
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b'%'
+                )
+        })
+}
+
+fn valid_uri_userinfo(value: &str) -> bool {
+    valid_uri_component(value, false)
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b':'
+                        | b'%'
+                )
+        })
+}
+
+fn valid_uri_component(value: &str, allow_question: bool) -> bool {
+    let bytes = value.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
         let byte = bytes[index];
@@ -799,10 +963,6 @@ fn is_absolute_uri(value: &str) -> bool {
                     | b'~'
                     | b':'
                     | b'/'
-                    | b'?'
-                    | b'#'
-                    | b'['
-                    | b']'
                     | b'@'
                     | b'!'
                     | b'$'
@@ -815,7 +975,8 @@ fn is_absolute_uri(value: &str) -> bool {
                     | b','
                     | b';'
                     | b'='
-            );
+            )
+            || (allow_question && byte == b'?');
         if !valid {
             return false;
         }
@@ -2427,7 +2588,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             }
         };
         if !valid_git_oid(&commit_sha)
-            || !commit_matches_tree_and_base(
+            || !gateway.verify_commit_tree_and_base(
                 artifact.repository_root(),
                 &commit_sha,
                 permit.tree_oid(),
@@ -3098,35 +3259,6 @@ fn valid_git_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn commit_matches_tree_and_base(
-    repository: &Path,
-    commit_sha: &str,
-    expected_tree: &str,
-    expected_base: &str,
-    timeout: Duration,
-) -> bool {
-    if !valid_git_oid(commit_sha) {
-        return false;
-    }
-    let output = match crate::process_runner::ProcessRunner.run(
-        crate::process_runner::ProcessRequest::new("git")
-            .arg("-C")
-            .arg(repository.as_os_str().to_owned())
-            .args(["show", "--no-patch", "--format=%T%n%P", commit_sha])
-            .timeout(timeout),
-    ) {
-        Ok(output) if !output.output_truncated => output,
-        _ => return false,
-    };
-    let Ok(text) = String::from_utf8(output.stdout) else {
-        return false;
-    };
-    let mut lines = text.lines();
-    lines.next() == Some(expected_tree)
-        && lines.next() == Some(expected_base)
-        && lines.next().is_none()
-}
-
 fn parse_attempt_state(value: &str) -> Result<AttemptState, ServiceError> {
     match value {
         "queued" => Ok(AttemptState::Queued),
@@ -3152,6 +3284,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         fs,
+        path::Path,
         process::{Child, Command},
         sync::{
             Arc, Barrier, Condvar, Mutex,
@@ -3362,6 +3495,40 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
             .unwrap();
         assert_eq!(task_count, 0);
+    }
+
+    #[test]
+    fn absolute_uri_validation_accepts_rfc3986_forms_and_rejects_malformed_components() {
+        for uri in [
+            "https://example.com/issues/1",
+            "urn:isbn:9780306406157",
+            "mailto:user@example.com",
+            "file:///tmp/a%20b",
+            "https://user:pass@[2001:db8::1]:8443/a?x=y#part",
+            "foo+bar.-1:opaque/path?query/part#fragment?part",
+            "https://[v1.fe80::a+en1]/",
+            "foo:",
+        ] {
+            assert!(is_absolute_uri(uri), "{uri}");
+        }
+        for uri in [
+            "https://[",
+            "https://example.com/[]",
+            "https://example.com/a[b]",
+            "https://[not-an-ipv6-address]/",
+            "https://example.com/%",
+            "https://example.com/%2",
+            "https://example.com/%GG",
+            "https://example.com:port/path",
+            "https://example.com:80:90/path",
+            "https://user@name@example.com/",
+            "1scheme:value",
+            "relative/path",
+            "//relative.example/path",
+            "urn:bad value",
+        ] {
+            assert!(!is_absolute_uri(uri), "{uri}");
+        }
     }
 
     #[test]
@@ -3633,6 +3800,28 @@ mod tests {
                 &self.repository,
                 &["commit-tree", tree_oid, "-p", base_commit, "-m", message],
             ))
+        }
+
+        fn verify_commit_tree_and_base(
+            &self,
+            _repository: &Path,
+            commit_sha: &str,
+            tree_oid: &str,
+            base_commit: &str,
+            _timeout: Duration,
+        ) -> bool {
+            git(&self.repository, &["cat-file", "commit", commit_sha])
+                .split_once("\n\n")
+                .is_some_and(|(headers, _)| {
+                    let mut lines = headers.lines();
+                    lines.next() == Some(&format!("tree {tree_oid}"))
+                        && lines.next() == Some(&format!("parent {base_commit}"))
+                        && lines.next().is_some_and(|line| {
+                            line.starts_with("author ")
+                                || line.starts_with("committer ")
+                                || line.starts_with("encoding ")
+                        })
+                })
         }
 
         fn push_commit(
