@@ -127,6 +127,8 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 |  |  | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約state |
 |  |  | `checks` | `array<CiCheck>` | 必須 | 個別check結果 |
 
+`digest`はmanaged repositoryのGit tree object IDであり、そのrepositoryのGit object format（SHA-1またはSHA-256）を使う。Artifact snapshotには追跡済みfileの作業tree上の内容と、Git ignore対象でない新規fileを含める。ignore対象の新規fileは含めない。Artifact ID自体はopaqueであり、digestとは別のLedger record IDである。
+
 `ContextItem.state`の値は次のとおり。sectionごとに別のenumであり、一覧にないstateを使わない。
 
 | Section | `state` type |

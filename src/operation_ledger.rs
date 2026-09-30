@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{ProviderRef, TaskId};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const DEFAULT_LOG_LIMIT: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -269,6 +269,104 @@ pub struct ReviewRecord {
     pub summary: String,
 }
 
+/// An immutable Git tree captured from a managed workspace.
+///
+/// `tree_oid` is the repository's native Git tree object ID. The dedicated ref
+/// keeps that tree reachable for as long as this record is retained.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactRecord {
+    id: String,
+    task_id: TaskId,
+    source_attempt_id: Option<String>,
+    input_artifact_id: Option<String>,
+    base_commit: String,
+    tree_oid: String,
+    repository_root: PathBuf,
+    ref_name: String,
+    state: ArtifactState,
+}
+
+impl ArtifactRecord {
+    // Keep the constructor explicit: each value maps to one persisted artifact field.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        id: impl Into<String>,
+        task_id: TaskId,
+        source_attempt_id: Option<String>,
+        input_artifact_id: Option<String>,
+        base_commit: impl Into<String>,
+        tree_oid: impl Into<String>,
+        repository_root: impl Into<PathBuf>,
+        ref_name: impl Into<String>,
+        state: ArtifactState,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            task_id,
+            source_attempt_id,
+            input_artifact_id,
+            base_commit: base_commit.into(),
+            tree_oid: tree_oid.into(),
+            repository_root: repository_root.into(),
+            ref_name: ref_name.into(),
+            state,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    pub fn source_attempt_id(&self) -> Option<&str> {
+        self.source_attempt_id.as_deref()
+    }
+    pub fn input_artifact_id(&self) -> Option<&str> {
+        self.input_artifact_id.as_deref()
+    }
+    pub fn base_commit(&self) -> &str {
+        &self.base_commit
+    }
+    pub fn tree_oid(&self) -> &str {
+        &self.tree_oid
+    }
+    pub(crate) fn repository_root(&self) -> &Path {
+        &self.repository_root
+    }
+    pub(crate) fn ref_name(&self) -> &str {
+        &self.ref_name
+    }
+    pub fn state(&self) -> ArtifactState {
+        self.state
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactState {
+    PendingRef,
+    Available,
+    RecoveryRequired,
+}
+
+impl ArtifactState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingRef => "pending_ref",
+            Self::Available => "available",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+    fn parse(value: &str) -> Result<Self, LedgerError> {
+        match value {
+            "pending_ref" => Ok(Self::PendingRef),
+            "available" => Ok(Self::Available),
+            "recovery_required" => Ok(Self::RecoveryRequired),
+            _ => Err(LedgerError::InvalidValue(value.into())),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationReference {
     pub repository: String,
@@ -364,12 +462,20 @@ impl SqliteExecutionLedger {
         Self::from_connection(Connection::open_in_memory()?)
     }
     fn from_connection(connection: Connection) -> Result<Self, LedgerError> {
+        let mut connection = connection;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(LedgerError::UnsupportedSchema(version));
         }
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL, instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT, status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT); CREATE TABLE IF NOT EXISTS task_revisions (task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence)); CREATE TABLE IF NOT EXISTS log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream)); CREATE TABLE IF NOT EXISTS validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT); CREATE TABLE IF NOT EXISTS budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT); PRAGMA user_version = 1;")?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL, instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT, status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT); CREATE TABLE IF NOT EXISTS task_revisions (task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS operation_events (operation_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(operation_id, sequence)); CREATE TABLE IF NOT EXISTS log_references (operation_id TEXT NOT NULL, stream TEXT NOT NULL, path TEXT NOT NULL, byte_count INTEGER NOT NULL, truncated INTEGER NOT NULL, PRIMARY KEY(operation_id, stream)); CREATE TABLE IF NOT EXISTS validations (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, passed INTEGER NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS reviews (operation_id TEXT PRIMARY KEY, artifact_ref TEXT NOT NULL, verdict TEXT NOT NULL, summary TEXT NOT NULL); CREATE TABLE IF NOT EXISTS usage (operation_id TEXT PRIMARY KEY, input_units TEXT, output_units TEXT, cost TEXT, currency TEXT); CREATE TABLE IF NOT EXISTS budget_reservations (operation_id TEXT PRIMARY KEY, amount TEXT NOT NULL, settled_amount TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS publications (operation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, branch TEXT, commit_sha TEXT, pull_request_url TEXT, ci_sha TEXT);")?;
+        if version < 2 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch("CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY NOT NULL, task_id TEXT NOT NULL, source_attempt_id TEXT, input_artifact_id TEXT, base_commit TEXT NOT NULL, tree_oid TEXT NOT NULL, repository_root TEXT NOT NULL, ref_name TEXT NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state IN ('pending_ref','available','recovery_required')), created_at INTEGER NOT NULL, UNIQUE(task_id, id), FOREIGN KEY(task_id, input_artifact_id) REFERENCES artifacts(task_id, id) ON DELETE RESTRICT);")?;
+            transaction.pragma_update(None, "user_version", 2)?;
+            transaction.commit()?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
             log_limit: DEFAULT_LOG_LIMIT,
@@ -382,6 +488,58 @@ impl SqliteExecutionLedger {
         let connection = self.connection.lock().expect("ledger mutex poisoned");
         connection.execute("INSERT INTO task_revisions(task_id, revision) VALUES(?1, ?2) ON CONFLICT(task_id) DO UPDATE SET revision=excluded.revision", params![task_id.as_str(), revision])?;
         Ok(())
+    }
+
+    pub(crate) fn prepare_artifact(&self, artifact: &ArtifactRecord) -> Result<(), LedgerError> {
+        let connection = self.connection.lock().expect("ledger mutex poisoned");
+        connection.execute(
+            "INSERT INTO artifacts (id, task_id, source_attempt_id, input_artifact_id, base_commit, tree_oid, repository_root, ref_name, state, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![artifact.id, artifact.task_id.as_str(), artifact.source_attempt_id,
+                artifact.input_artifact_id, artifact.base_commit, artifact.tree_oid,
+                artifact.repository_root.to_string_lossy().as_ref(), artifact.ref_name,
+                ArtifactState::PendingRef.as_str(), now()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn set_artifact_state(
+        &self,
+        task_id: &TaskId,
+        artifact_id: &str,
+        state: ArtifactState,
+    ) -> Result<(), LedgerError> {
+        let connection = self.connection.lock().expect("ledger mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE artifacts SET state=?3 WHERE task_id=?1 AND id=?2",
+            params![task_id.as_str(), artifact_id, state.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(LedgerError::InvalidValue(format!(
+                "artifact not found: {artifact_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_artifact(
+        &self,
+        task_id: &TaskId,
+        artifact_id: &str,
+    ) -> Result<Option<ArtifactRecord>, LedgerError> {
+        let connection = self.connection.lock().expect("ledger mutex poisoned");
+        connection.query_row(
+            "SELECT id, task_id, source_attempt_id, input_artifact_id, base_commit, tree_oid, repository_root, ref_name, state FROM artifacts WHERE task_id=?1 AND id=?2",
+            params![task_id.as_str(), artifact_id],
+            |row| {
+                let state: String = row.get(8)?;
+                Ok(ArtifactRecord::new(
+                    row.get::<_, String>(0)?, TaskId::new(row.get::<_, String>(1)?),
+                    row.get(2)?, row.get(3)?, row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?, PathBuf::from(row.get::<_, String>(6)?),
+                    row.get::<_, String>(7)?, ArtifactState::parse(&state).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                ))
+            },
+        ).optional().map_err(Into::into)
     }
     pub fn append_event(
         &self,
@@ -883,5 +1041,31 @@ mod tests {
             Err(LedgerError::InvalidValue(_))
         ));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn schema_v1_upgrade_preserves_existing_operation_records() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE operations (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL, payload TEXT NOT NULL, instruction TEXT NOT NULL, requested_provider TEXT NOT NULL, requested_model TEXT, status TEXT NOT NULL, accepted_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, observed_provider TEXT, observed_model TEXT, diagnostic TEXT, artifact_ref TEXT);
+                 INSERT INTO operations VALUES ('op-1', 'request-1', 'task-1', 3, 'payload', 'instruction', 'codex', 'gpt', 'accepted', 10, NULL, NULL, NULL, NULL, NULL, NULL);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
+        let operation = ledger
+            .get_operation(&OperationId::new("op-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.request().task_id(), &TaskId::new("task-1"));
+        assert_eq!(operation.request().payload(), "payload");
+        let version: u32 = ledger
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
     }
 }
