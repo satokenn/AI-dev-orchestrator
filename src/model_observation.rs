@@ -5,12 +5,18 @@
 //! remain unknown until a Provider exposes an authoritative source.
 
 use std::{
+    collections::HashMap,
     ffi::OsStr,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
     AttemptRecord, ModelChoice, ModelRef, ProcessError, ProcessRequest, ProcessRunner, ProviderRef,
+    StopReason,
 };
 
 const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -86,6 +92,162 @@ pub struct ProviderObservation {
     pub models: Vec<ModelAvailabilityObservation>,
 }
 
+/// Safe, fixed categories for a failed attempt to obtain a current observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationFetchFailureReason {
+    StartFailed,
+    TimedOut,
+    Interrupted { reason: StopReason, stopped: bool },
+    Cancelled,
+    IoFailure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LatestObservationFetch {
+    Succeeded {
+        observed_at_ms: i64,
+        source: EvidenceSource,
+    },
+    Failed {
+        reason: ObservationFetchFailureReason,
+        failed_at_ms: i64,
+        source: EvidenceSource,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationFreshness {
+    Current,
+    Stale { since_ms: i64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LastSuccessfulProviderObservation {
+    pub observation: ProviderObservation,
+    pub freshness: ObservationFreshness,
+}
+
+/// Latest fetch outcome and the latest successful observation, if one exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CachedProviderObservation {
+    pub latest_fetch: LatestObservationFetch,
+    pub last_successful: Option<LastSuccessfulProviderObservation>,
+}
+
+/// Process-local cache. Entries are intentionally not persisted and reset on restart.
+#[derive(Debug, Default)]
+pub struct ProviderObservationCache {
+    entries: Mutex<HashMap<ObservationCacheKey, CacheEntry>>,
+    next_refresh_id: AtomicU64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ObservationCacheKey {
+    provider: ProviderRef,
+    executable: std::ffi::OsString,
+}
+
+#[derive(Clone, Debug)]
+struct CacheEntry {
+    refresh_id: u64,
+    observation: CachedProviderObservation,
+}
+
+impl ProviderObservationCache {
+    #[must_use]
+    pub fn get(
+        &self,
+        provider: &ProviderRef,
+        executable: &OsStr,
+    ) -> Option<CachedProviderObservation> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&ObservationCacheKey {
+                provider: provider.clone(),
+                executable: executable.to_os_string(),
+            })
+            .map(|entry| entry.observation.clone())
+    }
+
+    /// Fetches a Provider CLI observation and retains the last successful result
+    /// separately if this fetch fails.
+    pub fn refresh_cli_at(
+        &self,
+        provider: ProviderRef,
+        executable: &OsStr,
+        observed_at_ms: i64,
+        runner: &ProcessRunner,
+    ) -> CachedProviderObservation {
+        let refresh_id = self.next_refresh_id.fetch_add(1, Ordering::Relaxed);
+        let key = ObservationCacheKey {
+            provider: provider.clone(),
+            executable: executable.to_os_string(),
+        };
+        let source = cli_probe_source(&provider);
+        let fetched = ProviderObservation::try_probe_cli_at(
+            provider.clone(),
+            executable,
+            observed_at_ms,
+            runner,
+        );
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = entries.get(&key) {
+            if entry.refresh_id > refresh_id {
+                return entry.observation.clone();
+            }
+        }
+        let previous_success = entries
+            .get(&key)
+            .and_then(|entry| entry.observation.last_successful.clone());
+        let next = match fetched {
+            Ok(observation) => CachedProviderObservation {
+                latest_fetch: LatestObservationFetch::Succeeded {
+                    observed_at_ms,
+                    source,
+                },
+                last_successful: Some(LastSuccessfulProviderObservation {
+                    observation,
+                    freshness: ObservationFreshness::Current,
+                }),
+            },
+            Err(reason) => {
+                let stale_since_ms =
+                    previous_success
+                        .as_ref()
+                        .map_or(observed_at_ms, |last| match last.freshness {
+                            ObservationFreshness::Current => observed_at_ms,
+                            ObservationFreshness::Stale { since_ms } => since_ms,
+                        });
+                CachedProviderObservation {
+                    latest_fetch: LatestObservationFetch::Failed {
+                        reason,
+                        failed_at_ms: observed_at_ms,
+                        source,
+                    },
+                    last_successful: previous_success.map(|mut last| {
+                        last.freshness = ObservationFreshness::Stale {
+                            since_ms: stale_since_ms,
+                        };
+                        last
+                    }),
+                }
+            }
+        };
+        entries.insert(
+            key,
+            CacheEntry {
+                refresh_id,
+                observation: next.clone(),
+            },
+        );
+        next
+    }
+}
+
 /// Requested and observed target values read from one persisted Attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttemptTargetObservation {
@@ -145,15 +307,41 @@ impl ProviderObservation {
         observed_at_ms: i64,
         runner: &ProcessRunner,
     ) -> Self {
-        let source = EvidenceSource {
-            kind: EvidenceSourceKind::ProviderCli,
-            reference: format!("{} --version", provider.as_str()),
-        };
         let result = runner.run(
             ProcessRequest::new(executable.to_os_string())
                 .arg("--version")
                 .timeout(CLI_PROBE_TIMEOUT),
         );
+        Self::from_cli_result(provider, observed_at_ms, result)
+    }
+
+    /// Fetches a current CLI observation, returning operational fetch failures
+    /// separately from successful probes that report unknown facts.
+    pub fn try_probe_cli_at(
+        provider: ProviderRef,
+        executable: &OsStr,
+        observed_at_ms: i64,
+        runner: &ProcessRunner,
+    ) -> Result<Self, ObservationFetchFailureReason> {
+        let result = runner.run(
+            ProcessRequest::new(executable.to_os_string())
+                .arg("--version")
+                .timeout(CLI_PROBE_TIMEOUT),
+        );
+        if let Err(error) = &result {
+            if let Some(reason) = fetch_failure_reason(error) {
+                return Err(reason);
+            }
+        }
+        Ok(Self::from_cli_result(provider, observed_at_ms, result))
+    }
+
+    fn from_cli_result(
+        provider: ProviderRef,
+        observed_at_ms: i64,
+        result: Result<crate::ProcessOutput, ProcessError>,
+    ) -> Self {
+        let source = cli_probe_source(&provider);
 
         let (cli_present, cli_version_check) = match result {
             Ok(output) => (
@@ -269,6 +457,32 @@ impl ProviderObservation {
     #[must_use]
     pub fn probe_cli(provider: ProviderRef, executable: &OsStr, runner: &ProcessRunner) -> Self {
         Self::probe_cli_at(provider, executable, current_time_ms(), runner)
+    }
+}
+
+fn cli_probe_source(provider: &ProviderRef) -> EvidenceSource {
+    EvidenceSource {
+        kind: EvidenceSourceKind::ProviderCli,
+        reference: format!("{} --version", provider.as_str()),
+    }
+}
+
+fn fetch_failure_reason(error: &ProcessError) -> Option<ObservationFetchFailureReason> {
+    match error {
+        ProcessError::Spawn(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        ProcessError::Spawn(_) => Some(ObservationFetchFailureReason::StartFailed),
+        ProcessError::TimedOut(_) => Some(ObservationFetchFailureReason::TimedOut),
+        ProcessError::Interrupted {
+            reason, stopped, ..
+        } => Some(ObservationFetchFailureReason::Interrupted {
+            reason: *reason,
+            stopped: *stopped,
+        }),
+        ProcessError::Cancelled(_) | ProcessError::CancelledBeforeStart => {
+            Some(ObservationFetchFailureReason::Cancelled)
+        }
+        ProcessError::Io(_) => Some(ObservationFetchFailureReason::IoFailure),
+        ProcessError::NonZeroExit(_) => None,
     }
 }
 
@@ -447,6 +661,132 @@ mod tests {
             observation.availability.status,
             AvailabilityStatus::Unknown { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_keeps_last_success_stale_after_a_later_probe_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let provider = ProviderRef::new("fixture");
+        let cache = ProviderObservationCache::default();
+        let executable = std::env::temp_dir().join(format!(
+            "provider-observation-fixture-{}",
+            std::process::id()
+        ));
+        std::fs::write(&executable, "#!/bin/sh\nprintf 'fixture version\\n'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let initial = cache.refresh_cli_at(
+            provider.clone(),
+            executable.as_os_str(),
+            1_000,
+            &ProcessRunner,
+        );
+        assert!(matches!(
+            initial.latest_fetch,
+            LatestObservationFetch::Succeeded {
+                observed_at_ms: 1_000,
+                source,
+            }
+                if source.reference == "fixture --version"
+        ));
+        let original = initial.last_successful.unwrap().observation;
+
+        assert!(
+            cache
+                .get(&provider, std::env::current_exe().unwrap().as_os_str())
+                .is_none()
+        );
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let failed = cache.refresh_cli_at(
+            provider.clone(),
+            executable.as_os_str(),
+            2_000,
+            &ProcessRunner,
+        );
+        assert_eq!(
+            failed.latest_fetch,
+            LatestObservationFetch::Failed {
+                reason: ObservationFetchFailureReason::StartFailed,
+                failed_at_ms: 2_000,
+                source: cli_probe_source(&provider),
+            }
+        );
+        assert!(
+            cache
+                .get(&provider, executable.as_os_str())
+                .unwrap()
+                .last_successful
+                .is_some()
+        );
+        let stale = failed.last_successful.unwrap();
+        assert_eq!(stale.observation, original);
+        assert_eq!(
+            stale.freshness,
+            ObservationFreshness::Stale { since_ms: 2_000 }
+        );
+
+        let later_failure = cache.refresh_cli_at(
+            provider.clone(),
+            executable.as_os_str(),
+            3_000,
+            &ProcessRunner,
+        );
+        assert_eq!(
+            later_failure.last_successful.unwrap().freshness,
+            ObservationFreshness::Stale { since_ms: 2_000 }
+        );
+        let _ = std::fs::remove_file(&executable);
+
+        std::fs::write(&executable, "#!/bin/sh\nprintf 'fixture version\\n'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let recovered =
+            cache.refresh_cli_at(provider, executable.as_os_str(), 4_000, &ProcessRunner);
+        assert!(matches!(
+            recovered.latest_fetch,
+            LatestObservationFetch::Succeeded {
+                observed_at_ms: 4_000,
+                ..
+            }
+        ));
+        assert_eq!(
+            recovered.last_successful.unwrap().freshness,
+            ObservationFreshness::Current
+        );
+        let _ = std::fs::remove_file(executable);
+    }
+
+    #[test]
+    fn interrupted_fetch_reason_preserves_stop_reason_and_confirmation_without_logs() {
+        let error = ProcessError::Interrupted {
+            reason: StopReason::PipeHeld,
+            stopped: false,
+            stdout: b"sensitive stdout".to_vec(),
+            stderr: b"sensitive stderr".to_vec(),
+            diagnostic: "sensitive diagnostic".to_owned(),
+        };
+
+        assert_eq!(
+            fetch_failure_reason(&error),
+            Some(ObservationFetchFailureReason::Interrupted {
+                reason: StopReason::PipeHeld,
+                stopped: false,
+            })
+        );
+        assert_eq!(
+            fetch_failure_reason(&ProcessError::Interrupted {
+                reason: StopReason::TimedOut,
+                stopped: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                diagnostic: String::new(),
+            }),
+            Some(ObservationFetchFailureReason::Interrupted {
+                reason: StopReason::TimedOut,
+                stopped: true,
+            })
+        );
     }
 
     #[test]

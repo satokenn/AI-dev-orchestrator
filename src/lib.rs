@@ -36,8 +36,11 @@ pub use github_workflow::{
     prepare_issue_publication,
 };
 pub use model_observation::{
-    AttemptTargetObservation, AvailabilityObservation, AvailabilityStatus, Evidence, EvidenceBasis,
-    EvidenceSource, EvidenceSourceKind, ModelAvailabilityObservation, ProviderObservation,
+    AttemptTargetObservation, AvailabilityObservation, AvailabilityStatus,
+    CachedProviderObservation, Evidence, EvidenceBasis, EvidenceSource, EvidenceSourceKind,
+    LastSuccessfulProviderObservation, LatestObservationFetch, ModelAvailabilityObservation,
+    ObservationFetchFailureReason, ObservationFreshness, ProviderObservation,
+    ProviderObservationCache,
 };
 pub use operation_ledger::{
     EventKind, ExecutionLedger as OperationLedger, LedgerError as OperationLedgerError,

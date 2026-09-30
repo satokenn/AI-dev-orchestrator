@@ -111,6 +111,7 @@ Codexは、入力で要求された各roleについて次の4項目だけを返�
 - Model は明示名または `provider_default` の判別可能な値とする。Model field の省略や
   空文字は許可しない。
 - 取得できない値を `0`、空文字、推定値で補わず、`unknown` として理由を保持する。
+- 観測fetchの失敗は、個別fieldの `unknown` と区別する。以前の成功観測を併記する場合は、最新fetchの失敗時刻とともに `stale` と明示し、最新の事実として扱わない。
 - 金額、token、request 数等を単一 score に換算しない。値と単位を組にして保持する。
 - 推定値は判断材料にはできるが、availability、hard limit、予算等の Rust 側検証を上書きしない。
 - Planner 出力には Task / Attempt state、availability、usage、limit、履歴を含めない。これらを
