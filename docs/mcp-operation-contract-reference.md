@@ -199,7 +199,7 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 | `items` | `array<ContextItem>` | 必須 | sectionに属する履歴record。section固有の`details`型を使う |
 | `next_cursor` | `string \| null` | 必須 | 次page取得用token。nullは現在のsnapshotに続きがない |
 
-cursorは不透明であり、Task・section・page size・snapshot revisionに束縛される。次pageでは同じpage sizeと、同じsectionのcursorを使う。revision変更等で利用できないcursorは`invalid_cursor`。履歴は`occurred_at`降順、同時刻ならID降順。page境界に重複・欠落を作らない。
+cursorは不透明であり、Task・section・page size・snapshot revisionに束縛される。次pageでは同じpage sizeと、同じsectionのcursorを使う。revision変更等で利用できないcursorは`invalid_cursor`。Usage / Attempt historyは`occurred_at`降順、同時刻ならID降順で並べる。`occurred_at: null`は全てのnon-null時刻より後に並べ、null同士はID降順にする。cursorはこの完全な順序キー（時刻の有無・時刻値・ID）で並んだsnapshot内の次位置を表し、同じ順序で続きから再開する。page境界に重複・欠落を作らない。
 
 ### `OperationAcceptance`
 
@@ -306,7 +306,7 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
 このService sliceは`providers`、`usage`、`attempts`のContextPageを生成する。`usage`はOperation Service Ledgerに保存されたProvider報告metricだけを返し、budgetやquotaは作らない。metricの`name`、`value`、`unit`は、Task snapshotと同じSecretScannerによるredactionと固定点検査を通してから保存する。scanner未設定・失敗・固定点不成立の場合、そのoperation自体はProvider結果どおり完了するがusage metricは一件も保存せず、固定diagnostic code `usage_redaction_unavailable`を記録する。既存Ledgerのmetricはcontext返却前にも再redactし、検査に失敗した場合は`policy_denied`とし、raw metricを返さない。保存値をJSON numberとして保持できない場合は`value:null`、`basis:"unknown"`とし、元の文字列値は返さない。redactionで値が変更された場合も数値を推定せず`value:null`、`basis:"unknown"`とする。観測時刻にはOperationの完了時刻を使い、未保存ならnullとする。MCP transportは#45の対象であり、ここでは未実装。
 内部の`ExecutionLedger::get_task` / `SqliteExecutionLedger::get_task`は保存内容を復元するだけで、redactionしないためMCP response sourceには使わない。`task.get_context`を含む外部応答はServiceのSecretScanner境界を通したデータだけから組み立てる。scanner未設定・失敗・redaction固定点不成立ならraw Task、Attempt、Usageを返さず、固定の業務errorでfail closedする。将来別のTask / Attempt直列化経路を追加する場合もscanner境界を通す。
 保存済みTask snapshotの要求textはcontext返却前にもSecretScannerでredactし、固定点であることを確認する。これにより既存の未redacted snapshotもraw textを返さない。SecretScannerが未設定、redactionが失敗、または固定点を作れない場合はProvider probeより前に`policy_denied`とし、raw snapshotを含む応答を返さない。
-`providers` sectionではprovider observationsの件数がpage_size以内なら同一snapshot内で全件を返し、page_sizeを超える場合はrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化し、cursorはTask、section、page size、Task revisionに束縛する。
+`providers` sectionではprovider observationsの件数がpage_size以内なら同一snapshot内で全件を返し、page_sizeを超える場合はrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化する。`occurred_at: null`は全non-null時刻より後に置き、null同士はID降順とする。cursorはこの順序キー（時刻の有無・時刻値・ID）で並んだ同じTask snapshot内の次位置から再開し、Task、section、page size、Task revisionに束縛する。
 Provider観測sourceがProvider一覧を列挙できない場合は、空配列として成功したように見せずcontext取得を失敗させる。
 
 | Request field | JSON type | Required | 意味 |
@@ -603,6 +603,8 @@ commandとworkspaceは実行前にpolicy allowlistで検査する。
 
 公開前にServiceは`decision_id`で保存済みdecisionを検索し、decisionが`accepted`で、その`artifact_id`が公開対象と一致することを確認する。不在・不一致・非acceptedなら`invalid_state_transition`で拒否する。加えてServiceはArtifactとpublication payloadをconfigured secret-scan policyで検査する。secret検出または検査を安全に完了できない場合は`policy_denied`とし、commit・push・PR作成を開始しない。通常のValidation成功だけではsecret scan済みを意味しない。
 
+push開始前に確定した検証・remote URL・push destinationの拒否は`failed`として記録する。push結果またはPR作成API結果が不明な場合は`recovery_required`とし、同じoperationを再実行しない。push成功後にPR list/parseなどのread-only観測が失敗し、既存matching PRの有無を確認できない場合も`recovery_required`とする。PR作成を始める前に確定したpayload/既存PR不一致は`failed`とするが、既に成功したpushは取り消さない。既存PRを再利用するにはstateが`OPEN`であり、Draft状態、head SHA、head/base branch、title/bodyが要求に一致しなければならない。`CLOSED` / `MERGED`のPRは成功結果として返さない。新規作成API応答も`open`状態を確認する。
+
 成功outputは`OperationAcceptance`の全fieldと、次の必須fieldを返す。最終結果は`operation.get`の`publication.publish` result schemaを参照。
 
 | Field | JSON type | Required | 意味 |
@@ -689,7 +691,7 @@ Task完了を要求する。指定されたArtifact、accepted decision、policy
 
 ## Artifact・diff・diagnostic・logの秘匿
 
-secret、認証token、環境変数値、Provider認証情報をcontextやlogに返さない。既知secretは保存前と返却前にredactする。Usage metricのname/value/unitもこの規則の対象であり、redact済みfieldはredact結果で返す。valueがredactで変更された場合は数値へ推測変換せず`value:null`、`basis:"unknown"`とする。Usage metric全体を保存しないのはscanner未設定・失敗・固定点不成立の場合であり、その場合は安全な固定diagnostic codeを残す。規則はArtifact本文、full diff、diagnostic本文、publication payloadにも適用する。redactできない本文は返さず、`forbidden` errorと必要な場合の権限付き参照を返す。redactionできない本文を空文字、`unknown`値、成功として偽装しない。log末尾やArtifact本文の取得量は要求範囲に限定する。
+secret、認証token、環境変数値、Provider認証情報をcontextやlogに返さない。既知secretは保存前と返却前にredactする。Usage metricのname/value/unitもこの規則の対象であり、redact済みfieldはredact結果で返す。valueがredactで変更された場合は数値へ推測変換せず`value:null`、`basis:"unknown"`とする。Usage metric全体を保存しないのはscanner未設定・失敗・固定点不成立の場合であり、その場合は安全な固定diagnostic codeを残す。規則はArtifact本文、full diff、diagnostic本文、publication payloadにも適用する。scanner未設定・失敗・redaction不能の場合は`policy_denied`で拒否し、本文を返さない。`forbidden`は権限境界で参照自体が許可されない場合に限る。redactionできない本文を空文字、`unknown`値、成功として偽装しない。log末尾やArtifact本文の取得量は要求範囲に限定する。
 
 業務errorのmessageへProviderのstdout / stderrやdiagnostic本文を埋め込まない。診断はtyped referenceで返し、本文を取得する場合は同じredaction規則と権限境界を適用する。redaction機能が利用できない実装はraw本文を返却・永続化せず、本文を含まない固定errorを返す。
 

@@ -3495,23 +3495,33 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ArtifactPublicationPhase::Pushing,
             Some(&commit_sha),
         )?;
-        if gateway
-            .push_commit(
-                artifact.repository_root(),
-                &commit_sha,
-                payload.head_branch(),
-                self.default_timeout,
-            )
-            .is_err()
-        {
-            self.finish_publication(
-                operation_id,
-                ServiceOperationStatus::RecoveryRequired,
-                "publication_push_ambiguous",
-                Some(&commit_sha),
-                None,
-            )?;
-            return Err(ServiceError::PublicationRecoveryRequired);
+        match gateway.push_commit(
+            artifact.repository_root(),
+            &commit_sha,
+            payload.head_branch(),
+            self.default_timeout,
+        ) {
+            Ok(()) => {}
+            Err(crate::artifact_publication::PublicationGatewayError::RejectedBeforeEffect) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_push_rejected_before_effect",
+                    Some(&commit_sha),
+                    None,
+                )?;
+                return Err(ServiceError::PublicationFailed);
+            }
+            Err(_) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::RecoveryRequired,
+                    "publication_push_ambiguous",
+                    Some(&commit_sha),
+                    None,
+                )?;
+                return Err(ServiceError::PublicationRecoveryRequired);
+            }
         }
         self.save_publication_phase(
             operation_id,
@@ -3531,6 +3541,28 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             self.default_timeout,
         ) {
             Ok(pull_request) => pull_request,
+            Err(crate::artifact_publication::PublicationGatewayError::RejectedBeforeEffect) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_pr_rejected_before_effect",
+                    Some(&commit_sha),
+                    None,
+                )?;
+                return Err(ServiceError::PublicationFailed);
+            }
+            Err(
+                crate::artifact_publication::PublicationGatewayError::ObservationUnavailableBeforeEffect,
+            ) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::RecoveryRequired,
+                    "publication_pr_observation_unavailable",
+                    Some(&commit_sha),
+                    None,
+                )?;
+                return Err(ServiceError::PublicationRecoveryRequired);
+            }
             Err(_) => {
                 self.finish_publication(
                     operation_id,
@@ -4532,6 +4564,93 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn task_context_attempt_history_orders_null_timestamps_last_and_pages_by_that_order() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(crate::CodexProvider::with_executable("true"));
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
+        let task = service
+            .create_task(
+                "caller",
+                &TaskCreateRequest::new(
+                    "create-null-time-pages",
+                    TaskSource::Manual,
+                    "Context task",
+                    "Check history ordering",
+                    vec![],
+                    None,
+                ),
+            )
+            .unwrap();
+
+        for (id, started_at) in [
+            ("attempt-timestamped", Some(100)),
+            ("attempt-null-a", None),
+            ("attempt-null-z", None),
+        ] {
+            let attempt = Attempt::new_provider_call_v2(
+                AttemptId::new(id),
+                ProviderRef::new("codex"),
+                ModelChoice::ProviderDefault,
+            );
+            ledger
+                .save_attempt(task.task_id(), &attempt, started_at, None)
+                .unwrap();
+        }
+
+        let sections = [TaskContextSection::Attempts];
+        let first = service
+            .get_context(task.task_id(), &sections, 1, &BTreeMap::new())
+            .unwrap();
+        assert_eq!(
+            first.sections()["attempts"].items()[0]["id"],
+            "attempt-timestamped"
+        );
+        let cursor = first.sections()["attempts"]
+            .next_cursor()
+            .unwrap()
+            .to_owned();
+        let second = service
+            .get_context(
+                task.task_id(),
+                &sections,
+                1,
+                &BTreeMap::from([("attempts".to_owned(), cursor)]),
+            )
+            .unwrap();
+        assert_eq!(
+            second.sections()["attempts"].items()[0]["id"],
+            "attempt-null-z"
+        );
+        assert_eq!(
+            second.sections()["attempts"].items()[0]["occurred_at"],
+            serde_json::Value::Null
+        );
+        let cursor = second.sections()["attempts"]
+            .next_cursor()
+            .unwrap()
+            .to_owned();
+        let third = service
+            .get_context(
+                task.task_id(),
+                &sections,
+                1,
+                &BTreeMap::from([("attempts".to_owned(), cursor)]),
+            )
+            .unwrap();
+        assert_eq!(
+            third.sections()["attempts"].items()[0]["id"],
+            "attempt-null-a"
+        );
+        assert!(third.sections()["attempts"].next_cursor().is_none());
     }
 
     #[test]
@@ -5964,6 +6083,9 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         fail_push: bool,
         fail_pull_request: bool,
+        reject_push_before_effect: bool,
+        reject_pull_request_before_effect: bool,
+        fail_pull_request_observation: bool,
     }
 
     impl ArtifactPublicationGateway for FakeArtifactPublicationGateway {
@@ -6016,6 +6138,11 @@ mod tests {
             _timeout: Duration,
         ) -> Result<(), PublicationGatewayError> {
             self.events.lock().unwrap().push("push");
+            if self.reject_push_before_effect {
+                return Err(
+                    crate::artifact_publication::PublicationGatewayError::RejectedBeforeEffect,
+                );
+            }
             if self.fail_push {
                 Err(PublicationGatewayError::CommandFailed)
             } else {
@@ -6031,6 +6158,14 @@ mod tests {
             _timeout: Duration,
         ) -> Result<DraftPullRequest, PublicationGatewayError> {
             self.events.lock().unwrap().push("draft_pr");
+            if self.fail_pull_request_observation {
+                return Err(crate::artifact_publication::PublicationGatewayError::ObservationUnavailableBeforeEffect);
+            }
+            if self.reject_pull_request_before_effect {
+                return Err(
+                    crate::artifact_publication::PublicationGatewayError::RejectedBeforeEffect,
+                );
+            }
             if self.fail_pull_request {
                 return Err(PublicationGatewayError::CommandFailed);
             }
@@ -8239,6 +8374,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let providers = ProviderRegistry::new();
         let service = OperationService::new(
@@ -8311,6 +8449,9 @@ mod tests {
             events: gateway_events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -8364,6 +8505,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -8425,6 +8569,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -8552,6 +8699,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -8629,6 +8779,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -8686,6 +8839,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -8731,6 +8887,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -8787,6 +8946,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -8841,6 +9003,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -8882,6 +9047,9 @@ mod tests {
             events: events.clone(),
             fail_push: true,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let recovery_service = OperationService::new(
             &fixture.ledger,
@@ -8926,6 +9094,137 @@ mod tests {
             &fixture.task_id,
             &fixture.attempt_id,
         );
+    }
+
+    #[test]
+    fn publication_pre_effect_rejections_and_pr_observation_failures_are_distinct() {
+        for (
+            suffix,
+            reject_push,
+            reject_pr,
+            unavailable_pr,
+            fail_pr,
+            expected_status,
+            expect_recovery,
+        ) in [
+            (
+                "push-rejected",
+                true,
+                false,
+                false,
+                false,
+                ServiceOperationStatus::Failed,
+                false,
+            ),
+            (
+                "pr-rejected",
+                false,
+                true,
+                false,
+                false,
+                ServiceOperationStatus::Failed,
+                false,
+            ),
+            (
+                "pr-observation-unavailable",
+                false,
+                false,
+                true,
+                false,
+                ServiceOperationStatus::RecoveryRequired,
+                true,
+            ),
+            (
+                "pr-ambiguous",
+                false,
+                false,
+                false,
+                true,
+                ServiceOperationStatus::RecoveryRequired,
+                true,
+            ),
+        ] {
+            let fixture = artifact_publication_fixture();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let scanner = FakeSecretScanner {
+                artifact_result: Ok(SecretScanResult::Clean),
+                payload_result: Ok(SecretScanResult::Clean),
+                events: events.clone(),
+            };
+            let gateway = FakeArtifactPublicationGateway {
+                repository: fixture.repo.0.clone(),
+                events: events.clone(),
+                fail_push: false,
+                fail_pull_request: fail_pr,
+                reject_push_before_effect: reject_push,
+                reject_pull_request_before_effect: reject_pr,
+                fail_pull_request_observation: unavailable_pr,
+            };
+            let service = OperationService::new(
+                &fixture.ledger,
+                &fixture.workspace,
+                &fixture.providers,
+                3,
+                Duration::from_secs(30),
+            )
+            .unwrap()
+            .with_secret_scanner(&scanner)
+            .with_artifact_publication_gateway(&gateway);
+            let request = publication_request(&fixture, suffix);
+            let acceptance = service.publish_artifact(&request).unwrap();
+            let result = service.run_artifact_publication(&acceptance, &request);
+            if expect_recovery {
+                assert!(matches!(
+                    result,
+                    Err(ServiceError::PublicationRecoveryRequired)
+                ));
+            } else {
+                assert!(matches!(result, Err(ServiceError::PublicationFailed)));
+            }
+            let snapshot = service
+                .get_artifact_publication_operation(acceptance.operation_id())
+                .unwrap();
+            assert_eq!(snapshot.state(), expected_status, "case {suffix}");
+            let expected_code = match suffix {
+                "push-rejected" => "publication_push_rejected_before_effect",
+                "pr-rejected" => "publication_pr_rejected_before_effect",
+                "pr-observation-unavailable" => "publication_pr_observation_unavailable",
+                _ => "publication_pr_ambiguous",
+            };
+            assert_eq!(snapshot.error_code(), Some(expected_code), "case {suffix}");
+            if reject_push {
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    [
+                        "scan_artifact",
+                        "scan_payload",
+                        "scan_artifact",
+                        "scan_payload",
+                        "commit",
+                        "push"
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    [
+                        "scan_artifact",
+                        "scan_payload",
+                        "scan_artifact",
+                        "scan_payload",
+                        "commit",
+                        "push",
+                        "draft_pr"
+                    ]
+                );
+            }
+            cleanup_fixture_worktree(
+                &fixture.repo,
+                &fixture.workspace,
+                &fixture.task_id,
+                &fixture.attempt_id,
+            );
+        }
     }
 
     #[test]
