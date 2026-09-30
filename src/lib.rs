@@ -12,6 +12,7 @@ mod copilot_provider;
 mod domain;
 mod execution_ledger;
 mod github_workflow;
+pub mod mcp_gateway;
 mod operation_ledger;
 mod operation_service;
 mod orchestrator;
@@ -62,10 +63,12 @@ pub use operation_ledger::{
 pub use operation_service::{
     ArtifactInput, ArtifactPublicationAcceptance, ArtifactPublicationPhase,
     ArtifactPublicationRequest, ArtifactPublicationSnapshot, AttemptInput, AttemptRunRequest,
-    BaseInput, CiServiceTarget, CiWaitAcceptance, CiWaitCancelTargetState, CiWaitOperationSnapshot,
-    CiWaitRequest, OperationAcceptance, OperationGetResult, OperationService, OperationSnapshot,
-    PublicationId, ServiceError, ServiceOperationStatus, TaskCreateRequest, TaskCreationResult,
-    TaskIssueSnapshot, TaskRequestSnapshot, TaskSource,
+    BaseInput, CancellationAcceptance, CancellationOperationSnapshot, CiServiceTarget,
+    CiWaitAcceptance, CiWaitCancelTargetState, CiWaitOperationSnapshot, CiWaitRequest,
+    OperationAcceptance, OperationGetResult, OperationService, OperationSnapshot, PublicationId,
+    ServiceError, ServiceOperationStatus, TaskCreateRequest, TaskCreationResult, TaskFinishResult,
+    TaskIssueSnapshot, TaskRequestSnapshot, TaskSource, ValidationAcceptance, ValidationCheckSpec,
+    ValidationOperationSnapshot, ValidationPolicy, ValidationRunRequest,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,

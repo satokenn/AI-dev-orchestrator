@@ -20,7 +20,7 @@ flowchart TB
     Service --> Workers[Provider / Model / Validator / GitHub / CI<br/>実行・観測]
 ```
 
-図は目標構成であり、MCP Gateway / transportはまだ実装対象外である（#45）。このPRが定義するのは、Gatewayが公開するtoolの意味と、Rust Operation Serviceとの境界である。現行CLIの挙動を示す図ではない。
+図のMCP Gateway / stdio transportは Issue #45 で実装済みであり、`ai-dev-orchestrator mcp-stdio` がOperation Serviceへ接続する。toolの意味と入出力はこの文書および[実装者向け詳細仕様](mcp-operation-contract-reference.md)、MCP/JSON-RPC envelopeはMCP 2026-07-28仕様に従う。
 
 ## この契約の役割
 

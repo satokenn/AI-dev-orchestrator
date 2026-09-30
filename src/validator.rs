@@ -16,6 +16,7 @@ pub struct ValidationCheck {
     command: OsString,
     args: Vec<OsString>,
     cwd: Option<PathBuf>,
+    timeout: Option<std::time::Duration>,
 }
 
 impl ValidationCheck {
@@ -27,6 +28,7 @@ impl ValidationCheck {
             command: command.into(),
             args: Vec::new(),
             cwd: None,
+            timeout: None,
         }
     }
 
@@ -49,6 +51,13 @@ impl ValidationCheck {
         self
     }
 
+    /// Sets a per-check wall-clock limit when one is supplied by trusted policy.
+    #[must_use]
+    pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -67,9 +76,13 @@ impl ValidationCheck {
     }
 
     fn request_with_cwd(&self, cwd: PathBuf) -> ProcessRequest {
-        ProcessRequest::new(self.command.clone())
+        let mut request = ProcessRequest::new(self.command.clone())
             .args(self.args.clone())
-            .cwd(cwd)
+            .cwd(cwd);
+        if let Some(timeout) = self.timeout {
+            request = request.timeout(timeout);
+        }
+        request
     }
 }
 

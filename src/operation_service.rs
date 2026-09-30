@@ -10,17 +10,21 @@ use std::{
 };
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 static NEXT_PUBLICATION_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_CI_WAIT_OPERATION_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_VALIDATION_OPERATION_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_CONTEXT_CURSOR_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_CANCELLATION_OPERATION_ID: AtomicU64 = AtomicU64::new(0);
 
 use crate::{
     Attempt, AttemptFailureReason, AttemptId, AttemptSemantics, AttemptState, CancellationToken,
     CiError, CiObservation, CiProvider, CiQueryTarget, CiRuntime, DomainError, LedgerError,
     ModelChoice, ModelRef, OperationId, ProviderError, ProviderRef, ProviderRequest,
-    ProviderResolver, SqliteExecutionLedger, TaskId, TaskRole, TaskState, UsageCost, UsageMetric,
-    ValidationResult, Validator, WorkspaceError, WorkspaceManager,
+    ProviderResolver, SqliteExecutionLedger, Task, TaskId, TaskRole, TaskState, UsageCost,
+    UsageMetric, ValidationResult, Validator, WorkspaceError, WorkspaceManager,
     artifact::{
         ArtifactCodexDecisionRecord, ArtifactPublicationPermit, ArtifactValidationRecord,
         CodexDecisionKind,
@@ -134,6 +138,338 @@ pub struct TaskCreationResult {
     revision: u64,
     state: TaskState,
     request: TaskRequestSnapshot,
+}
+
+/// Synchronous result for a Task completion request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskFinishResult {
+    request_id: String,
+    task_id: TaskId,
+    revision: u64,
+    artifact_id: String,
+    evidence: Vec<(String, String)>,
+}
+
+/// One explicit validation command described by the #55 wire contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationCheckSpec {
+    name: String,
+    command: String,
+    args: Vec<String>,
+    timeout_ms: u64,
+}
+
+impl ValidationCheckSpec {
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        timeout_ms: u64,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            command: command.into(),
+            args,
+            timeout_ms,
+        }
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+    pub const fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+}
+
+/// A configured validation policy resolves profiles and checks the command and
+/// workspace against its trusted allowlist before running any command.
+pub trait ValidationPolicy: Send + Sync {
+    fn validate(
+        &self,
+        repository_root: &Path,
+        workspace: &Path,
+        profile_id: Option<&str>,
+        checks: &[ValidationCheckSpec],
+    ) -> Result<ValidationResult, crate::ValidatorError>;
+}
+
+struct PolicyValidator<'a> {
+    policy: &'a dyn ValidationPolicy,
+    repository_root: &'a Path,
+    profile_id: Option<String>,
+    checks: Vec<ValidationCheckSpec>,
+}
+
+impl Validator for PolicyValidator<'_> {
+    fn validate(&self, workspace: &Path) -> Result<ValidationResult, crate::ValidatorError> {
+        self.policy.validate(
+            self.repository_root,
+            workspace,
+            self.profile_id.as_deref(),
+            &self.checks,
+        )
+    }
+}
+
+fn validation_checks_json(
+    ledger: &SqliteExecutionLedger,
+    validation_id: &str,
+) -> Result<Vec<serde_json::Value>, ServiceError> {
+    let connection = ledger.lock_connection()?;
+    let mut statement = connection.prepare("SELECT name,passed FROM artifact_validation_checks WHERE validation_id=?1 ORDER BY sequence")?;
+    let rows = statement.query_map(params![validation_id], |row| {
+        let name: String = row.get(0)?;
+        let passed: bool = row.get(1)?;
+        Ok(serde_json::json!({"name":name,"state":if passed {"passed"} else {"failed"},"diagnostic_ref":null}))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(ServiceError::from)
+}
+
+fn validation_specs_json(checks: &[ValidationCheckSpec]) -> serde_json::Value {
+    serde_json::Value::Array(checks.iter().map(|check| serde_json::json!({"name":check.name,"command":check.command,"args":check.args,"timeout_ms":check.timeout_ms})).collect())
+}
+
+fn validation_specs_from_json(
+    value: serde_json::Value,
+) -> Result<Vec<ValidationCheckSpec>, ServiceError> {
+    value
+        .as_array()
+        .ok_or(ServiceError::InvalidStoredState)?
+        .iter()
+        .map(|check| {
+            let name = check["name"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned();
+            let command = check["command"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned();
+            let args = check["args"]
+                .as_array()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .iter()
+                .map(|arg| {
+                    arg.as_str()
+                        .map(ToOwned::to_owned)
+                        .ok_or(ServiceError::InvalidStoredState)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let timeout_ms = check["timeout_ms"]
+                .as_u64()
+                .ok_or(ServiceError::InvalidStoredState)?;
+            Ok(ValidationCheckSpec::new(name, command, args, timeout_ms))
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationRunRequest {
+    request_id: String,
+    task_id: TaskId,
+    expected_revision: u64,
+    artifact_id: String,
+    profile_id: Option<String>,
+    checks: Vec<ValidationCheckSpec>,
+}
+
+impl ValidationRunRequest {
+    #[must_use]
+    pub fn new(
+        request_id: impl Into<String>,
+        task_id: TaskId,
+        expected_revision: u64,
+        artifact_id: impl Into<String>,
+        profile_id: Option<String>,
+        checks: Vec<ValidationCheckSpec>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            task_id,
+            expected_revision,
+            artifact_id: artifact_id.into(),
+            profile_id,
+            checks,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationAcceptance {
+    operation_id: OperationId,
+    task_id: TaskId,
+    artifact_id: String,
+    revision: u64,
+    status: ServiceOperationStatus,
+    accepted_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationAcceptance {
+    operation_id: OperationId,
+    task_id: TaskId,
+    kind: &'static str,
+    revision: u64,
+    accepted_at_ms: i64,
+}
+
+impl CancellationAcceptance {
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub const fn accepted_at_ms(&self) -> i64 {
+        self.accepted_at_ms
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationOperationSnapshot {
+    operation_id: OperationId,
+    task_id: TaskId,
+    kind: String,
+    status: ServiceOperationStatus,
+    revision: u64,
+    accepted_at_ms: i64,
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+    result: Option<Value>,
+    error_code: Option<String>,
+}
+
+impl CancellationOperationSnapshot {
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+    pub const fn status(&self) -> ServiceOperationStatus {
+        self.status
+    }
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub const fn accepted_at_ms(&self) -> i64 {
+        self.accepted_at_ms
+    }
+    pub const fn started_at_ms(&self) -> Option<i64> {
+        self.started_at_ms
+    }
+    pub const fn finished_at_ms(&self) -> Option<i64> {
+        self.finished_at_ms
+    }
+    pub fn result(&self) -> Option<&Value> {
+        self.result.as_ref()
+    }
+    pub fn error_code(&self) -> Option<&str> {
+        self.error_code.as_deref()
+    }
+}
+
+impl ValidationAcceptance {
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub const fn status(&self) -> ServiceOperationStatus {
+        self.status
+    }
+    pub const fn accepted_at_ms(&self) -> i64 {
+        self.accepted_at_ms
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationOperationSnapshot {
+    operation_id: OperationId,
+    task_id: TaskId,
+    artifact_id: String,
+    status: ServiceOperationStatus,
+    revision: u64,
+    accepted_at_ms: i64,
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+    result: Option<serde_json::Value>,
+    error_code: Option<String>,
+}
+
+impl ValidationOperationSnapshot {
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+    pub const fn status(&self) -> ServiceOperationStatus {
+        self.status
+    }
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub const fn accepted_at_ms(&self) -> i64 {
+        self.accepted_at_ms
+    }
+    pub const fn started_at_ms(&self) -> Option<i64> {
+        self.started_at_ms
+    }
+    pub const fn finished_at_ms(&self) -> Option<i64> {
+        self.finished_at_ms
+    }
+    pub fn result(&self) -> Option<&serde_json::Value> {
+        self.result.as_ref()
+    }
+    pub fn error_code(&self) -> Option<&str> {
+        self.error_code.as_deref()
+    }
+}
+
+impl TaskFinishResult {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+    pub fn evidence(&self) -> &[(String, String)] {
+        &self.evidence
+    }
 }
 
 impl TaskCreationResult {
@@ -691,6 +1027,9 @@ pub struct CiWaitOperationSnapshot {
     error_code: Option<String>,
     details_ref: Option<String>,
     revision: u64,
+    accepted_at_ms: i64,
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -698,6 +1037,8 @@ pub enum OperationGetResult {
     Attempt(OperationSnapshot),
     CiWait(CiWaitOperationSnapshot),
     ArtifactPublication(ArtifactPublicationSnapshot),
+    Validation(ValidationOperationSnapshot),
+    Cancellation(CancellationOperationSnapshot),
 }
 
 impl CiWaitOperationSnapshot {
@@ -728,6 +1069,18 @@ impl CiWaitOperationSnapshot {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+    #[must_use]
+    pub const fn accepted_at_ms(&self) -> i64 {
+        self.accepted_at_ms
+    }
+    #[must_use]
+    pub const fn started_at_ms(&self) -> Option<i64> {
+        self.started_at_ms
+    }
+    #[must_use]
+    pub const fn finished_at_ms(&self) -> Option<i64> {
+        self.finished_at_ms
     }
 }
 
@@ -838,9 +1191,13 @@ pub enum ServiceError {
     StaleRevision { expected: u64, actual: u64 },
     Busy(OperationId),
     PolicyDenied(&'static str),
+    Forbidden(&'static str),
     IdempotencyConflict,
+    EvidenceArtifactMismatch,
     OperationNotFound,
     InvalidStoredState,
+    InvalidCursor,
+    NotCancellable,
     ValidationFailed,
     PublicationFailed,
     PublicationRecoveryRequired,
@@ -877,10 +1234,19 @@ impl std::fmt::Display for ServiceError {
                 id.as_str()
             ),
             Self::PolicyDenied(reason) => write!(formatter, "operation denied by policy: {reason}"),
+            Self::Forbidden(reason) => write!(formatter, "operation is forbidden: {reason}"),
             Self::IdempotencyConflict => {
                 formatter.write_str("request ID was already used with a different payload")
             }
+            Self::EvidenceArtifactMismatch => {
+                formatter.write_str("evidence does not belong to the requested Artifact")
+            }
             Self::OperationNotFound => formatter.write_str("operation was not found"),
+            Self::InvalidCursor => {
+                formatter.write_str("context cursor is invalid for this Task snapshot")
+            }
+            Self::NotCancellable => formatter
+                .write_str("the requested operation cannot be cancelled in its current state"),
             Self::InvalidStoredState => {
                 formatter.write_str("invalid stored Operation Service state")
             }
@@ -1027,6 +1393,256 @@ fn is_absolute_uri(value: &str) -> bool {
     true
 }
 
+fn context_timestamp(ms: i64) -> String {
+    let seconds = ms.div_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        day_seconds / 3600,
+        (day_seconds % 3600) / 60,
+        day_seconds % 60,
+        ms.rem_euclid(1000)
+    )
+}
+
+fn context_item(
+    id: &str,
+    kind: &str,
+    state: Option<&str>,
+    at: i64,
+    summary: &str,
+    references: Value,
+    details: Value,
+) -> Value {
+    serde_json::json!({"id":id,"kind":kind,"state":state,"occurred_at":context_timestamp(at),"summary":summary,"references":references,"details":details,"_at":at})
+}
+
+fn context_items(
+    connection: &rusqlite::Connection,
+    task_id: &TaskId,
+    section: &str,
+) -> Result<Vec<Value>, ServiceError> {
+    let mut items = Vec::new();
+    match section {
+        "providers" => {
+            let mut stmt = connection.prepare("SELECT observed_provider,observed_model,finished_at FROM service_operations WHERE task_id=?1 AND observed_provider IS NOT NULL AND finished_at IS NOT NULL ORDER BY finished_at DESC,id DESC")?;
+            let rows = stmt.query_map(params![task_id.as_str()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut seen = std::collections::BTreeSet::new();
+            for row in rows {
+                let (provider, model, at) = row?;
+                if !seen.insert(provider.clone()) {
+                    continue;
+                }
+                let models = model.into_iter().collect::<Vec<_>>();
+                items.push(context_item(&provider,"provider",Some("unknown"),at,"Provider availability is unknown",serde_json::json!([]),serde_json::json!({"provider_id":provider,"model_ids":models,"availability":"unknown","observed_at":context_timestamp(at),"diagnostic_ref":null})));
+            }
+        }
+        "attempts" => {
+            let mut stmt=connection.prepare("SELECT o.id,o.attempt_id,o.provider,o.model_kind,o.model_name,o.observed_provider,o.observed_model,o.role,o.base_commit,o.status,o.accepted_at,r.input_artifact_id,r.output_artifact_id FROM service_operations o LEFT JOIN service_attempt_artifacts r ON r.task_id=o.task_id AND r.attempt_id=o.attempt_id WHERE o.task_id=?1 ORDER BY o.accepted_at DESC,o.id DESC")?;
+            let rows = stmt.query_map(params![task_id.as_str()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, String>(9)?,
+                    r.get::<_, i64>(10)?,
+                    r.get::<_, Option<String>>(11)?,
+                    r.get::<_, Option<String>>(12)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, attempt, provider, mk, mn, op, om, role, base, status, at, input, output) =
+                    row?;
+                let state = match status.as_str() {
+                    "completed" => "succeeded",
+                    "running" => "running",
+                    "accepted" => "queued",
+                    "cancelled" => "cancelled",
+                    _ => "failed",
+                };
+                let model = if mk == "named" {
+                    serde_json::json!({"kind":"named","model":mn})
+                } else {
+                    serde_json::json!({"kind":"provider_default"})
+                };
+                let refs = output
+                    .as_ref()
+                    .map(|v| serde_json::json!([{"kind":"artifact","id":v}]))
+                    .unwrap_or(serde_json::json!([]));
+                items.push(context_item(&attempt,"attempt",Some(state),at,"Provider attempt",refs,serde_json::json!({"requested_provider_id":provider,"requested_model":model,"observed_provider_id":op,"observed_model_id":om,"role":role,"input_artifact_id":input,"base_commit":base,"output_artifact_id":output,"diagnostic_ref":null})));
+                let _ = id;
+            }
+        }
+        "artifacts" => {
+            let mut stmt=connection.prepare("SELECT id,source_attempt_id,base_commit,tree_oid,state,created_at FROM service_artifacts WHERE task_id=?1 ORDER BY created_at DESC,id DESC")?;
+            let rows = stmt.query_map(params![task_id.as_str()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, attempt, base, digest, state, at) = row?;
+                items.push(context_item(&id,"artifact",None,at,"Saved artifact",serde_json::json!([]),serde_json::json!({"artifact_id":id,"digest":digest,"source_attempt_id":attempt,"base_commit":base,"diff_ref":null})));
+                let _ = state;
+            }
+        }
+        "validations" => {
+            let mut stmt=connection.prepare("SELECT v.id,v.artifact_id,v.passed,v.summary,v.created_at,(SELECT profile_id FROM service_validation_operations WHERE validation_id=v.id ORDER BY accepted_at DESC LIMIT 1) FROM artifact_validations v WHERE v.task_id=?1 ORDER BY v.created_at DESC,v.id DESC")?;
+            let rows = stmt.query_map(params![task_id.as_str()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, artifact, passed, summary, at, profile_id) = row?;
+                let mut checks = Vec::new();
+                let mut check_stmt=connection.prepare("SELECT name,passed FROM artifact_validation_checks WHERE validation_id=?1 ORDER BY sequence")?;
+                let check_rows = check_stmt.query_map(params![id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+                })?;
+                for check in check_rows {
+                    let (n, p) = check?;
+                    checks.push(serde_json::json!({"name":n,"state":if p{"passed"}else{"failed"},"diagnostic_ref":null}));
+                }
+                items.push(context_item(&id,"validation",Some(if passed{"passed"}else{"failed"}),at,&summary,serde_json::json!([{"kind":"artifact","id":artifact}]),serde_json::json!({"validation_id":id,"artifact_id":artifact,"check_profile_id":profile_id,"checks":checks})));
+            }
+        }
+        "decisions" => {
+            let mut stmt=connection.prepare("SELECT id,artifact_id,decision,reason,evidence_json,created_at FROM artifact_codex_decisions WHERE task_id=?1 ORDER BY created_at DESC,id DESC")?;
+            let rows = stmt.query_map(params![task_id.as_str()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, artifact, decision, reason, evidence, at) = row?;
+                let pairs: Vec<(String, String)> = serde_json::from_str(&evidence)
+                    .map_err(|_| ServiceError::InvalidStoredState)?;
+                let refs: Vec<Value> = pairs
+                    .iter()
+                    .map(|(kind, id)| serde_json::json!({"kind":kind,"id":id}))
+                    .collect();
+                let parsed: Vec<Value> = refs.clone();
+                items.push(context_item(&id,"codex_decision",Some(&decision),at,&reason,serde_json::json!([{"kind":"artifact","id":artifact}]),serde_json::json!({"decision_id":id,"artifact_id":artifact,"decision":decision,"reason":reason,"evidence":parsed})));
+            }
+        }
+        "publication" => {
+            let mut stmt=connection.prepare("SELECT identity.publication_id,publication.artifact_id,publication.commit_sha,publication.pull_request_number,publication.pull_request_url,publication.accepted_at FROM service_artifact_publication_operations publication JOIN service_publication_ids identity ON identity.operation_id=publication.id WHERE publication.task_id=?1 AND publication.status='completed' AND publication.commit_sha IS NOT NULL AND publication.pull_request_number IS NOT NULL AND publication.pull_request_url IS NOT NULL ORDER BY publication.accepted_at DESC,identity.publication_id DESC")?;
+            let rows = stmt.query_map(params![task_id.as_str()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, artifact, sha, number, url, at) = row?;
+                let repository = repository_from_pull_request_url(
+                    &url,
+                    u64::try_from(number).map_err(|_| ServiceError::InvalidStoredState)?,
+                )
+                .ok_or(ServiceError::InvalidStoredState)?;
+                items.push(context_item(&id,"publication",None,at,"Artifact publication",serde_json::json!([{"kind":"artifact","id":artifact}]),serde_json::json!({"publication_id":id,"artifact_id":artifact,"repository":repository,"head_sha":sha,"pull_request_number":number,"pull_request_url":url})));
+            }
+        }
+        "ci" => {
+            let mut stmt=connection.prepare("SELECT id,repository,pull_request_number,head_sha,state,observed_at_ms FROM ci_observations WHERE task_id=?1 ORDER BY observed_at_ms DESC,id DESC")?;
+            let rows = stmt.query_map(params![task_id.as_str()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, repo, number, sha, state, at) = row?;
+                let mut checks = Vec::new();
+                let mut cstmt=connection.prepare("SELECT name,state,url,completed_at FROM ci_observation_checks WHERE observation_id=?1 ORDER BY sequence")?;
+                let cr = cstmt.query_map(params![id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                })?;
+                for c in cr {
+                    let (n, s, u, t) = c?;
+                    checks.push(serde_json::json!({"name":n,"state":s,"url":u,"completed_at":t}));
+                }
+                items.push(context_item(&id,"ci_observation",Some(&state),at,"CI observation",serde_json::json!([]),serde_json::json!({"observation_id":id,"repository":repo,"pull_request_number":number,"head_sha":sha,"state":state,"checks":checks})));
+            }
+        }
+        "usage" => {
+            let mut stmt=connection.prepare("SELECT u.operation_id,u.sequence,u.name,u.value,u.unit,COALESCE(o.finished_at,o.accepted_at) FROM service_operation_usage u JOIN service_operations o ON o.id=u.operation_id WHERE o.task_id=?1 ORDER BY COALESCE(o.finished_at,o.accepted_at) DESC,u.sequence DESC")?;
+            let rows = stmt.query_map(params![task_id.as_str()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (op, sequence, name, value, unit, at) = row?;
+                let value = value
+                    .parse::<f64>()
+                    .map_err(|_| ServiceError::InvalidStoredState)?;
+                items.push(context_item(&format!("{op}:{sequence}"),"usage",None,at,"Recorded usage metric",serde_json::json!([{"kind":"operation","id":op}]),serde_json::json!({"name":name,"value":value,"unit":unit,"basis":"unknown","observed_at":context_timestamp(at)})));
+            }
+        }
+        "reviews" => {}
+        _ => return Err(ServiceError::InvalidRequest("unknown context section")),
+    }
+    Ok(items)
+}
+
 fn task_request_json(request: &TaskCreateRequest) -> String {
     let issue = request.issue.as_ref().map(|issue| {
         serde_json::json!({
@@ -1133,6 +1749,7 @@ impl From<WorkspaceError> for ServiceError {
 impl From<ArtifactError> for ServiceError {
     fn from(error: ArtifactError) -> Self {
         match error {
+            ArtifactError::IdempotencyConflict => Self::IdempotencyConflict,
             ArtifactError::TaskNotFound => Self::TaskNotFound,
             ArtifactError::StaleRevision { expected, actual } => {
                 Self::StaleRevision { expected, actual }
@@ -1159,6 +1776,21 @@ pub struct OperationService<'a, P> {
     ci_provider: Option<&'a (dyn CiProvider + Sync)>,
     ci_poll_interval: Duration,
     ci_api_timeout: Duration,
+    validation_policy: Option<&'a dyn ValidationPolicy>,
+    active_cancel_tokens: std::sync::Mutex<std::collections::HashMap<String, CancellationToken>>,
+}
+
+struct ActiveCancellationGuard<'a> {
+    registry: &'a std::sync::Mutex<std::collections::HashMap<String, CancellationToken>>,
+    operation_id: String,
+}
+
+impl Drop for ActiveCancellationGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.registry.lock() {
+            active.remove(&self.operation_id);
+        }
+    }
 }
 
 impl<'a, P: ProviderResolver> OperationService<'a, P> {
@@ -1224,6 +1856,8 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ci_provider: None,
             ci_poll_interval: Duration::from_millis(250),
             ci_api_timeout: default_timeout,
+            validation_policy: None,
+            active_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         service.recover_incomplete_operations()?;
         if ledger.ledger_path().is_some() {
@@ -1267,6 +1901,13 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         self.ci_poll_interval = poll_interval;
         self.ci_api_timeout = api_timeout;
         Ok(self)
+    }
+
+    /// Injects trusted validation profiles and an explicit command/workspace allowlist.
+    #[must_use]
+    pub fn with_validation_policy(mut self, policy: &'a dyn ValidationPolicy) -> Self {
+        self.validation_policy = Some(policy);
+        self
     }
 
     /// Creates a pending Task and its revision zero snapshot atomically. The
@@ -1343,6 +1984,220 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 issue: request.issue.clone(),
             },
         };
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Completes a Task only after checking the exact available Artifact and its
+    /// latest accepted decision. The state transition, revision, and durable
+    /// caller-scoped response are committed atomically.
+    #[allow(clippy::too_many_arguments)] // Parameters are the atomic Task.finish contract fields.
+    pub fn finish_task_idempotent(
+        &self,
+        caller: &str,
+        request_id: &str,
+        task_id: &TaskId,
+        expected_revision: u64,
+        artifact_id: &str,
+        decision_id: &str,
+        evidence: &[(String, String)],
+    ) -> Result<TaskFinishResult, ServiceError> {
+        if caller.trim().is_empty()
+            || request_id.trim().is_empty()
+            || artifact_id.trim().is_empty()
+            || decision_id.trim().is_empty()
+        {
+            return Err(ServiceError::InvalidRequest(
+                "caller, request, Artifact, and decision IDs must not be empty",
+            ));
+        }
+        let mut normalized_evidence = evidence.to_vec();
+        normalized_evidence.sort();
+        let request_json = serde_json::to_string(&(
+            task_id.as_str(),
+            expected_revision,
+            artifact_id,
+            decision_id,
+            &normalized_evidence,
+        ))
+        .map_err(|_| ServiceError::InvalidStoredState)?;
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let replay: Option<(String, String)> = tx.query_row(
+            "SELECT request_json,response_json FROM service_mcp_idempotency WHERE caller=?1 AND tool_name='task.finish' AND request_id=?2",
+            params![caller, request_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if let Some((stored, response)) = replay {
+            if stored != request_json {
+                return Err(ServiceError::IdempotencyConflict);
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(&response).map_err(|_| ServiceError::InvalidStoredState)?;
+            let evidence = serde_json::from_value(value["evidence"].clone())
+                .map_err(|_| ServiceError::InvalidStoredState)?;
+            let result = TaskFinishResult {
+                request_id: request_id.to_owned(),
+                task_id: TaskId::new(task_id.as_str()),
+                revision: value["revision"]
+                    .as_u64()
+                    .ok_or(ServiceError::InvalidStoredState)?,
+                artifact_id: value["artifact_id"]
+                    .as_str()
+                    .ok_or(ServiceError::InvalidStoredState)?
+                    .to_owned(),
+                evidence,
+            };
+            tx.commit()?;
+            return Ok(result);
+        }
+        let revision: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let revision = revision.ok_or(ServiceError::TaskNotFound)?;
+        if u64::try_from(revision).ok() != Some(expected_revision) {
+            return Err(ServiceError::StaleRevision {
+                expected: expected_revision,
+                actual: u64::try_from(revision).unwrap_or_default(),
+            });
+        }
+        let artifact_tree: Option<String> = tx.query_row(
+            "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
+            params![task_id.as_str(), artifact_id], |row| row.get(0),
+        ).optional()?;
+        let artifact_tree = artifact_tree.ok_or(ServiceError::Artifact(ArtifactError::NotFound))?;
+        let saved_decision: Option<(String, String)> = tx.query_row(
+            "SELECT tree_oid,evidence_json FROM artifact_codex_decisions WHERE id=?1 AND task_id=?2 AND artifact_id=?3 AND decision='accepted' AND rowid=(SELECT MAX(rowid) FROM artifact_codex_decisions WHERE task_id=?2 AND artifact_id=?3)",
+            params![decision_id, task_id.as_str(), artifact_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let (decision_tree, _) = saved_decision.ok_or(ServiceError::PolicyDenied(
+            "Task finish requires the latest accepted decision for the requested Artifact",
+        ))?;
+        if decision_tree != artifact_tree {
+            return Err(ServiceError::EvidenceArtifactMismatch);
+        }
+        let mut publication_target: Option<(String, Option<u64>, String)> = None;
+        // Resolve Publication refs first so CI refs work regardless of input
+        // ordering (evidence arrays are semantically a set of references).
+        for (kind, id) in &normalized_evidence {
+            if kind == "publication" {
+                let target: Option<(String, Option<i64>, String)> = tx.query_row(
+                    "SELECT publication.commit_sha,publication.pull_request_number,publication.pull_request_url
+                     FROM service_publication_ids identity JOIN service_artifact_publication_operations publication
+                       ON publication.id=identity.operation_id
+                     WHERE identity.publication_id=?1 AND publication.task_id=?2 AND publication.artifact_id=?3",
+                    params![id, task_id.as_str(), artifact_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).optional()?;
+                let (sha, number, url) = target.ok_or(ServiceError::EvidenceArtifactMismatch)?;
+                let number = number.ok_or(ServiceError::InvalidStoredState)?;
+                let number = u64::try_from(number).map_err(|_| ServiceError::InvalidStoredState)?;
+                let repository = repository_from_pull_request_url(&url, number)
+                    .ok_or(ServiceError::InvalidStoredState)?;
+                publication_target = Some((repository, Some(number), sha));
+            }
+        }
+        for (kind, id) in &normalized_evidence {
+            match kind.as_str() {
+                "validation" => {
+                    let matches: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM artifact_validations WHERE id=?1 AND task_id=?2 AND artifact_id=?3 AND tree_oid=?4)",
+                        params![id, task_id.as_str(), artifact_id, artifact_tree], |row| row.get(0),
+                    )?;
+                    if !matches {
+                        return Err(ServiceError::EvidenceArtifactMismatch);
+                    }
+                }
+                "decision" => {
+                    let matches: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM artifact_codex_decisions WHERE id=?1 AND task_id=?2 AND artifact_id=?3 AND tree_oid=?4)",
+                        params![id, task_id.as_str(), artifact_id, artifact_tree], |row| row.get(0),
+                    )?;
+                    if !matches {
+                        return Err(ServiceError::EvidenceArtifactMismatch);
+                    }
+                }
+                "publication" => {}
+                "ci" => {
+                    let observation: Option<(Option<String>, String, Option<i64>, String)> = tx.query_row(
+                        "SELECT task_id,repository,pull_request_number,head_sha FROM ci_observations WHERE id=?1",
+                        params![id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    ).optional()?;
+                    let (observed_task, repository, number, sha) = observation
+                        .ok_or(ServiceError::InvalidRequest("CI evidence ID was not found"))?;
+                    if observed_task
+                        .as_deref()
+                        .is_some_and(|observed| observed != task_id.as_str())
+                    {
+                        return Err(ServiceError::EvidenceArtifactMismatch);
+                    }
+                    let Some((published_repository, published_number, published_sha)) =
+                        &publication_target
+                    else {
+                        return Err(ServiceError::EvidenceArtifactMismatch);
+                    };
+                    if &repository != published_repository
+                        || number.and_then(|value| u64::try_from(value).ok()) != *published_number
+                        || &sha != published_sha
+                    {
+                        return Err(ServiceError::EvidenceArtifactMismatch);
+                    }
+                }
+                // Review records are not persisted by this Service yet. A typed
+                // policy rejection is safer than accepting an unverifiable ref.
+                "review" => {
+                    return Err(ServiceError::PolicyDenied(
+                        "review verdict evidence is not configured",
+                    ));
+                }
+                _ => return Err(ServiceError::InvalidRequest("unsupported evidence kind")),
+            }
+        }
+        let (description, role, state): (String, String, String) = tx.query_row(
+            "SELECT description,role,state FROM tasks WHERE id=?1",
+            params![task_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let state = match state.as_str() {
+            "pending" => TaskState::Pending,
+            "active" => TaskState::Active,
+            "completed" => TaskState::Completed,
+            "failed" => TaskState::Failed,
+            "cancelled" => TaskState::Cancelled,
+            _ => return Err(ServiceError::InvalidStoredState),
+        };
+        let mut task = Task::restore(
+            task_id.clone(),
+            description,
+            TaskRole::new(role),
+            state,
+            Vec::new(),
+        );
+        task.complete()?;
+        let next_revision = expected_revision
+            .checked_add(1)
+            .filter(|value| *value <= i64::MAX as u64)
+            .ok_or(ServiceError::InvalidStoredState)?;
+        tx.execute(
+            "UPDATE tasks SET state=?2 WHERE id=?1",
+            params![task_id.as_str(), task_state_to_str(task.state())],
+        )?;
+        tx.execute(
+            "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+            params![task_id.as_str(), next_revision as i64],
+        )?;
+        let result = TaskFinishResult {
+            request_id: request_id.to_owned(),
+            task_id: task_id.clone(),
+            revision: next_revision,
+            artifact_id: artifact_id.to_owned(),
+            evidence: normalized_evidence,
+        };
+        let response = serde_json::json!({"revision":result.revision,"artifact_id":result.artifact_id,"evidence":result.evidence}).to_string();
+        tx.execute("INSERT INTO service_mcp_idempotency(caller,tool_name,request_id,request_json,response_json) VALUES(?1,'task.finish',?2,?3,?4)", params![caller, request_id, request_json, response])?;
         tx.commit()?;
         Ok(result)
     }
@@ -1658,6 +2513,14 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         operation_id: &OperationId,
         cancellation: CancellationToken,
     ) -> Result<OperationSnapshot, ServiceError> {
+        self.active_cancel_tokens
+            .lock()
+            .map_err(|_| ServiceError::InvalidStoredState)?
+            .insert(operation_id.as_str().to_owned(), cancellation.clone());
+        let _active_guard = ActiveCancellationGuard {
+            registry: &self.active_cancel_tokens,
+            operation_id: operation_id.as_str().to_owned(),
+        };
         let stored = self.load_request(operation_id)?;
         if stored.status != ServiceOperationStatus::Accepted {
             return self.get_operation(operation_id);
@@ -1989,6 +2852,259 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             .map_err(ServiceError::from)
     }
 
+    /// Atomically accepts an asynchronous MCP validation operation.
+    pub fn accept_validation(
+        &self,
+        caller: &str,
+        request: &ValidationRunRequest,
+    ) -> Result<ValidationAcceptance, ServiceError> {
+        if caller.trim().is_empty()
+            || request.request_id.trim().is_empty()
+            || request.artifact_id.trim().is_empty()
+        {
+            return Err(ServiceError::InvalidRequest(
+                "caller, request_id, and artifact_id must not be empty",
+            ));
+        }
+        if request.profile_id.is_some() != request.checks.is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "exactly one validation profile or explicit checks is required",
+            ));
+        }
+        for check in &request.checks {
+            if check.name.trim().is_empty()
+                || check.command.trim().is_empty()
+                || check.timeout_ms == 0
+            {
+                return Err(ServiceError::InvalidRequest(
+                    "validation check name, command, and positive timeout are required",
+                ));
+            }
+        }
+        if self.validation_policy.is_none() {
+            return Err(ServiceError::PolicyDenied(
+                "validation policy and command allowlist are not configured",
+            ));
+        }
+        let normalized_checks = validation_specs_json(&request.checks);
+        let request_json = serde_json::json!({"task_id":request.task_id.as_str(),"expected_revision":request.expected_revision,"artifact_id":request.artifact_id,"profile_id":request.profile_id,"checks":normalized_checks}).to_string();
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let replay: Option<(String, String)> = tx.query_row(
+            "SELECT request_json,response_json FROM service_mcp_idempotency WHERE caller=?1 AND tool_name='validation.run' AND request_id=?2",
+            params![caller, request.request_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if let Some((stored, response)) = replay {
+            if stored != request_json {
+                return Err(ServiceError::IdempotencyConflict);
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(&response).map_err(|_| ServiceError::InvalidStoredState)?;
+            let operation_id = OperationId::new(
+                value["operation_id"]
+                    .as_str()
+                    .ok_or(ServiceError::InvalidStoredState)?,
+            );
+            let accepted_at_ms = value["submitted_at_ms"]
+                .as_i64()
+                .ok_or(ServiceError::InvalidStoredState)?;
+            let revision = value["revision"]
+                .as_u64()
+                .ok_or(ServiceError::InvalidStoredState)?;
+            let status = ServiceOperationStatus::from_str(
+                value["state"]
+                    .as_str()
+                    .ok_or(ServiceError::InvalidStoredState)?,
+            )?;
+            tx.commit()?;
+            return Ok(ValidationAcceptance {
+                operation_id,
+                task_id: request.task_id.clone(),
+                artifact_id: request.artifact_id.clone(),
+                revision,
+                status,
+                accepted_at_ms,
+            });
+        }
+        let actual: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![request.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let actual = actual.ok_or(ServiceError::TaskNotFound)?;
+        if u64::try_from(actual).ok() != Some(request.expected_revision) {
+            return Err(ServiceError::StaleRevision {
+                expected: request.expected_revision,
+                actual: u64::try_from(actual).unwrap_or_default(),
+            });
+        }
+        let task_state: String = tx.query_row(
+            "SELECT state FROM tasks WHERE id=?1",
+            params![request.task_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if matches!(task_state.as_str(), "completed" | "failed" | "cancelled") {
+            return Err(ServiceError::PolicyDenied(
+                "cannot validate an Artifact for a closed Task",
+            ));
+        }
+        let artifact_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available')", params![request.task_id.as_str(), request.artifact_id], |row| row.get(0))?;
+        if !artifact_exists {
+            return Err(ServiceError::Artifact(ArtifactError::NotFound));
+        }
+        let busy: Option<String> = tx.query_row(
+            "SELECT id FROM service_validation_operations WHERE task_id=?1 AND status IN ('accepted','running') UNION ALL SELECT id FROM service_operations WHERE task_id=?1 AND status IN ('accepted','running') UNION ALL SELECT id FROM service_ci_wait_operations WHERE task_id=?1 AND status IN ('accepted','running') UNION ALL SELECT id FROM service_artifact_publication_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') LIMIT 1",
+            params![request.task_id.as_str()], |row| row.get(0),
+        ).optional()?;
+        if let Some(id) = busy {
+            return Err(ServiceError::Busy(OperationId::new(id)));
+        }
+        let operation_id = OperationId::new(format!(
+            "validation-op-{}-{}",
+            now_ms(),
+            NEXT_VALIDATION_OPERATION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let accepted_at_ms = now_ms();
+        let revision = request
+            .expected_revision
+            .checked_add(1)
+            .filter(|value| *value <= i64::MAX as u64)
+            .ok_or(ServiceError::InvalidStoredState)?;
+        let checks_json = validation_specs_json(&request.checks).to_string();
+        let empty_profile = request.profile_id.as_deref();
+        tx.execute(
+            "INSERT INTO service_validation_operations(id,task_id,request_id,expected_revision,accepted_revision,revision,artifact_id,profile_id,checks_json,status,accepted_at) VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8,'accepted',?9)",
+            params![operation_id.as_str(), request.task_id.as_str(), request.request_id, request.expected_revision as i64, revision as i64, request.artifact_id, empty_profile, checks_json, accepted_at_ms],
+        )?;
+        tx.execute(
+            "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+            params![request.task_id.as_str(), revision as i64],
+        )?;
+        let response = serde_json::json!({"operation_id":operation_id.as_str(),"revision":revision,"state":"accepted","submitted_at_ms":accepted_at_ms}).to_string();
+        tx.execute("INSERT INTO service_mcp_idempotency(caller,tool_name,request_id,request_json,response_json) VALUES(?1,'validation.run',?2,?3,?4)", params![caller, request.request_id, request_json, response])?;
+        tx.commit()?;
+        Ok(ValidationAcceptance {
+            operation_id,
+            task_id: request.task_id.clone(),
+            artifact_id: request.artifact_id.clone(),
+            revision,
+            status: ServiceOperationStatus::Accepted,
+            accepted_at_ms,
+        })
+    }
+
+    /// Runs one accepted validation request. Restarted running work is never replayed.
+    pub fn run_validation_operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<ValidationOperationSnapshot, ServiceError> {
+        let request: Option<(String, i64, String, Option<String>, String, String)> = {
+            let mut connection = self.ledger.lock_connection()?;
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let request = tx.query_row(
+                "SELECT task_id,accepted_revision,artifact_id,profile_id,checks_json,status FROM service_validation_operations WHERE id=?1",
+                params![operation_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+            ).optional()?;
+            let Some((task, revision, artifact, profile, checks, status)) = request else {
+                return Err(ServiceError::OperationNotFound);
+            };
+            if status != "accepted" {
+                tx.commit()?;
+                return self.get_validation_operation(operation_id);
+            }
+            tx.execute("UPDATE service_validation_operations SET status='running',started_at=?2 WHERE id=?1 AND status='accepted'", params![operation_id.as_str(), now_ms()])?;
+            tx.commit()?;
+            Some((task, revision, artifact, profile, checks, status))
+        };
+        let (task, revision, artifact, profile, checks_json, _) =
+            request.ok_or(ServiceError::OperationNotFound)?;
+        let checks = validation_specs_from_json(
+            serde_json::from_str(&checks_json).map_err(|_| ServiceError::InvalidStoredState)?,
+        )?;
+        let policy = self.validation_policy.ok_or(ServiceError::PolicyDenied(
+            "validation policy and command allowlist are not configured",
+        ))?;
+        let adapter = PolicyValidator {
+            policy,
+            repository_root: self.workspaces.repository_root(),
+            profile_id: profile,
+            checks,
+        };
+        let validation_result = self.validate_artifact(
+            &TaskId::new(task.clone()),
+            &artifact,
+            u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?,
+            &adapter,
+        );
+        match validation_result {
+            Ok(record) => {
+                let result = serde_json::json!({"validation_id":record.id(),"artifact_id":record.artifact_id(),"state":if record.passed() {"passed"} else {"failed"},"checks":validation_checks_json(self.ledger, record.id())?});
+                let result_json = result.to_string();
+                let mut connection = self.ledger.lock_connection()?;
+                let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let current_revision: i64 = tx.query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task],
+                    |row| row.get(0),
+                )?;
+                tx.execute("UPDATE service_validation_operations SET status='completed',validation_id=?2,result_json=?3,revision=?4,finished_at=?5 WHERE id=?1 AND status='running'", params![operation_id.as_str(), record.id(), result_json, current_revision, now_ms()])?;
+                tx.commit()?;
+            }
+            Err(error) => {
+                let code = match &error {
+                    ServiceError::PolicyDenied(_) => "policy_denied",
+                    ServiceError::Artifact(ArtifactError::WorkspaceRetained { .. }) => {
+                        "recovery_required"
+                    }
+                    ServiceError::ValidationFailed => "internal_error",
+                    _ => "internal_error",
+                };
+                let status = if code == "recovery_required" {
+                    "recovery_required"
+                } else {
+                    "failed"
+                };
+                self.ledger.lock_connection()?.execute("UPDATE service_validation_operations SET status=?2,error_code=?3,finished_at=?4 WHERE id=?1 AND status='running'", params![operation_id.as_str(), status, code, now_ms()])?;
+            }
+        }
+        self.get_validation_operation(operation_id)
+    }
+
+    #[allow(clippy::type_complexity)] // Mirrors one persisted validation snapshot row.
+    pub fn get_validation_operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<ValidationOperationSnapshot, ServiceError> {
+        let connection = self.ledger.lock_connection()?;
+        let row: Option<(String,String,String,i64,i64,Option<i64>,Option<i64>,Option<String>,Option<String>)> = connection.query_row(
+            "SELECT task_id,artifact_id,status,revision,accepted_at,started_at,finished_at,result_json,error_code FROM service_validation_operations WHERE id=?1",
+            params![operation_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+        ).optional()?;
+        let Some((task, artifact, status, revision, accepted, started, finished, result, error)) =
+            row
+        else {
+            return Err(ServiceError::OperationNotFound);
+        };
+        Ok(ValidationOperationSnapshot {
+            operation_id: operation_id.clone(),
+            task_id: TaskId::new(task),
+            artifact_id: artifact,
+            status: ServiceOperationStatus::from_str(&status)?,
+            revision: u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?,
+            accepted_at_ms: accepted,
+            started_at_ms: started,
+            finished_at_ms: finished,
+            result: result
+                .map(|value| {
+                    serde_json::from_str(&value).map_err(|_| ServiceError::InvalidStoredState)
+                })
+                .transpose()?,
+            error_code: error,
+        })
+    }
+
     /// Records the supervisor Codex's decision without deriving it from mechanical evidence.
     pub fn record_artifact_decision(
         &self,
@@ -2001,6 +3117,35 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
     ) -> Result<ArtifactCodexDecisionRecord, ServiceError> {
         ArtifactManager::new(self.workspaces, self.ledger)
             .record_decision(
+                task_id,
+                artifact_id,
+                expected_revision,
+                decision,
+                reason,
+                evidence,
+            )
+            .map_err(ServiceError::from)
+    }
+
+    /// Records a decision with durable MCP caller/request idempotency in the same SQLite transaction.
+    #[allow(clippy::too_many_arguments)] // Parameters are the atomic decision record fields.
+    pub fn record_artifact_decision_idempotent(
+        &self,
+        caller: &str,
+        request_id: &str,
+        task_id: &TaskId,
+        artifact_id: &str,
+        expected_revision: u64,
+        decision: CodexDecisionKind,
+        reason: &str,
+        evidence: &[(String, String)],
+    ) -> Result<ArtifactCodexDecisionRecord, ServiceError> {
+        if request_id.trim().is_empty() {
+            return Err(ServiceError::InvalidRequest("request_id must not be empty"));
+        }
+        ArtifactManager::new(self.workspaces, self.ledger)
+            .record_decision_scoped(
+                Some((caller, "decision.record", request_id)),
                 task_id,
                 artifact_id,
                 expected_revision,
@@ -2559,6 +3704,14 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         operation_id: &OperationId,
     ) -> Result<CiWaitOperationSnapshot, ServiceError> {
         let token = CancellationToken::new();
+        self.active_cancel_tokens
+            .lock()
+            .map_err(|_| ServiceError::InvalidStoredState)?
+            .insert(operation_id.as_str().to_owned(), token.clone());
+        let _active_guard = ActiveCancellationGuard {
+            registry: &self.active_cancel_tokens,
+            operation_id: operation_id.as_str().to_owned(),
+        };
         self.run_ci_wait_operation_inner(operation_id, &token)
     }
 
@@ -2704,14 +3857,15 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         self.get_ci_wait_operation(operation_id)
     }
 
+    #[allow(clippy::type_complexity)] // Mirrors one persisted CI wait snapshot row.
     pub fn get_ci_wait_operation(
         &self,
         operation_id: &OperationId,
     ) -> Result<CiWaitOperationSnapshot, ServiceError> {
         let connection = self.ledger.lock_connection()?;
-        let row: (String,String,Option<String>,Option<String>,Option<String>,i64) = connection.query_row(
-            "SELECT task_id,status,observation_id,error_code,details_ref,expected_revision FROM service_ci_wait_operations WHERE id=?1",
-            params![operation_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        let row: (String,String,Option<String>,Option<String>,Option<String>,i64,i64,Option<i64>,Option<i64>) = connection.query_row(
+            "SELECT task_id,status,observation_id,error_code,details_ref,expected_revision,accepted_at,started_at,finished_at FROM service_ci_wait_operations WHERE id=?1",
+            params![operation_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
         ).optional()?.ok_or(ServiceError::OperationNotFound)?;
         drop(connection);
         let status = match row.1.as_str() {
@@ -2741,6 +3895,9 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             error_code: row.3,
             details_ref: row.4,
             revision: u64::try_from(row.5).map_err(|_| ServiceError::InvalidStoredState)?,
+            accepted_at_ms: row.6,
+            started_at_ms: row.7,
+            finished_at_ms: row.8,
         })
     }
 
@@ -2833,14 +3990,497 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             Err(ServiceError::OperationNotFound) => {
                 match self.get_ci_wait_operation(operation_id) {
                     Ok(snapshot) => Ok(OperationGetResult::CiWait(snapshot)),
-                    Err(ServiceError::OperationNotFound) => self
-                        .get_artifact_publication_operation(operation_id)
-                        .map(OperationGetResult::ArtifactPublication),
+                    Err(ServiceError::OperationNotFound) => {
+                        match self.get_artifact_publication_operation(operation_id) {
+                            Ok(snapshot) => Ok(OperationGetResult::ArtifactPublication(snapshot)),
+                            Err(ServiceError::OperationNotFound) => {
+                                match self.get_validation_operation(operation_id) {
+                                    Ok(snapshot) => Ok(OperationGetResult::Validation(snapshot)),
+                                    Err(ServiceError::OperationNotFound) => self
+                                        .get_cancellation_operation(operation_id)
+                                        .map(OperationGetResult::Cancellation),
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
                     Err(error) => Err(error),
                 }
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Verifies the referenced operation before refusing log reads when no
+    /// configured redactor and retained safe log store are available. Raw
+    /// Provider output is never used as a fallback.
+    /// Reads a Task snapshot and persists section cursors bound to its revision.
+    pub fn get_task_context(
+        &self,
+        task_id: &TaskId,
+        sections: &[String],
+        page_size: usize,
+        cursors: &std::collections::BTreeMap<String, String>,
+    ) -> Result<serde_json::Value, ServiceError> {
+        if sections.is_empty()
+            || page_size == 0
+            || page_size > 100
+            || sections
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != sections.len()
+            || cursors.keys().any(|section| !sections.contains(section))
+        {
+            return Err(ServiceError::InvalidRequest("invalid context page request"));
+        }
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let (state, revision, request_json): (String, i64, String) = tx.query_row(
+            "SELECT tasks.state,service_task_revisions.revision,task_request_snapshots.request_json FROM tasks JOIN service_task_revisions ON service_task_revisions.task_id=tasks.id JOIN task_request_snapshots ON task_request_snapshots.task_id=tasks.id WHERE tasks.id=?1",
+            params![task_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional()?.ok_or(ServiceError::TaskNotFound)?;
+        let request: serde_json::Value =
+            serde_json::from_str(&request_json).map_err(|_| ServiceError::InvalidStoredState)?;
+        let revision_u64 = u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?;
+        let mut page_map = serde_json::Map::new();
+        for section in sections {
+            let mut all = context_items(&tx, task_id, section)?;
+            all.sort_by(|a, b| {
+                b["_at"]
+                    .as_i64()
+                    .cmp(&a["_at"].as_i64())
+                    .then_with(|| b["id"].as_str().cmp(&a["id"].as_str()))
+            });
+            let offset = if let Some(cursor) = cursors.get(section) {
+                tx.query_row("SELECT offset FROM service_context_cursors WHERE cursor=?1 AND task_id=?2 AND section=?3 AND page_size=?4 AND revision=?5",params![cursor,task_id.as_str(),section,page_size as i64,revision],|row|row.get::<_,i64>(0)).optional()?.ok_or(ServiceError::InvalidCursor)? as usize
+            } else {
+                0
+            };
+            if offset > all.len() {
+                return Err(ServiceError::InvalidCursor);
+            }
+            let end = offset.saturating_add(page_size).min(all.len());
+            let mut visible = Vec::new();
+            for mut item in all[offset..end].iter().cloned() {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.remove("_at");
+                }
+                visible.push(item);
+            }
+            let next_cursor = if end < all.len() {
+                let cursor = format!(
+                    "ctx-{}-{}",
+                    now_ms(),
+                    NEXT_CONTEXT_CURSOR_ID.fetch_add(1, Ordering::Relaxed)
+                );
+                tx.execute("INSERT INTO service_context_cursors(cursor,task_id,section,page_size,revision,offset) VALUES(?1,?2,?3,?4,?5,?6)",params![cursor,task_id.as_str(),section,page_size as i64,revision,end as i64])?;
+                Some(cursor)
+            } else {
+                None
+            };
+            page_map.insert(
+                section.clone(),
+                serde_json::json!({"items":visible,"next_cursor":next_cursor}),
+            );
+        }
+        tx.commit()?;
+        Ok(
+            serde_json::json!({"schema_version":"v2","task":{"task_id":task_id.as_str(),"revision":revision_u64,"state":state,"request":request},"sections":page_map,"observed_at":context_timestamp(now_ms())}),
+        )
+    }
+
+    pub fn list_operation_logs(&self, operation_id: &OperationId) -> Result<(), ServiceError> {
+        self.get_operation_result(operation_id)?;
+        Err(ServiceError::Forbidden(
+            "redacted operation log storage is not configured",
+        ))
+    }
+
+    #[allow(clippy::type_complexity)] // Mirrors one persisted cancellation snapshot row.
+    pub fn get_cancellation_operation(
+        &self,
+        id: &OperationId,
+    ) -> Result<CancellationOperationSnapshot, ServiceError> {
+        let connection = self.ledger.lock_connection()?;
+        let row:(String,String,String,String,Option<String>,Option<String>,i64,i64,Option<i64>,Option<i64>)=connection.query_row("SELECT task_id,kind,status,target_ids_json,target_states_json,error_code,revision,accepted_at,started_at,finished_at FROM service_cancellation_operations WHERE id=?1",params![id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional()?.ok_or(ServiceError::OperationNotFound)?;
+        let status = ServiceOperationStatus::from_str(&row.2)
+            .map_err(|_| ServiceError::InvalidStoredState)?;
+        let targets: Vec<Value> =
+            serde_json::from_str(&row.3).map_err(|_| ServiceError::InvalidStoredState)?;
+        let result = row
+            .4
+            .map(|json| serde_json::from_str(&json).map_err(|_| ServiceError::InvalidStoredState))
+            .transpose()?;
+        let _ = targets;
+        Ok(CancellationOperationSnapshot {
+            operation_id: id.clone(),
+            task_id: TaskId::new(row.0),
+            kind: row.1,
+            status,
+            revision: u64::try_from(row.6).map_err(|_| ServiceError::InvalidStoredState)?,
+            accepted_at_ms: row.7,
+            started_at_ms: row.8,
+            finished_at_ms: row.9,
+            result,
+            error_code: row.5,
+        })
+    }
+
+    pub fn run_cancellation_operation(
+        &self,
+        id: &OperationId,
+    ) -> Result<CancellationOperationSnapshot, ServiceError> {
+        let current = self.get_cancellation_operation(id)?;
+        if current.status() != ServiceOperationStatus::Accepted {
+            return Ok(current);
+        }
+        {
+            let connection = self.ledger.lock_connection()?;
+            connection.execute("UPDATE service_cancellation_operations SET status='running',started_at=?2 WHERE id=?1 AND status='accepted'",params![id.as_str(),now_ms()])?;
+        }
+        let connection = self.ledger.lock_connection()?;
+        let (task_id, kind, target_json): (String, String, String) = connection.query_row(
+            "SELECT task_id,kind,target_ids_json FROM service_cancellation_operations WHERE id=?1",
+            params![id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let targets: Vec<Value> =
+            serde_json::from_str(&target_json).map_err(|_| ServiceError::InvalidStoredState)?;
+        drop(connection);
+        if targets.iter().any(|target| {
+            matches!(
+                target["kind"].as_str(),
+                Some("validation.run" | "publication.publish")
+            )
+        }) {
+            let c = self.ledger.lock_connection()?;
+            c.execute("UPDATE service_cancellation_operations SET status='failed',error_code='not_cancellable',finished_at=?2 WHERE id=?1 AND status='running'", params![id.as_str(), now_ms()])?;
+            drop(c);
+            return self.get_cancellation_operation(id);
+        }
+        let mut observations = Vec::new();
+        for target in &targets {
+            let target_kind = target["kind"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?;
+            let target_id = target["id"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?;
+            let state = self.request_target_stop(target_kind, target_id)?;
+            observations.push(serde_json::json!({"kind":target_kind,"id":target_id,"state":state}));
+        }
+        let can_wait = targets
+            .iter()
+            .all(|target| matches!(target["kind"].as_str(), Some("attempt.run" | "ci.wait")));
+        if can_wait {
+            loop {
+                let mut all_terminal = true;
+                observations.clear();
+                for target in &targets {
+                    let target_kind = target["kind"]
+                        .as_str()
+                        .ok_or(ServiceError::InvalidStoredState)?;
+                    let target_id = target["id"]
+                        .as_str()
+                        .ok_or(ServiceError::InvalidStoredState)?;
+                    let state = self.target_stop_state(target_kind, target_id)?;
+                    if state == "running" {
+                        all_terminal = false;
+                    }
+                    observations
+                        .push(serde_json::json!({"kind":target_kind,"id":target_id,"state":state}));
+                }
+                if all_terminal {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        let all_cancelled = observations.iter().all(|v| v["state"] == "cancelled");
+        let unrepresentable = observations.iter().any(|v| v["state"] == "finished");
+        if kind == "operation.cancel" && unrepresentable {
+            let c = self.ledger.lock_connection()?;
+            c.execute("UPDATE service_cancellation_operations SET status='failed',error_code='invalid_state_transition',finished_at=?2 WHERE id=?1",params![id.as_str(),now_ms()])?;
+            drop(c);
+            return self.get_cancellation_operation(id);
+        }
+        let result = if kind == "operation.cancel" {
+            serde_json::json!({"target_operation_id":targets.first().and_then(|v|v["id"].as_str()),"target_state":observations.first().and_then(|v|v["state"].as_str()).unwrap_or("recovery_required")})
+        } else {
+            serde_json::json!({"task_state":if all_cancelled{"cancelled"}else{"active"},"cancelled_operation_ids":observations.iter().filter(|v|v["state"]=="cancelled").filter_map(|v|v["id"].as_str()).collect::<Vec<_>>()})
+        };
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE service_cancellation_operations SET status='completed',target_states_json=?2,finished_at=?3 WHERE id=?1 AND status='running'",params![id.as_str(),result.to_string(),now_ms()])?;
+        if kind == "task.cancel" {
+            let task_state = if all_cancelled { "cancelled" } else { "active" };
+            let changed = tx.execute(
+                "UPDATE tasks SET state=?2 WHERE id=?1 AND state<>?2",
+                params![task_id, task_state],
+            )?;
+            if changed == 1 {
+                tx.execute(
+                    "UPDATE service_task_revisions SET revision=revision+1 WHERE task_id=?1",
+                    params![task_id],
+                )?;
+                tx.execute(
+                    "UPDATE service_cancellation_operations SET revision=revision+1 WHERE id=?1",
+                    params![id.as_str()],
+                )?;
+            }
+        }
+        tx.commit()?;
+        drop(connection);
+        self.get_cancellation_operation(id)
+    }
+
+    fn request_target_stop(
+        &self,
+        kind: &str,
+        target_id: &str,
+    ) -> Result<&'static str, ServiceError> {
+        let operation_id = OperationId::new(target_id);
+        match kind {
+            "attempt.run" => {
+                let status: String = {
+                    let c = self.ledger.lock_connection()?;
+                    c.query_row(
+                        "SELECT status FROM service_operations WHERE id=?1",
+                        params![target_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .ok_or(ServiceError::OperationNotFound)?
+                };
+                if status == "accepted" {
+                    let c = self.ledger.lock_connection()?;
+                    let (task, attempt): (String, String) = c.query_row(
+                        "SELECT task_id,attempt_id FROM service_operations WHERE id=?1",
+                        params![target_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
+                    c.execute("UPDATE service_operations SET status='cancelled',diagnostic_code='cancelled',finished_at=?2 WHERE id=?1 AND status='accepted'",params![target_id,now_ms()])?;
+                    c.execute("UPDATE attempts SET state='cancelled',finished_at=?3,failure_reason='cancelled' WHERE task_id=?1 AND id=?2",params![task,attempt,now_ms()])?;
+                    Ok("cancelled")
+                } else if let Some(token) = self
+                    .active_cancel_tokens
+                    .lock()
+                    .map_err(|_| ServiceError::InvalidStoredState)?
+                    .get(target_id)
+                    .cloned()
+                {
+                    token.cancel();
+                    Ok("running")
+                } else {
+                    Ok("recovery_required")
+                }
+            }
+            "ci.wait" => match self.request_ci_wait_cancellation(&operation_id)? {
+                CiWaitCancelTargetState::Cancelled => Ok("cancelled"),
+                CiWaitCancelTargetState::Running => Ok("running"),
+                CiWaitCancelTargetState::RecoveryRequired => Ok("recovery_required"),
+            },
+            "validation.run" | "publication.publish" => {
+                Ok(self.target_stop_state(kind, target_id)?)
+            }
+            _ => Err(ServiceError::InvalidStoredState),
+        }
+    }
+
+    fn target_stop_state(&self, kind: &str, id: &str) -> Result<&'static str, ServiceError> {
+        let c = self.ledger.lock_connection()?;
+        let (table, completed, cancelled, recovery) = match kind {
+            "attempt.run" => (
+                "service_operations",
+                "completed",
+                "cancelled",
+                "recovery_required",
+            ),
+            "ci.wait" => (
+                "service_ci_wait_operations",
+                "completed",
+                "cancelled",
+                "recovery_required",
+            ),
+            "validation.run" => (
+                "service_validation_operations",
+                "completed",
+                "cancelled",
+                "recovery_required",
+            ),
+            "publication.publish" => (
+                "service_artifact_publication_operations",
+                "completed",
+                "cancelled",
+                "recovery_required",
+            ),
+            _ => return Err(ServiceError::InvalidStoredState),
+        };
+        let sql = format!("SELECT status FROM {table} WHERE id=?1");
+        let state: String = c
+            .query_row(&sql, params![id], |r| r.get(0))
+            .optional()?
+            .ok_or(ServiceError::OperationNotFound)?;
+        Ok(if state == cancelled {
+            "cancelled"
+        } else if state == recovery {
+            "recovery_required"
+        } else if state == completed || matches!(state.as_str(), "failed") {
+            "finished"
+        } else {
+            "running"
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // Parameters are the caller-scoped cancellation contract fields.
+    pub fn accept_cancellation(
+        &self,
+        caller: &str,
+        request_id: &str,
+        task_id: &TaskId,
+        expected_revision: u64,
+        kind: &'static str,
+        target_operation_id: Option<&OperationId>,
+        reason: Option<&str>,
+    ) -> Result<CancellationAcceptance, ServiceError> {
+        if caller.is_empty()
+            || request_id.is_empty()
+            || !matches!(kind, "operation.cancel" | "task.cancel")
+        {
+            return Err(ServiceError::InvalidRequest(
+                "invalid cancellation identity or kind",
+            ));
+        }
+        if (kind == "operation.cancel") != target_operation_id.is_some() {
+            return Err(ServiceError::InvalidRequest(
+                "operation.cancel requires one target",
+            ));
+        }
+        let request_json=serde_json::json!({"task_id":task_id.as_str(),"expected_revision":expected_revision,"target_operation_id":target_operation_id.map(OperationId::as_str),"reason":reason}).to_string();
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((saved_request,saved_response))=tx.query_row("SELECT request_json,response_json FROM service_mcp_idempotency WHERE caller=?1 AND tool_name=?2 AND request_id=?3",params![caller,kind,request_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? {
+            if saved_request!=request_json {return Err(ServiceError::IdempotencyConflict);}
+            let value:Value=serde_json::from_str(&saved_response).map_err(|_|ServiceError::InvalidStoredState)?;
+            return Ok(CancellationAcceptance{operation_id:OperationId::new(value["operation_id"].as_str().ok_or(ServiceError::InvalidStoredState)?),task_id:TaskId::new(value["task_id"].as_str().ok_or(ServiceError::InvalidStoredState)?),kind,revision:value["revision"].as_u64().ok_or(ServiceError::InvalidStoredState)?,accepted_at_ms:value["accepted_at_ms"].as_i64().ok_or(ServiceError::InvalidStoredState)?});
+        }
+        let (state,actual):(String,i64)=tx.query_row("SELECT tasks.state,service_task_revisions.revision FROM tasks JOIN service_task_revisions ON service_task_revisions.task_id=tasks.id WHERE tasks.id=?1",params![task_id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?.ok_or(ServiceError::TaskNotFound)?;
+        if state != "pending" && state != "active" {
+            return Err(ServiceError::NotCancellable);
+        }
+        if u64::try_from(actual).ok() != Some(expected_revision) {
+            return Err(ServiceError::StaleRevision {
+                expected: expected_revision,
+                actual: u64::try_from(actual).map_err(|_| ServiceError::InvalidStoredState)?,
+            });
+        }
+        let mut targets: Vec<Value> = Vec::new();
+        if let Some(target) = target_operation_id {
+            let found: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT task_id,status FROM service_operations WHERE id=?1",
+                    params![target.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((owner, status)) = found {
+                if owner != task_id.as_str()
+                    || !matches!(status.as_str(), "accepted" | "running" | "cancelling")
+                {
+                    return Err(ServiceError::NotCancellable);
+                }
+                targets.push(serde_json::json!({"kind":"attempt.run","id":target.as_str()}));
+            } else {
+                let found: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT task_id,status FROM service_ci_wait_operations WHERE id=?1",
+                        params![target.as_str()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((owner, status)) = found {
+                    if owner != task_id.as_str()
+                        || !matches!(status.as_str(), "accepted" | "running" | "cancelling")
+                    {
+                        return Err(ServiceError::NotCancellable);
+                    }
+                    targets.push(serde_json::json!({"kind":"ci.wait","id":target.as_str()}));
+                } else {
+                    let found:Option<(String,String,String)>=tx.query_row("SELECT task_id,status,'validation.run' FROM service_validation_operations WHERE id=?1",params![target.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                    if let Some((owner, status, kind)) = found {
+                        if owner != task_id.as_str()
+                            || !matches!(status.as_str(), "accepted" | "running")
+                        {
+                            return Err(ServiceError::NotCancellable);
+                        }
+                        let _ = kind;
+                        return Err(ServiceError::NotCancellable);
+                    } else {
+                        let found:Option<(String,String)>=tx.query_row("SELECT task_id,status FROM service_artifact_publication_operations WHERE id=?1",params![target.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                        if let Some((owner, status)) = found {
+                            if owner != task_id.as_str()
+                                || !matches!(status.as_str(), "accepted" | "running")
+                            {
+                                return Err(ServiceError::NotCancellable);
+                            }
+                            return Err(ServiceError::NotCancellable);
+                        } else {
+                            return Err(ServiceError::OperationNotFound);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (kind, table) in [
+                ("attempt.run", "service_operations"),
+                ("ci.wait", "service_ci_wait_operations"),
+                ("validation.run", "service_validation_operations"),
+                (
+                    "publication.publish",
+                    "service_artifact_publication_operations",
+                ),
+            ] {
+                let sql = format!(
+                    "SELECT id FROM {table} WHERE task_id=?1 AND status IN ('accepted','running','cancelling') ORDER BY accepted_at,id"
+                );
+                let mut stmt = tx.prepare(&sql)?;
+                let ids = stmt
+                    .query_map(params![task_id.as_str()], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if matches!(kind, "validation.run" | "publication.publish") && !ids.is_empty() {
+                    return Err(ServiceError::NotCancellable);
+                }
+                targets.extend(
+                    ids.into_iter()
+                        .map(|id| serde_json::json!({"kind":kind,"id":id})),
+                );
+            }
+        }
+        let new_revision = actual
+            .checked_add(1)
+            .ok_or(ServiceError::InvalidStoredState)?;
+        let now = now_ms();
+        let operation_id = OperationId::new(format!(
+            "cancel-{now}-{}",
+            NEXT_CANCELLATION_OPERATION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let response=serde_json::json!({"operation_id":operation_id.as_str(),"task_id":task_id.as_str(),"revision":new_revision,"accepted_at_ms":now}).to_string();
+        tx.execute("INSERT INTO service_cancellation_operations(id,task_id,kind,target_operation_id,target_ids_json,status,accepted_revision,revision,accepted_at,reason) VALUES(?1,?2,?3,?4,?5,'accepted',?6,?7,?8,?9)",params![operation_id.as_str(),task_id.as_str(),kind,target_operation_id.map(OperationId::as_str),serde_json::to_string(&targets).map_err(|_|ServiceError::InvalidStoredState)?,actual,new_revision,now,reason])?;
+        tx.execute(
+            "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+            params![task_id.as_str(), new_revision],
+        )?;
+        tx.execute("INSERT INTO service_mcp_idempotency(caller,tool_name,request_id,request_json,response_json) VALUES(?1,?2,?3,?4,?5)",params![caller,kind,request_id,request_json,response])?;
+        tx.commit()?;
+        Ok(CancellationAcceptance {
+            operation_id,
+            task_id: task_id.clone(),
+            kind,
+            revision: u64::try_from(new_revision).map_err(|_| ServiceError::InvalidStoredState)?,
+            accepted_at_ms: now,
+        })
     }
 
     fn finish_ci_wait(
@@ -3469,6 +5109,41 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         };
         for operation_id in pending_ci_waits {
             tx.execute("UPDATE service_ci_wait_operations SET status='recovery_required',error_code='interrupted',finished_at=?2 WHERE id=?1 AND status IN ('accepted','running','cancelling')", params![operation_id, now_ms()])?;
+            recovered.push(OperationId::new(operation_id));
+        }
+        let pending_validations = {
+            let mut statement = tx.prepare("SELECT id,task_id,status FROM service_validation_operations WHERE status IN ('accepted','running') ORDER BY accepted_at,id")?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (operation_id, task_text, status) in pending_validations {
+            let (next_status, code) = match status.as_str() {
+                "accepted" => ("failed", "interrupted"),
+                "running" => ("recovery_required", "interrupted"),
+                _ => return Err(ServiceError::InvalidStoredState),
+            };
+            tx.execute("UPDATE service_validation_operations SET status=?2,error_code=?3,finished_at=?4 WHERE id=?1", params![operation_id, next_status, code, now_ms()])?;
+            bump_revision(&tx, &TaskId::new(task_text))?;
+            recovered.push(OperationId::new(operation_id));
+        }
+        let pending_cancellations = {
+            let mut statement=tx.prepare("SELECT id,task_id FROM service_cancellation_operations WHERE status IN ('accepted','running') ORDER BY accepted_at,id")?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (operation_id, task_id) in pending_cancellations {
+            tx.execute("UPDATE service_cancellation_operations SET status='recovery_required',error_code='interrupted',finished_at=?2 WHERE id=?1",params![operation_id,now_ms()])?;
+            bump_revision(&tx, &TaskId::new(task_id))?;
             recovered.push(OperationId::new(operation_id));
         }
         tx.commit()?;
@@ -4725,6 +6400,145 @@ mod tests {
                 "payload-body-private-marker",
             ),
         )
+    }
+
+    struct AllowTrueValidationPolicy;
+
+    impl ValidationPolicy for AllowTrueValidationPolicy {
+        fn validate(
+            &self,
+            repository_root: &Path,
+            _workspace: &Path,
+            profile_id: Option<&str>,
+            checks: &[ValidationCheckSpec],
+        ) -> Result<ValidationResult, crate::ValidatorError> {
+            use crate::{CommandValidator, ValidationCheck};
+            assert_eq!(profile_id, None);
+            assert!(!checks.is_empty());
+            assert!(checks.iter().all(|check| check.command() == "true"));
+            assert!(repository_root.is_dir());
+            let checks = checks
+                .iter()
+                .map(|check| {
+                    ValidationCheck::new(check.name(), check.command())
+                        .args(check.args().iter().cloned())
+                        .timeout(Duration::from_millis(check.timeout_ms()))
+                })
+                .collect::<Vec<_>>();
+            CommandValidator::new(checks).validate(_workspace)
+        }
+    }
+
+    #[test]
+    fn validation_run_is_idempotent_async_and_exposes_saved_check_result() {
+        let fixture = artifact_publication_fixture();
+        let policy = AllowTrueValidationPolicy;
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_validation_policy(&policy);
+        let request = ValidationRunRequest::new(
+            "validation-request-1",
+            fixture.task_id.clone(),
+            fixture.revision,
+            fixture.artifact_id.clone(),
+            None,
+            vec![ValidationCheckSpec::new(
+                "fast-check",
+                "true",
+                Vec::new(),
+                1000,
+            )],
+        );
+        let accepted = service
+            .accept_validation("validation-caller", &request)
+            .unwrap();
+        assert_eq!(accepted.status(), ServiceOperationStatus::Accepted);
+        assert_eq!(accepted.revision(), fixture.revision + 1);
+        assert_eq!(
+            service
+                .accept_validation("validation-caller", &request)
+                .unwrap(),
+            accepted
+        );
+        let completed = service
+            .run_validation_operation(accepted.operation_id())
+            .unwrap();
+        assert_eq!(completed.status(), ServiceOperationStatus::Completed);
+        let result = completed.result().unwrap();
+        assert_eq!(result["state"], "passed");
+        assert_eq!(result["artifact_id"], fixture.artifact_id);
+        assert_eq!(result["checks"][0]["name"], "fast-check");
+        assert_eq!(result["checks"][0]["state"], "passed");
+        assert!(result["checks"][0]["diagnostic_ref"].is_null());
+        assert!(matches!(
+            service
+                .get_operation_result(accepted.operation_id())
+                .unwrap(),
+            OperationGetResult::Validation(_)
+        ));
+    }
+
+    #[test]
+    fn task_finish_checks_artifact_decision_and_persists_idempotent_response_atomically() {
+        let fixture = artifact_publication_fixture();
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let evidence = vec![("validation".to_owned(), fixture.validation_id.clone())];
+        let first = service
+            .finish_task_idempotent(
+                "mcp-test-caller",
+                "finish-1",
+                &fixture.task_id,
+                fixture.revision,
+                &fixture.artifact_id,
+                &fixture.decision_id,
+                &evidence,
+            )
+            .unwrap();
+        assert_eq!(first.revision(), fixture.revision + 1);
+        assert_eq!(first.evidence(), evidence.as_slice());
+        let replay = service
+            .finish_task_idempotent(
+                "mcp-test-caller",
+                "finish-1",
+                &fixture.task_id,
+                fixture.revision,
+                &fixture.artifact_id,
+                &fixture.decision_id,
+                &evidence,
+            )
+            .unwrap();
+        assert_eq!(replay, first);
+        assert!(matches!(
+            service.finish_task_idempotent(
+                "mcp-test-caller",
+                "finish-1",
+                &fixture.task_id,
+                fixture.revision,
+                &fixture.artifact_id,
+                &fixture.decision_id,
+                &[],
+            ),
+            Err(ServiceError::IdempotencyConflict)
+        ));
+        let (state, revision): (String, i64) = fixture.ledger.lock_connection().unwrap().query_row(
+            "SELECT tasks.state,service_task_revisions.revision FROM tasks JOIN service_task_revisions ON tasks.id=service_task_revisions.task_id WHERE tasks.id=?1",
+            params![fixture.task_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(state, "completed");
+        assert_eq!(revision, i64::try_from(first.revision()).unwrap());
     }
 
     #[derive(Default)]
@@ -6031,16 +7845,45 @@ mod tests {
                 &CommandValidator::new([ValidationCheck::new("passes-again", "true")]),
             )
             .unwrap();
+        let decision_expected_revision = revision();
         let decision_id = service
-            .record_artifact_decision(
+            .record_artifact_decision_idempotent(
+                "mcp-test-caller",
+                "decision-idempotency-1",
                 &task_id,
                 &artifact_id,
-                revision(),
+                decision_expected_revision,
                 CodexDecisionKind::Accepted,
                 "The supervisor accepted this artifact.",
                 &[("validation".into(), validation.id().into())],
             )
             .unwrap();
+        let replayed_decision = service
+            .record_artifact_decision_idempotent(
+                "mcp-test-caller",
+                "decision-idempotency-1",
+                &task_id,
+                &artifact_id,
+                decision_expected_revision,
+                CodexDecisionKind::Accepted,
+                "The supervisor accepted this artifact.",
+                &[("validation".into(), validation.id().into())],
+            )
+            .unwrap();
+        assert_eq!(replayed_decision.id(), decision_id.id());
+        assert!(matches!(
+            service.record_artifact_decision_idempotent(
+                "mcp-test-caller",
+                "decision-idempotency-1",
+                &task_id,
+                &artifact_id,
+                decision_expected_revision,
+                CodexDecisionKind::Rejected,
+                "different payload",
+                &[("validation".into(), validation.id().into())],
+            ),
+            Err(ServiceError::IdempotencyConflict)
+        ));
         assert_eq!(decision_id.artifact_id(), artifact_id);
         assert_eq!(decision_id.tree_oid(), validation.tree_oid());
         assert_eq!(decision_id.revision(), revision());
@@ -7727,5 +9570,161 @@ mod tests {
             &fixture.task_id,
             &fixture.attempt_id,
         );
+    }
+    #[test]
+    fn cancellation_fails_closed_for_validation_targets() {
+        let fixture = artifact_publication_fixture();
+        let validation_operation_id = "validation-active-no-stop-hook";
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        {
+            let connection = fixture.ledger.lock_connection().unwrap();
+            connection.execute(
+                "INSERT INTO service_validation_operations(id,task_id,request_id,expected_revision,accepted_revision,revision,artifact_id,profile_id,checks_json,status,accepted_at) VALUES(?1,?2,'validation-request',0,0,0,'missing-artifact',NULL,'[]','running',?3)",
+                params![validation_operation_id, fixture.task_id.as_str(), now_ms()],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO service_artifact_publication_operations(id,request_id,task_id,request_digest,artifact_id,tree_oid,base_commit,validation_id,decision_id,base_branch,head_branch,status,phase,accepted_revision,revision,accepted_at) VALUES('publication-active-no-stop-hook','publication-request',?1,'digest','artifact','tree','base','validation','decision','main','agent','running','workspace_prepared',0,0,?2)",
+                params![fixture.task_id.as_str(), now_ms()],
+            ).unwrap();
+        }
+        let revision = task_revision(&fixture.ledger, &fixture.task_id);
+        assert!(matches!(
+            service.accept_cancellation(
+                "trusted-caller",
+                "cancel-validation",
+                &fixture.task_id,
+                revision,
+                "operation.cancel",
+                Some(&OperationId::new(validation_operation_id)),
+                None,
+            ),
+            Err(ServiceError::NotCancellable)
+        ));
+        assert!(matches!(
+            service.accept_cancellation(
+                "trusted-caller",
+                "cancel-publication",
+                &fixture.task_id,
+                revision,
+                "operation.cancel",
+                Some(&OperationId::new("publication-active-no-stop-hook")),
+                None,
+            ),
+            Err(ServiceError::NotCancellable)
+        ));
+        assert!(matches!(
+            service.accept_cancellation(
+                "trusted-caller",
+                "cancel-task-with-validation",
+                &fixture.task_id,
+                revision,
+                "task.cancel",
+                None,
+                None,
+            ),
+            Err(ServiceError::NotCancellable)
+        ));
+        let cancellation_count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_cancellation_operations WHERE task_id=?1",
+                params![fixture.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cancellation_count, 0);
+    }
+
+    #[test]
+    fn previously_accepted_unsupported_cancellation_fails_instead_of_claiming_success() {
+        let fixture = artifact_publication_fixture();
+        let target_id = "validation-running-before-restart";
+        let cancellation_id = OperationId::new("cancel-accepted-before-target-race");
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let revision = task_revision(&fixture.ledger, &fixture.task_id);
+        {
+            let connection = fixture.ledger.lock_connection().unwrap();
+            connection.execute(
+                "INSERT INTO service_validation_operations(id,task_id,request_id,expected_revision,accepted_revision,revision,artifact_id,profile_id,checks_json,status,accepted_at) VALUES(?1,?2,'validation-request',?3,?3,?3,'missing-artifact',NULL,'[]','running',?4)",
+                params![target_id, fixture.task_id.as_str(), revision as i64, now_ms()],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO service_cancellation_operations(id,task_id,kind,target_operation_id,target_ids_json,status,accepted_revision,revision,accepted_at) VALUES(?1,?2,'task.cancel',NULL,?3,'accepted',?4,?4,?5)",
+                params![cancellation_id.as_str(), fixture.task_id.as_str(), serde_json::json!([{"kind":"validation.run","id":target_id}]).to_string(), revision as i64, now_ms()],
+            ).unwrap();
+        }
+        let result = service
+            .run_cancellation_operation(&cancellation_id)
+            .unwrap();
+        assert_eq!(result.status(), ServiceOperationStatus::Failed);
+        assert_eq!(result.error_code(), Some("not_cancellable"));
+        let task_state: String = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM tasks WHERE id=?1",
+                params![fixture.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_state, "active");
+    }
+    #[test]
+    fn restart_never_completes_cancellation_of_unsupported_targets() {
+        let fixture = artifact_publication_fixture_with_persistent_ledger(true);
+        let target_id = "validation-running-at-crash";
+        let cancellation_id = OperationId::new("cancel-accepted-at-crash");
+        let revision = task_revision(&fixture.ledger, &fixture.task_id);
+        {
+            let connection = fixture.ledger.lock_connection().unwrap();
+            connection.execute(
+                "INSERT INTO service_validation_operations(id,task_id,request_id,expected_revision,accepted_revision,revision,artifact_id,profile_id,checks_json,status,accepted_at) VALUES(?1,?2,'validation-request',?3,?3,?3,'missing-artifact',NULL,'[]','running',?4)",
+                params![target_id, fixture.task_id.as_str(), revision as i64, now_ms()],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO service_cancellation_operations(id,task_id,kind,target_operation_id,target_ids_json,status,accepted_revision,revision,accepted_at) VALUES(?1,?2,'task.cancel',NULL,?3,'accepted',?4,?4,?5)",
+                params![cancellation_id.as_str(), fixture.task_id.as_str(), serde_json::json!([{"kind":"validation.run","id":target_id}]).to_string(), revision as i64, now_ms()],
+            ).unwrap();
+        }
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let result = service
+            .get_cancellation_operation(&cancellation_id)
+            .unwrap();
+        assert_eq!(result.status(), ServiceOperationStatus::RecoveryRequired);
+        let task_state: String = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM tasks WHERE id=?1",
+                params![fixture.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_state, "active");
     }
 }

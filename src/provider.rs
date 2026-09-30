@@ -431,7 +431,7 @@ impl std::fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 /// Common boundary for all agent CLI providers.
-pub trait AgentProvider {
+pub trait AgentProvider: Send + Sync {
     fn provider_ref(&self) -> &ProviderRef;
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError>;
 

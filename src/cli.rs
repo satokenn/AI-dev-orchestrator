@@ -40,7 +40,7 @@ fn open_ledger_for_run(path: &Path) -> Result<SqliteExecutionLedger, String> {
 
 fn help() -> String {
     format!(
-        "ai-dev-orchestrator {}\n\nUSAGE:\n  ai-dev-orchestrator doctor [--json]\n  ai-dev-orchestrator run --repo OWNER/NAME --issue N --repository-root PATH --ledger PATH\n  ai-dev-orchestrator status --task-id ID --ledger PATH [--json]\n\nEXIT CODES: 0 success, 1 operation failure, 2 usage error, 3 provider unavailable\n",
+        "ai-dev-orchestrator {}\n\nUSAGE:\n  ai-dev-orchestrator doctor [--json]\n  ai-dev-orchestrator run --repo OWNER/NAME --issue N --repository-root PATH --ledger PATH\n  ai-dev-orchestrator status --task-id ID --ledger PATH [--json]\n  ai-dev-orchestrator mcp-stdio --repository-root PATH --ledger PATH [--caller ID]\n\nEXIT CODES: 0 success, 1 operation failure, 2 usage error, 3 provider unavailable\n",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -508,5 +508,62 @@ pub fn run_with_runtime<I: IntoIterator<Item = String>>(args: I, runtime: &dyn C
 }
 
 pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
+    let args: Vec<String> = args.into_iter().collect();
+    if args.first().is_some_and(|arg| arg == "mcp-stdio") {
+        return mcp_stdio_command(&args[1..]);
+    }
     run_with_runtime(args, &ProductionRuntime)
+}
+
+fn mcp_stdio_command(args: &[String]) -> i32 {
+    if !has_only(args, &["--repository-root", "--ledger", "--caller"]) {
+        eprintln!("mcp-stdio requires --repository-root PATH and --ledger PATH");
+        return USAGE_ERROR;
+    }
+    let Some(root) = value(args, "--repository-root") else {
+        eprintln!("mcp-stdio requires --repository-root PATH");
+        return USAGE_ERROR;
+    };
+    let Some(ledger_path) = value(args, "--ledger") else {
+        eprintln!("mcp-stdio requires --ledger PATH");
+        return USAGE_ERROR;
+    };
+    let caller = value(args, "--caller").unwrap_or_else(|| "stdio-supervisor".to_owned());
+    if caller.trim().is_empty() {
+        eprintln!("--caller must not be empty");
+        return USAGE_ERROR;
+    }
+    let Ok(ledger) = open_ledger_for_run(Path::new(&ledger_path)) else {
+        eprintln!("cannot open the Operation Service ledger");
+        return OPERATION_ERROR;
+    };
+    let Ok(workspaces) = WorkspaceManager::new(&root) else {
+        eprintln!("cannot initialize repository workspace boundary");
+        return OPERATION_ERROR;
+    };
+    let mut providers = ProviderRegistry::new();
+    providers.register(CodexProvider::new());
+    providers.register(CopilotProvider::new());
+    providers.register(AntigravityProvider::new());
+    let ledger = Box::leak(Box::new(ledger));
+    let workspaces = Box::leak(Box::new(workspaces));
+    let providers = Box::leak(Box::new(providers));
+    let service = match crate::OperationService::new(
+        ledger,
+        workspaces,
+        providers,
+        1,
+        Duration::from_secs(3600),
+    ) {
+        Ok(service) => Box::leak(Box::new(service)),
+        Err(_) => {
+            eprintln!("cannot initialize Operation Service safely");
+            return OPERATION_ERROR;
+        }
+    };
+    let handler = crate::mcp_gateway::OperationServiceHandler::new(service, caller);
+    match crate::mcp_gateway::serve_stdio(&handler) {
+        Ok(()) => SUCCESS,
+        Err(_) => OPERATION_ERROR,
+    }
 }
