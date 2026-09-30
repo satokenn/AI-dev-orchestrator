@@ -73,7 +73,7 @@ Provider APIでは成功・失敗結果にUTF-8変換前のstdout/stderr byte列
 
 Provider起動前にworkspaceのHEADが指定commitと一致し、tracked・untracked・ignored fileが空であることも確認します。hook等が内容を作った場合はProviderを起動せず、workspaceと内容を保持します。実行中のOperationはworkspace pathとbranchを参照として記録し、結果確認・Artifact連携までは自動削除しません。永続LedgerのService構築時は、取得したロックの下で残存するrunning Operationを `recovery_required` として閉じてから依頼受付を始めます。中断結果を推測せず、同じOperationを再実行しません。これはRust Service APIの中核実装であり、MCP transport、ArtifactInput、redacted log保存、named Model catalog、CLIへの配線は別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
 
-Task作成はService APIでのみ利用できます。たとえばmanual Task要求は次のように渡します。
+Task作成のRust Service APIは実装済みで、MCP transportからの呼び出しは未実装です。たとえばmanual Task要求は次のように渡します。
 
 ```rust,ignore
 let request = TaskCreateRequest::new(
@@ -87,7 +87,7 @@ let request = TaskCreateRequest::new(
 let created = service.create_task("supervisor", &request)?;
 ```
 
-応答には初期 `task_id`、revision `0`、`pending` 状態、および保存した要求snapshotが含まれます。Task作成、MCP transport、ArtifactInput、redacted log保存、named Model catalog、CLIへの配線は別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
+応答には初期 `task_id`、revision `0`、`pending` 状態、および保存した要求snapshotが含まれます。このAPIをMCP transportから利用する配線、ArtifactInput、redacted log保存、named Model catalog、CLIへの配線は別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
 
 manual Task要求に対する応答例:
 
