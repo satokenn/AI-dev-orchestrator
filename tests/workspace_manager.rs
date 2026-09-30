@@ -63,7 +63,11 @@ fn resolves_repository_and_isolates_each_attempt() {
     );
 
     let task = Task::new(TaskId::new("task-1"), "implement", TaskRole::new("worker"));
-    let attempt = Attempt::new(AttemptId::new("attempt-2"), ProviderRef::new("codex"));
+    let attempt = Attempt::new(
+        AttemptId::new("attempt-2"),
+        ProviderRef::new("codex"),
+        ai_dev_orchestrator::ModelChoice::ProviderDefault,
+    );
     assert_eq!(
         manager.branch_name(task.id(), attempt.id()),
         "orchestrator/task/task-1/attempt/attempt-2"

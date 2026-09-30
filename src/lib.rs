@@ -22,9 +22,9 @@ pub use antigravity::AntigravityProvider;
 pub use codex_provider::CodexProvider;
 pub use copilot_provider::CopilotProvider;
 pub use domain::{
-    AgentResult, Attempt, AttemptFailureReason, AttemptId, AttemptState, DomainError, ProviderRef,
-    Task, TaskId, TaskRole, TaskState, UsageCost, UsageMetric, ValidationCheckResult,
-    ValidationResult,
+    AgentResult, Attempt, AttemptFailureReason, AttemptId, AttemptState, DomainError, ModelChoice,
+    ModelRef, ProviderRef, Task, TaskId, TaskRole, TaskState, UsageCost, UsageMetric,
+    ValidationCheckResult, ValidationResult,
 };
 pub use execution_ledger::{AttemptRecord, ExecutionLedger, LedgerError, SqliteExecutionLedger};
 pub use github_workflow::{

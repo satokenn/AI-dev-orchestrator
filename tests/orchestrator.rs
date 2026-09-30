@@ -159,7 +159,7 @@ fn successful_attempt_records_agent_result_and_validation_once() {
             task.description(),
             task.description(),
             ProviderRef::new("fake-provider"),
-            None,
+            ai_dev_orchestrator::ModelChoice::ProviderDefault,
         ))
         .expect("operation is persisted");
     assert_eq!(
@@ -170,7 +170,7 @@ fn successful_attempt_records_agent_result_and_validation_once() {
             .status(),
         ai_dev_orchestrator::OperationStatus::Succeeded
     );
-    assert_eq!(operation_ledger.events(operation.id()).unwrap().len(), 3);
+    assert_eq!(operation_ledger.events(operation.id()).unwrap().len(), 4);
     manager
         .cleanup(report.workspace())
         .expect("clean workspace");

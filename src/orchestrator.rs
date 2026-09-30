@@ -4,10 +4,10 @@ use std::{fmt, path::Path, sync::Arc, time::Duration};
 
 use crate::operation_ledger::{ExecutionLedger, OperationId, OperationRequest, OperationStatus};
 use crate::{
-    AgentProvider, Attempt, AttemptId, DomainError, ExecutionPolicy, PlannerDecision, PolicyError,
-    ProviderError, ProviderRequest, ProviderResolutionError, ProviderResolver, ProviderResult,
-    RetryPolicy, Task, ValidationResult, Validator, ValidatorError, Workspace, WorkspaceError,
-    WorkspaceManager,
+    AgentProvider, Attempt, AttemptId, DomainError, ExecutionPolicy, ModelChoice, PlannerDecision,
+    PolicyError, ProviderError, ProviderRequest, ProviderResolutionError, ProviderResolver,
+    ProviderResult, RetryPolicy, Task, ValidationResult, Validator, ValidatorError, Workspace,
+    WorkspaceError, WorkspaceManager,
 };
 
 /// Boundary used by the application service to prepare and validate an agent workspace.
@@ -213,7 +213,24 @@ where
         attempt_id: AttemptId,
         timeout: Duration,
     ) -> Result<OrchestrationReport, OrchestratorError> {
-        self.execute_provider(task, attempt_id, timeout, &self.provider)
+        self.execute_provider(
+            task,
+            attempt_id,
+            timeout,
+            ModelChoice::ProviderDefault,
+            &self.provider,
+        )
+    }
+
+    /// Executes one Attempt with an explicit named model or provider default.
+    pub fn execute_with_model(
+        &self,
+        task: &mut Task,
+        attempt_id: AttemptId,
+        model: ModelChoice,
+        timeout: Duration,
+    ) -> Result<OrchestrationReport, OrchestratorError> {
+        self.execute_provider(task, attempt_id, timeout, model, &self.provider)
     }
 
     fn execute_provider(
@@ -221,6 +238,7 @@ where
         task: &mut Task,
         attempt_id: AttemptId,
         timeout: Duration,
+        model: ModelChoice,
         provider: &dyn AgentProvider,
     ) -> Result<OrchestrationReport, OrchestratorError> {
         match task.state() {
@@ -235,6 +253,7 @@ where
         task.add_attempt(Attempt::new(
             attempt_id.clone(),
             provider.provider_ref().clone(),
+            model.clone(),
         ))
         .map_err(OrchestratorError::Domain)?;
         task.attempt_mut(&attempt_id)
@@ -250,13 +269,13 @@ where
                 task.description(),
                 task.description(),
                 provider.provider_ref().clone(),
-                None,
+                model.clone(),
             );
             let operation = ledger
                 .accept_operation(&request)
                 .map_err(OrchestratorError::Ledger)?;
             ledger
-                .start_operation(operation.id(), provider.provider_ref(), None)
+                .start_operation(operation.id())
                 .map_err(OrchestratorError::Ledger)?;
             Some(operation.id().clone())
         } else {
@@ -306,7 +325,7 @@ where
             });
         }
 
-        let request = ProviderRequest::new(workspace.path(), task.description(), timeout);
+        let request = ProviderRequest::new(workspace.path(), task.description(), timeout, model);
         let provider_result = match provider.execute(&request) {
             Ok(result) => result,
             Err(error) => {
@@ -324,6 +343,24 @@ where
                 });
             }
         };
+
+        task.attempt_mut(&attempt_id)
+            .expect("newly added attempt must be owned by its task")
+            .record_observed_target(
+                provider_result.observed_provider().cloned(),
+                provider_result.observed_model().cloned(),
+            );
+        if let Some(operation_id) = operation_id.as_ref() {
+            self.operation_ledger
+                .as_deref()
+                .expect("operation ID is created with its ledger")
+                .record_observed_target(
+                    operation_id,
+                    provider_result.observed_provider(),
+                    provider_result.observed_model(),
+                )
+                .map_err(OrchestratorError::Ledger)?;
+        }
 
         if let Some(agent_result) = provider_result.agent_result().cloned() {
             task.attempt_mut(&attempt_id)
@@ -423,7 +460,13 @@ where
             .provider
             .resolve(decision.provider())
             .map_err(OrchestratorError::UnknownProvider)?;
-        self.execute_provider(task, attempt_id, timeout, provider)
+        self.execute_provider(
+            task,
+            attempt_id,
+            timeout,
+            ModelChoice::ProviderDefault,
+            provider,
+        )
     }
 
     /// Variant where the orchestrator owns Attempt ID generation.
@@ -489,7 +532,13 @@ where
                 reason: error.to_string(),
             })
         })?;
-        self.execute_provider(task, attempt_id, timeout, provider)
+        self.execute_provider(
+            task,
+            attempt_id,
+            timeout,
+            ModelChoice::ProviderDefault,
+            provider,
+        )
     }
 
     /// Preferred hard-gated planner entry. The decision must have been validated

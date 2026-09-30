@@ -49,3 +49,9 @@ CLI が PATH にない場合は `ProviderError::Unavailable` になります。�
 Provider 経由の利用では、`ProviderRequest` の timeout と
 `AntigravityProvider::execute_with_cancellation` の
 `CancellationToken` が ProcessRunner に渡されます。
+
+`ProviderRequest::model()` が `ModelChoice::Named` の場合は `--model <slug>` を
+CLIへ渡します。`ProviderDefault` の場合はModel引数を省き、Antigravity CLIの設定または
+既定Modelを使います。現行のJSON resultは実際に解決したModel名を含まないため、
+observed Providerは`antigravity`、observed Modelはunknownです。CLIがModel slugを
+認識しない場合は、Provider境界で`ProviderError::UnsupportedModel`として返します。

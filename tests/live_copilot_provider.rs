@@ -1,4 +1,4 @@
-use ai_dev_orchestrator::{AgentProvider, CopilotProvider, ProviderRequest};
+use ai_dev_orchestrator::{AgentProvider, CopilotProvider, ModelChoice, ProviderRequest};
 use std::{env, time::Duration};
 
 #[test]
@@ -10,6 +10,7 @@ fn copilot_cli_provider_live_smoke_test() {
         workspace,
         "Respond with exactly LIVE_PROVIDER_OK. Do not modify any files.",
         Duration::from_secs(120),
+        ModelChoice::ProviderDefault,
     );
     let result = CopilotProvider::new()
         .with_allowed_tools(["write", "shell"])
