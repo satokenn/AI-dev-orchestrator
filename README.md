@@ -89,6 +89,24 @@ let created = service.create_task("supervisor", &request)?;
 
 応答には初期 `task_id`、revision `0`、`pending` 状態、および保存した要求snapshotが含まれます。Task作成、MCP transport、ArtifactInput、redacted log保存、named Model catalog、CLIへの配線は別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
 
+manual Task要求に対する応答例:
+
+```json
+{
+  "request_id": "request-01",
+  "task_id": "task-create-1",
+  "revision": 0,
+  "state": "pending",
+  "request": {
+    "source": "manual",
+    "title": "Update parser",
+    "description": "Support escaped delimiters",
+    "constraints": [],
+    "issue": null
+  }
+}
+```
+
 Service利用側は明示したbase commitで受付し、返されたIDで同期実行または後から状態取得を行います。
 
 ```rust,ignore
