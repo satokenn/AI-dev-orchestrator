@@ -228,7 +228,7 @@ impl CodexProvider {
                 if let Some(error) = crate::provider::unsupported_model_error(
                     &self.reference,
                     model,
-                    &classification_text,
+                    &String::from_utf8_lossy(&output.stderr),
                 ) {
                     error.with_captured_output(captured)
                 } else if looks_like_authentication_failure(&classification_text) {
@@ -518,6 +518,10 @@ mod tests {
                 .expose_stderr_bytes_for_trusted_processing(),
             b"unknown model"
         );
+
+        let provider = shell_provider("printf 'unsupported model'; exit 1");
+        let error = provider.execute(&request).unwrap_err();
+        assert!(matches!(error.kind(), ProviderError::ExecutionFailed(_)));
     }
 
     #[test]

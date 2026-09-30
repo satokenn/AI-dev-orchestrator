@@ -4,7 +4,10 @@
 //! It does not select a target or expose Provider output and raw diagnostics.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -996,6 +999,23 @@ fn task_request_json(request: &TaskCreateRequest) -> String {
     .to_string()
 }
 
+const TASK_CREATE_UNSAFE_TEXT: &str = "task.create text cannot be stored safely";
+
+fn ensure_task_create_text_safe(
+    scanner: Option<&dyn SecretScanner>,
+    request_json: &str,
+) -> Result<(), ServiceError> {
+    let scanner = scanner.ok_or(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
+    let payload =
+        ArtifactPublicationPayload::new("", "", "task.create request snapshot", request_json);
+    match scanner.scan_publication_payload(&payload) {
+        Ok(SecretScanResult::Clean) => Ok(()),
+        Ok(SecretScanResult::Findings) | Err(_) => {
+            Err(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))
+        }
+    }
+}
+
 fn load_task_creation_result(
     connection: &rusqlite::Connection,
     request_id: &str,
@@ -1195,6 +1215,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         }
         validate_task_create(request)?;
         let payload = task_request_json(request);
+        ensure_task_create_text_safe(self.secret_scanner, &payload)?;
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx
@@ -1206,6 +1227,16 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             )
             .optional()?;
         if let Some((stored, task_id)) = existing {
+            ensure_task_create_text_safe(self.secret_scanner, &stored)?;
+            let snapshot: String = tx.query_row(
+                "SELECT request_json FROM task_request_snapshots WHERE task_id=?1",
+                params![task_id],
+                |row| row.get(0),
+            )?;
+            ensure_task_create_text_safe(self.secret_scanner, &snapshot)?;
+            if snapshot != stored {
+                return Err(ServiceError::InvalidStoredState);
+            }
             if stored != payload {
                 return Err(ServiceError::IdempotencyConflict);
             }
@@ -1883,7 +1914,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         }
         let result: ValidationResult = match validator.validate(workspace.path()) {
             Ok(result) => result,
-            Err(error) => {
+            Err(_error) => {
                 return match artifacts.cleanup_unchanged_artifact_validation_workspace(
                     task_id,
                     &attempt_id,
@@ -1891,10 +1922,10 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                     &workspace,
                 ) {
                     Ok(()) => Err(ServiceError::ValidationFailed),
-                    Err(cleanup_error) => Err(ServiceError::Artifact(
+                    Err(_cleanup_error) => Err(ServiceError::Artifact(
                         ArtifactManager::retained_workspace_error(
                             &workspace,
-                            format!("validation failed ({error}); {cleanup_error}"),
+                            "validator failed; cleanup failed and the validation workspace was retained",
                         ),
                     )),
                 };
@@ -2012,6 +2043,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let artifact = artifacts
             .verify_input(&request.task_id, &request.artifact_id)
             .map_err(ServiceError::from)?;
+        if repository_has_replace_refs(artifact.repository_root(), self.default_timeout) {
+            return Err(ServiceError::PolicyDenied(
+                "Git replace refs make Artifact scanning ambiguous",
+            ));
+        }
         if artifact.tree_oid() != permit.tree_oid()
             || artifact.base_commit() != permit.base_commit()
         {
@@ -2145,6 +2181,18 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 return Err(ServiceError::from(error));
             }
         };
+        if repository_has_replace_refs(artifact.repository_root(), self.default_timeout) {
+            self.finish_publication(
+                &acceptance.operation_id,
+                ServiceOperationStatus::Failed,
+                "publication_replace_refs_present",
+                None,
+                None,
+            )?;
+            return Err(ServiceError::PolicyDenied(
+                "Git replace refs make Artifact scanning ambiguous",
+            ));
+        }
         let artifact_scan =
             match scanner.scan_artifact_tree(artifact.repository_root(), artifact.tree_oid()) {
                 Ok(result) => result,
@@ -3065,6 +3113,31 @@ fn valid_git_branch(branch: &str) -> bool {
             .any(|byte| byte <= b' ' || byte == 0x7f || b"~^:?*[\\".contains(&byte))
 }
 
+fn repository_has_replace_refs(repository: &Path, timeout: Duration) -> bool {
+    let output = crate::process_runner::ProcessRunner.run_with_env_removed(
+        crate::process_runner::ProcessRequest::new("git")
+            .arg("-C")
+            .arg(repository.as_os_str().to_owned())
+            .args(["for-each-ref", "--format=%(refname)", "refs/replace"])
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .timeout(timeout),
+        &[
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+        ],
+    );
+    match output {
+        Ok(output) if !output.output_truncated && output.status.success() => {
+            !output.stdout.is_empty()
+        }
+        _ => true,
+    }
+}
+
 fn valid_git_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -3114,6 +3187,42 @@ mod tests {
     const CHILD_REPOSITORY_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_REPOSITORY";
     const CHILD_OPERATION_ID: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_OPERATION";
     const CHILD_MARKER_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_MARKER";
+
+    const TASK_SECRET_SENTINEL: &str = "TASK_CREATE_SECRET_SENTINEL";
+
+    struct TaskCreateScanner {
+        unavailable: bool,
+    }
+
+    impl SecretScanner for TaskCreateScanner {
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+
+        fn scan_publication_payload(
+            &self,
+            payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            if self.unavailable {
+                return Err(SecretScanError::Unavailable);
+            }
+            if payload.title().contains(TASK_SECRET_SENTINEL)
+                || payload.body().contains(TASK_SECRET_SENTINEL)
+            {
+                Ok(SecretScanResult::Findings)
+            } else {
+                Ok(SecretScanResult::Clean)
+            }
+        }
+    }
+
+    fn clean_task_scanner() -> TaskCreateScanner {
+        TaskCreateScanner { unavailable: false }
+    }
 
     fn sqlite_open_is_busy(error: &crate::LedgerError) -> bool {
         matches!(
@@ -3169,6 +3278,19 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
+    #[test]
+    fn publication_preflight_rejects_git_replace_refs() {
+        let repo = Repo::new();
+        let tree = git(&repo.0, &["rev-parse", "HEAD^{tree}"]);
+        let replacement = git(&repo.0, &["mktree"]);
+        git(
+            &repo.0,
+            &["update-ref", &format!("refs/replace/{tree}"), &replacement],
+        );
+
+        assert!(repository_has_replace_refs(&repo.0, Duration::from_secs(1)));
+    }
+
     fn cleanup_fixture_worktree(
         repo: &Repo,
         workspace: &WorkspaceManager,
@@ -3188,9 +3310,11 @@ mod tests {
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
         let providers = ProviderRegistry::new();
         let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
+                .unwrap()
+                .with_secret_scanner(&scanner);
         let request = TaskCreateRequest::new(
             "create-1",
             TaskSource::Manual,
@@ -3230,6 +3354,152 @@ mod tests {
         ));
         let other_caller = service.create_task("caller-b", &request).unwrap();
         assert_ne!(other_caller.task_id(), first.task_id());
+    }
+
+    #[test]
+    fn task_create_rejects_detected_secrets_in_every_snapshot_text_field() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+
+        for field in 0..6 {
+            let mut request = TaskCreateRequest::new(
+                format!("secret-{field}"),
+                TaskSource::Issue,
+                "safe title",
+                "safe description",
+                vec!["safe constraint".into()],
+                Some(TaskIssueSnapshot {
+                    url: "https://example.test/issues/1".into(),
+                    number: 1,
+                    title: "safe issue title".into(),
+                    body: "safe issue body".into(),
+                }),
+            );
+            match field {
+                0 => request.title = TASK_SECRET_SENTINEL.into(),
+                1 => request.description = TASK_SECRET_SENTINEL.into(),
+                2 => request.constraints[0] = TASK_SECRET_SENTINEL.into(),
+                3 => {
+                    request.issue.as_mut().unwrap().url =
+                        format!("https://example.test/issues/1?token={TASK_SECRET_SENTINEL}")
+                }
+                4 => request.issue.as_mut().unwrap().title = TASK_SECRET_SENTINEL.into(),
+                5 => request.issue.as_mut().unwrap().body = TASK_SECRET_SENTINEL.into(),
+                _ => unreachable!(),
+            }
+            let error = service.create_task("caller", &request).unwrap_err();
+            assert!(matches!(
+                error,
+                ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+            ));
+            assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+        }
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let idempotency_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_create_idempotency", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_count, 0);
+        assert_eq!(idempotency_count, 0);
+    }
+
+    #[test]
+    fn task_create_fails_closed_when_scanner_is_missing_or_unavailable() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let request = TaskCreateRequest::new(
+            "scanner-unavailable",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![TASK_SECRET_SENTINEL.into()],
+            None,
+        );
+        let missing_scanner =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let error = missing_scanner.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+
+        let unavailable = TaskCreateScanner { unavailable: true };
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&unavailable);
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_count, 0);
+    }
+
+    #[test]
+    fn task_create_replay_scans_persisted_snapshot_before_returning_it() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "safe-replay",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![],
+            None,
+        );
+        let created = service.create_task("caller", &request).unwrap();
+        let malicious_snapshot = format!(
+            r#"{{"source":"manual","title":"{TASK_SECRET_SENTINEL}","description":"","constraints":[],"issue":null}}"#
+        );
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE task_request_snapshots SET request_json=?1 WHERE task_id=?2",
+                params![malicious_snapshot, created.task_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE task_create_idempotency SET request_json=?1 WHERE caller='caller' AND request_id='safe-replay'",
+                params![malicious_snapshot],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
     }
 
     #[test]
@@ -3361,13 +3631,16 @@ mod tests {
         let first = {
             let ledger = SqliteExecutionLedger::open(&database).unwrap();
             let workspace = WorkspaceManager::new(&repo.0).unwrap();
+            let scanner = clean_task_scanner();
             let service =
                 OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                    .unwrap();
+                    .unwrap()
+                    .with_secret_scanner(&scanner);
             service.create_task("durable-caller", &request).unwrap()
         };
         let reopened = SqliteExecutionLedger::open(&database).unwrap();
         let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
         let service = OperationService::new(
             &reopened,
             &workspace,
@@ -3375,7 +3648,8 @@ mod tests {
             3,
             Duration::from_secs(30),
         )
-        .unwrap();
+        .unwrap()
+        .with_secret_scanner(&scanner);
         let replay = service.create_task("durable-caller", &request).unwrap();
         assert_eq!(replay, first);
         assert_eq!(replay.issue(), request.issue.as_ref());
@@ -3835,6 +4109,11 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct MutatingFailingValidator {
+        workspace: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    #[derive(Default)]
     struct TrackingValidator {
         workspace: std::sync::Mutex<Option<PathBuf>>,
     }
@@ -3889,6 +4168,21 @@ mod tests {
         ) -> Result<ValidationResult, crate::ValidatorError> {
             *self.workspace.lock().unwrap() = Some(workspace.to_owned());
             Err(crate::ValidatorError::NoChecksConfigured)
+        }
+    }
+
+    impl crate::Validator for MutatingFailingValidator {
+        fn validate(
+            &self,
+            workspace: &std::path::Path,
+        ) -> Result<ValidationResult, crate::ValidatorError> {
+            *self.workspace.lock().unwrap() = Some(workspace.to_owned());
+            fs::write(workspace.join("README.md"), "validator mutation\n")
+                .expect("modify validation worktree");
+            Err(crate::ValidatorError::InvalidWorkspace {
+                workspace: workspace.to_owned(),
+                reason: "SECRET_SENTINEL_VALIDATOR_RAW_DIAGNOSTIC".into(),
+            })
         }
     }
 
@@ -5084,6 +5378,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(validation_count, 0);
+        let mutating_validator = MutatingFailingValidator::default();
+        let returned_error = service
+            .validate_artifact(&task_id, &artifact_id, revision(), &mutating_validator)
+            .unwrap_err();
+        let debug_output = format!("{returned_error:?}");
+        let display_output = format!("{returned_error}");
+        assert!(!debug_output.contains("SECRET_SENTINEL_VALIDATOR_RAW_DIAGNOSTIC"));
+        assert!(!display_output.contains("SECRET_SENTINEL_VALIDATOR_RAW_DIAGNOSTIC"));
+        let retained_path = match returned_error {
+            ServiceError::Artifact(ArtifactError::WorkspaceRetained { path, reason }) => {
+                assert_eq!(
+                    reason,
+                    "validator failed; cleanup failed and the validation workspace was retained"
+                );
+                path
+            }
+            other => panic!("failed cleanup must retain the validation worktree: {other:?}"),
+        };
+        assert!(retained_path.exists());
+        assert_eq!(
+            fs::read_to_string(retained_path.join("README.md")).unwrap(),
+            "validator mutation\n"
+        );
+        let retained_path_text = retained_path.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &["worktree", "remove", "--force", &retained_path_text],
+        );
+        let validation_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_validations WHERE task_id=?1 AND artifact_id=?2",
+                params![task_id.as_str(), artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(validation_count, 0);
         assert!(
             git(&repo.0, &["ls-tree", "-r", "--name-only", &artifact_tree])
                 .contains("artifact-new-file.txt")
@@ -5362,6 +5694,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_rejects_replace_refs_before_secret_scan_or_ledger_write() {
+        let fixture = artifact_publication_fixture();
+        let artifact_tree: String = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT tree_oid FROM service_artifacts WHERE id=?1",
+                params![fixture.artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let replacement_tree = git(&fixture.repo.0, &["mktree"]);
+        git(
+            &fixture.repo.0,
+            &[
+                "update-ref",
+                &format!("refs/replace/{artifact_tree}"),
+                &replacement_tree,
+            ],
+        );
+
+        let scanner_events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: scanner_events.clone(),
+        };
+        let gateway_events = Arc::new(Mutex::new(Vec::new()));
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: gateway_events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+
+        assert!(matches!(
+            service.publish_artifact(&publication_request(&fixture, "replace-ref-blocked")),
+            Err(ServiceError::PolicyDenied(
+                "Git replace refs make Artifact scanning ambiguous"
+            ))
+        ));
+        let operation_count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_artifact_publication_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation_count, 0);
+        assert!(scanner_events.lock().unwrap().is_empty());
+        assert!(gateway_events.lock().unwrap().is_empty());
         cleanup_fixture_worktree(
             &fixture.repo,
             &fixture.workspace,
