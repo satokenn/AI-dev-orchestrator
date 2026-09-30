@@ -90,6 +90,13 @@ impl LedgerRunLock {
 }
 
 fn open_exclusive_lock(path: &Path) -> Result<std::fs::File, LedgerError> {
+    open_exclusive_lock_with(path, || {})
+}
+
+fn open_exclusive_lock_with(
+    path: &Path,
+    mut on_contention: impl FnMut(),
+) -> Result<std::fs::File, LedgerError> {
     reject_lock_alias(path)?;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
@@ -105,6 +112,7 @@ fn open_exclusive_lock(path: &Path) -> Result<std::fs::File, LedgerError> {
         match file.try_lock_exclusive() {
             Ok(()) => break,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                on_contention();
                 if Instant::now() >= deadline {
                     return Err(LedgerError::LockBusy);
                 }
@@ -1127,6 +1135,7 @@ mod tests {
 
     const CHILD_LOCK_PATH: &str = "AI_DEV_ORCHESTRATOR_CHILD_LOCK_PATH";
     const CHILD_LOCK_MARKER: &str = "AI_DEV_ORCHESTRATOR_CHILD_LOCK_MARKER";
+    const CHILD_LOCK_RELEASE: &str = "AI_DEV_ORCHESTRATOR_CHILD_LOCK_RELEASE";
 
     fn lock_test_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1148,7 +1157,69 @@ mod tests {
         };
         let _lock = LedgerRunLock::acquire(lock_path).unwrap();
         fs::write(marker, "locked").unwrap();
-        thread::sleep(Duration::from_secs(2));
+        if let Some(release_marker) = std::env::var_os(CHILD_LOCK_RELEASE) {
+            let release_marker = PathBuf::from(release_marker);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !release_marker.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                release_marker.exists(),
+                "parent did not release the child lock"
+            );
+        } else {
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn process_local_lock_reservation_rejects_duplicate_immediately() {
+        let path = std::env::temp_dir().join(format!(
+            "operation-ledger-process-lock-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let first = ProcessLockReservation::reserve(vec![path.clone()]).unwrap();
+        assert!(matches!(
+            ProcessLockReservation::reserve(vec![path]),
+            Err(LedgerError::LockBusy)
+        ));
+        drop(first);
+    }
+
+    #[test]
+    fn transient_cross_process_file_lock_contention_retries_until_acquired() {
+        let root = lock_test_root("cross-process-released");
+        let ledger_path = root.join("ledger.sqlite3");
+        let marker = root.join("child-locked");
+        let release_marker = root.join("child-release");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("operation_ledger::tests::child_holds_ledger_lock_for_contention_test")
+            .arg("--nocapture")
+            .env(CHILD_LOCK_PATH, &ledger_path)
+            .env(CHILD_LOCK_MARKER, &marker)
+            .env(CHILD_LOCK_RELEASE, &release_marker)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "child did not acquire the lock in time");
+
+        let mut lock_name = ledger_path.as_os_str().to_os_string();
+        lock_name.push(".operations.lock");
+        let mut contention_count = 0;
+        let acquired = open_exclusive_lock_with(&PathBuf::from(lock_name), || {
+            contention_count += 1;
+            fs::write(&release_marker, "release").unwrap();
+        })
+        .unwrap();
+        assert!(contention_count > 0, "OS lock contention was not observed");
+        drop(acquired);
+        assert!(child.wait().unwrap().success());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
