@@ -373,7 +373,8 @@ fn parse_codex_jsonl(stdout: &[u8], truncated: bool) -> Result<ParsedCodexJsonl,
         }
     }
     let usage = (!metrics.is_empty()).then(|| UsageCost::new(metrics));
-    let agent_result = final_message.map(|message| AgentResult::new(message, true));
+    let agent_result =
+        final_message.map(|message| AgentResult::new(message, diagnostics.is_empty()));
     Ok(ParsedCodexJsonl {
         agent_result,
         usage,
@@ -680,6 +681,23 @@ mod tests {
         ).unwrap();
         assert_eq!(parsed.agent_result.unwrap().summary(), "last");
         assert!(parsed.usage.is_none());
+    }
+
+    #[test]
+    fn item_error_marks_reported_success_false_and_preserves_final_message() {
+        let parsed = parse_codex_jsonl(
+            b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"partial result\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":\"tool failed\"}}\n",
+            false,
+        )
+        .unwrap();
+
+        let result = parsed.agent_result.unwrap();
+        assert_eq!(result.summary(), "partial result");
+        assert!(!result.reported_success());
+        assert_eq!(
+            parsed.diagnostics,
+            vec!["Codex CLI emitted an item error event"]
+        );
     }
 
     #[test]
