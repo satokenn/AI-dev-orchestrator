@@ -7602,10 +7602,15 @@ mod tests {
             .unwrap()
             .with_ci_provider(&provider, Duration::from_millis(1), Duration::from_secs(1))
             .unwrap();
-            service.accept_ci_wait("caller-a", &request).unwrap()
+            let accepted = service.accept_ci_wait("caller-a", &request).unwrap();
+            drop(service);
+            accepted
         };
+        let database_path = fixture.repo.0.join("service-ledger.sqlite");
+        drop(fixture.ledger);
+        let ledger = SqliteExecutionLedger::open(database_path).unwrap();
         let service = OperationService::new(
-            &fixture.ledger,
+            &ledger,
             &fixture.workspace,
             &fixture.providers,
             3,

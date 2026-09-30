@@ -1835,7 +1835,7 @@ if [ "$mode" = 'head_recheck_unavailable' ] && [ "$endpoint" = 'repos/owner/repo
                     number: 42,
                     expected_head_sha: None,
                 },
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(10),
             )
             .unwrap_err();
         assert!(matches!(
