@@ -103,10 +103,10 @@ pub struct HistoricalPerformance {
     target: PerformanceTarget,
     window: PerformanceWindow,
     attempts: u64,
-    provider_call_succeeded: u64,
-    provider_call_failed: u64,
-    provider_call_cancelled: u64,
-    provider_call_pending: u64,
+    provider_call_succeeded: Option<u64>,
+    provider_call_failed: Option<u64>,
+    provider_call_cancelled: Option<u64>,
+    provider_call_pending: Option<u64>,
     validation_passed: Option<u64>,
     validation_failed: Option<u64>,
     validation_observations: Option<u64>,
@@ -157,20 +157,24 @@ impl HistoricalPerformance {
     pub const fn attempts(&self) -> u64 {
         self.attempts
     }
+    /// Returns the observed count, or `None` when legacy semantics cannot establish it.
     #[must_use]
-    pub const fn provider_call_succeeded(&self) -> u64 {
+    pub const fn provider_call_succeeded(&self) -> Option<u64> {
         self.provider_call_succeeded
     }
+    /// Returns the observed count, or `None` when legacy semantics cannot establish it.
     #[must_use]
-    pub const fn provider_call_failed(&self) -> u64 {
+    pub const fn provider_call_failed(&self) -> Option<u64> {
         self.provider_call_failed
     }
+    /// Returns the observed count, or `None` when legacy semantics cannot establish it.
     #[must_use]
-    pub const fn provider_call_cancelled(&self) -> u64 {
+    pub const fn provider_call_cancelled(&self) -> Option<u64> {
         self.provider_call_cancelled
     }
+    /// Returns the observed count, or `None` when legacy semantics cannot establish it.
     #[must_use]
-    pub const fn provider_call_pending(&self) -> u64 {
+    pub const fn provider_call_pending(&self) -> Option<u64> {
         self.provider_call_pending
     }
     #[must_use]
@@ -961,15 +965,20 @@ impl SqliteExecutionLedger {
                         "V2 Validation is Artifact-scoped but the Ledger stores no Artifact identity for it",
                     );
                 }
+                let provider_call_outcomes_available = target.semantics == "provider_call_v2";
                 let validation_available = target.semantics == "legacy_validation_coupled";
                 HistoricalPerformance {
                     target,
                     window,
                     attempts: counts.attempts,
-                    provider_call_succeeded: counts.succeeded,
-                    provider_call_failed: counts.failed,
-                    provider_call_cancelled: counts.cancelled,
-                    provider_call_pending: counts.pending,
+                    provider_call_succeeded: provider_call_outcomes_available
+                        .then_some(counts.succeeded),
+                    provider_call_failed: provider_call_outcomes_available
+                        .then_some(counts.failed),
+                    provider_call_cancelled: provider_call_outcomes_available
+                        .then_some(counts.cancelled),
+                    provider_call_pending: provider_call_outcomes_available
+                        .then_some(counts.pending),
                     validation_passed: validation_available.then_some(counts.validation_passed),
                     validation_failed: validation_available.then_some(counts.validation_failed),
                     validation_observations: validation_available
@@ -1638,7 +1647,10 @@ mod tests {
             .find(|entry| entry.target().observed_model() == Some("observed-a"))
             .unwrap();
         assert_eq!(observed.attempts(), 1);
-        assert_eq!(observed.provider_call_succeeded(), 1);
+        assert_eq!(observed.provider_call_succeeded(), Some(1));
+        assert_eq!(observed.provider_call_failed(), Some(0));
+        assert_eq!(observed.provider_call_cancelled(), Some(0));
+        assert_eq!(observed.provider_call_pending(), Some(0));
         assert_eq!(observed.validation_observations(), None);
         assert_eq!(observed.validation_passed(), None);
         assert_eq!(observed.validation_failed(), None);
@@ -1662,7 +1674,7 @@ mod tests {
             unknown.target().requested_model(),
             &PerformanceRequestedModel::Named("requested-a".into())
         );
-        assert_eq!(unknown.provider_call_failed(), 1);
+        assert_eq!(unknown.provider_call_failed(), Some(1));
         assert!(results.entries().iter().all(|entry| {
             entry
                 .unavailable()
@@ -1675,7 +1687,10 @@ mod tests {
             .unwrap();
         assert_eq!(legacy.window_attempts(), 1);
         let legacy_entry = &legacy.entries()[0];
-        assert_eq!(legacy_entry.provider_call_succeeded(), 0);
+        assert_eq!(legacy_entry.provider_call_succeeded(), None);
+        assert_eq!(legacy_entry.provider_call_failed(), None);
+        assert_eq!(legacy_entry.provider_call_cancelled(), None);
+        assert_eq!(legacy_entry.provider_call_pending(), None);
         assert!(
             legacy_entry
                 .unavailable()

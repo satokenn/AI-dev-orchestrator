@@ -471,9 +471,10 @@ API の実使用量は `actual_usage` に `measured` として、設定予算は
 半開区間 `[starts_at_ms, ends_at_ms)` に入る Attempt を、requested target・observed target・state semantics
 ごとに分けて集計する。モデル性能の帰属先は observed target であり、observed model が記録されていない
 Attempt は unknown bucket に残す。provider-call semantics の成功・失敗・取消・実行中件数を返す。
-ValidationはArtifactに対する事実なので、Artifact identityを持たないV2 groupでは `unavailable` とし、数値を
-返さない。legacy validation-coupled AttemptはValidationをそのAttempt内に保持する既存意味論に限り別groupで
-pass / failを集計し、terminal stateはProvider呼び出し結果として数えない。結果には区間内のAttempt母数と、
+各provider-call countはV2 groupでは観測済みの`0`を含め数値で返し、legacy groupでは`unknown` (`None`) とする。
+legacy validation-coupled AttemptはValidationをそのAttempt内に保持する既存意味論に限り別groupで
+pass / failを集計し、terminal stateはProvider呼び出し結果として数えない。ValidationはArtifactに対する事実
+なので、Artifact identityを持たないV2 groupでは`unavailable`とし、数値を返さない。結果には区間内のAttempt母数と、
 開始時刻がなく区間へ割り当てられない全Attempt数を添える。指定区間の外、または開始時刻不明のAttemptは
 区間内母数へ含めない。
 
