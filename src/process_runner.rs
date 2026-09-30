@@ -84,6 +84,15 @@ impl ProcessRequest {
         self.stdin_bytes = Some(bytes);
         self
     }
+    #[cfg(test)]
+    pub(crate) fn test_inherited_env(
+        mut self,
+        key: impl Into<OsString>,
+        value: impl Into<OsString>,
+    ) -> Self {
+        self.test_inherited_env.push((key.into(), value.into()));
+        self
+    }
 }
 
 /// Captured result of a process that exited or was confirmed stopped.
@@ -167,7 +176,16 @@ impl ProcessRunner {
 
     /// Runs Git without inheriting environment variables that can redirect its repository.
     pub(crate) fn run_git(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
-        self.run_inner(request, CancellationToken::new(), true)
+        self.run_inner(request, CancellationToken::new(), GIT_LOCATION_ENV)
+    }
+
+    /// Runs a command after removing selected inherited environment variables.
+    pub(crate) fn run_with_env_removed(
+        &self,
+        request: ProcessRequest,
+        env_vars: &[&str],
+    ) -> Result<ProcessOutput, ProcessError> {
+        self.run_inner(request, CancellationToken::new(), env_vars)
     }
 
     /// Runs a command, stopping it when cancelled or when its timeout elapses.
@@ -176,14 +194,14 @@ impl ProcessRunner {
         request: ProcessRequest,
         token: CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_inner(request, token, false)
+        self.run_inner(request, token, &[])
     }
 
     fn run_inner(
         &self,
         request: ProcessRequest,
         token: CancellationToken,
-        isolate_git: bool,
+        env_vars_to_remove: &[&str],
     ) -> Result<ProcessOutput, ProcessError> {
         let timeout = request.timeout;
         let stdin_bytes = request.stdin_bytes;
@@ -208,10 +226,8 @@ impl ProcessRunner {
         if let Some(cwd) = request.cwd {
             command.current_dir(cwd);
         }
-        if isolate_git {
-            for key in GIT_LOCATION_ENV {
-                command.env_remove(key);
-            }
+        for key in env_vars_to_remove {
+            command.env_remove(key);
         }
         for (key, value) in request.env {
             command.env(key, value);
@@ -693,6 +709,25 @@ mod tests {
                 .to_string_lossy()
         );
         fs::remove_dir_all(root).expect("remove temporary repositories");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_can_remove_a_selected_inherited_environment_variable() {
+        let mut request = ProcessRequest::new("sh").args([
+            "-c",
+            "if [ \"${GH_REPO+x}${GH_HOST+x}\" = xx ]; then printf 'set'; else printf 'repo:%s host:%s' \"${GH_REPO-unset}\" \"${GH_HOST-unset}\"; fi",
+        ]);
+        request
+            .test_inherited_env
+            .push(("GH_REPO".into(), "wrong/target".into()));
+        request
+            .test_inherited_env
+            .push(("GH_HOST".into(), "wrong.host".into()));
+        let output = ProcessRunner
+            .run_with_env_removed(request, &["GH_REPO", "GH_HOST"])
+            .expect("shell process succeeds");
+        assert_eq!(output.stdout, b"repo:unset host:unset");
     }
 
     #[test]

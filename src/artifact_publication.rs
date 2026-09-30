@@ -279,7 +279,9 @@ impl GitHubArtifactPublicationGateway {
         stdin_bytes: Option<Vec<u8>>,
     ) -> Result<String, PublicationGatewayError> {
         let request = self.gh_request(repository, args, timeout, stdin_bytes);
-        let output = ProcessRunner.run(request).map_err(map_process_error)?;
+        let output = ProcessRunner
+            .run_with_env_removed(request, &["GH_REPO", "GH_HOST"])
+            .map_err(map_process_error)?;
         if output.output_truncated {
             return Err(PublicationGatewayError::InvalidResponse);
         }
@@ -347,11 +349,16 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
         commit_sha: &str,
         timeout: Duration,
     ) -> Result<DraftPullRequest, PublicationGatewayError> {
+        let remote = self.git_output(repository, &["remote", "get-url", "origin"], timeout)?;
+        let remote = github_repository_from_remote_url(&remote)
+            .ok_or(PublicationGatewayError::InvalidResponse)?;
         let listed = self.gh_output(
             repository,
             &[
                 "pr",
                 "list",
+                "--repo",
+                &remote.cli_selector,
                 "--state",
                 "all",
                 "--head",
@@ -376,21 +383,6 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
             return verify_pull_request(existing, payload, commit_sha);
         }
 
-        let repo = self.gh_output(
-            repository,
-            &[
-                "repo",
-                "view",
-                "--json",
-                "nameWithOwner",
-                "--jq",
-                ".nameWithOwner",
-            ],
-            timeout,
-        )?;
-        if !valid_repository_slug(&repo) {
-            return Err(PublicationGatewayError::InvalidResponse);
-        }
         let request_body = json!({
             "base": payload.base_branch(),
             "head": payload.head_branch(),
@@ -400,10 +392,19 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
         });
         let request_body = serde_json::to_vec(&request_body)
             .map_err(|_| PublicationGatewayError::InvalidResponse)?;
-        let endpoint = format!("repos/{repo}/pulls");
+        let endpoint = format!("repos/{}/pulls", remote.api_path);
         let created = self.gh_output_with_stdin(
             repository,
-            &["api", &endpoint, "--method", "POST", "--input", "-"],
+            &[
+                "api",
+                "--hostname",
+                &remote.hostname,
+                &endpoint,
+                "--method",
+                "POST",
+                "--input",
+                "-",
+            ],
             timeout,
             Some(request_body),
         );
@@ -422,11 +423,58 @@ fn map_process_error(error: crate::process_runner::ProcessError) -> PublicationG
     }
 }
 
-fn valid_repository_slug(value: &str) -> bool {
-    let mut components = value.split('/');
-    components.next().is_some_and(valid_repository_component)
-        && components.next().is_some_and(valid_repository_component)
-        && components.next().is_none()
+#[derive(Debug, Eq, PartialEq)]
+struct GitHubRemoteRepository {
+    hostname: String,
+    cli_selector: String,
+    api_path: String,
+}
+
+fn github_repository_from_remote_url(remote: &str) -> Option<GitHubRemoteRepository> {
+    let remote = remote.trim();
+    let (host, path) = if let Some((scheme, remainder)) = remote.split_once("://") {
+        if !matches!(scheme, "https" | "http" | "ssh" | "git") {
+            return None;
+        }
+        let (authority, path) = remainder.split_once('/')?;
+        (authority.rsplit('@').next()?, path)
+    } else {
+        let (authority, path) = remote.rsplit_once(':')?;
+        if path.starts_with('/') || !authority.contains('@') {
+            return None;
+        }
+        (authority.rsplit('@').next()?, path)
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return None;
+    }
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut components = path.split('/');
+    let owner = components.next()?;
+    let name = components.next()?;
+    if components.next().is_some()
+        || !valid_repository_component(owner)
+        || !valid_repository_component(name)
+    {
+        return None;
+    }
+    let api_path = format!("{owner}/{name}");
+    let host = host.to_ascii_lowercase();
+    let cli_selector = if host == "github.com" {
+        api_path.clone()
+    } else {
+        format!("{host}/{api_path}")
+    };
+    Some(GitHubRemoteRepository {
+        hostname: host,
+        cli_selector,
+        api_path,
+    })
 }
 
 fn valid_repository_component(value: &str) -> bool {
@@ -537,6 +585,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn origin_remote_is_normalized_to_explicit_github_repository_selectors() {
+        for remote in [
+            "https://github.com/example/project.git",
+            "git@github.com:example/project.git",
+            "ssh://git@github.com/example/project.git",
+        ] {
+            assert_eq!(
+                github_repository_from_remote_url(remote),
+                Some(GitHubRemoteRepository {
+                    hostname: "github.com".into(),
+                    cli_selector: "example/project".into(),
+                    api_path: "example/project".into(),
+                })
+            );
+        }
+        assert_eq!(
+            github_repository_from_remote_url("ssh://git@github.example/example/project.git"),
+            Some(GitHubRemoteRepository {
+                hostname: "github.example".into(),
+                cli_selector: "github.example/example/project".into(),
+                api_path: "example/project".into(),
+            })
+        );
+        assert!(github_repository_from_remote_url("not-a-github-remote").is_none());
+    }
+
+    #[test]
     fn api_pull_request_response_requires_exact_draft_identity() {
         let response = r#"{
             "number": 42,
@@ -584,6 +659,8 @@ mod tests {
         let body = b"private title and body".to_vec();
         let args = [
             "api",
+            "--hostname",
+            "github.com",
             "repos/example/project/pulls",
             "--method",
             "POST",
@@ -605,20 +682,23 @@ mod tests {
         assert_eq!(request.stdin_bytes.as_deref(), Some(body.as_slice()));
         assert!(!request_args.join(" ").contains("private title and body"));
 
+        let fixture = ProcessRequest::new("sh")
+            .args([
+                "-c",
+                "printf 'repo=%s host=%s argv=%s\n' \"${GH_REPO-unset}\" \"${GH_HOST-unset}\" \"$*\"; count=$(wc -c | tr -d ' '); printf 'stdin-bytes=%s\n' \"$count\"",
+                "fake-gh",
+            ])
+            .args(request.args.clone())
+            .stdin_bytes(body.clone())
+            .timeout(Duration::from_secs(2))
+            .test_inherited_env("GH_REPO", "wrong/target")
+            .test_inherited_env("GH_HOST", "wrong.host");
         let result = ProcessRunner
-            .run(
-                ProcessRequest::new("sh")
-                    .args([
-                        "-c",
-                        "printf 'argv=%s\\n' \"$*\"; count=$(wc -c | tr -d ' '); printf 'stdin-bytes=%s\\n' \"$count\"",
-                        "fake-gh",
-                    ])
-                    .args(request.args)
-                    .stdin_bytes(body.clone())
-                    .timeout(Duration::from_secs(2)),
-            )
+            .run_with_env_removed(fixture, &["GH_REPO", "GH_HOST"])
             .expect("shell fixture consumes stdin");
         let result = String::from_utf8(result.stdout).expect("fixture output is UTF-8");
+        assert!(result.contains("repo=unset host=unset"));
+        assert!(result.contains("--hostname github.com repos/example/project/pulls"));
         assert!(result.contains("--input -"));
         assert!(
             result.contains(&format!("stdin-bytes={}", body.len())),
