@@ -4,7 +4,10 @@
 //! It does not select a target or expose Provider output and raw diagnostics.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -1463,6 +1466,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let artifact = artifacts
             .verify_input(&request.task_id, &request.artifact_id)
             .map_err(ServiceError::from)?;
+        if repository_has_replace_refs(artifact.repository_root(), self.default_timeout) {
+            return Err(ServiceError::PolicyDenied(
+                "Git replace refs make Artifact scanning ambiguous",
+            ));
+        }
         if artifact.tree_oid() != permit.tree_oid()
             || artifact.base_commit() != permit.base_commit()
         {
@@ -1596,6 +1604,18 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 return Err(ServiceError::from(error));
             }
         };
+        if repository_has_replace_refs(artifact.repository_root(), self.default_timeout) {
+            self.finish_publication(
+                &acceptance.operation_id,
+                ServiceOperationStatus::Failed,
+                "publication_replace_refs_present",
+                None,
+                None,
+            )?;
+            return Err(ServiceError::PolicyDenied(
+                "Git replace refs make Artifact scanning ambiguous",
+            ));
+        }
         let artifact_scan =
             match scanner.scan_artifact_tree(artifact.repository_root(), artifact.tree_oid()) {
                 Ok(result) => result,
@@ -2516,6 +2536,31 @@ fn valid_git_branch(branch: &str) -> bool {
             .any(|byte| byte <= b' ' || byte == 0x7f || b"~^:?*[\\".contains(&byte))
 }
 
+fn repository_has_replace_refs(repository: &Path, timeout: Duration) -> bool {
+    let output = crate::process_runner::ProcessRunner.run_with_env_removed(
+        crate::process_runner::ProcessRequest::new("git")
+            .arg("-C")
+            .arg(repository.as_os_str().to_owned())
+            .args(["for-each-ref", "--format=%(refname)", "refs/replace"])
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .timeout(timeout),
+        &[
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+        ],
+    );
+    match output {
+        Ok(output) if !output.output_truncated && output.status.success() => {
+            !output.stdout.is_empty()
+        }
+        _ => true,
+    }
+}
+
 fn valid_git_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -2618,6 +2663,19 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn publication_preflight_rejects_git_replace_refs() {
+        let repo = Repo::new();
+        let tree = git(&repo.0, &["rev-parse", "HEAD^{tree}"]);
+        let replacement = git(&repo.0, &["mktree"]);
+        git(
+            &repo.0,
+            &["update-ref", &format!("refs/replace/{tree}"), &replacement],
+        );
+
+        assert!(repository_has_replace_refs(&repo.0, Duration::from_secs(1)));
     }
 
     fn cleanup_fixture_worktree(
@@ -4614,6 +4672,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
+    fn publication_rejects_replace_refs_before_secret_scan_or_ledger_write() {
+        let fixture = artifact_publication_fixture();
+        let artifact_tree: String = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT tree_oid FROM service_artifacts WHERE id=?1",
+                params![fixture.artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let replacement_tree = git(&fixture.repo.0, &["mktree"]);
+        git(
+            &fixture.repo.0,
+            &[
+                "update-ref",
+                &format!("refs/replace/{artifact_tree}"),
+                &replacement_tree,
+            ],
+        );
+
+        let scanner_events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: scanner_events.clone(),
+        };
+        let gateway_events = Arc::new(Mutex::new(Vec::new()));
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: gateway_events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+
+        assert!(matches!(
+            service.publish_artifact(&publication_request(&fixture, "replace-ref-blocked")),
+            Err(ServiceError::PolicyDenied(
+                "Git replace refs make Artifact scanning ambiguous"
+            ))
+        ));
+        let operation_count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_artifact_publication_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation_count, 0);
+        assert!(scanner_events.lock().unwrap().is_empty());
+        assert!(gateway_events.lock().unwrap().is_empty());
         cleanup_fixture_worktree(
             &fixture.repo,
             &fixture.workspace,
