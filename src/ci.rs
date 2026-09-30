@@ -440,6 +440,7 @@ pub trait CiProvider {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CiProviderError {
     Unavailable(String),
+    HeadChanged { expected: String, actual: String },
     InvalidResponse(String),
 }
 
@@ -447,6 +448,12 @@ impl fmt::Display for CiProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable(message) => write!(f, "CI observation unavailable: {message}"),
+            Self::HeadChanged { expected, actual } => {
+                write!(
+                    f,
+                    "PR head changed from {expected} to {actual} while CI checks were collected"
+                )
+            }
             Self::InvalidResponse(message) => write!(f, "invalid GitHub CI response: {message}"),
         }
     }
@@ -762,6 +769,21 @@ impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
                         last_observation_id,
                     });
                 }
+                Err(CiError::Provider(CiProviderError::HeadChanged { expected, actual })) => {
+                    if let Some(observation) = last {
+                        return Err(CiError::HeadChanged {
+                            expected,
+                            actual,
+                            last_observation_id: observation.id,
+                        });
+                    }
+                    return Err(CiError::Unavailable {
+                        reason: format!(
+                            "PR head changed from {expected} to {actual} during CI observation"
+                        ),
+                        last_observation_id: None,
+                    });
+                }
                 Err(error) => return Err(error),
             };
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -781,29 +803,21 @@ impl<'a, P: CiProvider + ?Sized> CiRuntime<'a, P> {
             } else {
                 pinned_sha = Some(observation.target.head_sha.clone());
             }
-            // `observe_until` persists before returning. A provider can finish
-            // its poll after our wait deadline, so do not report a late
-            // terminal result as if it arrived within the requested window.
-            if Instant::now() >= deadline {
-                return Err(CiError::Timeout {
-                    last_observation_id: Some(observation.id),
-                });
-            }
             let terminal = matches!(
                 observation.state,
                 CiAggregateState::Passed | CiAggregateState::Failed
             );
             let observation_id = observation.id.clone();
-            if terminal {
-                return Ok(observation);
-            }
-            last = Some(observation);
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(CiError::Timeout {
                     last_observation_id: Some(observation_id),
                 });
             }
+            if terminal {
+                return Ok(observation);
+            }
+            last = Some(observation);
             let sleep_for = self.poll_interval.min(remaining);
             let sleep_deadline = Instant::now() + sleep_for;
             while Instant::now() < sleep_deadline {
@@ -990,6 +1004,23 @@ impl Default for GhCiProvider {
         Self::new()
     }
 }
+fn pull_request_head_sha(value: &Value) -> Result<String, CiProviderError> {
+    let pr = page_values(value)
+        .first()
+        .copied()
+        .ok_or_else(|| CiProviderError::InvalidResponse("PR response was empty".into()))?;
+    let sha = pr
+        .pointer("/head/sha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CiProviderError::InvalidResponse("PR response omitted head SHA".into()))?;
+    if !valid_sha(sha) {
+        return Err(CiProviderError::InvalidResponse(
+            "PR response contained an invalid head SHA".into(),
+        ));
+    }
+    Ok(sha.to_owned())
+}
+
 impl GhCiProvider {
     pub fn new() -> Self {
         Self {
@@ -1096,6 +1127,18 @@ impl CiProvider for GhCiProvider {
                 }
                 Err(_) => false,
             };
+        if let Some(number) = pr_number {
+            let current_pr = remaining_timeout(deadline).and_then(|remaining| {
+                self.api_json(&format!("repos/{repository}/pulls/{number}"), remaining)
+            })?;
+            let current_sha = pull_request_head_sha(&current_pr)?;
+            if current_sha != sha {
+                return Err(CiProviderError::HeadChanged {
+                    expected: sha,
+                    actual: current_sha,
+                });
+            }
+        }
         Ok(CiProviderSnapshot {
             target: CiTarget {
                 repository,
@@ -1464,6 +1507,80 @@ mod tests {
     use crate::{Task, TaskRole};
     use std::{collections::VecDeque, sync::Mutex};
 
+    #[cfg(unix)]
+    struct FakeGh {
+        directory: std::path::PathBuf,
+        executable: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeGh {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_gh(mode: &str) -> FakeGh {
+        use std::os::unix::fs::PermissionsExt;
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "ci-fake-gh-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let executable = directory.join("gh");
+        let counter = directory.join("pr-query-count");
+        let script = r#"#!/bin/sh
+mode='__MODE__'
+counter='__COUNTER__'
+for arg in "$@"; do endpoint=$arg; done
+case "$endpoint" in
+  repos/owner/repo/pulls/42)
+    sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    if [ "$mode" = 'head_change' ] || [ "$mode" = 'head_recheck_unavailable' ]; then
+      count=0
+      if [ -f "$counter" ]; then count=$(cat "$counter"); fi
+      count=$((count + 1))
+      printf '%s' "$count" > "$counter"
+      if [ "$count" -gt 1 ] && [ "$mode" = 'head_change' ]; then sha='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; fi
+    fi
+    printf '%s' '[{"head":{"sha":"'"$sha"'"},"base":{"ref":"main"}}]'
+    ;;
+  repos/owner/repo/branches/main/protection)
+    if [ "$mode" = 'required_unknown' ]; then
+      printf '%s\r\n' 'HTTP/1.1 404 Not Found' 'Content-Type: application/json' ''
+    else
+      printf '%s\r\n' 'HTTP/1.1 200 OK' 'Content-Type: application/json' '' '{"required_status_checks":null}'
+    fi
+    ;;
+  *rules/branches/main*)
+    printf '%s' '[[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"build","integration_id":7}]}}]]'
+    ;;
+  *check-runs*)
+    if [ "$mode" = 'failure' ]; then conclusion='failure'; status='completed'; else conclusion='success'; status='completed'; fi
+    printf '%s' '[{"check_runs":[{"name":"build","status":"'"$status"'","conclusion":"'"$conclusion"'","app":{"id":7}}]}]'
+    ;;
+  *statuses*) printf '%s' '[[]]' ;;
+  *) printf '%s\n' "unexpected fake gh endpoint: $endpoint" >&2; exit 2 ;;
+esac
+if [ "$mode" = 'unavailable' ] && [ "$endpoint" = 'repos/owner/repo/pulls/42' ]; then exit 1; fi
+if [ "$mode" = 'head_recheck_unavailable' ] && [ "$endpoint" = 'repos/owner/repo/pulls/42' ] && [ "$(cat "$counter")" -gt 1 ]; then exit 1; fi
+"#
+        .replace("__MODE__", mode)
+        .replace("__COUNTER__", &counter.display().to_string());
+        std::fs::write(&executable, script).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        FakeGh {
+            directory,
+            executable,
+        }
+    }
+
     fn save_task(ledger: &SqliteExecutionLedger, id: &str) -> TaskId {
         let task_id = TaskId::new(id);
         ledger
@@ -1481,7 +1598,7 @@ mod tests {
         fallback: CiProviderSnapshot,
         queries: Mutex<Vec<CiQueryTarget>>,
         unavailable_delay: Duration,
-        success_delay: Duration,
+        terminal_delay: Duration,
     }
 
     impl FakeProvider {
@@ -1493,17 +1610,7 @@ mod tests {
                 fallback,
                 queries: Mutex::new(Vec::new()),
                 unavailable_delay: Duration::ZERO,
-                success_delay: Duration::ZERO,
-            }
-        }
-
-        fn success_after_with_delay(snapshot: CiProviderSnapshot, delay: Duration) -> Self {
-            Self {
-                responses: Mutex::new(VecDeque::from([Ok(snapshot.clone())])),
-                fallback: snapshot,
-                queries: Mutex::new(Vec::new()),
-                unavailable_delay: Duration::ZERO,
-                success_delay: delay,
+                terminal_delay: Duration::ZERO,
             }
         }
 
@@ -1521,7 +1628,21 @@ mod tests {
                 fallback: first,
                 queries: Mutex::new(Vec::new()),
                 unavailable_delay: delay,
-                success_delay: Duration::ZERO,
+                terminal_delay: Duration::ZERO,
+            }
+        }
+
+        fn terminal_after_with_delay(
+            first: CiProviderSnapshot,
+            terminal: CiProviderSnapshot,
+            delay: Duration,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from([Ok(first), Ok(terminal.clone())])),
+                fallback: terminal,
+                queries: Mutex::new(Vec::new()),
+                unavailable_delay: Duration::ZERO,
+                terminal_delay: delay,
             }
         }
     }
@@ -1532,7 +1653,11 @@ mod tests {
             target: &CiQueryTarget,
             _: Duration,
         ) -> Result<CiProviderSnapshot, CiProviderError> {
-            self.queries.lock().unwrap().push(target.clone());
+            let query_count = {
+                let mut queries = self.queries.lock().unwrap();
+                queries.push(target.clone());
+                queries.len()
+            };
             let response = self
                 .responses
                 .lock()
@@ -1541,8 +1666,9 @@ mod tests {
                 .unwrap_or_else(|| Ok(self.fallback.clone()));
             if response.is_err() && !self.unavailable_delay.is_zero() {
                 thread::sleep(self.unavailable_delay);
-            } else if response.is_ok() && !self.success_delay.is_zero() {
-                thread::sleep(self.success_delay);
+            }
+            if response.is_ok() && query_count > 1 && !self.terminal_delay.is_zero() {
+                thread::sleep(self.terminal_delay);
             }
             response
         }
@@ -1567,6 +1693,209 @@ mod tests {
             commit_statuses_available: true,
             observed_at_ms: 123,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_adapter_fake_executable_covers_success_failure_unknown_and_unavailable() {
+        let target = CiQueryTarget::PullRequest {
+            repository: "owner/repo".into(),
+            number: 42,
+            expected_head_sha: None,
+        };
+
+        for (mode, expected_state) in [
+            ("success", CiAggregateState::Passed),
+            ("failure", CiAggregateState::Failed),
+            ("required_unknown", CiAggregateState::Unknown),
+        ] {
+            let fake = fake_gh(mode);
+            let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+            let provider = GhCiProvider::with_executable(&fake.executable);
+            let runtime = CiRuntime::new(
+                &ledger,
+                &provider,
+                Duration::from_millis(1),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            let observation = runtime.observe(None, &target).unwrap();
+            assert_eq!(observation.state(), expected_state, "fixture mode {mode}");
+            if mode == "required_unknown" {
+                assert_eq!(
+                    observation.required_checks().state(),
+                    RequiredCheckSetState::Unknown
+                );
+            } else {
+                assert_eq!(
+                    observation.required_checks().state(),
+                    RequiredCheckSetState::Known
+                );
+            }
+        }
+
+        let fake = fake_gh("unavailable");
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let provider = GhCiProvider::with_executable(&fake.executable);
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(matches!(
+            runtime.observe(None, &target),
+            Err(CiError::Provider(CiProviderError::Unavailable(_)))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_adapter_does_not_persist_checks_when_pr_head_changes_during_collection() {
+        let fake = fake_gh("head_change");
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let provider = GhCiProvider::with_executable(&fake.executable);
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let target = CiQueryTarget::PullRequest {
+            repository: "owner/repo".into(),
+            number: 42,
+            expected_head_sha: None,
+        };
+
+        assert!(matches!(
+            runtime.observe(None, &target),
+            Err(CiError::Provider(CiProviderError::HeadChanged { expected, actual }))
+                if expected == "a".repeat(40) && actual == "b".repeat(40)
+        ));
+        let count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM ci_observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_adapter_does_not_persist_checks_when_pr_head_recheck_is_unavailable() {
+        let fake = fake_gh("head_recheck_unavailable");
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let provider = GhCiProvider::with_executable(&fake.executable);
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let target = CiQueryTarget::PullRequest {
+            repository: "owner/repo".into(),
+            number: 42,
+            expected_head_sha: None,
+        };
+
+        assert!(matches!(
+            runtime.observe(None, &target),
+            Err(CiError::Provider(CiProviderError::Unavailable(_)))
+        ));
+        let count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM ci_observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_adapter_wait_does_not_return_stale_success_after_head_changes_during_collection() {
+        let fake = fake_gh("head_change");
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = save_task(&ledger, "ci-gh-head-change-task");
+        let provider = GhCiProvider::with_executable(&fake.executable);
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(1),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let error = runtime
+            .wait(
+                &task_id,
+                &CiQueryTarget::PullRequest {
+                    repository: "owner/repo".into(),
+                    number: 42,
+                    expected_head_sha: None,
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CiError::Unavailable { reason, last_observation_id: None }
+                if reason.contains("head changed")
+        ));
+        let count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM ci_observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn wait_preserves_confirmed_head_change_after_prior_observation() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = save_task(&ledger, "ci-gh-head-change-after-observation-task");
+        let provider = FakeProvider::unavailable_after(
+            snapshot(&"a".repeat(40), CiCheckDetailState::Pending),
+            CiProviderError::HeadChanged {
+                expected: "a".repeat(40),
+                actual: "b".repeat(40),
+            },
+        );
+        let runtime = CiRuntime::new(
+            &ledger,
+            &provider,
+            Duration::from_millis(10),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let error = runtime
+            .wait(
+                &task_id,
+                &CiQueryTarget::PullRequest {
+                    repository: "owner/repo".into(),
+                    number: 4,
+                    expected_head_sha: None,
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+        let CiError::HeadChanged {
+            expected,
+            actual,
+            last_observation_id,
+        } = error
+        else {
+            panic!("expected confirmed head change, got {error:?}");
+        };
+        assert_eq!(expected, "a".repeat(40));
+        assert_eq!(actual, "b".repeat(40));
+        let last = ledger
+            .get_ci_observation(&last_observation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.target().head_sha(), "a".repeat(40));
+        assert_eq!(last.state(), CiAggregateState::Pending);
     }
 
     #[test]
@@ -1870,10 +2199,11 @@ mod tests {
     }
 
     #[test]
-    fn wait_returns_timeout_when_terminal_observation_is_persisted_after_deadline() {
+    fn wait_returns_timeout_with_late_terminal_observation_after_deadline() {
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
         let task_id = save_task(&ledger, "ci-timeout-late-terminal-task");
-        let provider = FakeProvider::success_after_with_delay(
+        let provider = FakeProvider::terminal_after_with_delay(
+            snapshot(&"a".repeat(40), CiCheckDetailState::Pending),
             snapshot(&"a".repeat(40), CiCheckDetailState::Passed),
             Duration::from_millis(150),
         );
@@ -1903,6 +2233,7 @@ mod tests {
         };
         let last = ledger.get_ci_observation(&id).unwrap().unwrap();
         assert_eq!(last.task_id(), Some(&task_id));
+        assert_eq!(last.target().head_sha(), "a".repeat(40));
         assert_eq!(last.state(), CiAggregateState::Passed);
     }
 

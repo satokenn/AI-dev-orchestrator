@@ -190,6 +190,7 @@ impl ProcessRunner {
             .spawn_if_not_cancelled(&mut command)
             .map_err(ProcessError::Spawn)?
             .ok_or(ProcessError::CancelledBeforeStart)?;
+        drop(command);
         let started = Instant::now();
         let stdout = Arc::new(Mutex::new(CapturedBytes::default()));
         let stderr = Arc::new(Mutex::new(CapturedBytes::default()));
@@ -221,7 +222,7 @@ impl ProcessRunner {
             let stdin_finished = if let Some(writer) = stdin_writer.as_mut() {
                 if let Err(error) = writer.write_available(&token) {
                     stdin_error = Some(error);
-                    true
+                    break Some(StopReason::PipeHeld);
                 } else {
                     writer.is_complete()
                 }
@@ -305,10 +306,8 @@ impl ProcessRunner {
             });
         }
         #[cfg(unix)]
-        if reason.is_none() {
-            if let Some(error) = stdin_error {
-                return Err(ProcessError::Stdin(error));
-            }
+        if let Some(error) = stdin_error {
+            return Err(ProcessError::Stdin(error));
         }
         match reason {
             Some(StopReason::Cancelled) => Err(ProcessError::Cancelled(output)),
@@ -683,6 +682,43 @@ mod tests {
                 .windows(16)
                 .any(|window| window == b"xxxxxxxxxxxxxxxx")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_write_error_stops_child_before_returning_stdin_error() {
+        let marker = std::env::temp_dir().join(format!(
+            "process-runner-stdin-write-error-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script =
+            "import os, time\nos.close(0)\nopen(os.environ['MARKER'], 'w').close()\ntime.sleep(10)";
+        let started = Instant::now();
+        let result = ProcessRunner.run(
+            ProcessRequest::new("python3")
+                .args(["-c", script])
+                .env("MARKER", marker.as_os_str())
+                .stdin_bytes(vec![b'x'; 16 * 1024 * 1024])
+                .timeout(Duration::from_secs(3)),
+        );
+        let marker_created = marker.exists();
+        let _ = std::fs::remove_file(marker);
+
+        assert!(
+            marker_created,
+            "child closed stdin before the test proceeded"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "stdin failure waited for the command timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            result,
+            Err(ProcessError::Stdin(error))
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
     }
 
     #[cfg(unix)]
