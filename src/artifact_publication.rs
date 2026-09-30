@@ -178,6 +178,19 @@ pub trait ArtifactPublicationGateway: Send + Sync {
         timeout: Duration,
     ) -> Result<String, PublicationGatewayError>;
 
+    /// Verifies a commit's raw tree and sole parent headers using the same Git executable
+    /// that created it. Implementations that cannot provide this check fail closed.
+    fn verify_commit_tree_and_base(
+        &self,
+        _repository: &Path,
+        _commit_sha: &str,
+        _tree_oid: &str,
+        _base_commit: &str,
+        _timeout: Duration,
+    ) -> bool {
+        false
+    }
+
     fn push_commit(
         &self,
         repository: &Path,
@@ -262,7 +275,7 @@ impl GitHubArtifactPublicationGateway {
         request
             .args
             .extend(args.iter().map(std::ffi::OsString::from));
-        let output = ProcessRunner.run(request).map_err(map_process_error)?;
+        let output = ProcessRunner.run_git(request).map_err(map_process_error)?;
         if output.output_truncated {
             return Err(PublicationGatewayError::InvalidResponse);
         }
@@ -288,7 +301,9 @@ impl GitHubArtifactPublicationGateway {
         stdin_bytes: Option<Vec<u8>>,
     ) -> Result<String, PublicationGatewayError> {
         let request = self.gh_request(repository, args, timeout, stdin_bytes);
-        let output = ProcessRunner.run(request).map_err(map_process_error)?;
+        let output = ProcessRunner
+            .run_with_env_removed(request, &["GH_REPO", "GH_HOST"])
+            .map_err(map_process_error)?;
         if output.output_truncated {
             return Err(PublicationGatewayError::InvalidResponse);
         }
@@ -333,6 +348,50 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
         )
     }
 
+    fn verify_commit_tree_and_base(
+        &self,
+        repository: &Path,
+        commit_sha: &str,
+        tree_oid: &str,
+        base_commit: &str,
+        timeout: Duration,
+    ) -> bool {
+        if !valid_git_oid(commit_sha) {
+            return false;
+        }
+        let mut request = ProcessRequest::new(self.git_executable.clone())
+            .arg("-C")
+            .arg(repository.as_os_str().to_owned())
+            .args(["cat-file", "commit", commit_sha])
+            .timeout(timeout);
+        request.env.push((
+            std::ffi::OsString::from("GIT_NO_REPLACE_OBJECTS"),
+            std::ffi::OsString::from("1"),
+        ));
+        let output = match ProcessRunner.run_git(request) {
+            Ok(output) if !output.output_truncated => output,
+            _ => return false,
+        };
+        let Ok(text) = String::from_utf8(output.stdout) else {
+            return false;
+        };
+        let Some(headers) = text.split_once("\n\n").map(|(headers, _)| headers) else {
+            return false;
+        };
+        let mut tree = None;
+        let mut parents = Vec::new();
+        for line in headers.lines() {
+            if let Some(value) = line.strip_prefix("tree ") {
+                if tree.replace(value).is_some() {
+                    return false;
+                }
+            } else if let Some(value) = line.strip_prefix("parent ") {
+                parents.push(value);
+            }
+        }
+        tree == Some(tree_oid) && parents.as_slice() == [base_commit]
+    }
+
     fn push_commit(
         &self,
         repository: &Path,
@@ -340,6 +399,18 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
         head_branch: &str,
         timeout: Duration,
     ) -> Result<(), PublicationGatewayError> {
+        // `git push origin` follows pushurl entries, which can target repositories
+        // different from the fetch URL used below to select the Pull Request target.
+        // Resolve and validate every effective push destination before any push effect.
+        let fetch_url = self.git_output(repository, &["remote", "get-url", "origin"], timeout)?;
+        let push_urls = self.git_output(
+            repository,
+            &["remote", "get-url", "--push", "--all", "origin"],
+            timeout,
+        )?;
+        let expected = github_repository_from_remote_url(&fetch_url)
+            .ok_or(PublicationGatewayError::InvalidResponse)?;
+        validate_push_destinations(&expected, &push_urls)?;
         let refspec = format!("{commit_sha}:refs/heads/{head_branch}");
         self.git_output(
             repository,
@@ -356,11 +427,16 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
         commit_sha: &str,
         timeout: Duration,
     ) -> Result<DraftPullRequest, PublicationGatewayError> {
+        let remote = self.git_output(repository, &["remote", "get-url", "origin"], timeout)?;
+        let remote = github_repository_from_remote_url(&remote)
+            .ok_or(PublicationGatewayError::InvalidResponse)?;
         let listed = self.gh_output(
             repository,
             &[
                 "pr",
                 "list",
+                "--repo",
+                &remote.cli_selector,
                 "--state",
                 "all",
                 "--head",
@@ -385,21 +461,6 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
             return verify_pull_request(existing, payload, commit_sha);
         }
 
-        let repo = self.gh_output(
-            repository,
-            &[
-                "repo",
-                "view",
-                "--json",
-                "nameWithOwner",
-                "--jq",
-                ".nameWithOwner",
-            ],
-            timeout,
-        )?;
-        if !valid_repository_slug(&repo) {
-            return Err(PublicationGatewayError::InvalidResponse);
-        }
         let request_body = json!({
             "base": payload.base_branch(),
             "head": payload.head_branch(),
@@ -409,10 +470,19 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
         });
         let request_body = serde_json::to_vec(&request_body)
             .map_err(|_| PublicationGatewayError::InvalidResponse)?;
-        let endpoint = format!("repos/{repo}/pulls");
+        let endpoint = format!("repos/{}/pulls", remote.api_path);
         let created = self.gh_output_with_stdin(
             repository,
-            &["api", &endpoint, "--method", "POST", "--input", "-"],
+            &[
+                "api",
+                "--hostname",
+                &remote.hostname,
+                &endpoint,
+                "--method",
+                "POST",
+                "--input",
+                "-",
+            ],
             timeout,
             Some(request_body),
         );
@@ -424,6 +494,27 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
     }
 }
 
+fn validate_push_destinations(
+    expected: &GitHubRemoteRepository,
+    push_urls: &str,
+) -> Result<(), PublicationGatewayError> {
+    let mut destinations = push_urls
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = destinations
+        .next()
+        .ok_or(PublicationGatewayError::InvalidResponse)?;
+    for destination in std::iter::once(first).chain(destinations) {
+        let parsed = github_repository_from_remote_url(destination)
+            .ok_or(PublicationGatewayError::InvalidResponse)?;
+        if parsed != *expected {
+            return Err(PublicationGatewayError::InvalidResponse);
+        }
+    }
+    Ok(())
+}
+
 fn map_process_error(error: crate::process_runner::ProcessError) -> PublicationGatewayError {
     match error {
         crate::process_runner::ProcessError::Spawn(_) => PublicationGatewayError::Spawn,
@@ -431,11 +522,62 @@ fn map_process_error(error: crate::process_runner::ProcessError) -> PublicationG
     }
 }
 
-fn valid_repository_slug(value: &str) -> bool {
-    let mut components = value.split('/');
-    components.next().is_some_and(valid_repository_component)
-        && components.next().is_some_and(valid_repository_component)
-        && components.next().is_none()
+fn valid_git_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct GitHubRemoteRepository {
+    hostname: String,
+    cli_selector: String,
+    api_path: String,
+}
+
+fn github_repository_from_remote_url(remote: &str) -> Option<GitHubRemoteRepository> {
+    let remote = remote.trim();
+    let (host, path) = if let Some((scheme, remainder)) = remote.split_once("://") {
+        if !matches!(scheme, "https" | "ssh") {
+            return None;
+        }
+        let (authority, path) = remainder.split_once('/')?;
+        (authority.rsplit('@').next()?, path)
+    } else {
+        let (authority, path) = remote.rsplit_once(':')?;
+        if path.starts_with('/') || !authority.contains('@') {
+            return None;
+        }
+        (authority.rsplit('@').next()?, path)
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return None;
+    }
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut components = path.split('/');
+    let owner = components.next()?;
+    let name = components.next()?;
+    if components.next().is_some()
+        || !valid_repository_component(owner)
+        || !valid_repository_component(name)
+    {
+        return None;
+    }
+    let api_path = format!("{owner}/{name}");
+    let host = host.to_ascii_lowercase();
+    let cli_selector = if host == "github.com" {
+        api_path.clone()
+    } else {
+        format!("{host}/{api_path}")
+    };
+    Some(GitHubRemoteRepository {
+        hostname: host,
+        cli_selector,
+        api_path,
+    })
 }
 
 fn valid_repository_component(value: &str) -> bool {
@@ -546,6 +688,176 @@ mod tests {
     use super::*;
 
     #[test]
+    fn origin_remote_is_normalized_to_explicit_github_repository_selectors() {
+        for remote in [
+            "https://github.com/example/project.git",
+            "git@github.com:example/project.git",
+            "ssh://git@github.com/example/project.git",
+        ] {
+            assert_eq!(
+                github_repository_from_remote_url(remote),
+                Some(GitHubRemoteRepository {
+                    hostname: "github.com".into(),
+                    cli_selector: "example/project".into(),
+                    api_path: "example/project".into(),
+                })
+            );
+        }
+        assert_eq!(
+            github_repository_from_remote_url("ssh://git@github.example/example/project.git"),
+            Some(GitHubRemoteRepository {
+                hostname: "github.example".into(),
+                cli_selector: "github.example/example/project".into(),
+                api_path: "example/project".into(),
+            })
+        );
+        assert!(github_repository_from_remote_url("not-a-github-remote").is_none());
+        assert!(
+            github_repository_from_remote_url("http://github.com/example/project.git").is_none()
+        );
+        assert!(
+            github_repository_from_remote_url("git://github.com/example/project.git").is_none()
+        );
+    }
+
+    #[test]
+    fn push_destinations_must_match_origin_repository() {
+        let expected = github_repository_from_remote_url("https://github.com/example/project.git")
+            .expect("valid origin URL");
+
+        // With no configured pushurl, Git reports the fetch URL as the effective destination.
+        validate_push_destinations(&expected, "https://github.com/example/project.git\n")
+            .expect("unset pushurl falls back to origin");
+        validate_push_destinations(&expected, "git@github.com:example/project.git\n")
+            .expect("equivalent SSH URL targets same repository");
+        validate_push_destinations(
+            &expected,
+            "https://github.com/example/project.git\ngit@github.com:example/project.git\n",
+        )
+        .expect("all configured pushurls target same repository");
+        assert_eq!(
+            validate_push_destinations(&expected, "https://github.com/other/project.git\n"),
+            Err(PublicationGatewayError::InvalidResponse)
+        );
+        assert_eq!(
+            validate_push_destinations(
+                &expected,
+                "https://github.com/example/project.git\nhttps://github.com/other/project.git\n",
+            ),
+            Err(PublicationGatewayError::InvalidResponse)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mismatched_pushurl_is_rejected_before_git_push_is_invoked() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "artifact-pushurl-gateway-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fake repository directory");
+        let repository = root.join("repository");
+        std::fs::create_dir(&repository).expect("create repository");
+        let invocations = root.join("invocations");
+        let fake_git = root.join("git");
+        std::fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$3:$5\" >> '{}'\ncase \"$3:$5\" in\n  remote:origin) printf '%s\\n' 'https://github.com/example/project.git' ;;\n  remote:--push) printf '%s\\n' 'https://github.com/other/project.git' ;;\n  push:*) printf '%s\\n' 'push' >> '{}' ;;\n  *) exit 90 ;;\nesac\n",
+                invocations.display(),
+                invocations.display(),
+            ),
+        )
+        .expect("write fake git executable");
+        let mut permissions = std::fs::metadata(&fake_git)
+            .expect("stat fake git executable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_git, permissions).expect("make fake git executable");
+
+        let gateway = GitHubArtifactPublicationGateway::with_executables(&fake_git, "gh");
+        assert_eq!(
+            gateway.push_commit(
+                &repository,
+                "0123456789012345678901234567890123456789",
+                "feature",
+                Duration::from_secs(2),
+            ),
+            Err(PublicationGatewayError::InvalidResponse)
+        );
+        let calls = std::fs::read_to_string(&invocations).expect("read fake git invocations");
+        assert!(calls.contains("remote:origin"));
+        assert!(calls.contains("remote:--push"));
+        assert!(
+            !calls.lines().any(|call| call.starts_with("push:")),
+            "git push must not be invoked: {calls}"
+        );
+        std::fs::remove_dir_all(root).expect("remove fake repository");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_verification_uses_configured_git_and_raw_headers_without_replacements() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "artifact-commit-verify-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fake repository directory");
+        let repository = root.join("repository");
+        std::fs::create_dir(&repository).expect("create repository");
+        let invocations = root.join("invocations");
+        let fake_git = root.join("custom-git");
+        let tree_oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let base_commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let commit_sha = "cccccccccccccccccccccccccccccccccccccccc";
+        std::fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\nprintf '%s:%s:%s:%s\\n' \"${{GIT_NO_REPLACE_OBJECTS-unset}}\" \"$3\" \"$4\" \"$5\" > '{}'\nprintf '%s\\n' 'tree {tree_oid}' 'parent {base_commit}' 'author Test <test@example.invalid> 0 +0000' '' 'message'\n",
+                invocations.display(),
+            ),
+        )
+        .expect("write custom git executable");
+        let mut permissions = std::fs::metadata(&fake_git)
+            .expect("stat custom git executable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_git, permissions).expect("make custom git executable");
+
+        let gateway = GitHubArtifactPublicationGateway::with_executables(&fake_git, "gh");
+        assert!(gateway.verify_commit_tree_and_base(
+            &repository,
+            commit_sha,
+            tree_oid,
+            base_commit,
+            Duration::from_secs(2),
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&invocations).expect("read custom git invocation"),
+            format!("1:cat-file:commit:{commit_sha}\n")
+        );
+        std::fs::remove_dir_all(root).expect("remove fake repository");
+    }
+
+    #[test]
     fn api_pull_request_response_requires_exact_draft_identity() {
         let response = r#"{
             "number": 42,
@@ -593,6 +905,8 @@ mod tests {
         let body = b"private title and body".to_vec();
         let args = [
             "api",
+            "--hostname",
+            "github.com",
             "repos/example/project/pulls",
             "--method",
             "POST",
@@ -614,20 +928,23 @@ mod tests {
         assert_eq!(request.stdin_bytes.as_deref(), Some(body.as_slice()));
         assert!(!request_args.join(" ").contains("private title and body"));
 
+        let fixture = ProcessRequest::new("sh")
+            .args([
+                "-c",
+                "printf 'repo=%s host=%s argv=%s\n' \"${GH_REPO-unset}\" \"${GH_HOST-unset}\" \"$*\"; count=$(wc -c | tr -d ' '); printf 'stdin-bytes=%s\n' \"$count\"",
+                "fake-gh",
+            ])
+            .args(request.args.clone())
+            .stdin_bytes(body.clone())
+            .timeout(Duration::from_secs(2))
+            .test_inherited_env("GH_REPO", "wrong/target")
+            .test_inherited_env("GH_HOST", "wrong.host");
         let result = ProcessRunner
-            .run(
-                ProcessRequest::new("sh")
-                    .args([
-                        "-c",
-                        "printf 'argv=%s\\n' \"$*\"; count=$(wc -c | tr -d ' '); printf 'stdin-bytes=%s\\n' \"$count\"",
-                        "fake-gh",
-                    ])
-                    .args(request.args)
-                    .stdin_bytes(body.clone())
-                    .timeout(Duration::from_secs(2)),
-            )
+            .run_with_env_removed(fixture, &["GH_REPO", "GH_HOST"])
             .expect("shell fixture consumes stdin");
         let result = String::from_utf8(result.stdout).expect("fixture output is UTF-8");
+        assert!(result.contains("repo=unset host=unset"));
+        assert!(result.contains("--hostname github.com repos/example/project/pulls"));
         assert!(result.contains("--input -"));
         assert!(
             result.contains(&format!("stdin-bytes={}", body.len())),
