@@ -56,7 +56,8 @@ pub use operation_service::{
     ArtifactInput, ArtifactPublicationAcceptance, ArtifactPublicationPhase,
     ArtifactPublicationRequest, ArtifactPublicationSnapshot, AttemptInput, AttemptRunRequest,
     BaseInput, OperationAcceptance, OperationService, OperationSnapshot, ServiceError,
-    ServiceOperationStatus,
+    ServiceOperationStatus, TaskCreateRequest, TaskCreationResult, TaskIssueSnapshot,
+    TaskRequestSnapshot, TaskSource,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,

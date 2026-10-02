@@ -32,6 +32,149 @@ use crate::{
     },
 };
 
+/// Origin recorded in the immutable request snapshot for a newly created Task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskSource {
+    Issue,
+    Manual,
+}
+
+impl TaskSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+/// Issue details captured by the caller at task creation time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskIssueSnapshot {
+    pub url: String,
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+}
+
+/// Input to the service-side `task.create` operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskCreateRequest {
+    request_id: String,
+    source: TaskSource,
+    title: String,
+    description: String,
+    constraints: Vec<String>,
+    issue: Option<TaskIssueSnapshot>,
+}
+
+impl TaskCreateRequest {
+    #[must_use]
+    pub fn new(
+        request_id: impl Into<String>,
+        source: TaskSource,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        constraints: Vec<String>,
+        issue: Option<TaskIssueSnapshot>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            source,
+            title: title.into(),
+            description: description.into(),
+            constraints,
+            issue,
+        }
+    }
+}
+
+/// The immutable request portion returned in a task.create snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskRequestSnapshot {
+    source: TaskSource,
+    title: String,
+    description: String,
+    constraints: Vec<String>,
+    issue: Option<TaskIssueSnapshot>,
+}
+
+impl TaskRequestSnapshot {
+    #[must_use]
+    pub const fn source(&self) -> TaskSource {
+        self.source
+    }
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+    #[must_use]
+    pub fn constraints(&self) -> &[String] {
+        &self.constraints
+    }
+    #[must_use]
+    pub const fn issue(&self) -> Option<&TaskIssueSnapshot> {
+        self.issue.as_ref()
+    }
+}
+
+/// Durable result returned by `task.create`, including its original request snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskCreationResult {
+    request_id: String,
+    task_id: TaskId,
+    revision: u64,
+    state: TaskState,
+    request: TaskRequestSnapshot,
+}
+
+impl TaskCreationResult {
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    #[must_use]
+    pub const fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    #[must_use]
+    pub const fn state(&self) -> TaskState {
+        self.state
+    }
+    #[must_use]
+    pub const fn source(&self) -> TaskSource {
+        self.request.source
+    }
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.request.title
+    }
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.request.description
+    }
+    #[must_use]
+    pub fn constraints(&self) -> &[String] {
+        &self.request.constraints
+    }
+    #[must_use]
+    pub const fn issue(&self) -> Option<&TaskIssueSnapshot> {
+        self.request.issue.as_ref()
+    }
+    #[must_use]
+    pub const fn request(&self) -> &TaskRequestSnapshot {
+        &self.request
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaseInput {
     repository: PathBuf,
@@ -597,6 +740,383 @@ impl std::fmt::Display for ServiceError {
 
 impl std::error::Error for ServiceError {}
 
+fn validate_task_create(request: &TaskCreateRequest) -> Result<(), ServiceError> {
+    match (request.source, request.issue.as_ref()) {
+        (TaskSource::Issue, None) => {
+            return Err(ServiceError::InvalidRequest(
+                "issue source requires an issue snapshot",
+            ));
+        }
+        (TaskSource::Manual, Some(_)) => {
+            return Err(ServiceError::InvalidRequest(
+                "manual source must omit the issue snapshot",
+            ));
+        }
+        _ => {}
+    }
+    if let Some(issue) = &request.issue {
+        if !is_absolute_uri(&issue.url) || issue.number == 0 {
+            return Err(ServiceError::InvalidRequest(
+                "issue snapshot has an invalid URI or issue number",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_absolute_uri(value: &str) -> bool {
+    let Some(colon) = value.find(':') else {
+        return false;
+    };
+    let scheme = &value[..colon];
+    if scheme.is_empty()
+        || !scheme.as_bytes()[0].is_ascii_alphabetic()
+        || !scheme
+            .bytes()
+            .skip(1)
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return false;
+    }
+    let rest = &value[colon + 1..];
+    let after_authority = if let Some(authority_and_path) = rest.strip_prefix("//") {
+        let authority_end = authority_and_path
+            .find(['/', '?', '#'])
+            .unwrap_or(authority_and_path.len());
+        if !valid_uri_authority(&authority_and_path[..authority_end]) {
+            return false;
+        }
+        &authority_and_path[authority_end..]
+    } else {
+        rest
+    };
+    let without_fragment = if let Some((head, fragment)) = after_authority.split_once('#') {
+        if !valid_uri_component(fragment, true) {
+            return false;
+        }
+        head
+    } else {
+        after_authority
+    };
+    let (path, query) = without_fragment
+        .split_once('?')
+        .map_or((without_fragment, None), |(path, query)| {
+            (path, Some(query))
+        });
+    if path.contains('#') || path.contains('?') || !valid_uri_component(path, false) {
+        return false;
+    }
+    if let Some(query) = query {
+        if !valid_uri_component(query, true) {
+            return false;
+        }
+    }
+    true
+}
+
+fn valid_uri_authority(authority: &str) -> bool {
+    let host_port = if let Some((userinfo, host)) = authority.rsplit_once('@') {
+        if userinfo.contains('@') || !valid_uri_userinfo(userinfo) {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+    let (host, port) = if let Some(bracketed) = host_port.strip_prefix('[') {
+        let Some(close) = bracketed.find(']') else {
+            return false;
+        };
+        let literal = &bracketed[..close];
+        if !valid_ip_literal(literal) {
+            return false;
+        }
+        let suffix = &bracketed[close + 1..];
+        if suffix.is_empty() {
+            ("", None)
+        } else if let Some(port) = suffix.strip_prefix(':') {
+            ("", Some(port))
+        } else {
+            return false;
+        }
+    } else {
+        if host_port.contains(['[', ']']) {
+            return false;
+        }
+        match host_port.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, Some(port)),
+            Some(_) => return false,
+            None => (host_port, None),
+        }
+    };
+    if !host.is_empty() && !valid_uri_reg_name(host) {
+        return false;
+    }
+    port.is_none_or(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn valid_ip_literal(literal: &str) -> bool {
+    if let Some(ipvfuture) = literal.strip_prefix(['v', 'V']) {
+        let Some((version, address)) = ipvfuture.split_once('.') else {
+            return false;
+        };
+        !version.is_empty()
+            && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && !address.is_empty()
+            && address.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'-' | b'.'
+                            | b'_'
+                            | b'~'
+                            | b'!'
+                            | b'$'
+                            | b'&'
+                            | b'\''
+                            | b'('
+                            | b')'
+                            | b'*'
+                            | b'+'
+                            | b','
+                            | b';'
+                            | b'='
+                            | b':'
+                    )
+            })
+    } else {
+        literal.parse::<std::net::Ipv6Addr>().is_ok()
+    }
+}
+
+fn valid_uri_reg_name(value: &str) -> bool {
+    valid_uri_component(value, false)
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b'%'
+                )
+        })
+}
+
+fn valid_uri_userinfo(value: &str) -> bool {
+    valid_uri_component(value, false)
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b':'
+                        | b'%'
+                )
+        })
+}
+
+fn valid_uri_component(value: &str, allow_question: bool) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        let valid = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b':'
+                    | b'/'
+                    | b'@'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+            )
+            || (allow_question && byte == b'?');
+        if !valid {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn task_request_json(request: &TaskCreateRequest) -> String {
+    let issue = request.issue.as_ref().map(|issue| {
+        serde_json::json!({
+            "url": issue.url, "number": issue.number, "title": issue.title, "body": issue.body
+        })
+    });
+    serde_json::json!({
+        "source": request.source.as_str(), "title": request.title,
+        "description": request.description, "constraints": request.constraints,
+        "issue": issue
+    })
+    .to_string()
+}
+
+const TASK_CREATE_UNSAFE_TEXT: &str = "task.create text cannot be stored safely";
+
+fn ensure_task_create_text_safe(
+    scanner: Option<&dyn SecretScanner>,
+    request_json: &str,
+) -> Result<(), ServiceError> {
+    let scanner = scanner.ok_or(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
+    let value: serde_json::Value =
+        serde_json::from_str(request_json).map_err(|_| ServiceError::InvalidStoredState)?;
+    let mut text_fields = Vec::new();
+    collect_json_text_fields(&value, &mut text_fields);
+    for text in text_fields {
+        ensure_task_create_field_safe(Some(scanner), text)?;
+    }
+    Ok(())
+}
+
+fn collect_json_text_fields<'a>(value: &'a serde_json::Value, text_fields: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(text) => text_fields.push(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_text_fields(value, text_fields);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                text_fields.push(key);
+                collect_json_text_fields(value, text_fields);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn ensure_task_create_field_safe(
+    scanner: Option<&dyn SecretScanner>,
+    text: &str,
+) -> Result<(), ServiceError> {
+    let scanner = scanner.ok_or(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
+    let payload = ArtifactPublicationPayload::new("", "", "task.create request text", text);
+    match scanner.scan_publication_payload(&payload) {
+        Ok(SecretScanResult::Clean) => Ok(()),
+        Ok(SecretScanResult::Findings) | Err(_) => {
+            Err(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))
+        }
+    }
+}
+
+fn load_task_creation_result(
+    connection: &rusqlite::Connection,
+    request_id: &str,
+    task_id: &str,
+) -> Result<TaskCreationResult, ServiceError> {
+    let json: String = connection.query_row(
+        "SELECT request_json FROM task_request_snapshots WHERE task_id=?1",
+        params![task_id],
+        |row| row.get(0),
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|_| ServiceError::InvalidStoredState)?;
+    let source = match value["source"].as_str() {
+        Some("issue") => TaskSource::Issue,
+        Some("manual") => TaskSource::Manual,
+        _ => return Err(ServiceError::InvalidStoredState),
+    };
+    let issue = if value["issue"].is_null() {
+        None
+    } else {
+        Some(TaskIssueSnapshot {
+            url: value["issue"]["url"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            number: value["issue"]["number"]
+                .as_u64()
+                .ok_or(ServiceError::InvalidStoredState)?,
+            title: value["issue"]["title"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            body: value["issue"]["body"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+        })
+    };
+    let constraints = value["constraints"]
+        .as_array()
+        .ok_or(ServiceError::InvalidStoredState)?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or(ServiceError::InvalidStoredState)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(TaskCreationResult {
+        request_id: request_id.to_owned(),
+        task_id: TaskId::new(task_id),
+        revision: 0,
+        state: TaskState::Pending,
+        request: TaskRequestSnapshot {
+            source,
+            title: value["title"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            description: value["description"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            constraints,
+            issue,
+        },
+    })
+}
+
 impl From<LedgerError> for ServiceError {
     fn from(error: LedgerError) -> Self {
         Self::Ledger(error)
@@ -711,6 +1231,97 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ArtifactManager::new(workspaces, ledger).recover_pending()?;
         }
         Ok(service)
+    }
+
+    /// Creates a pending Task and its revision zero snapshot atomically. The
+    /// caller scopes the task.create request ID; replay returns the first result.
+    pub fn create_task(
+        &self,
+        caller: &str,
+        request: &TaskCreateRequest,
+    ) -> Result<TaskCreationResult, ServiceError> {
+        if caller.is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "caller identity must not be empty",
+            ));
+        }
+        validate_task_create(request)?;
+        let payload = task_request_json(request);
+        ensure_task_create_text_safe(self.secret_scanner, &payload)?;
+        ensure_task_create_field_safe(self.secret_scanner, caller)?;
+        ensure_task_create_field_safe(self.secret_scanner, &request.request_id)?;
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                "SELECT request_json, task_id FROM task_create_idempotency
+             WHERE caller=?1 AND tool_name='task.create' AND request_id=?2",
+                params![caller, request.request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((stored, task_id)) = existing {
+            ensure_task_create_text_safe(self.secret_scanner, &stored)?;
+            let snapshot: String = tx.query_row(
+                "SELECT request_json FROM task_request_snapshots WHERE task_id=?1",
+                params![task_id],
+                |row| row.get(0),
+            )?;
+            ensure_task_create_text_safe(self.secret_scanner, &snapshot)?;
+            if snapshot != stored {
+                return Err(ServiceError::InvalidStoredState);
+            }
+            if stored != payload {
+                return Err(ServiceError::IdempotencyConflict);
+            }
+            let result = load_task_creation_result(&tx, &request.request_id, &task_id)?;
+            tx.commit()?;
+            return Ok(result);
+        }
+
+        tx.execute("INSERT INTO service_task_id_sequence DEFAULT VALUES", [])?;
+        let sequence = tx.last_insert_rowid();
+        let mut task_id = TaskId::new(format!("task-create-{sequence}"));
+        while tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",
+            params![task_id.as_str()],
+            |row| row.get::<_, bool>(0),
+        )? {
+            tx.execute("INSERT INTO service_task_id_sequence DEFAULT VALUES", [])?;
+            task_id = TaskId::new(format!("task-create-{}", tx.last_insert_rowid()));
+        }
+        tx.execute(
+            "INSERT INTO tasks(id,description,role,state) VALUES(?1,?2,'unspecified','pending')",
+            params![task_id.as_str(), request.description],
+        )?;
+        tx.execute(
+            "INSERT INTO service_task_revisions(task_id,revision) VALUES(?1,0)",
+            params![task_id.as_str()],
+        )?;
+        tx.execute(
+            "INSERT INTO task_request_snapshots(task_id,request_json) VALUES(?1,?2)",
+            params![task_id.as_str(), payload],
+        )?;
+        tx.execute(
+            "INSERT INTO task_create_idempotency(caller,tool_name,request_id,request_json,task_id)
+             VALUES(?1,'task.create',?2,?3,?4)",
+            params![caller, request.request_id, payload, task_id.as_str()],
+        )?;
+        let result = TaskCreationResult {
+            request_id: request.request_id.clone(),
+            task_id,
+            revision: 0,
+            state: TaskState::Pending,
+            request: TaskRequestSnapshot {
+                source: request.source,
+                title: request.title.clone(),
+                description: request.description.clone(),
+                constraints: request.constraints.clone(),
+                issue: request.issue.clone(),
+            },
+        };
+        tx.commit()?;
+        Ok(result)
     }
 
     /// Injects the caller's secret scanning policy. Publication is denied when absent.
@@ -2611,6 +3222,45 @@ mod tests {
     const CHILD_OPERATION_ID: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_OPERATION";
     const CHILD_MARKER_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_MARKER";
 
+    const TASK_SECRET_SENTINEL: &str = "TASK_CREATE_SECRET_SENTINEL";
+    const TASK_MULTILINE_SECRET_SENTINEL: &str = "TASK_CREATE_MULTILINE_SECRET\nSENTINEL";
+
+    struct TaskCreateScanner {
+        unavailable: bool,
+    }
+
+    impl SecretScanner for TaskCreateScanner {
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+
+        fn scan_publication_payload(
+            &self,
+            payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            if self.unavailable {
+                return Err(SecretScanError::Unavailable);
+            }
+            if payload.title().contains(TASK_SECRET_SENTINEL)
+                || payload.body().contains(TASK_SECRET_SENTINEL)
+                || payload.title().contains(TASK_MULTILINE_SECRET_SENTINEL)
+                || payload.body().contains(TASK_MULTILINE_SECRET_SENTINEL)
+            {
+                Ok(SecretScanResult::Findings)
+            } else {
+                Ok(SecretScanResult::Clean)
+            }
+        }
+    }
+
+    fn clean_task_scanner() -> TaskCreateScanner {
+        TaskCreateScanner { unavailable: false }
+    }
+
     fn sqlite_open_is_busy(error: &crate::LedgerError) -> bool {
         matches!(
             error,
@@ -2689,6 +3339,467 @@ mod tests {
             let path_text = path.to_string_lossy().into_owned();
             git(&repo.0, &["worktree", "remove", "--force", &path_text]);
         }
+    }
+
+    #[test]
+    fn task_create_persists_pending_task_and_scoped_idempotency() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "create-1",
+            TaskSource::Manual,
+            "Title",
+            "Description",
+            vec!["keep behavior".into()],
+            None,
+        );
+
+        let first = service.create_task("caller-a", &request).unwrap();
+        assert_eq!(first.revision(), 0);
+        assert_eq!(first.state(), TaskState::Pending);
+        assert_eq!(first.title(), "Title");
+        assert_eq!(first.constraints(), &["keep behavior"]);
+        let mut task = ledger.get_task(first.task_id()).unwrap().unwrap();
+        assert_eq!(task.state(), TaskState::Pending);
+        assert_eq!(task.role().as_str(), "unspecified");
+        assert_eq!(task.description(), "Description");
+        task.start().unwrap();
+        ledger.save_task(&task).unwrap();
+
+        let replay = service.create_task("caller-a", &request).unwrap();
+        assert_eq!(replay, first);
+        assert!(matches!(
+            service.create_task(
+                "caller-a",
+                &TaskCreateRequest::new(
+                    "create-1",
+                    TaskSource::Manual,
+                    "Changed",
+                    "Description",
+                    vec!["keep behavior".into()],
+                    None
+                )
+            ),
+            Err(ServiceError::IdempotencyConflict)
+        ));
+        let other_caller = service.create_task("caller-b", &request).unwrap();
+        assert_ne!(other_caller.task_id(), first.task_id());
+    }
+
+    #[test]
+    fn task_create_rejects_detected_secrets_in_every_snapshot_text_field() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+
+        for field in 0..6 {
+            let mut request = TaskCreateRequest::new(
+                format!("secret-{field}"),
+                TaskSource::Issue,
+                "safe title",
+                "safe description",
+                vec!["safe constraint".into()],
+                Some(TaskIssueSnapshot {
+                    url: "https://example.test/issues/1".into(),
+                    number: 1,
+                    title: "safe issue title".into(),
+                    body: "safe issue body".into(),
+                }),
+            );
+            match field {
+                0 => request.title = TASK_SECRET_SENTINEL.into(),
+                1 => request.description = TASK_SECRET_SENTINEL.into(),
+                2 => request.constraints[0] = TASK_SECRET_SENTINEL.into(),
+                3 => {
+                    request.issue.as_mut().unwrap().url =
+                        format!("https://example.test/issues/1?token={TASK_SECRET_SENTINEL}")
+                }
+                4 => request.issue.as_mut().unwrap().title = TASK_SECRET_SENTINEL.into(),
+                5 => request.issue.as_mut().unwrap().body = TASK_SECRET_SENTINEL.into(),
+                _ => unreachable!(),
+            }
+            let error = service.create_task("caller", &request).unwrap_err();
+            assert!(matches!(
+                error,
+                ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+            ));
+            assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+        }
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let idempotency_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_create_idempotency", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_count, 0);
+        assert_eq!(idempotency_count, 0);
+    }
+
+    #[test]
+    fn task_create_scans_raw_multiline_text_before_persisting() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "multiline-secret",
+            TaskSource::Manual,
+            "safe title",
+            TASK_MULTILINE_SECRET_SENTINEL,
+            vec![],
+            None,
+        );
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains("TASK_CREATE_MULTILINE_SECRET"));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let idempotency_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_create_idempotency", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_count, 0);
+        assert_eq!(idempotency_count, 0);
+    }
+
+    #[test]
+    fn task_create_fails_closed_when_scanner_is_missing_or_unavailable() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let request = TaskCreateRequest::new(
+            "scanner-unavailable",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![TASK_SECRET_SENTINEL.into()],
+            None,
+        );
+        let missing_scanner =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let error = missing_scanner.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+
+        let unavailable = TaskCreateScanner { unavailable: true };
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&unavailable);
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_count, 0);
+    }
+
+    #[test]
+    fn task_create_replay_scans_persisted_snapshot_before_returning_it() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "safe-replay",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![],
+            None,
+        );
+        let created = service.create_task("caller", &request).unwrap();
+        let malicious_snapshot = serde_json::json!({
+            "source": "manual",
+            "title": "safe title",
+            "description": TASK_MULTILINE_SECRET_SENTINEL,
+            "constraints": [],
+            "issue": null
+        })
+        .to_string();
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE task_request_snapshots SET request_json=?1 WHERE task_id=?2",
+                params![malicious_snapshot, created.task_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE task_create_idempotency SET request_json=?1 WHERE caller='caller' AND request_id='safe-replay'",
+                params![malicious_snapshot],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains("TASK_CREATE_MULTILINE_SECRET"));
+    }
+
+    #[test]
+    fn task_create_replay_reports_corrupt_stored_json_without_raw_diagnostics() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "corrupt-replay",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![],
+            None,
+        );
+        let created = service.create_task("caller", &request).unwrap();
+        let corrupted = format!("{{\"description\":\"{TASK_SECRET_SENTINEL}");
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE task_request_snapshots SET request_json=?1 WHERE task_id=?2",
+                params![corrupted, created.task_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE task_create_idempotency SET request_json=?1 WHERE caller='caller' AND request_id='corrupt-replay'",
+                params![corrupted],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(error, ServiceError::InvalidStoredState));
+        assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let revision: i64 = connection
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                [created.task_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let snapshot_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_request_snapshots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let idempotency_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_create_idempotency", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_count, 1);
+        assert_eq!(revision, 0);
+        assert_eq!(snapshot_count, 1);
+        assert_eq!(idempotency_count, 1);
+    }
+
+    #[test]
+    fn task_create_validates_issue_shape_before_persisting() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let missing_issue = TaskCreateRequest::new(
+            "bad-1",
+            TaskSource::Issue,
+            "Title",
+            "Description",
+            vec![],
+            None,
+        );
+        assert!(matches!(
+            service.create_task("caller", &missing_issue),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+        let invalid_uri = TaskCreateRequest::new(
+            "bad-2",
+            TaskSource::Issue,
+            "Title",
+            "Description",
+            vec![],
+            Some(TaskIssueSnapshot {
+                url: "not-a-uri".into(),
+                number: 1,
+                title: "Issue".into(),
+                body: "Body".into(),
+            }),
+        );
+        assert!(matches!(
+            service.create_task("caller", &invalid_uri),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+        let empty_scheme = TaskCreateRequest::new(
+            "bad-3",
+            TaskSource::Issue,
+            "Title",
+            "Description",
+            vec![],
+            Some(TaskIssueSnapshot {
+                url: ":rest".into(),
+                number: 1,
+                title: "Issue".into(),
+                body: "Body".into(),
+            }),
+        );
+        assert!(matches!(
+            service.create_task("caller", &empty_scheme),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+        let valid_manual = TaskCreateRequest::new(
+            "bad-4",
+            TaskSource::Manual,
+            "Title",
+            "Description",
+            vec![],
+            None,
+        );
+        assert!(matches!(
+            service.create_task("", &valid_manual),
+            Err(ServiceError::InvalidRequest(_))
+        ));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_count, 0);
+    }
+
+    #[test]
+    fn absolute_uri_validation_accepts_rfc3986_forms_and_rejects_malformed_components() {
+        for uri in [
+            "https://example.com/issues/1",
+            "urn:isbn:9780306406157",
+            "mailto:user@example.com",
+            "file:///tmp/a%20b",
+            "https://user:pass@[2001:db8::1]:8443/a?x=y#part",
+            "foo+bar.-1:opaque/path?query/part#fragment?part",
+            "https://[v1.fe80::a+en1]/",
+            "foo:",
+        ] {
+            assert!(is_absolute_uri(uri), "{uri}");
+        }
+        for uri in [
+            "https://[",
+            "https://example.com/[]",
+            "https://example.com/a[b]",
+            "https://[not-an-ipv6-address]/",
+            "https://example.com/%",
+            "https://example.com/%2",
+            "https://example.com/%GG",
+            "https://example.com:port/path",
+            "https://example.com:80:90/path",
+            "https://user@name@example.com/",
+            "1scheme:value",
+            "relative/path",
+            "//relative.example/path",
+            "urn:bad value",
+        ] {
+            assert!(!is_absolute_uri(uri), "{uri}");
+        }
+    }
+
+    #[test]
+    fn task_create_replay_survives_reopening_the_ledger() {
+        let repo = Repo::new();
+        let database = repo.0.join("ledger.sqlite3");
+        let providers = ProviderRegistry::new();
+        let request = TaskCreateRequest::new(
+            "durable-1",
+            TaskSource::Issue,
+            "Snapshot title",
+            "Snapshot description",
+            vec!["constraint".into()],
+            Some(TaskIssueSnapshot {
+                url: "https://example.test/issues/4".into(),
+                number: 4,
+                title: "Issue title".into(),
+                body: "Issue body".into(),
+            }),
+        );
+        let first = {
+            let ledger = SqliteExecutionLedger::open(&database).unwrap();
+            let workspace = WorkspaceManager::new(&repo.0).unwrap();
+            let scanner = clean_task_scanner();
+            let service =
+                OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                    .unwrap()
+                    .with_secret_scanner(&scanner);
+            service.create_task("durable-caller", &request).unwrap()
+        };
+        let reopened = SqliteExecutionLedger::open(&database).unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service = OperationService::new(
+            &reopened,
+            &workspace,
+            &providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner);
+        let replay = service.create_task("durable-caller", &request).unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(replay.issue(), request.issue.as_ref());
     }
 
     #[derive(Clone)]
