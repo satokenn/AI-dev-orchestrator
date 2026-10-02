@@ -1,7 +1,12 @@
 use std::{
-    fmt, fs, io,
+    fmt, fs,
+    fs::OpenOptions,
+    io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -18,6 +23,7 @@ const FILE_LOCK_RETRY_LIMIT: Duration = Duration::from_millis(100);
 const FILE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
 static PROCESS_LOCKS: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+static NEXT_LOG_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Exclusive process lock shared by services using the same base and operation ledgers.
 pub struct LedgerRunLock {
@@ -111,7 +117,7 @@ fn open_exclusive_lock_with(
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => break,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if is_lock_contention(&error) => {
                 on_contention();
                 if Instant::now() >= deadline {
                     return Err(LedgerError::LockBusy);
@@ -122,6 +128,14 @@ fn open_exclusive_lock_with(
         }
     }
     Ok(file)
+}
+
+fn is_lock_contention(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || matches!(
+            (error.raw_os_error(), fs2::lock_contended_error().raw_os_error()),
+            (Some(actual), Some(contention)) if actual == contention
+        )
 }
 
 fn reject_lock_alias(path: &Path) -> Result<(), LedgerError> {
@@ -730,39 +744,94 @@ impl SqliteExecutionLedger {
     ) -> Result<LogReference, LedgerError> {
         let limit = self.log_limit.min(content.len());
         let truncated = source_truncated || limit < content.len();
-        let directory = directory.as_ref();
-        fs::create_dir_all(directory)?;
         let operation_component = safe_log_component(id.as_str())?;
         let stream_component = safe_log_component(stream)?;
-        let canonical_directory = directory.canonicalize()?;
-        let path =
-            canonical_directory.join(format!("{operation_component}-{stream_component}.log"));
-        let canonical_parent = path
-            .parent()
-            .ok_or_else(|| LedgerError::InvalidValue("log path has no parent".into()))?
-            .canonicalize()?;
-        if canonical_parent != canonical_directory || !path.starts_with(&canonical_directory) {
-            return Err(LedgerError::InvalidValue(
-                "log path escapes directory".into(),
-            ));
+        // Keep the ownership check and reference insertion in one transaction. Holding
+        // it while writing also prevents a concurrent operation deletion (if added later)
+        // from separating the file write from its owning record.
+        let mut connection = self.connection.lock().expect("ledger mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let operation_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1)",
+            params![id.as_str()],
+            |row| row.get(0),
+        )?;
+        if !operation_exists {
+            return Err(LedgerError::InvalidValue(format!(
+                "unknown operation {}",
+                id.as_str()
+            )));
         }
-        fs::write(&path, &content[..limit])?;
+
+        let directory = directory.as_ref();
+        fs::create_dir_all(directory)?;
+        let canonical_directory = directory.canonicalize()?;
+        // Each save gets a new immutable file. The reference is replaced only after the
+        // complete file has been written, so concurrent writers cannot change the bytes
+        // observed through an already committed reference.
+        let (path, mut file) = loop {
+            let sequence = NEXT_LOG_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = canonical_directory.join(format!(
+                "{operation_component}-{stream_component}-{}-{}-{sequence}.log",
+                std::process::id(),
+                now()
+            ));
+            if !candidate.starts_with(&canonical_directory) {
+                return Err(LedgerError::InvalidValue(
+                    "log path escapes directory".into(),
+                ));
+            }
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if let Err(error) = file.write_all(&content[..limit]) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(error.into());
+        }
+        drop(file);
         let reference = LogReference {
             path,
             byte_count: limit as u64,
             truncated,
         };
-        let connection = self.connection.lock().expect("ledger mutex poisoned");
-        connection.execute(
-            "INSERT OR REPLACE INTO log_references VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![
-                id.as_str(),
-                stream,
-                reference.path.to_string_lossy().as_ref(),
-                reference.byte_count as i64,
-                reference.truncated
-            ],
-        )?;
+        let persist_result = (|| {
+            transaction.execute(
+                "INSERT INTO log_references VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(operation_id, stream) DO UPDATE SET
+                   path=excluded.path, byte_count=excluded.byte_count, truncated=excluded.truncated",
+                params![
+                    id.as_str(),
+                    stream,
+                    reference.path.to_string_lossy().as_ref(),
+                    reference.byte_count as i64,
+                    reference.truncated
+                ],
+            )?;
+            transaction.commit()?;
+            Ok::<(), LedgerError>(())
+        })();
+        if let Err(error) = persist_result {
+            // The filesystem and SQLite cannot share a transaction. If SQLite reports an
+            // error (including an ambiguous commit result), remove the new file only when
+            // a fresh query confirms that no committed row points at it.
+            let referenced: rusqlite::Result<bool> = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM log_references WHERE path=?1)",
+                params![reference.path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            );
+            if matches!(referenced, Ok(false)) {
+                let _ = fs::remove_file(&reference.path);
+            }
+            return Err(error);
+        }
         Ok(reference)
     }
     pub fn save_validation(
@@ -817,6 +886,17 @@ impl SqliteExecutionLedger {
     ) -> Result<(), LedgerError> {
         let mut connection = self.connection.lock().expect("ledger mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let operation_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1)",
+            params![id.as_str()],
+            |row| row.get(0),
+        )?;
+        if !operation_exists {
+            return Err(LedgerError::InvalidValue(format!(
+                "unknown operation {}",
+                id.as_str()
+            )));
+        }
         transaction.execute(
             "DELETE FROM operation_usage_metrics WHERE operation_id=?1",
             params![id.as_str()],
@@ -1145,6 +1225,21 @@ mod tests {
     const CHILD_LOCK_MARKER: &str = "AI_DEV_ORCHESTRATOR_CHILD_LOCK_MARKER";
     const CHILD_LOCK_RELEASE: &str = "AI_DEV_ORCHESTRATOR_CHILD_LOCK_RELEASE";
 
+    #[test]
+    fn lock_contention_detection_matches_platform_error_without_matching_missing_codes() {
+        let platform_contention = fs2::lock_contended_error();
+        if let Some(code) = platform_contention.raw_os_error() {
+            assert!(is_lock_contention(&io::Error::from_raw_os_error(code)));
+        }
+
+        assert!(is_lock_contention(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+        assert!(!is_lock_contention(&io::Error::other(
+            "unrelated lock failure"
+        )));
+    }
+
     fn lock_test_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "operation-ledger-lock-{name}-{}-{}",
@@ -1451,6 +1546,19 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn usage_metrics_reject_unknown_operation_ids() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let unknown = OperationId::new("missing-operation");
+        let usage = UsageCost::new([UsageMetric::new("input_tokens", "12", "tokens")]);
+
+        assert!(matches!(
+            ledger.save_usage_metrics(&unknown, &usage),
+            Err(LedgerError::InvalidValue(message)) if message.contains("unknown operation")
+        ));
+        assert_eq!(ledger.usage_metrics(&unknown).unwrap(), None);
+    }
     #[test]
     fn terminal_fact_cannot_be_overwritten() {
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
@@ -1699,6 +1807,19 @@ mod tests {
     }
 
     #[test]
+    fn raw_log_save_rejects_unknown_operation_before_creating_directory() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let directory = std::env::temp_dir().join(format!("ledger-unknown-log-{}", now()));
+        let unknown = OperationId::new("missing-operation");
+
+        assert!(matches!(
+            ledger.save_log(&unknown, "stdout", &directory, b"raw output"),
+            Err(LedgerError::InvalidValue(message)) if message.contains("unknown operation")
+        ));
+        assert!(!directory.exists());
+    }
+
+    #[test]
     fn raw_log_reference_preserves_upstream_truncation() {
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
         let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
@@ -1714,6 +1835,91 @@ mod tests {
         assert!(reference.truncated());
         assert_eq!(fs::read(reference.path()).unwrap(), b"already limited");
         let _ = fs::remove_file(reference.path());
+    }
+
+    #[test]
+    fn concurrent_raw_log_saves_keep_each_file_immutable_and_reference_coherent() {
+        let ledger = std::sync::Arc::new(SqliteExecutionLedger::open_in_memory().unwrap());
+        let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
+        let directory = std::env::temp_dir().join(format!("ledger-concurrent-log-{}", now()));
+        let mut workers = Vec::new();
+        for index in 0..12u8 {
+            let ledger = std::sync::Arc::clone(&ledger);
+            let operation = operation.id().clone();
+            let directory = directory.clone();
+            workers.push(std::thread::spawn(move || {
+                let content = vec![b'a' + index; 64];
+                let reference = ledger
+                    .save_log(&operation, "stdout", directory, &content)
+                    .unwrap();
+                (reference, content)
+            }));
+        }
+        let saved = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        for (reference, expected) in &saved {
+            assert_eq!(fs::read(reference.path()).unwrap(), *expected);
+        }
+
+        let connection = ledger.connection.lock().unwrap();
+        let (path, byte_count, truncated): (String, i64, bool) = connection
+            .query_row(
+                "SELECT path, byte_count, truncated FROM log_references WHERE operation_id=?1 AND stream='stdout'",
+                params![operation.id().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let persisted = fs::read(&path).unwrap();
+        assert_eq!(byte_count as usize, persisted.len());
+        assert!(!truncated);
+        assert!(saved.iter().any(|(reference, expected)| {
+            reference.path().to_string_lossy() == path && expected == &persisted
+        }));
+        drop(connection);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn failed_log_reference_update_leaves_existing_reference_and_file_unchanged() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
+        let directory = std::env::temp_dir().join(format!("ledger-log-db-failure-{}", now()));
+        let original = ledger
+            .save_log(operation.id(), "stdout", &directory, b"original")
+            .unwrap();
+        ledger
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_log_reference_update
+                 BEFORE UPDATE ON log_references
+                 BEGIN SELECT RAISE(ABORT, 'injected log reference failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            ledger
+                .save_log(operation.id(), "stdout", &directory, b"replacement")
+                .is_err()
+        );
+        assert_eq!(fs::read(original.path()).unwrap(), b"original");
+        let (path, byte_count): (String, i64) = ledger
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT path, byte_count FROM log_references WHERE operation_id=?1 AND stream='stdout'",
+                params![operation.id().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(path), original.path());
+        assert_eq!(byte_count, 8);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

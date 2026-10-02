@@ -3930,6 +3930,88 @@ mod tests {
     }
 
     #[test]
+    fn previously_accepted_artifact_input_fails_before_provider_start() {
+        let (repo, ledger, workspace, providers, calls, checks, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 4, Duration::from_secs(30))
+                .unwrap();
+        let first = service
+            .submit_attempt(&request(&repo, &task_id, 0, "legacy-artifact-source"))
+            .unwrap();
+        let first_result = service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        let artifact_id = first_result.output_artifact_id().unwrap().to_owned();
+        // Recreate the persisted row shape accepted by earlier ArtifactInput-capable
+        // code: an Accepted operation, a Queued Attempt, and an input Artifact relation.
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE service_operations SET status='accepted',finished_at=NULL,diagnostic_code=NULL,workspace_path=NULL,workspace_branch=NULL WHERE id=?1",
+                params![first.operation_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE attempts SET state='queued',finished_at=NULL,failure_reason=NULL WHERE task_id=?1 AND id=?2",
+                params![task_id.as_str(), first.attempt_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE service_attempt_artifacts SET input_artifact_id=?1 WHERE task_id=?2 AND attempt_id=?3",
+                params![artifact_id, task_id.as_str(), first.attempt_id().as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        calls.store(0, Ordering::SeqCst);
+        checks.store(0, Ordering::SeqCst);
+
+        let result = service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(result.status(), ServiceOperationStatus::Failed);
+        assert_eq!(result.diagnostic_code(), Some("review_evidence_required"));
+        assert_eq!(result.attempt_state(), AttemptState::Queued);
+        assert_eq!(result.workspace_path(), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+
+        let replay = service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(replay.status(), ServiceOperationStatus::Failed);
+        assert_eq!(replay.diagnostic_code(), Some("review_evidence_required"));
+        assert_eq!(replay.attempt_state(), AttemptState::Queued);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+
+        let connection = ledger.lock_connection().unwrap();
+        let operation: (String, String) = connection
+            .query_row(
+                "SELECT status,diagnostic_code FROM service_operations WHERE id=?1",
+                params![first.operation_id().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            operation,
+            ("failed".to_owned(), "review_evidence_required".to_owned())
+        );
+        let attempt_state: String = connection
+            .query_row(
+                "SELECT state FROM attempts WHERE task_id=?1 AND id=?2",
+                params![task_id.as_str(), result.attempt_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_state, "queued");
+        drop(connection);
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, first_result.attempt_id());
+    }
+
+    #[test]
     fn provider_timeout_is_recorded_without_raw_streams() {
         let (repo, ledger, workspace, providers, calls, _, task_id) =
             service_parts(true, Duration::ZERO, false, None);
@@ -4123,6 +4205,92 @@ mod tests {
 
         // The test owns this fixture and removes it explicitly after checking preservation.
         cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_checkout_submodule_change_is_preserved_and_provider_is_not_started() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let child = std::env::temp_dir().join(format!(
+            "operation-service-submodule-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&child).unwrap();
+        git(&child, &["init", "-b", "main"]);
+        git(&child, &["config", "user.email", "service@example.invalid"]);
+        git(&child, &["config", "user.name", "Service Test"]);
+        fs::write(child.join("tracked.txt"), "base\n").unwrap();
+        git(&child, &["add", "tracked.txt"]);
+        git(&child, &["commit", "-m", "submodule base"]);
+        let child_text = child.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &child_text,
+                "modules/child",
+            ],
+        );
+        git(
+            &repo.0,
+            &["config", "--local", "submodule.modules/child.ignore", "all"],
+        );
+        git(&repo.0, &["commit", "-m", "add ignored submodule"]);
+        let base = repo.commit();
+
+        let hooks = repo.0.join(".git").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hooks_path = hooks.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &["config", "--local", "core.hooksPath", &hooks_path],
+        );
+        let hook = hooks.join("post-checkout");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nset -e\ngit -c protocol.file.allow=always submodule update --init -- modules/child\nprintf 'changed by checkout hook\\n' > modules/child/tracked.txt\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let mut req = request(&repo, &task_id, 0, "post-checkout-submodule");
+        req.input = AttemptInput::Base(BaseInput::new(&repo.0, base.clone()));
+        let accepted = service.submit_attempt(&req).unwrap();
+        let result = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(
+            result.status(),
+            ServiceOperationStatus::Failed,
+            "{result:?}; calls={}; workspace={:?}",
+            calls.load(Ordering::SeqCst),
+            result.workspace_path()
+        );
+        assert_eq!(result.attempt_state(), AttemptState::Queued);
+        assert_eq!(result.diagnostic_code(), Some("workspace_unavailable"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let workspace_path = result.workspace_path().unwrap();
+        assert_eq!(git(workspace_path, &["rev-parse", "HEAD"]), base);
+        assert_eq!(
+            fs::read_to_string(workspace_path.join("modules/child/tracked.txt")).unwrap(),
+            "changed by checkout hook\n"
+        );
+
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+        fs::remove_dir_all(child).unwrap();
     }
 
     #[test]
