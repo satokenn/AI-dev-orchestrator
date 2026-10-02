@@ -1006,8 +1006,40 @@ fn ensure_task_create_text_safe(
     request_json: &str,
 ) -> Result<(), ServiceError> {
     let scanner = scanner.ok_or(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
-    let payload =
-        ArtifactPublicationPayload::new("", "", "task.create request snapshot", request_json);
+    let value: serde_json::Value =
+        serde_json::from_str(request_json).map_err(|_| ServiceError::InvalidStoredState)?;
+    let mut text_fields = Vec::new();
+    collect_json_text_fields(&value, &mut text_fields);
+    for text in text_fields {
+        ensure_task_create_field_safe(Some(scanner), text)?;
+    }
+    Ok(())
+}
+
+fn collect_json_text_fields<'a>(value: &'a serde_json::Value, text_fields: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(text) => text_fields.push(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_text_fields(value, text_fields);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                text_fields.push(key);
+                collect_json_text_fields(value, text_fields);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn ensure_task_create_field_safe(
+    scanner: Option<&dyn SecretScanner>,
+    text: &str,
+) -> Result<(), ServiceError> {
+    let scanner = scanner.ok_or(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
+    let payload = ArtifactPublicationPayload::new("", "", "task.create request text", text);
     match scanner.scan_publication_payload(&payload) {
         Ok(SecretScanResult::Clean) => Ok(()),
         Ok(SecretScanResult::Findings) | Err(_) => {
@@ -1251,55 +1283,6 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         Ok(service)
     }
 
-    /// Enables named models using an explicit, source-attributed capability catalog.
-    #[must_use]
-    pub fn with_model_catalog(mut self, catalog: &'a dyn ModelCatalog, max_age: Duration) -> Self {
-        self.model_catalog = Some(catalog);
-        self.model_catalog_max_age = max_age;
-        self
-    }
-
-    fn validate_named_model(
-        &self,
-        provider: &ProviderRef,
-        choice: &ModelChoice,
-    ) -> Result<(), ServiceError> {
-        let ModelChoice::Named(model) = choice else {
-            return Ok(());
-        };
-        let Some(catalog) = self.model_catalog else {
-            return Err(ServiceError::NamedModelRequiresCatalog);
-        };
-        let entry = catalog
-            .lookup(provider, model)
-            .map_err(|_| ServiceError::NamedModelRequiresCatalog)?
-            .ok_or(ServiceError::NamedModelRequiresCatalog)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ServiceError::NamedModelRequiresCatalog)?;
-        if !model_catalog_entry_is_fresh_at(&entry, now, self.model_catalog_max_age) {
-            return Err(ServiceError::NamedModelRequiresCatalog);
-        }
-        Ok(())
-    }
-
-    /// Injects the caller's secret scanning policy. Publication is denied when absent.
-    #[must_use]
-    pub fn with_secret_scanner(mut self, scanner: &'a dyn SecretScanner) -> Self {
-        self.secret_scanner = Some(scanner);
-        self
-    }
-
-    /// Injects the Git/GitHub publication adapter used after both scans pass.
-    #[must_use]
-    pub fn with_artifact_publication_gateway(
-        mut self,
-        gateway: &'a dyn ArtifactPublicationGateway,
-    ) -> Self {
-        self.publication_gateway = Some(gateway);
-        self
-    }
-
     /// Creates a pending Task and its revision zero snapshot atomically. The
     /// caller scopes the task.create request ID; replay returns the first result.
     pub fn create_task(
@@ -1315,6 +1298,8 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         validate_task_create(request)?;
         let payload = task_request_json(request);
         ensure_task_create_text_safe(self.secret_scanner, &payload)?;
+        ensure_task_create_field_safe(self.secret_scanner, caller)?;
+        ensure_task_create_field_safe(self.secret_scanner, &request.request_id)?;
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx
@@ -1389,6 +1374,67 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         Ok(result)
     }
 
+    /// Enables named models using an explicit, source-attributed capability catalog.
+    #[must_use]
+    pub fn with_model_catalog(mut self, catalog: &'a dyn ModelCatalog, max_age: Duration) -> Self {
+        self.model_catalog = Some(catalog);
+        self.model_catalog_max_age = max_age;
+        self
+    }
+
+    fn validate_model_choice_shape(choice: &ModelChoice) -> Result<(), ServiceError> {
+        if matches!(choice, ModelChoice::Named(model) if model.as_str().is_empty()) {
+            return Err(ServiceError::InvalidRequest(
+                "named model must not be empty",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_named_model(
+        &self,
+        provider: &ProviderRef,
+        choice: &ModelChoice,
+    ) -> Result<(), ServiceError> {
+        Self::validate_model_choice_shape(choice)?;
+        let ModelChoice::Named(model) = choice else {
+            return Ok(());
+        };
+        let Some(catalog) = self.model_catalog else {
+            return Err(ServiceError::NamedModelRequiresCatalog);
+        };
+        let entry = catalog
+            .lookup(provider, model)
+            .map_err(|_| ServiceError::NamedModelRequiresCatalog)?
+            .ok_or(ServiceError::NamedModelRequiresCatalog)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ServiceError::NamedModelRequiresCatalog)?;
+        if !model_catalog_entry_is_fresh_at(&entry, now, self.model_catalog_max_age) {
+            return Err(ServiceError::NamedModelRequiresCatalog);
+        }
+        Ok(())
+    }
+
+    /// Injects the caller's secret scanning policy. Publication is denied when absent.
+    #[must_use]
+    pub fn with_secret_scanner(mut self, scanner: &'a dyn SecretScanner) -> Self {
+        self.secret_scanner = Some(scanner);
+        self
+    }
+
+    /// Injects the Git/GitHub publication adapter used after both scans pass.
+    #[must_use]
+    pub fn with_artifact_publication_gateway(
+        mut self,
+        gateway: &'a dyn ArtifactPublicationGateway,
+    ) -> Self {
+        self.publication_gateway = Some(gateway);
+        self
+    }
+
+    /// Creates a pending Task and its revision zero snapshot atomically. The
+    /// caller scopes the task.create request ID; replay returns the first result.
     fn idempotent_acceptance(
         &self,
         request: &AttemptRunRequest,
@@ -1503,6 +1549,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 "ArtifactInput requires a successful changes_requested ReviewVerdict",
             ));
         }
+        Self::validate_model_choice_shape(&request.model_id)?;
         if let Some(accepted) = self.idempotent_acceptance(request)? {
             return Ok(accepted);
         }
@@ -3377,6 +3424,7 @@ mod tests {
     const CHILD_MARKER_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_MARKER";
 
     const TASK_SECRET_SENTINEL: &str = "TASK_CREATE_SECRET_SENTINEL";
+    const TASK_MULTILINE_SECRET_SENTINEL: &str = "TASK_CREATE_MULTILINE_SECRET\nSENTINEL";
 
     struct TaskCreateScanner {
         unavailable: bool,
@@ -3400,6 +3448,8 @@ mod tests {
             }
             if payload.title().contains(TASK_SECRET_SENTINEL)
                 || payload.body().contains(TASK_SECRET_SENTINEL)
+                || payload.title().contains(TASK_MULTILINE_SECRET_SENTINEL)
+                || payload.body().contains(TASK_MULTILINE_SECRET_SENTINEL)
             {
                 Ok(SecretScanResult::Findings)
             } else {
@@ -3603,6 +3653,45 @@ mod tests {
     }
 
     #[test]
+    fn task_create_scans_raw_multiline_text_before_persisting() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "multiline-secret",
+            TaskSource::Manual,
+            "safe title",
+            TASK_MULTILINE_SECRET_SENTINEL,
+            vec![],
+            None,
+        );
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains("TASK_CREATE_MULTILINE_SECRET"));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let idempotency_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_create_idempotency", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_count, 0);
+        assert_eq!(idempotency_count, 0);
+    }
+
+    #[test]
     fn task_create_fails_closed_when_scanner_is_missing_or_unavailable() {
         let repo = Repo::new();
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
@@ -3664,9 +3753,14 @@ mod tests {
             None,
         );
         let created = service.create_task("caller", &request).unwrap();
-        let malicious_snapshot = format!(
-            r#"{{"source":"manual","title":"{TASK_SECRET_SENTINEL}","description":"","constraints":[],"issue":null}}"#
-        );
+        let malicious_snapshot = serde_json::json!({
+            "source": "manual",
+            "title": "safe title",
+            "description": TASK_MULTILINE_SECRET_SENTINEL,
+            "constraints": [],
+            "issue": null
+        })
+        .to_string();
         let connection = ledger.lock_connection().unwrap();
         connection
             .execute(
@@ -3687,7 +3781,73 @@ mod tests {
             error,
             ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
         ));
+        assert!(!error.to_string().contains("TASK_CREATE_MULTILINE_SECRET"));
+    }
+
+    #[test]
+    fn task_create_replay_reports_corrupt_stored_json_without_raw_diagnostics() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "corrupt-replay",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![],
+            None,
+        );
+        let created = service.create_task("caller", &request).unwrap();
+        let corrupted = format!("{{\"description\":\"{TASK_SECRET_SENTINEL}");
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE task_request_snapshots SET request_json=?1 WHERE task_id=?2",
+                params![corrupted, created.task_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE task_create_idempotency SET request_json=?1 WHERE caller='caller' AND request_id='corrupt-replay'",
+                params![corrupted],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(error, ServiceError::InvalidStoredState));
         assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let revision: i64 = connection
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                [created.task_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let snapshot_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_request_snapshots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let idempotency_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_create_idempotency", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_count, 1);
+        assert_eq!(revision, 0);
+        assert_eq!(snapshot_count, 1);
+        assert_eq!(idempotency_count, 1);
     }
 
     #[test]
@@ -4857,6 +5017,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_named_model_is_rejected_before_catalog_or_ledger_side_effects() {
+        let (repo, ledger, workspace, providers, calls, checks, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let catalog = CatalogSequence::new([ModelCatalogEntry {
+            source: "test-catalog".into(),
+            observed_at_unix_seconds: now,
+            status: ModelCapabilityStatus::Supported,
+        }]);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_model_catalog(&catalog, Duration::from_secs(60));
+        let mut req = request(&repo, &task_id, 0, "empty-named-model");
+        req.model_id = ModelChoice::Named(ModelRef::new(""));
+
+        assert!(matches!(
+            service.submit_attempt(&req),
+            Err(ServiceError::InvalidRequest(
+                "named model must not be empty"
+            ))
+        ));
+        assert_eq!(catalog.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+        let connection = ledger.lock_connection().unwrap();
+        let operation_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM service_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let attempt_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+            .unwrap();
+        let revision: i64 = connection
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                [task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation_count, 0);
+        assert_eq!(attempt_count, 0);
+        assert_eq!(revision, 0);
+    }
+
+    #[test]
+    fn accepted_operation_with_empty_stored_model_fails_before_catalog_or_provider() {
+        let (repo, ledger, workspace, providers, calls, checks, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let catalog = CatalogSequence::new([ModelCatalogEntry {
+            source: "test-catalog".into(),
+            observed_at_unix_seconds: now,
+            status: ModelCapabilityStatus::Supported,
+        }]);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_model_catalog(&catalog, Duration::from_secs(60));
+        let mut req = request(&repo, &task_id, 0, "accepted-empty-model");
+        req.model_id = ModelChoice::Named(ModelRef::new("supported-model"));
+        let accepted = service.submit_attempt(&req).unwrap();
+        assert_eq!(catalog.lookups.load(Ordering::SeqCst), 1);
+
+        // Recreate a persisted Accepted request from an older writer that allowed
+        // an empty named model, while leaving the Attempt queued and unstarted.
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE service_operations SET model_kind='named',model_name='' WHERE id=?1",
+                params![accepted.operation_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE attempts SET requested_model_kind='named',requested_model='' WHERE task_id=?1 AND id=?2",
+                params![task_id.as_str(), accepted.attempt_id().as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        catalog.lookups.store(0, Ordering::SeqCst);
+
+        let result = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(result.status(), ServiceOperationStatus::Failed);
+        assert_eq!(result.diagnostic_code(), Some("model_catalog_unavailable"));
+        assert_eq!(result.attempt_state(), AttemptState::Queued);
+        assert_eq!(result.started_at_ms(), None);
+        assert_eq!(result.workspace_path(), None);
+        assert_eq!(catalog.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+    }
+
     struct StaticCatalog(ModelCatalogEntry);
     impl ModelCatalog for StaticCatalog {
         fn lookup(
@@ -5536,6 +5799,88 @@ mod tests {
     }
 
     #[test]
+    fn previously_accepted_artifact_input_fails_before_provider_start() {
+        let (repo, ledger, workspace, providers, calls, checks, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 4, Duration::from_secs(30))
+                .unwrap();
+        let first = service
+            .submit_attempt(&request(&repo, &task_id, 0, "legacy-artifact-source"))
+            .unwrap();
+        let first_result = service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        let artifact_id = first_result.output_artifact_id().unwrap().to_owned();
+        // Recreate the persisted row shape accepted by earlier ArtifactInput-capable
+        // code: an Accepted operation, a Queued Attempt, and an input Artifact relation.
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE service_operations SET status='accepted',finished_at=NULL,diagnostic_code=NULL,workspace_path=NULL,workspace_branch=NULL WHERE id=?1",
+                params![first.operation_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE attempts SET state='queued',finished_at=NULL,failure_reason=NULL WHERE task_id=?1 AND id=?2",
+                params![task_id.as_str(), first.attempt_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE service_attempt_artifacts SET input_artifact_id=?1 WHERE task_id=?2 AND attempt_id=?3",
+                params![artifact_id, task_id.as_str(), first.attempt_id().as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        calls.store(0, Ordering::SeqCst);
+        checks.store(0, Ordering::SeqCst);
+
+        let result = service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(result.status(), ServiceOperationStatus::Failed);
+        assert_eq!(result.diagnostic_code(), Some("review_evidence_required"));
+        assert_eq!(result.attempt_state(), AttemptState::Queued);
+        assert_eq!(result.workspace_path(), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+
+        let replay = service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(replay.status(), ServiceOperationStatus::Failed);
+        assert_eq!(replay.diagnostic_code(), Some("review_evidence_required"));
+        assert_eq!(replay.attempt_state(), AttemptState::Queued);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+
+        let connection = ledger.lock_connection().unwrap();
+        let operation: (String, String) = connection
+            .query_row(
+                "SELECT status,diagnostic_code FROM service_operations WHERE id=?1",
+                params![first.operation_id().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            operation,
+            ("failed".to_owned(), "review_evidence_required".to_owned())
+        );
+        let attempt_state: String = connection
+            .query_row(
+                "SELECT state FROM attempts WHERE task_id=?1 AND id=?2",
+                params![task_id.as_str(), result.attempt_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_state, "queued");
+        drop(connection);
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, first_result.attempt_id());
+    }
+
+    #[test]
     fn provider_timeout_is_recorded_without_raw_streams() {
         let (repo, ledger, workspace, providers, calls, _, task_id) =
             service_parts(true, Duration::ZERO, false, None);
@@ -5729,6 +6074,92 @@ mod tests {
 
         // The test owns this fixture and removes it explicitly after checking preservation.
         cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_checkout_submodule_change_is_preserved_and_provider_is_not_started() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let child = std::env::temp_dir().join(format!(
+            "operation-service-submodule-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&child).unwrap();
+        git(&child, &["init", "-b", "main"]);
+        git(&child, &["config", "user.email", "service@example.invalid"]);
+        git(&child, &["config", "user.name", "Service Test"]);
+        fs::write(child.join("tracked.txt"), "base\n").unwrap();
+        git(&child, &["add", "tracked.txt"]);
+        git(&child, &["commit", "-m", "submodule base"]);
+        let child_text = child.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &child_text,
+                "modules/child",
+            ],
+        );
+        git(
+            &repo.0,
+            &["config", "--local", "submodule.modules/child.ignore", "all"],
+        );
+        git(&repo.0, &["commit", "-m", "add ignored submodule"]);
+        let base = repo.commit();
+
+        let hooks = repo.0.join(".git").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hooks_path = hooks.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &["config", "--local", "core.hooksPath", &hooks_path],
+        );
+        let hook = hooks.join("post-checkout");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nset -e\ngit -c protocol.file.allow=always submodule update --init -- modules/child\nprintf 'changed by checkout hook\\n' > modules/child/tracked.txt\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let mut req = request(&repo, &task_id, 0, "post-checkout-submodule");
+        req.input = AttemptInput::Base(BaseInput::new(&repo.0, base.clone()));
+        let accepted = service.submit_attempt(&req).unwrap();
+        let result = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(
+            result.status(),
+            ServiceOperationStatus::Failed,
+            "{result:?}; calls={}; workspace={:?}",
+            calls.load(Ordering::SeqCst),
+            result.workspace_path()
+        );
+        assert_eq!(result.attempt_state(), AttemptState::Queued);
+        assert_eq!(result.diagnostic_code(), Some("workspace_unavailable"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let workspace_path = result.workspace_path().unwrap();
+        assert_eq!(git(workspace_path, &["rev-parse", "HEAD"]), base);
+        assert_eq!(
+            fs::read_to_string(workspace_path.join("modules/child/tracked.txt")).unwrap(),
+            "changed by checkout hook\n"
+        );
+
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+        fs::remove_dir_all(child).unwrap();
     }
 
     #[test]
