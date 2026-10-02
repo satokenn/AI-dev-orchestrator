@@ -10,6 +10,7 @@ mod domain;
 mod execution_ledger;
 mod github_workflow;
 mod operation_ledger;
+mod operation_service;
 mod orchestrator;
 mod planner;
 mod process_runner;
@@ -22,9 +23,9 @@ pub use antigravity::AntigravityProvider;
 pub use codex_provider::CodexProvider;
 pub use copilot_provider::CopilotProvider;
 pub use domain::{
-    AgentResult, Attempt, AttemptFailureReason, AttemptId, AttemptState, DomainError, ModelChoice,
-    ModelRef, ProviderRef, Task, TaskId, TaskRole, TaskState, UsageCost, UsageMetric,
-    ValidationCheckResult, ValidationResult,
+    AgentResult, Attempt, AttemptFailureReason, AttemptId, AttemptSemantics, AttemptState,
+    DomainError, ModelChoice, ModelRef, ProviderRef, Task, TaskId, TaskRole, TaskState, UsageCost,
+    UsageMetric, ValidationCheckResult, ValidationResult,
 };
 pub use execution_ledger::{AttemptRecord, ExecutionLedger, LedgerError, SqliteExecutionLedger};
 pub use github_workflow::{
@@ -36,9 +37,13 @@ pub use github_workflow::{
 };
 pub use operation_ledger::{
     EventKind, ExecutionLedger as OperationLedger, LedgerError as OperationLedgerError,
-    LogReference, OperationEvent, OperationId, OperationRecord, OperationRequest, OperationStatus,
-    PublicationReference, RecoveryRecord, ReviewRecord,
+    LedgerRunLock, LogReference, OperationEvent, OperationId, OperationRecord, OperationRequest,
+    OperationStatus, PublicationReference, RecoveryRecord, ReviewRecord,
     SqliteExecutionLedger as SqliteOperationLedger, UsageRecord, ValidationRecord,
+};
+pub use operation_service::{
+    AttemptRunRequest, BaseInput, OperationAcceptance, OperationService, OperationSnapshot,
+    ServiceError, ServiceOperationStatus,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,

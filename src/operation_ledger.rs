@@ -10,6 +10,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use fs2::FileExt;
+
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{ModelChoice, ModelRef, ProviderRef, TaskId, UsageCost, UsageMetric};
@@ -17,6 +19,143 @@ use crate::{ModelChoice, ModelRef, ProviderRef, TaskId, UsageCost, UsageMetric};
 const SCHEMA_VERSION: u32 = 3;
 const DEFAULT_LOG_LIMIT: usize = 1024 * 1024;
 static NEXT_LOG_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Exclusive process lock shared by services using the same base and operation ledgers.
+pub struct LedgerRunLock {
+    _base_file: std::fs::File,
+    _operation_file: std::fs::File,
+    ledger_path: PathBuf,
+    operation_path: PathBuf,
+}
+
+impl LedgerRunLock {
+    pub fn acquire(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
+        let ledger_path = canonical_ledger_path(path.as_ref())?;
+        let operation_path = operation_database_path(&ledger_path)?;
+        let mut base_lock_name = ledger_path
+            .file_name()
+            .ok_or_else(|| LedgerError::InvalidValue("ledger path has no file name".into()))?
+            .to_os_string();
+        base_lock_name.push(".operations.lock");
+        let mut operation_lock_name = operation_path.as_os_str().to_os_string();
+        operation_lock_name.push(".recovery.lock");
+        let base_file = open_exclusive_lock(&ledger_path.with_file_name(base_lock_name))?;
+        let operation_file = open_exclusive_lock(&PathBuf::from(operation_lock_name))?;
+        Ok(Self {
+            _base_file: base_file,
+            _operation_file: operation_file,
+            ledger_path,
+            operation_path,
+        })
+    }
+
+    pub(crate) fn matches_identity(&self, ledger_path: &Path, operation_path: &Path) -> bool {
+        self.ledger_path == ledger_path && self.operation_path == operation_path
+    }
+}
+
+fn open_exclusive_lock(path: &Path) -> Result<std::fs::File, LedgerError> {
+    reject_lock_alias(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    reject_lock_file_metadata(&file.metadata()?)?;
+    file.try_lock_exclusive().map_err(|error| {
+        if is_lock_contention(&error) {
+            LedgerError::LockBusy
+        } else {
+            LedgerError::Io(error)
+        }
+    })?;
+    Ok(file)
+}
+
+fn is_lock_contention(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || matches!(
+            (error.raw_os_error(), fs2::lock_contended_error().raw_os_error()),
+            (Some(actual), Some(contention)) if actual == contention
+        )
+}
+
+fn reject_lock_alias(path: &Path) -> Result<(), LedgerError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(LedgerError::InvalidValue(
+            "ledger lock files must not be symlinks".into(),
+        )),
+        Ok(metadata) => reject_lock_file_metadata(&metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn reject_lock_file_metadata(metadata: &fs::Metadata) -> Result<(), LedgerError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 {
+            return Err(LedgerError::InvalidValue(
+                "hard-linked ledger lock files are not supported".into(),
+            ));
+        }
+    }
+    let _ = metadata;
+    Ok(())
+}
+
+pub(crate) fn canonical_ledger_path(path: &Path) -> Result<PathBuf, LedgerError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = parent.canonicalize()?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| LedgerError::InvalidValue("ledger path has no file name".into()))?;
+    let candidate = parent.join(name);
+    let canonical = match fs::symlink_metadata(&candidate) {
+        Ok(_) => fs::canonicalize(&candidate)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => candidate,
+        Err(error) => return Err(error.into()),
+    };
+    reject_hard_link(&canonical, "hard-linked ledger files are not supported")?;
+    Ok(canonical)
+}
+
+pub(crate) fn operation_database_path(ledger_path: &Path) -> Result<PathBuf, LedgerError> {
+    let mut name = ledger_path.as_os_str().to_os_string();
+    name.push(".operations.sqlite3");
+    let candidate = PathBuf::from(name);
+    let canonical = match fs::symlink_metadata(&candidate) {
+        Ok(_) => fs::canonicalize(&candidate)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => candidate,
+        Err(error) => return Err(error.into()),
+    };
+    reject_hard_link(
+        &canonical,
+        "hard-linked operation ledger files are not supported",
+    )?;
+    Ok(canonical)
+}
+
+fn reject_hard_link(path: &Path, message: &str) -> Result<(), LedgerError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = fs::metadata(path) {
+            if metadata.nlink() > 1 {
+                return Err(LedgerError::InvalidValue(message.into()));
+            }
+        }
+    }
+    let _ = (path, message);
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OperationId(String);
@@ -321,6 +460,9 @@ pub enum LedgerError {
     ActiveOperation(OperationId),
     TerminalConflict(OperationId),
     UnsupportedSchema(u32),
+    RecoveryLockRequired,
+    RecoveryLockMismatch,
+    LockBusy,
 }
 impl fmt::Display for LedgerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -344,6 +486,9 @@ impl fmt::Display for LedgerError {
                 id.as_str()
             ),
             Self::UnsupportedSchema(v) => write!(f, "unsupported ledger schema: {v}"),
+            Self::RecoveryLockRequired => write!(f, "recovery requires an exclusive ledger lock"),
+            Self::RecoveryLockMismatch => write!(f, "recovery lock belongs to a different ledger"),
+            Self::LockBusy => write!(f, "ledger is busy: another process is running it"),
         }
     }
 }
@@ -380,12 +525,18 @@ pub trait ExecutionLedger {
 pub struct SqliteExecutionLedger {
     connection: Mutex<Connection>,
     log_limit: usize,
+    ledger_path: Option<PathBuf>,
+    operation_path: Option<PathBuf>,
 }
 
 impl SqliteExecutionLedger {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
-        let sidecar = PathBuf::from(format!("{}.operations.sqlite3", path.as_ref().display()));
-        Self::from_connection(Connection::open(sidecar)?)
+        let ledger_path = canonical_ledger_path(path.as_ref())?;
+        let sidecar = operation_database_path(&ledger_path)?;
+        let mut ledger = Self::from_connection(Connection::open(&sidecar)?)?;
+        ledger.ledger_path = Some(ledger_path);
+        ledger.operation_path = Some(sidecar);
+        Ok(ledger)
     }
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         Self::from_connection(Connection::open_in_memory()?)
@@ -407,6 +558,8 @@ impl SqliteExecutionLedger {
         Ok(Self {
             connection: Mutex::new(connection),
             log_limit: DEFAULT_LOG_LIMIT,
+            ledger_path: None,
+            operation_path: None,
         })
     }
     pub fn set_log_limit(&mut self, bytes: usize) {
@@ -759,7 +912,18 @@ impl SqliteExecutionLedger {
         )?;
         Ok(())
     }
-    pub fn recover(&self) -> Result<Vec<RecoveryRecord>, LedgerError> {
+    pub fn recover(&self, lock: &LedgerRunLock) -> Result<Vec<RecoveryRecord>, LedgerError> {
+        let ledger_path = self
+            .ledger_path
+            .as_ref()
+            .ok_or(LedgerError::RecoveryLockRequired)?;
+        let operation_path = self
+            .operation_path
+            .as_ref()
+            .ok_or(LedgerError::RecoveryLockRequired)?;
+        if !lock.matches_identity(ledger_path, operation_path) {
+            return Err(LedgerError::RecoveryLockMismatch);
+        }
         let mut connection = self.connection.lock().expect("ledger mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut statement = transaction.prepare("SELECT id, status FROM operations WHERE status IN ('accepted','running','interrupted')")?;
@@ -1001,6 +1165,143 @@ fn operation_column_exists(connection: &Connection, column: &str) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_contention_detection_matches_platform_error_without_matching_missing_codes() {
+        let platform_contention = fs2::lock_contended_error();
+        if let Some(code) = platform_contention.raw_os_error() {
+            assert!(is_lock_contention(&io::Error::from_raw_os_error(code)));
+        }
+
+        assert!(is_lock_contention(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+        assert!(!is_lock_contention(&io::Error::other(
+            "unrelated lock failure"
+        )));
+    }
+
+    fn lock_test_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "operation-ledger-lock-{name}-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_lock_rejects_symlinked_lock_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = lock_test_root("symlink");
+        let ledger_path = root.join("ledger.sqlite3");
+        let mut base_lock = ledger_path.as_os_str().to_os_string();
+        base_lock.push(".operations.lock");
+        let base_lock = PathBuf::from(base_lock);
+        let target = root.join("unrelated.lock");
+        fs::write(&target, b"").unwrap();
+        symlink(&target, &base_lock).unwrap();
+        assert!(matches!(
+            LedgerRunLock::acquire(&ledger_path),
+            Err(LedgerError::InvalidValue(message)) if message.contains("must not be symlinks")
+        ));
+
+        fs::remove_file(&base_lock).unwrap();
+        let operation_path =
+            operation_database_path(&canonical_ledger_path(&ledger_path).unwrap()).unwrap();
+        let mut operation_lock = operation_path.as_os_str().to_os_string();
+        operation_lock.push(".recovery.lock");
+        let operation_lock = PathBuf::from(operation_lock);
+        symlink(&target, &operation_lock).unwrap();
+        assert!(matches!(
+            LedgerRunLock::acquire(&ledger_path),
+            Err(LedgerError::InvalidValue(message)) if message.contains("must not be symlinks")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_lock_rejects_hard_linked_lock_files() {
+        let root = lock_test_root("hardlink");
+        let ledger_path = root.join("ledger.sqlite3");
+        let mut base_lock = ledger_path.as_os_str().to_os_string();
+        base_lock.push(".operations.lock");
+        let base_lock = PathBuf::from(base_lock);
+        let alias = root.join("lock-alias");
+        fs::write(&base_lock, b"").unwrap();
+        fs::hard_link(&base_lock, &alias).unwrap();
+        assert!(matches!(
+            LedgerRunLock::acquire(&ledger_path),
+            Err(LedgerError::InvalidValue(message)) if message.contains("hard-linked ledger lock")
+        ));
+        fs::remove_file(&base_lock).unwrap();
+        fs::remove_file(&alias).unwrap();
+        let operation_path =
+            operation_database_path(&canonical_ledger_path(&ledger_path).unwrap()).unwrap();
+        let mut operation_lock = operation_path.as_os_str().to_os_string();
+        operation_lock.push(".recovery.lock");
+        let operation_lock = PathBuf::from(operation_lock);
+        fs::write(&operation_lock, b"").unwrap();
+        fs::hard_link(&operation_lock, &alias).unwrap();
+        assert!(matches!(
+            LedgerRunLock::acquire(&ledger_path),
+            Err(LedgerError::InvalidValue(message)) if message.contains("hard-linked ledger lock")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_symlink_aliases_share_one_process_lock() {
+        use std::os::unix::fs::symlink;
+
+        let root = lock_test_root("sidecar-symlink");
+        let first_ledger = root.join("first.sqlite3");
+        let second_ledger = root.join("second.sqlite3");
+        let target = root.join("shared-operation.sqlite3");
+        fs::write(&target, b"").unwrap();
+        let mut first_sidecar = first_ledger.as_os_str().to_os_string();
+        first_sidecar.push(".operations.sqlite3");
+        let mut second_sidecar = second_ledger.as_os_str().to_os_string();
+        second_sidecar.push(".operations.sqlite3");
+        symlink(&target, PathBuf::from(first_sidecar)).unwrap();
+        symlink(&target, PathBuf::from(second_sidecar)).unwrap();
+        let first_lock = LedgerRunLock::acquire(&first_ledger).unwrap();
+        assert!(matches!(
+            LedgerRunLock::acquire(&second_ledger),
+            Err(LedgerError::LockBusy)
+        ));
+        drop(first_lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_operation_sidecar_is_rejected_by_open_and_lock() {
+        let root = lock_test_root("sidecar-hardlink");
+        let first_ledger = root.join("first.sqlite3");
+        let second_ledger = root.join("second.sqlite3");
+        drop(SqliteExecutionLedger::open(&first_ledger).unwrap());
+        let mut first_sidecar = first_ledger.as_os_str().to_os_string();
+        first_sidecar.push(".operations.sqlite3");
+        let mut second_sidecar = second_ledger.as_os_str().to_os_string();
+        second_sidecar.push(".operations.sqlite3");
+        fs::hard_link(PathBuf::from(first_sidecar), PathBuf::from(second_sidecar)).unwrap();
+        assert!(matches!(
+            SqliteExecutionLedger::open(&second_ledger),
+            Err(LedgerError::InvalidValue(message)) if message.contains("hard-linked operation ledger")
+        ));
+        assert!(matches!(
+            LedgerRunLock::acquire(&first_ledger),
+            Err(LedgerError::InvalidValue(message)) if message.contains("hard-linked operation ledger")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn request(id: &str, payload: &str) -> OperationRequest {
         OperationRequest::new(
             id,
@@ -1277,9 +1578,12 @@ mod tests {
     }
     #[test]
     fn recovery_marks_unknown_state_without_claiming_success() {
-        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let root = lock_test_root("recover");
+        let ledger_path = root.join("ledger.sqlite3");
+        let ledger = SqliteExecutionLedger::open(&ledger_path).unwrap();
         let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
-        let recovered = ledger.recover().unwrap();
+        let lock = LedgerRunLock::acquire(&ledger_path).unwrap();
+        let recovered = ledger.recover(&lock).unwrap();
         assert_eq!(recovered[0].operation, *operation.id());
         assert_eq!(
             ledger
@@ -1289,6 +1593,34 @@ mod tests {
                 .status(),
             OperationStatus::RecoveryRequired
         );
+        drop(lock);
+        drop(ledger);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_a_lock_for_a_different_operation_database() {
+        let root = lock_test_root("recover-mismatch");
+        let ledger_path = root.join("ledger.sqlite3");
+        let other_path = root.join("other.sqlite3");
+        let ledger = SqliteExecutionLedger::open(&ledger_path).unwrap();
+        let operation = ledger.accept_operation(&request("r1", "a")).unwrap();
+        let wrong_lock = LedgerRunLock::acquire(&other_path).unwrap();
+        assert!(matches!(
+            ledger.recover(&wrong_lock),
+            Err(LedgerError::RecoveryLockMismatch)
+        ));
+        assert_eq!(
+            ledger
+                .get_operation(operation.id())
+                .unwrap()
+                .unwrap()
+                .status(),
+            OperationStatus::Accepted
+        );
+        drop(wrong_lock);
+        drop(ledger);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn raw_logs_are_bounded_and_referenced() {

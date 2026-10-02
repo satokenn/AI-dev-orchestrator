@@ -51,6 +51,38 @@ fn repository() -> PathBuf {
     directory
 }
 
+fn add_ignored_submodule(repository: &Path) -> PathBuf {
+    let child = temporary_directory();
+    git(&child, &["init", "-b", "main"]);
+    git(
+        &child,
+        &["config", "user.email", "submodule@example.invalid"],
+    );
+    git(&child, &["config", "user.name", "Submodule Test"]);
+    fs::write(child.join("tracked.txt"), "base\n").unwrap();
+    git(&child, &["add", "tracked.txt"]);
+    git(&child, &["commit", "-m", "submodule base"]);
+
+    let child_text = child.to_string_lossy().into_owned();
+    git(
+        repository,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &child_text,
+            "modules/child",
+        ],
+    );
+    git(
+        repository,
+        &["config", "--local", "submodule.modules/child.ignore", "all"],
+    );
+    git(repository, &["commit", "-m", "add ignored submodule"]);
+    child
+}
+
 #[test]
 fn resolves_repository_and_isolates_each_attempt() {
     let repository = repository();
@@ -175,4 +207,85 @@ fn reports_diagnostic_git_error_for_non_repository() {
         other => panic!("unexpected error: {other:?}"),
     }
     fs::remove_dir_all(directory).expect("remove test directory");
+}
+
+#[test]
+fn freshness_rejects_tracked_untracked_and_commit_changes_in_ignored_submodule() {
+    let repository = repository();
+    let child = add_ignored_submodule(&repository);
+    let manager = WorkspaceManager::new(&repository).unwrap();
+    let workspace = manager
+        .create(
+            &TaskId::new("submodule-task"),
+            &AttemptId::new("submodule-attempt"),
+        )
+        .unwrap();
+    let base = git(workspace.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    git(
+        workspace.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--",
+            "modules/child",
+        ],
+    );
+    let baseline = manager.validate_provider_workspace_at_base(workspace.path(), &base);
+    assert!(
+        baseline.is_ok(),
+        "{baseline:?}; status={}",
+        git(
+            workspace.path(),
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--ignore-submodules=none",
+            ]
+        )
+    );
+
+    let submodule = workspace.path().join("modules/child");
+    fs::write(submodule.join("tracked.txt"), "changed\n").unwrap();
+    assert!(matches!(
+        manager.validate_provider_workspace_at_base(workspace.path(), &base),
+        Err(WorkspaceError::ProviderWorkspaceNotFresh { .. })
+    ));
+    git(&submodule, &["checkout", "--", "tracked.txt"]);
+
+    fs::write(submodule.join("untracked.txt"), "untracked\n").unwrap();
+    assert!(matches!(
+        manager.validate_provider_workspace_at_base(workspace.path(), &base),
+        Err(WorkspaceError::ProviderWorkspaceNotFresh { .. })
+    ));
+    fs::remove_file(submodule.join("untracked.txt")).unwrap();
+
+    fs::write(submodule.join("tracked.txt"), "new commit\n").unwrap();
+    git(&submodule, &["add", "tracked.txt"]);
+    git(
+        &submodule,
+        &[
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=Workspace Test",
+            "commit",
+            "-m",
+            "new submodule commit",
+        ],
+    );
+    assert!(matches!(
+        manager.validate_provider_workspace_at_base(workspace.path(), &base),
+        Err(WorkspaceError::ProviderWorkspaceNotFresh { .. })
+    ));
+
+    manager.cleanup_force(&workspace).unwrap();
+    fs::remove_dir_all(repository).unwrap();
+    fs::remove_dir_all(child).unwrap();
 }

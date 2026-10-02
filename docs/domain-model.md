@@ -118,7 +118,7 @@ Codex自身が編集した場合はAttemptを作らない。管理済みArtifact
 
 ## Operation Serviceとの境界
 
-監督Codexは目的の解釈、Provider / Model選択、実行・review・再試行の要否、成果物の採否、Task完了を判断する。Operation ServiceはTask ID、expected revision、request ID、workspace / Artifactの所属を検証し、操作受付・各事実・公開/CI参照を永続化する。Provider / Model、Validator、GitHub adapterを実行し、stale revision、busy、未知Provider / Model、policy違反、異なるArtifactへの証拠流用を外部副作用前に拒否する。これが #66 のOperation Service契約である。
+監督Codexは目的の解釈、Provider / Model選択、実行・review・再試行の要否、成果物の採否、Task完了を判断する。Operation ServiceはTask ID、expected revision、request ID、workspace / Artifactの所属を検証し、操作受付・各事実・公開/CI参照を永続化する。Provider / Model、Validator、GitHub adapterを実行し、stale revision、busy、未知Provider / Model、policy違反、異なるArtifactへの証拠流用を外部副作用前に拒否する。永続LedgerではServiceがベースLedgerとOperation sidecarのcanonical identityに結び付いたプロセス排他ロックを保持し、同じLedgerへの別プロセス実行を拒否する。Service構築時はそのロックを得た後、残存する実行中Operationを `recovery_required` にしてからServiceを返す。復旧をProvider実行中に再呼出しする公開操作は設けない。in-memory LedgerはService構築時の自動復旧を行わない。これが #66 のOperation Service契約である。
 
 ## 旧データとの互換性
 

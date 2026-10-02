@@ -53,7 +53,7 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 JSONLの最後の`item.completed` / `agent_message.text`を`AgentResult`へ、各`turn.completed.usage`の明示済みtoken値を名前と`tokens`単位を保った`UsageMetric`へ変換します。usageの欠落、不正値、負数、または集計不能な値はunknownとしてmetricに追加しません。金額はJSONLに含まれないため推定しません。`error`と`turn.failed`イベント、壊れたJSONL、stdoutの切り詰めはraw本文を含めない実行エラーとして返し、空出力は`AgentResult`なしで返します。stderrだけの切り詰めはJSONL解析を妨げず、raw captureの切り詰め情報で確認できます。未知のイベントは無視しraw出力に残します。公式JSONLイベントは実Modelを示さないため、observed Modelはunknownです。
 
-Provider APIでは成功・失敗結果にUTF-8変換前のstdout/stderr byte列、終了状態、capture切り詰め状態を保持します。raw byte列は`expose_captured_output_for_trusted_processing` / `expose_*_bytes_for_trusted_processing`を呼んだ信頼された処理だけが参照します。ProviderErrorは`kind()`で意味上のエラーを確認できますが、timeout / cancel / interrupted errorのフィールド、通常のerror本文、Debug表示にはraw診断を含めません。raw captureはsecretや認証tokenを含む可能性があり、redactionなしに永続化・返却してはいけません。正規化usageは`save_usage_metrics`へ渡せます。Codex JSONL解析はfixture unit testで検証し、実Codex CLIは通常のPR testで起動しません。AgentResultを含むAttemptの保存は既存Execution Ledgerの責務です。両LedgerとOperationを自動で結び付けるServiceは#66の対象であり、ここでは未実装です。長時間実行は `execute_with_cancellation` に `CancellationToken` を渡して停止できます。
+Provider APIでは成功・失敗結果にUTF-8変換前のstdout/stderr byte列、終了状態、capture切り詰め状態を保持します。raw byte列は`expose_captured_output_for_trusted_processing` / `expose_*_bytes_for_trusted_processing`を呼んだ信頼された処理だけが参照します。ProviderErrorは`kind()`で意味上のエラーを確認できますが、timeout / cancel / interrupted errorのフィールド、通常のerror本文、Debug表示にはraw診断を含めません。raw captureはsecretや認証tokenを含む可能性があり、redactionなしに永続化・返却してはいけません。正規化usageは`save_usage_metrics`へ渡せます。Codex JSONL解析はfixture unit testで検証し、実Codex CLIは通常のPR testで起動しません。OperationServiceはProvider-call Attemptの状態とusageをLedgerへ保存しますが、AgentResult本文やProviderのraw stdout/stderr本文は保存・返却しません。長時間実行は `execute_with_cancellation` に `CancellationToken` を渡して停止できます。
 
 ## Codex Planner
 
@@ -64,6 +64,28 @@ Provider APIでは成功・失敗結果にUTF-8変換前のstdout/stderr byte列
 `RustValidator` は明示された workspace を cwd として、`cargo fmt`、`cargo clippy`、`cargo test` の機械的なチェックを順番に実行します。全チェックを内包した aggregate の `ValidationResult` を1件返し、各コマンドの終了状態と stdout / stderr の診断は `ValidationResult::checks()` から参照できます。1つでも失敗した場合は aggregate を成功として扱いません。`CommandValidator` と `ValidationCheck` を使えば、同じ `Validator` API で決定的なチェック列も構成できます。
 
 ## Orchestrator Service
+
+### MCP Operation Service（中核実装）
+
+`OperationService` は監督側が明示した `attempt.run` を単一のExecution Ledger DBで受け付け、request ID・Task revision・busy状態を検査してOperationとQueued Attemptを原子的に保存します。永続LedgerではService生成時にベースLedgerとOperation sidecarのプロセス排他ロックを取得し、未完了Operationの復旧を完了してからServiceを返します。ロックはService破棄まで保持されるため、別プロセスのService生成と復旧はロック競合で拒否されます。復旧はService構築時だけに行い、Provider実行中に再度呼び出す公開APIはありません。`SqliteOperationLedger::recover` も同じ `LedgerRunLock` を要求します。既存ロックを共有する呼出元は `new_with_run_lock` に同じcanonical Ledger identityのguardを渡します。in-memory Ledgerはプロセス間で生存する中断状態を持たないため、Service構築時の自動復旧を行いません。現在実行できる入力は同じrepositoryの完全なbase commitを指定する `BaseInput` と `ProviderDefault` です。named Modelは信頼できるcatalogが用意されるまで実行前に拒否します。成功・timeout・cancel・中断状態と汎用usageを保存し、Providerのstdout/stderr、AgentResult、秘密を含む診断本文は保存・返却しません。
+
+Provider起動前にworkspaceのHEADが指定commitと一致し、tracked・untracked・ignored fileが空であることも確認します。hook等が内容を作った場合はProviderを起動せず、workspaceと内容を保持します。実行中のOperationはworkspace pathとbranchを参照として記録し、結果確認・Artifact連携までは自動削除しません。永続LedgerのService構築時は、取得したロックの下で残存するrunning Operationを `recovery_required` として閉じてから依頼受付を始めます。中断結果を推測せず、同じOperationを再実行しません。これはRust Service APIの中核実装であり、MCP transport、ArtifactInput、redacted log保存、named Model catalog、CLIへの配線は別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
+
+Service利用側は明示したbase commitで受付し、返されたIDで同期実行または後から状態取得を行います。
+
+```rust,ignore
+let accepted = service.submit_attempt(&AttemptRunRequest::new(
+    request_id,
+    task_id,
+    expected_revision,
+    provider_id,
+    ModelChoice::ProviderDefault,
+    instruction,
+    role,
+    BaseInput::new(repository_path, full_base_commit_oid),
+))?;
+let snapshot = service.run(accepted.operation_id(), CancellationToken::new())?;
+```
 
 以下は現在のCLI Orchestrator実装の説明です。現行LedgerではAttemptのSucceeded/FailedがValidation結果と結合した旧意味論です（`legacy_validation_coupled`）。新しいMCP Operation Serviceの契約ではAttempt stateはProvider呼出し結果のみを表します。両者を同一のruntime semanticsとして扱わないでください。
 
