@@ -1006,8 +1006,40 @@ fn ensure_task_create_text_safe(
     request_json: &str,
 ) -> Result<(), ServiceError> {
     let scanner = scanner.ok_or(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
-    let payload =
-        ArtifactPublicationPayload::new("", "", "task.create request snapshot", request_json);
+    let value: serde_json::Value =
+        serde_json::from_str(request_json).map_err(|_| ServiceError::InvalidStoredState)?;
+    let mut text_fields = Vec::new();
+    collect_json_text_fields(&value, &mut text_fields);
+    for text in text_fields {
+        ensure_task_create_field_safe(Some(scanner), text)?;
+    }
+    Ok(())
+}
+
+fn collect_json_text_fields<'a>(value: &'a serde_json::Value, text_fields: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(text) => text_fields.push(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_text_fields(value, text_fields);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                text_fields.push(key);
+                collect_json_text_fields(value, text_fields);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn ensure_task_create_field_safe(
+    scanner: Option<&dyn SecretScanner>,
+    text: &str,
+) -> Result<(), ServiceError> {
+    let scanner = scanner.ok_or(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
+    let payload = ArtifactPublicationPayload::new("", "", "task.create request text", text);
     match scanner.scan_publication_payload(&payload) {
         Ok(SecretScanResult::Clean) => Ok(()),
         Ok(SecretScanResult::Findings) | Err(_) => {
@@ -1216,6 +1248,8 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         validate_task_create(request)?;
         let payload = task_request_json(request);
         ensure_task_create_text_safe(self.secret_scanner, &payload)?;
+        ensure_task_create_field_safe(self.secret_scanner, caller)?;
+        ensure_task_create_field_safe(self.secret_scanner, &request.request_id)?;
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx
@@ -3189,6 +3223,7 @@ mod tests {
     const CHILD_MARKER_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_MARKER";
 
     const TASK_SECRET_SENTINEL: &str = "TASK_CREATE_SECRET_SENTINEL";
+    const TASK_MULTILINE_SECRET_SENTINEL: &str = "TASK_CREATE_MULTILINE_SECRET\nSENTINEL";
 
     struct TaskCreateScanner {
         unavailable: bool,
@@ -3212,6 +3247,8 @@ mod tests {
             }
             if payload.title().contains(TASK_SECRET_SENTINEL)
                 || payload.body().contains(TASK_SECRET_SENTINEL)
+                || payload.title().contains(TASK_MULTILINE_SECRET_SENTINEL)
+                || payload.body().contains(TASK_MULTILINE_SECRET_SENTINEL)
             {
                 Ok(SecretScanResult::Findings)
             } else {
@@ -3415,6 +3452,45 @@ mod tests {
     }
 
     #[test]
+    fn task_create_scans_raw_multiline_text_before_persisting() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "multiline-secret",
+            TaskSource::Manual,
+            "safe title",
+            TASK_MULTILINE_SECRET_SENTINEL,
+            vec![],
+            None,
+        );
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains("TASK_CREATE_MULTILINE_SECRET"));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let idempotency_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_create_idempotency", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_count, 0);
+        assert_eq!(idempotency_count, 0);
+    }
+
+    #[test]
     fn task_create_fails_closed_when_scanner_is_missing_or_unavailable() {
         let repo = Repo::new();
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
@@ -3476,9 +3552,14 @@ mod tests {
             None,
         );
         let created = service.create_task("caller", &request).unwrap();
-        let malicious_snapshot = format!(
-            r#"{{"source":"manual","title":"{TASK_SECRET_SENTINEL}","description":"","constraints":[],"issue":null}}"#
-        );
+        let malicious_snapshot = serde_json::json!({
+            "source": "manual",
+            "title": "safe title",
+            "description": TASK_MULTILINE_SECRET_SENTINEL,
+            "constraints": [],
+            "issue": null
+        })
+        .to_string();
         let connection = ledger.lock_connection().unwrap();
         connection
             .execute(
@@ -3499,7 +3580,73 @@ mod tests {
             error,
             ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
         ));
+        assert!(!error.to_string().contains("TASK_CREATE_MULTILINE_SECRET"));
+    }
+
+    #[test]
+    fn task_create_replay_reports_corrupt_stored_json_without_raw_diagnostics() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "corrupt-replay",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![],
+            None,
+        );
+        let created = service.create_task("caller", &request).unwrap();
+        let corrupted = format!("{{\"description\":\"{TASK_SECRET_SENTINEL}");
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE task_request_snapshots SET request_json=?1 WHERE task_id=?2",
+                params![corrupted, created.task_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE task_create_idempotency SET request_json=?1 WHERE caller='caller' AND request_id='corrupt-replay'",
+                params![corrupted],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(error, ServiceError::InvalidStoredState));
         assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let revision: i64 = connection
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                [created.task_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let snapshot_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_request_snapshots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let idempotency_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_create_idempotency", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_count, 1);
+        assert_eq!(revision, 0);
+        assert_eq!(snapshot_count, 1);
+        assert_eq!(idempotency_count, 1);
     }
 
     #[test]
