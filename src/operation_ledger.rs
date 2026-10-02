@@ -66,13 +66,21 @@ fn open_exclusive_lock(path: &Path) -> Result<std::fs::File, LedgerError> {
     let file = options.open(path)?;
     reject_lock_file_metadata(&file.metadata()?)?;
     file.try_lock_exclusive().map_err(|error| {
-        if error.kind() == io::ErrorKind::WouldBlock {
+        if is_lock_contention(&error) {
             LedgerError::LockBusy
         } else {
             LedgerError::Io(error)
         }
     })?;
     Ok(file)
+}
+
+fn is_lock_contention(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || matches!(
+            (error.raw_os_error(), fs2::lock_contended_error().raw_os_error()),
+            (Some(actual), Some(contention)) if actual == contention
+        )
 }
 
 fn reject_lock_alias(path: &Path) -> Result<(), LedgerError> {
@@ -1157,6 +1165,21 @@ fn operation_column_exists(connection: &Connection, column: &str) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_contention_detection_matches_platform_error_without_matching_missing_codes() {
+        let platform_contention = fs2::lock_contended_error();
+        if let Some(code) = platform_contention.raw_os_error() {
+            assert!(is_lock_contention(&io::Error::from_raw_os_error(code)));
+        }
+
+        assert!(is_lock_contention(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+        assert!(!is_lock_contention(&io::Error::other(
+            "unrelated lock failure"
+        )));
+    }
 
     fn lock_test_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
