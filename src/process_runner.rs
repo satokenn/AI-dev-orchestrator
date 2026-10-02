@@ -1,6 +1,6 @@
 //! Run external commands with bounded, observable process lifecycles.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::io::Write;
 use std::io::{self, Read};
@@ -21,6 +21,14 @@ const GIT_LOCATION_ENV: &[&str] = &[
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_INDEX_FILE",
+];
+const GIT_CONFIG_ENV: &[&str] = &[
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
 ];
 
 /// A command invocation independent of a shell.
@@ -176,7 +184,8 @@ impl ProcessRunner {
 
     /// Runs Git without inheriting environment variables that can redirect its repository.
     pub(crate) fn run_git(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
-        self.run_inner(request, CancellationToken::new(), GIT_LOCATION_ENV)
+        let env_vars_to_remove = git_environment_to_remove(&request);
+        self.run_inner(request, CancellationToken::new(), &env_vars_to_remove)
     }
 
     /// Runs a command after removing selected inherited environment variables.
@@ -185,7 +194,8 @@ impl ProcessRunner {
         request: ProcessRequest,
         env_vars: &[&str],
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_inner(request, CancellationToken::new(), env_vars)
+        let env_vars = env_vars.iter().map(OsString::from).collect::<Vec<_>>();
+        self.run_inner(request, CancellationToken::new(), &env_vars)
     }
 
     /// Runs a command, stopping it when cancelled or when its timeout elapses.
@@ -201,7 +211,7 @@ impl ProcessRunner {
         &self,
         request: ProcessRequest,
         token: CancellationToken,
-        env_vars_to_remove: &[&str],
+        env_vars_to_remove: &[OsString],
     ) -> Result<ProcessOutput, ProcessError> {
         let timeout = request.timeout;
         let stdin_bytes = request.stdin_bytes;
@@ -374,6 +384,38 @@ impl ProcessRunner {
             None => Ok(output),
         }
     }
+}
+
+fn git_environment_to_remove(request: &ProcessRequest) -> Vec<OsString> {
+    let _ = request;
+    let mut keys = GIT_LOCATION_ENV
+        .iter()
+        .chain(GIT_CONFIG_ENV)
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    let inherited = std::env::vars_os().map(|(key, _)| key);
+    #[cfg(test)]
+    let inherited = inherited.chain(
+        request
+            .test_inherited_env
+            .iter()
+            .map(|(key, _)| key.clone()),
+    );
+    for key in inherited {
+        if is_git_config_injection_env(&key) && !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+fn is_git_config_injection_env(key: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    GIT_CONFIG_ENV.contains(&key)
+        || key.starts_with("GIT_CONFIG_KEY_")
+        || key.starts_with("GIT_CONFIG_VALUE_")
 }
 
 impl CancellationToken {
@@ -709,6 +751,148 @@ mod tests {
                 .to_string_lossy()
         );
         fs::remove_dir_all(root).expect("remove temporary repositories");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_runner_ignores_inherited_config_injection_but_keeps_explicit_overrides() {
+        use std::fs;
+        use std::process::Command as SetupCommand;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-dev-orchestrator-git-config-isolation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).expect("create repository directory");
+        let config_override = root.join("redirected.config");
+        fs::write(
+            &config_override,
+            "[url \"https://github.com/wrong/\"]\n\tinsteadOf = https://github.com/right/\n",
+        )
+        .expect("write injected Git config");
+        let setup = |args: &[&str]| {
+            let output = SetupCommand::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env_remove("GIT_CONFIG")
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env_remove("GIT_CONFIG_SYSTEM")
+                .env_remove("GIT_CONFIG_NOSYSTEM")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_KEY_0")
+                .env_remove("GIT_CONFIG_VALUE_0")
+                .output()
+                .expect("git setup starts");
+            assert!(
+                output.status.success(),
+                "git setup: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        setup(&["init", "--quiet"]);
+        setup(&["config", "user.name", "Test"]);
+        setup(&["config", "user.email", "test@example.invalid"]);
+        setup(&[
+            "config",
+            "remote.origin.url",
+            "https://github.com/right/repo.git",
+        ]);
+        fs::write(repo.join("tracked.txt"), "base\n").expect("write tracked file");
+        setup(&["add", "tracked.txt"]);
+        setup(&["commit", "--quiet", "-m", "base"]);
+
+        let injected = ProcessRequest::new("git")
+            .args([
+                "-C",
+                repo.to_str().expect("repo path is UTF-8"),
+                "remote",
+                "get-url",
+                "origin",
+            ])
+            .test_inherited_env("GIT_CONFIG_COUNT", "1")
+            .test_inherited_env("GIT_CONFIG_KEY_0", "remote.origin.url")
+            .test_inherited_env("GIT_CONFIG_VALUE_0", "https://github.com/wrong/target.git")
+            .test_inherited_env(
+                "GIT_CONFIG_PARAMETERS",
+                "'remote.origin.url=https://github.com/wrong/parameters.git'",
+            )
+            .test_inherited_env("GIT_CONFIG", config_override.as_os_str())
+            .test_inherited_env("GIT_CONFIG_GLOBAL", config_override.as_os_str())
+            .test_inherited_env("GIT_CONFIG_SYSTEM", config_override.as_os_str());
+        let output = ProcessRunner
+            .run_git(injected)
+            .expect("git reads the local origin");
+        assert_eq!(output.stdout, b"https://github.com/right/repo.git\n");
+
+        let explicit = ProcessRunner
+            .run_git(
+                ProcessRequest::new("git")
+                    .args([
+                        "-c",
+                        "orchestrator.explicit-test=preserved",
+                        "-C",
+                        repo.to_str().expect("repo path is UTF-8"),
+                        "config",
+                        "--get",
+                        "orchestrator.explicit-test",
+                    ])
+                    .test_inherited_env("GIT_CONFIG_KEY_0", "remote.origin.url")
+                    .test_inherited_env(
+                        "GIT_CONFIG_VALUE_0",
+                        "https://github.com/wrong/target.git",
+                    ),
+            )
+            .expect("explicit git -c is preserved");
+        assert_eq!(explicit.stdout, b"preserved\n");
+
+        fs::write(repo.join("tracked.txt"), "captured\n").expect("modify tracked file");
+        let index = root.join("publication.index");
+        ProcessRunner
+            .run_git(
+                ProcessRequest::new("git")
+                    .args([
+                        "-C",
+                        repo.to_str().expect("repo path is UTF-8"),
+                        "add",
+                        "-A",
+                    ])
+                    .env("GIT_INDEX_FILE", index.as_os_str()),
+            )
+            .expect("explicit internal index is preserved");
+        assert!(index.exists());
+        let staged = ProcessRunner
+            .run_git(
+                ProcessRequest::new("git")
+                    .args([
+                        "-C",
+                        repo.to_str().expect("repo path is UTF-8"),
+                        "diff",
+                        "--cached",
+                        "--name-only",
+                    ])
+                    .env("GIT_INDEX_FILE", index.as_os_str()),
+            )
+            .expect("read explicit internal index");
+        assert_eq!(staged.stdout, b"tracked.txt\n");
+        let default = ProcessRunner
+            .run_git(ProcessRequest::new("git").args([
+                "-C",
+                repo.to_str().expect("repo path is UTF-8"),
+                "diff",
+                "--cached",
+                "--name-only",
+            ]))
+            .expect("default repository index remains untouched");
+        assert!(default.stdout.is_empty());
+
+        fs::remove_dir_all(root).expect("remove temporary repository");
     }
 
     #[cfg(unix)]
