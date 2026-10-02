@@ -148,13 +148,24 @@ impl CodexProvider {
             .run_with_cancellation(self.process_request(request), cancellation)
             .map_err(|error| self.map_process_error(error, request.timeout(), request.model()))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stdout = match std::str::from_utf8(&output.stdout) {
+            Ok(stdout) => stdout.to_owned(),
+            Err(_) => {
+                let captured_output = CapturedOutput::from_process_output(&output);
+                return Err(ProviderError::ExecutionFailed(
+                    "Codex CLI emitted invalid UTF-8 in JSONL stdout".into(),
+                )
+                .with_captured_output(captured_output));
+            }
+        };
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let exit_status = output.exit_code();
         let captured_output = CapturedOutput::from_process_output(&output);
-        let parsed = parse_codex_jsonl(&stdout, output.stdout_truncated).map_err(|message| {
-            ProviderError::ExecutionFailed(message).with_captured_output(captured_output.clone())
-        })?;
+        let parsed =
+            parse_codex_jsonl(stdout.as_bytes(), output.stdout_truncated).map_err(|message| {
+                ProviderError::ExecutionFailed(message)
+                    .with_captured_output(captured_output.clone())
+            })?;
         let result = ProviderResult::new(
             stdout,
             stderr,
@@ -251,10 +262,12 @@ struct ParsedCodexJsonl {
 
 /// Parses the stable Codex JSONL events needed by the provider contract.
 /// Unknown event types are ignored, and the caller retains the original stream.
-fn parse_codex_jsonl(stdout: &str, truncated: bool) -> Result<ParsedCodexJsonl, String> {
+fn parse_codex_jsonl(stdout: &[u8], truncated: bool) -> Result<ParsedCodexJsonl, String> {
     if truncated {
         return Err("Codex JSONL stdout was truncated before parsing".into());
     }
+    let stdout = std::str::from_utf8(stdout)
+        .map_err(|_| "Codex CLI emitted invalid UTF-8 in JSONL stdout".to_owned())?;
     let mut final_message = None;
     let mut usage_events = Vec::new();
     let mut completed_turn_without_usage = false;
@@ -360,7 +373,8 @@ fn parse_codex_jsonl(stdout: &str, truncated: bool) -> Result<ParsedCodexJsonl, 
         }
     }
     let usage = (!metrics.is_empty()).then(|| UsageCost::new(metrics));
-    let agent_result = final_message.map(|message| AgentResult::new(message, true));
+    let agent_result =
+        final_message.map(|message| AgentResult::new(message, diagnostics.is_empty()));
     Ok(ParsedCodexJsonl {
         agent_result,
         usage,
@@ -635,9 +649,11 @@ mod tests {
 
     #[test]
     fn fixture_extracts_final_message_and_all_reported_token_metrics() {
-        let parsed =
-            parse_codex_jsonl(include_str!("../tests/fixtures/codex/success.jsonl"), false)
-                .unwrap();
+        let parsed = parse_codex_jsonl(
+            include_bytes!("../tests/fixtures/codex/success.jsonl"),
+            false,
+        )
+        .unwrap();
         assert_eq!(parsed.agent_result.unwrap().summary(), "task complete");
         let metrics = parsed.usage.unwrap();
         let values = metrics
@@ -660,7 +676,7 @@ mod tests {
     #[test]
     fn latest_agent_message_wins_and_unknown_events_are_ignored() {
         let parsed = parse_codex_jsonl(
-            "{\"type\":\"future.event\",\"payload\":{}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"first\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"last\"}}\n",
+            b"{\"type\":\"future.event\",\"payload\":{}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"first\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"last\"}}\n",
             false,
         ).unwrap();
         assert_eq!(parsed.agent_result.unwrap().summary(), "last");
@@ -668,13 +684,30 @@ mod tests {
     }
 
     #[test]
+    fn item_error_marks_reported_success_false_and_preserves_final_message() {
+        let parsed = parse_codex_jsonl(
+            b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"partial result\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":\"tool failed\"}}\n",
+            false,
+        )
+        .unwrap();
+
+        let result = parsed.agent_result.unwrap();
+        assert_eq!(result.summary(), "partial result");
+        assert!(!result.reported_success());
+        assert_eq!(
+            parsed.diagnostics,
+            vec!["Codex CLI emitted an item error event"]
+        );
+    }
+
+    #[test]
     fn empty_output_and_unknown_usage_remain_unknown() {
-        let empty = parse_codex_jsonl("", false).unwrap();
+        let empty = parse_codex_jsonl(b"", false).unwrap();
         assert!(empty.agent_result.is_none());
         assert!(empty.usage.is_none());
 
         let parsed = parse_codex_jsonl(
-            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":-1}}\n",
+            b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":-1}}\n",
             false,
         )
         .unwrap();
@@ -683,8 +716,46 @@ mod tests {
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].name(), "input_tokens");
         assert_eq!(metrics[0].value(), "12");
-        assert!(parse_codex_jsonl("{broken\n", false).is_err());
-        assert!(parse_codex_jsonl("{}", true).is_err());
+        assert!(parse_codex_jsonl(b"{broken\n", false).is_err());
+        assert!(parse_codex_jsonl(b"{}", true).is_err());
+    }
+
+    #[test]
+    fn jsonl_rejects_invalid_utf8_without_replacing_captured_bytes() {
+        let raw_stdout = b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"\xff\"}}\n";
+        assert!(matches!(
+            parse_codex_jsonl(raw_stdout, false),
+            Err(message) if message.contains("invalid UTF-8")
+        ));
+        let lossy = String::from_utf8_lossy(raw_stdout);
+        assert!(parse_codex_jsonl(lossy.as_bytes(), false).is_ok());
+
+        let captured = CapturedOutput::new(raw_stdout.to_vec(), Vec::new(), Some(0), false);
+        assert_eq!(
+            captured.expose_stdout_bytes_for_trusted_processing(),
+            raw_stdout
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_rejects_invalid_utf8_and_keeps_original_capture() {
+        let provider = shell_provider(
+            "printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"\\377\"}}\\n'",
+        );
+        let error = provider
+            .execute(&request(Duration::from_secs(1)))
+            .unwrap_err();
+        assert!(
+            matches!(error.kind(), ProviderError::ExecutionFailed(message) if message.contains("invalid UTF-8"))
+        );
+        assert_eq!(
+            error
+                .expose_captured_output_for_trusted_processing()
+                .unwrap()
+                .expose_stdout_bytes_for_trusted_processing(),
+            b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"\xff\"}}\n"
+        );
     }
 
     #[test]

@@ -472,6 +472,7 @@ impl WorkspaceManager {
                 "--porcelain=v1",
                 "--untracked-files=all",
                 "--ignored=matching",
+                "--ignore-submodules=none",
             ],
         )?;
         if !status.stdout.is_empty() {
