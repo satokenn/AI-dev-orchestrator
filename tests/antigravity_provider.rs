@@ -282,6 +282,10 @@ fn maps_timeout_to_provider_error() {
     assert!(
         matches!(error.kind(), ProviderError::TimedOutWithOutput { timeout } if *timeout == Duration::from_secs(15))
     );
+    assert!(
+        !error.to_string().contains("partial"),
+        "ordinary provider diagnostics must not expose captured output"
+    );
     assert_eq!(
         error
             .expose_captured_output_for_trusted_processing()

@@ -211,7 +211,7 @@ impl WorkspaceManager {
             });
         }
         let output = ProcessRunner
-            .run(ProcessRequest::new("git").args([
+            .run_git(ProcessRequest::new("git").args([
                 "-C",
                 path.to_string_lossy().as_ref(),
                 "rev-parse",
@@ -545,7 +545,7 @@ impl WorkspaceManager {
                 "--quiet",
             ])
             .arg(format!("refs/heads/{branch}"));
-        match self.runner.run(request) {
+        match self.runner.run_git(request) {
             Ok(_) => Ok(true),
             Err(ProcessError::NonZeroExit(_)) => Ok(false),
             Err(error) => Err(git_error(
@@ -571,7 +571,7 @@ impl WorkspaceManager {
         args: &[&str],
     ) -> Result<crate::ProcessOutput, WorkspaceError> {
         self.runner
-            .run(
+            .run_git(
                 ProcessRequest::new("git")
                     .args(args.iter().copied())
                     .cwd(&self.repository_root),
@@ -586,7 +586,7 @@ impl WorkspaceManager {
         args: &[&str],
     ) -> Result<crate::ProcessOutput, WorkspaceError> {
         self.runner
-            .run(
+            .run_git(
                 ProcessRequest::new("git")
                     .args(args.iter().copied())
                     .cwd(cwd),
@@ -636,7 +636,7 @@ fn git_error(
     error: ProcessError,
 ) -> WorkspaceError {
     let (status, stdout, stderr) = match error {
-        ProcessError::Spawn(error) | ProcessError::Io(error) => {
+        ProcessError::Spawn(error) | ProcessError::Io(error) | ProcessError::Stdin(error) => {
             (None, Vec::new(), error.to_string())
         }
         ProcessError::NonZeroExit(output)

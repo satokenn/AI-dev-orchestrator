@@ -138,7 +138,7 @@ type PublicationTaskRow = (
 
 // Version 10 was independently used by the parent Attempt-history migration and
 // the Artifact migration. Version 11 reconciles both layouts and is idempotent.
-const LATEST_SCHEMA_VERSION: u32 = 12;
+const LATEST_SCHEMA_VERSION: u32 = 13;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -294,6 +294,7 @@ impl SqliteExecutionLedger {
         create_service_schema(&transaction)?;
         create_artifact_service_schema(&transaction)?;
         create_artifact_evidence_schema(&transaction)?;
+        create_artifact_publication_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -951,6 +952,7 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
                 backfill_legacy_attempt_history(connection)?;
                 create_artifact_evidence_schema(connection)?;
             }
+            13 => create_artifact_publication_schema(connection)?,
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
@@ -1084,6 +1086,38 @@ fn create_service_schema(connection: &Connection) -> Result<(), rusqlite::Error>
              ON service_operations(task_id, status);
          INSERT OR IGNORE INTO service_task_revisions(task_id, revision)
              SELECT id, 0 FROM tasks;",
+    )
+}
+
+fn create_artifact_publication_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_artifact_publication_operations (
+             id TEXT PRIMARY KEY NOT NULL,
+             request_id TEXT NOT NULL UNIQUE,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             request_digest TEXT NOT NULL,
+             artifact_id TEXT NOT NULL,
+             tree_oid TEXT NOT NULL,
+             base_commit TEXT NOT NULL,
+             validation_id TEXT NOT NULL,
+             decision_id TEXT NOT NULL,
+             base_branch TEXT NOT NULL,
+             head_branch TEXT NOT NULL,
+             status TEXT NOT NULL CHECK(status IN ('accepted','running','completed','failed','recovery_required')),
+             phase TEXT NOT NULL,
+             commit_sha TEXT,
+             pull_request_number INTEGER,
+             pull_request_url TEXT,
+             is_draft INTEGER CHECK(is_draft IS NULL OR is_draft IN (0,1)),
+             error_code TEXT,
+             accepted_revision INTEGER NOT NULL,
+             revision INTEGER NOT NULL,
+             accepted_at INTEGER NOT NULL,
+             started_at INTEGER,
+             finished_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS service_artifact_publications_task_status
+             ON service_artifact_publication_operations(task_id, status);",
     )
 }
 
@@ -1613,14 +1647,62 @@ mod tests {
     }
 
     #[test]
+    fn schema_v12_migration_adds_artifact_publication_table() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_latest_schema(&connection).unwrap();
+        create_service_schema(&connection).unwrap();
+        create_artifact_service_schema(&connection).unwrap();
+        create_artifact_evidence_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks(id,description,role,state) VALUES ('task-v11','existing','developer','active')",
+                [],
+            )
+            .unwrap();
+        set_schema_version(&connection, 12).unwrap();
+
+        let has_publication_table: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifact_publication_operations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_publication_table);
+
+        let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
+        let migrated = ledger.lock_connection().unwrap();
+        let version: u32 = migrated
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 13);
+        let has_publication_table: bool = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifact_publication_operations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_publication_table);
+        let preserved_task: String = migrated
+            .query_row(
+                "SELECT description FROM tasks WHERE id='task-v11'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_task, "existing");
+    }
+
+    #[test]
     fn future_schema_version_is_rejected() {
         let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 13;")
+            .execute_batch("PRAGMA user_version = 14;")
             .unwrap();
         assert!(matches!(
             SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(13))
+            Err(LedgerError::UnsupportedSchemaVersion(14))
         ));
     }
 
@@ -1666,7 +1748,7 @@ mod tests {
             let version: u32 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 12);
+            assert_eq!(version, 13);
             let history: (String, i64, Option<String>) = connection.query_row(
                 "SELECT relation_kind, sequence, role FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
                 [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1722,7 +1804,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         let history: (Option<String>, String) = connection
             .query_row(
                 "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
@@ -1742,9 +1824,9 @@ mod tests {
     }
 
     #[test]
-    fn version_twelve_open_does_not_backfill_new_cli_attempts() {
+    fn version_thirteen_open_does_not_backfill_new_cli_attempts() {
         let root = std::env::temp_dir().join(format!(
-            "ai-dev-orchestrator-v12-attempt-history-{}-{}",
+            "ai-dev-orchestrator-v13-attempt-history-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1779,7 +1861,7 @@ mod tests {
             let version: u32 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 12);
+            assert_eq!(version, 13);
             let migrated: (Option<String>, String) = connection
                 .query_row(
                     "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='before-v12'",
@@ -1795,7 +1877,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO attempts(task_id,id,provider,state,semantics_version)
-             VALUES('legacy-task','after-v12','codex','failed','legacy_validation_coupled')",
+             VALUES('legacy-task','after-v13','codex','failed','legacy_validation_coupled')",
                 [],
             )
             .unwrap();
@@ -1812,7 +1894,7 @@ mod tests {
             .unwrap();
         let post_migration_history_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='after-v12'",
+                "SELECT COUNT(*) FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='after-v13'",
                 [],
                 |row| row.get(0),
             )

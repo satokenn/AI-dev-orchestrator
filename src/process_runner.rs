@@ -1,6 +1,8 @@
 //! Run external commands with bounded, observable process lifecycles.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::io::Write;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -12,6 +14,22 @@ use std::time::{Duration, Instant};
 const MAX_CAPTURE_BYTES_PER_STREAM: usize = 1024 * 1024;
 const STOP_GRACE_PERIOD: Duration = Duration::from_millis(200);
 const PIPE_DRAIN_PERIOD: Duration = Duration::from_millis(200);
+const GIT_LOCATION_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+];
+const GIT_CONFIG_ENV: &[&str] = &[
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
 
 /// A command invocation independent of a shell.
 #[derive(Debug, Clone)]
@@ -21,6 +39,11 @@ pub struct ProcessRequest {
     pub cwd: Option<PathBuf>,
     pub env: Vec<(OsString, OsString)>,
     pub timeout: Option<Duration>,
+    /// Optional stdin payload, written in full without being captured as output.
+    /// Payloads are accepted only where the runner can cancel the writer synchronously.
+    pub stdin_bytes: Option<Vec<u8>>,
+    #[cfg(test)]
+    test_inherited_env: Vec<(OsString, OsString)>,
 }
 
 impl ProcessRequest {
@@ -32,6 +55,9 @@ impl ProcessRequest {
             cwd: None,
             env: Vec::new(),
             timeout: None,
+            stdin_bytes: None,
+            #[cfg(test)]
+            test_inherited_env: Vec::new(),
         }
     }
     #[must_use]
@@ -57,6 +83,22 @@ impl ProcessRequest {
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+    #[must_use]
+    /// Writes the complete byte vector to stdin with cancellable nonblocking writes.
+    /// Targets without that support return `ProcessError::Stdin(Unsupported)` before spawning.
+    pub fn stdin_bytes(mut self, bytes: Vec<u8>) -> Self {
+        self.stdin_bytes = Some(bytes);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn test_inherited_env(
+        mut self,
+        key: impl Into<OsString>,
+        value: impl Into<OsString>,
+    ) -> Self {
+        self.test_inherited_env.push((key.into(), value.into()));
         self
     }
 }
@@ -115,6 +157,7 @@ pub enum ProcessError {
     TimedOut(ProcessOutput),
     Cancelled(ProcessOutput),
     CancelledBeforeStart,
+    Stdin(io::Error),
     /// Stop was requested, but the managed process group could not be
     /// confirmed stopped within the grace period.
     Interrupted {
@@ -139,21 +182,62 @@ impl ProcessRunner {
         self.run_with_cancellation(request, CancellationToken::new())
     }
 
+    /// Runs Git without inheriting environment variables that can redirect its repository.
+    pub(crate) fn run_git(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
+        let env_vars_to_remove = git_environment_to_remove(&request);
+        self.run_inner(request, CancellationToken::new(), &env_vars_to_remove)
+    }
+
+    /// Runs a command after removing selected inherited environment variables.
+    pub(crate) fn run_with_env_removed(
+        &self,
+        request: ProcessRequest,
+        env_vars: &[&str],
+    ) -> Result<ProcessOutput, ProcessError> {
+        let env_vars = env_vars.iter().map(OsString::from).collect::<Vec<_>>();
+        self.run_inner(request, CancellationToken::new(), &env_vars)
+    }
+
     /// Runs a command, stopping it when cancelled or when its timeout elapses.
     pub fn run_with_cancellation(
         &self,
         request: ProcessRequest,
         token: CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
+        self.run_inner(request, token, &[])
+    }
+
+    fn run_inner(
+        &self,
+        request: ProcessRequest,
+        token: CancellationToken,
+        env_vars_to_remove: &[OsString],
+    ) -> Result<ProcessOutput, ProcessError> {
         let timeout = request.timeout;
+        let stdin_bytes = request.stdin_bytes;
+        validate_stdin_support(cfg!(unix), stdin_bytes.is_some())?;
         let mut command = Command::new(&request.command);
         command
             .args(&request.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(test)]
+        for (key, value) in &request.test_inherited_env {
+            command.env(key, value);
+        }
+        #[cfg(unix)]
+        let mut stdin_writer = stdin_bytes
+            .map(|bytes| NonblockingStdin::attach(&mut command, bytes))
+            .transpose()
+            .map_err(ProcessError::Spawn)?;
+        #[cfg(not(unix))]
+        command.stdin(Stdio::null());
         if let Some(cwd) = request.cwd {
             command.current_dir(cwd);
+        }
+        for key in env_vars_to_remove {
+            command.env_remove(key);
         }
         for (key, value) in request.env {
             command.env(key, value);
@@ -164,11 +248,16 @@ impl ProcessRunner {
             .spawn_if_not_cancelled(&mut command)
             .map_err(ProcessError::Spawn)?
             .ok_or(ProcessError::CancelledBeforeStart)?;
+        drop(command);
+        let started = Instant::now();
         let stdout = Arc::new(Mutex::new(CapturedBytes::default()));
         let stderr = Arc::new(Mutex::new(CapturedBytes::default()));
         let stdout_reader = take_pipe(&mut child, true, Arc::clone(&stdout))?;
         let stderr_reader = take_pipe(&mut child, false, Arc::clone(&stderr))?;
-        let started = Instant::now();
+        #[cfg(unix)]
+        let mut stdin_error = None;
+        #[cfg(unix)]
+        let mut stdin_incomplete = false;
         let mut reason = loop {
             if token.is_cancelled() {
                 break Some(StopReason::Cancelled);
@@ -177,10 +266,35 @@ impl ProcessRunner {
                 break Some(StopReason::TimedOut);
             }
             if child.try_wait().map_err(ProcessError::Io)?.is_some() {
+                #[cfg(unix)]
+                if stdin_writer
+                    .as_ref()
+                    .is_some_and(|writer| !writer.is_complete())
+                {
+                    stdin_incomplete = true;
+                    break Some(StopReason::PipeHeld);
+                }
                 break None;
+            }
+            #[cfg(unix)]
+            let stdin_finished = if let Some(writer) = stdin_writer.as_mut() {
+                if let Err(error) = writer.write_available(&token) {
+                    stdin_error = Some(error);
+                    break Some(StopReason::PipeHeld);
+                } else {
+                    writer.is_complete()
+                }
+            } else {
+                false
+            };
+            #[cfg(unix)]
+            if stdin_finished {
+                stdin_writer = None;
             }
             thread::sleep(Duration::from_millis(5));
         };
+        #[cfg(unix)]
+        drop(stdin_writer);
         let stopped = if let Some(_reason) = reason {
             stop_process_group(&mut child, STOP_GRACE_PERIOD)?
         } else {
@@ -200,14 +314,15 @@ impl ProcessRunner {
                 diagnostic: "managed process group did not stop within the grace period".into(),
             });
         }
+        let mut process_group_stopped = stopped;
         let status = child.wait().map_err(ProcessError::Io)?;
         let drain_deadline = Instant::now() + PIPE_DRAIN_PERIOD;
         let stdout_done = join_pipe_until(stdout_reader, drain_deadline);
         let stderr_done = join_pipe_until(stderr_reader, drain_deadline);
         if (stdout_done.is_err() || stderr_done.is_err()) && reason.is_none() {
             reason = Some(StopReason::PipeHeld);
-            let stopped = stop_process_group(&mut child, STOP_GRACE_PERIOD)?;
-            if !stopped {
+            process_group_stopped = stop_process_group(&mut child, STOP_GRACE_PERIOD)?;
+            if !process_group_stopped {
                 let stdout_capture = captured(&stdout);
                 let stderr_capture = captured(&stderr);
                 return Err(ProcessError::Interrupted {
@@ -233,6 +348,25 @@ impl ProcessRunner {
             stdout_truncated: stdout_capture.truncated,
             stderr_truncated: stderr_capture.truncated,
         };
+        #[cfg(unix)]
+        if stdin_incomplete {
+            return Err(ProcessError::Interrupted {
+                reason: reason.unwrap_or(StopReason::PipeHeld),
+                stopped: process_group_stopped,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                output_truncated: output.output_truncated,
+                stdout_truncated: output.stdout_truncated,
+                stderr_truncated: output.stderr_truncated,
+                diagnostic:
+                    "stdin payload was not fully delivered before the managed process group stopped"
+                        .into(),
+            });
+        }
+        #[cfg(unix)]
+        if let Some(error) = stdin_error {
+            return Err(ProcessError::Stdin(error));
+        }
         match reason {
             Some(StopReason::Cancelled) => Err(ProcessError::Cancelled(output)),
             Some(StopReason::TimedOut) => Err(ProcessError::TimedOut(output)),
@@ -250,6 +384,38 @@ impl ProcessRunner {
             None => Ok(output),
         }
     }
+}
+
+fn git_environment_to_remove(request: &ProcessRequest) -> Vec<OsString> {
+    let _ = request;
+    let mut keys = GIT_LOCATION_ENV
+        .iter()
+        .chain(GIT_CONFIG_ENV)
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    let inherited = std::env::vars_os().map(|(key, _)| key);
+    #[cfg(test)]
+    let inherited = inherited.chain(
+        request
+            .test_inherited_env
+            .iter()
+            .map(|(key, _)| key.clone()),
+    );
+    for key in inherited {
+        if is_git_config_injection_env(&key) && !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+fn is_git_config_injection_env(key: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    GIT_CONFIG_ENV.contains(&key)
+        || key.starts_with("GIT_CONFIG_KEY_")
+        || key.starts_with("GIT_CONFIG_VALUE_")
 }
 
 impl CancellationToken {
@@ -284,6 +450,19 @@ fn take_pipe(
         child.stderr.take().map(|pipe| spawn_reader(pipe, capture))
     };
     pipe.ok_or_else(|| ProcessError::Io(io::Error::other("missing output pipe")))
+}
+
+fn validate_stdin_support(
+    supports_cancellable_stdin: bool,
+    payload_requested: bool,
+) -> Result<(), ProcessError> {
+    if payload_requested && !supports_cancellable_stdin {
+        return Err(ProcessError::Stdin(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "stdin payload requires a platform with cancellable nonblocking writes",
+        )));
+    }
+    Ok(())
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -341,6 +520,68 @@ fn join_pipe_until(
         return Err(());
     }
     handle.join().map_err(|_| ())?.map_err(|_| ())
+}
+
+#[cfg(unix)]
+struct NonblockingStdin {
+    stream: Option<std::os::unix::net::UnixStream>,
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+#[cfg(unix)]
+impl NonblockingStdin {
+    fn attach(command: &mut Command, bytes: Vec<u8>) -> io::Result<Self> {
+        use std::os::unix::net::UnixStream;
+
+        let (writer, child_stdin) = UnixStream::pair()?;
+        writer.set_nonblocking(true)?;
+        command.stdin(Stdio::from(std::os::fd::OwnedFd::from(child_stdin)));
+        Ok(Self {
+            stream: Some(writer),
+            bytes,
+            offset: 0,
+        })
+    }
+
+    fn write_available(&mut self, cancellation: &CancellationToken) -> io::Result<()> {
+        loop {
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+            if self.offset == self.bytes.len() {
+                self.finish();
+                return Ok(());
+            }
+
+            match self
+                .stream
+                .as_mut()
+                .expect("stdin stream remains open until all bytes are written")
+                .write(&self.bytes[self.offset..])
+            {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write stdin payload",
+                    ));
+                }
+                Ok(count) => self.offset += count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    const fn is_complete(&self) -> bool {
+        self.offset >= self.bytes.len()
+    }
+
+    fn finish(&mut self) {
+        self.stream = None;
+        self.bytes.clear();
+    }
 }
 
 #[cfg(unix)]
@@ -444,6 +685,235 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn git_runner_ignores_inherited_repository_location_environment() {
+        use std::fs;
+        use std::process::Command as SetupCommand;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-dev-orchestrator-git-isolation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        let actual = root.join("actual");
+        let foreign = root.join("foreign");
+        fs::create_dir_all(&actual).expect("create actual repository directory");
+        fs::create_dir_all(&foreign).expect("create foreign repository directory");
+        for repository in [&actual, &foreign] {
+            let output = SetupCommand::new("git")
+                .args(["init", "--quiet"])
+                .arg(repository)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .expect("git init starts");
+            assert!(
+                output.status.success(),
+                "git init: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let mut request = ProcessRequest::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .cwd(&actual);
+        let injected = [
+            ("GIT_DIR", foreign.join(".git")),
+            ("GIT_WORK_TREE", foreign.clone()),
+            ("GIT_COMMON_DIR", foreign.join(".git")),
+            ("GIT_OBJECT_DIRECTORY", foreign.join(".git/objects")),
+            (
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                foreign.join(".git/objects"),
+            ),
+            ("GIT_INDEX_FILE", foreign.join("index")),
+        ];
+        for (key, value) in injected {
+            request
+                .test_inherited_env
+                .push((key.into(), value.into_os_string()));
+        }
+        let output = ProcessRunner
+            .run_git(request)
+            .expect("git uses requested repository");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            fs::canonicalize(&actual)
+                .expect("canonicalize actual repository")
+                .to_string_lossy()
+        );
+        fs::remove_dir_all(root).expect("remove temporary repositories");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_runner_ignores_inherited_config_injection_but_keeps_explicit_overrides() {
+        use std::fs;
+        use std::process::Command as SetupCommand;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-dev-orchestrator-git-config-isolation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).expect("create repository directory");
+        let config_override = root.join("redirected.config");
+        fs::write(
+            &config_override,
+            "[url \"https://github.com/wrong/\"]\n\tinsteadOf = https://github.com/right/\n",
+        )
+        .expect("write injected Git config");
+        let setup = |args: &[&str]| {
+            let output = SetupCommand::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env_remove("GIT_CONFIG")
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env_remove("GIT_CONFIG_SYSTEM")
+                .env_remove("GIT_CONFIG_NOSYSTEM")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_KEY_0")
+                .env_remove("GIT_CONFIG_VALUE_0")
+                .output()
+                .expect("git setup starts");
+            assert!(
+                output.status.success(),
+                "git setup: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        setup(&["init", "--quiet"]);
+        setup(&["config", "user.name", "Test"]);
+        setup(&["config", "user.email", "test@example.invalid"]);
+        setup(&[
+            "config",
+            "remote.origin.url",
+            "https://github.com/right/repo.git",
+        ]);
+        fs::write(repo.join("tracked.txt"), "base\n").expect("write tracked file");
+        setup(&["add", "tracked.txt"]);
+        setup(&["commit", "--quiet", "-m", "base"]);
+
+        let injected = ProcessRequest::new("git")
+            .args([
+                "-C",
+                repo.to_str().expect("repo path is UTF-8"),
+                "remote",
+                "get-url",
+                "origin",
+            ])
+            .test_inherited_env("GIT_CONFIG_COUNT", "1")
+            .test_inherited_env("GIT_CONFIG_KEY_0", "remote.origin.url")
+            .test_inherited_env("GIT_CONFIG_VALUE_0", "https://github.com/wrong/target.git")
+            .test_inherited_env(
+                "GIT_CONFIG_PARAMETERS",
+                "'remote.origin.url=https://github.com/wrong/parameters.git'",
+            )
+            .test_inherited_env("GIT_CONFIG", config_override.as_os_str())
+            .test_inherited_env("GIT_CONFIG_GLOBAL", config_override.as_os_str())
+            .test_inherited_env("GIT_CONFIG_SYSTEM", config_override.as_os_str());
+        let output = ProcessRunner
+            .run_git(injected)
+            .expect("git reads the local origin");
+        assert_eq!(output.stdout, b"https://github.com/right/repo.git\n");
+
+        let explicit = ProcessRunner
+            .run_git(
+                ProcessRequest::new("git")
+                    .args([
+                        "-c",
+                        "orchestrator.explicit-test=preserved",
+                        "-C",
+                        repo.to_str().expect("repo path is UTF-8"),
+                        "config",
+                        "--get",
+                        "orchestrator.explicit-test",
+                    ])
+                    .test_inherited_env("GIT_CONFIG_KEY_0", "remote.origin.url")
+                    .test_inherited_env(
+                        "GIT_CONFIG_VALUE_0",
+                        "https://github.com/wrong/target.git",
+                    ),
+            )
+            .expect("explicit git -c is preserved");
+        assert_eq!(explicit.stdout, b"preserved\n");
+
+        fs::write(repo.join("tracked.txt"), "captured\n").expect("modify tracked file");
+        let index = root.join("publication.index");
+        ProcessRunner
+            .run_git(
+                ProcessRequest::new("git")
+                    .args([
+                        "-C",
+                        repo.to_str().expect("repo path is UTF-8"),
+                        "add",
+                        "-A",
+                    ])
+                    .env("GIT_INDEX_FILE", index.as_os_str()),
+            )
+            .expect("explicit internal index is preserved");
+        assert!(index.exists());
+        let staged = ProcessRunner
+            .run_git(
+                ProcessRequest::new("git")
+                    .args([
+                        "-C",
+                        repo.to_str().expect("repo path is UTF-8"),
+                        "diff",
+                        "--cached",
+                        "--name-only",
+                    ])
+                    .env("GIT_INDEX_FILE", index.as_os_str()),
+            )
+            .expect("read explicit internal index");
+        assert_eq!(staged.stdout, b"tracked.txt\n");
+        let default = ProcessRunner
+            .run_git(ProcessRequest::new("git").args([
+                "-C",
+                repo.to_str().expect("repo path is UTF-8"),
+                "diff",
+                "--cached",
+                "--name-only",
+            ]))
+            .expect("default repository index remains untouched");
+        assert!(default.stdout.is_empty());
+
+        fs::remove_dir_all(root).expect("remove temporary repository");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_can_remove_a_selected_inherited_environment_variable() {
+        let mut request = ProcessRequest::new("sh").args([
+            "-c",
+            "if [ \"${GH_REPO+x}${GH_HOST+x}\" = xx ]; then printf 'set'; else printf 'repo:%s host:%s' \"${GH_REPO-unset}\" \"${GH_HOST-unset}\"; fi",
+        ]);
+        request
+            .test_inherited_env
+            .push(("GH_REPO".into(), "wrong/target".into()));
+        request
+            .test_inherited_env
+            .push(("GH_HOST".into(), "wrong.host".into()));
+        let output = ProcessRunner
+            .run_with_env_removed(request, &["GH_REPO", "GH_HOST"])
+            .expect("shell process succeeds");
+        assert_eq!(output.stdout, b"repo:unset host:unset");
+    }
+
     #[test]
     fn captures_output_and_exit_code() {
         let request = ProcessRequest::new(shell()).args(shell_args("printf out; printf err >&2"));
@@ -471,12 +941,199 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stdin_payload_requires_cancellable_nonblocking_support() {
+        assert!(validate_stdin_support(false, false).is_ok());
+        assert!(matches!(
+            validate_stdin_support(false, true),
+            Err(ProcessError::Stdin(error))
+                if error.kind() == std::io::ErrorKind::Unsupported
+        ));
+        assert!(validate_stdin_support(true, true).is_ok());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_stdin_payload_is_rejected_before_process_spawn() {
+        let result = ProcessRunner.run(
+            ProcessRequest::new("this-command-must-not-be-spawned")
+                .stdin_bytes(b"private payload".to_vec()),
+        );
+        assert!(matches!(
+            result,
+            Err(ProcessError::Stdin(error))
+                if error.kind() == std::io::ErrorKind::Unsupported
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn stops_a_timed_out_process() {
         let request = ProcessRequest::new("sleep")
             .arg("10")
             .timeout(Duration::from_millis(20));
+        assert!(matches!(
+            ProcessRunner.run(request),
+            Err(ProcessError::TimedOut(_))
+                | Err(ProcessError::Interrupted {
+                    reason: StopReason::TimedOut,
+                    ..
+                })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_all_stdin_bytes_without_capturing_them() {
+        let input = vec![b'x'; 2 * 1024 * 1024];
+        let request = ProcessRequest::new("wc")
+            .arg("-c")
+            .stdin_bytes(input.clone())
+            .timeout(Duration::from_secs(10));
+        let output = ProcessRunner.run(request).expect("stdin consumer succeeds");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            input.len().to_string()
+        );
+        assert!(
+            !output
+                .stdout
+                .windows(16)
+                .any(|window| window == b"xxxxxxxxxxxxxxxx")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_write_error_stops_child_before_returning_stdin_error() {
+        let marker = std::env::temp_dir().join(format!(
+            "process-runner-stdin-write-error-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script =
+            "import os, time\nos.close(0)\nopen(os.environ['MARKER'], 'w').close()\ntime.sleep(10)";
+        let started = Instant::now();
+        let result = ProcessRunner.run(
+            ProcessRequest::new("python3")
+                .args(["-c", script])
+                .env("MARKER", marker.as_os_str())
+                .stdin_bytes(vec![b'x'; 16 * 1024 * 1024])
+                .timeout(Duration::from_secs(3)),
+        );
+        let marker_created = marker.exists();
+        let _ = std::fs::remove_file(marker);
+
+        assert!(
+            marker_created,
+            "child closed stdin before the test proceeded"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "stdin failure waited for the command timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            result,
+            Err(ProcessError::Stdin(error))
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_process_group_stop_when_stdin_writer_does_not_drain() {
+        let marker =
+            std::env::temp_dir().join(format!("process-runner-stdin-held-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = "import os, time\npid = os.fork()\nif pid == 0:\n    null = os.open(os.devnull, os.O_WRONLY)\n    os.dup2(null, 1)\n    os.dup2(null, 2)\n    os.dup(0)\n    open(os.environ['MARKER'], 'w').close()\n    time.sleep(10)\n    os._exit(0)\ndeadline = time.monotonic() + 1\nwhile not os.path.exists(os.environ['MARKER']):\n    if time.monotonic() >= deadline:\n        os._exit(2)\n    time.sleep(0.005)\nos._exit(0)";
+        let request = ProcessRequest::new("python3")
+            .args(["-c", script])
+            .env("MARKER", marker.as_os_str())
+            .stdin_bytes(vec![b'x'; 1024 * 1024])
+            .timeout(Duration::from_secs(2));
+        let result = ProcessRunner.run(request);
+        let _ = std::fs::remove_file(marker);
+        match result {
+            Err(ProcessError::Interrupted {
+                reason: StopReason::PipeHeld,
+                stopped,
+                diagnostic,
+                ..
+            }) => {
+                assert!(stopped, "managed process group was stopped");
+                assert!(diagnostic.contains("stdin"));
+            }
+            Err(ProcessError::Stdin(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                panic!("fixture closed stdin before holding it in the descendant")
+            }
+            result => panic!("unexpected result: {result:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_stop_returns_with_an_escaped_stdin_reader() {
+        let marker = std::env::temp_dir().join(format!(
+            "process-runner-stdin-escaped-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script = "import os, time\npid = os.fork()\nif pid == 0:\n    os.setsid()\n    null = os.open(os.devnull, os.O_WRONLY)\n    os.dup2(null, 1)\n    os.dup2(null, 2)\n    os.dup(0)\n    with open(os.environ['MARKER'], 'w') as marker: marker.write(str(os.getpid()))\n    time.sleep(10)\n    os._exit(0)\ndeadline = time.monotonic() + 1\nwhile not os.path.exists(os.environ['MARKER']):\n    if time.monotonic() >= deadline: os._exit(2)\n    time.sleep(0.005)\nos._exit(0)";
+        let started = Instant::now();
+        let result = ProcessRunner.run(
+            ProcessRequest::new("python3")
+                .args(["-c", script])
+                .env("MARKER", marker.as_os_str())
+                .stdin_bytes(vec![b's'; 4 * 1024 * 1024])
+                .timeout(Duration::from_secs(2)),
+        );
+        let marker_deadline = Instant::now() + Duration::from_secs(1);
+        let escaped_pid = loop {
+            if let Ok(contents) = std::fs::read_to_string(&marker) {
+                if let Ok(pid) = contents.trim().parse::<u32>() {
+                    break EscapedReaderProcess(pid);
+                }
+            }
+            assert!(
+                Instant::now() < marker_deadline,
+                "escaped reader marker was not created"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        let _ = std::fs::remove_file(marker);
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            result,
+            Err(ProcessError::Interrupted {
+                reason: StopReason::PipeHeld,
+                stopped: true,
+                ..
+            })
+        ));
+        drop(escaped_pid);
+    }
+
+    #[cfg(unix)]
+    struct EscapedReaderProcess(u32);
+
+    #[cfg(unix)]
+    impl Drop for EscapedReaderProcess {
+        fn drop(&mut self) {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &self.0.to_string()])
+                .status();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_stops_a_blocked_stdin_writer() {
+        let request = ProcessRequest::new("sh")
+            .args(["-c", "sleep 10"])
+            .stdin_bytes(vec![b'x'; 1024 * 1024])
+            .timeout(Duration::from_millis(30));
         assert!(matches!(
             ProcessRunner.run(request),
             Err(ProcessError::TimedOut(_))
@@ -496,6 +1153,31 @@ mod tests {
             ProcessRunner.run_with_cancellation(ProcessRequest::new("sleep").arg("10"), other)
         });
         std::thread::sleep(Duration::from_millis(20));
+        token.cancel();
+        assert!(matches!(
+            thread.join().expect("runner thread"),
+            Err(ProcessError::Cancelled(_))
+                | Err(ProcessError::Interrupted {
+                    reason: StopReason::Cancelled,
+                    ..
+                })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_stops_a_blocked_stdin_writer() {
+        let token = CancellationToken::new();
+        let other = token.clone();
+        let thread = std::thread::spawn(move || {
+            ProcessRunner.run_with_cancellation(
+                ProcessRequest::new("sh")
+                    .args(["-c", "sleep 10"])
+                    .stdin_bytes(vec![b'x'; 1024 * 1024]),
+                other,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(30));
         token.cancel();
         assert!(matches!(
             thread.join().expect("runner thread"),

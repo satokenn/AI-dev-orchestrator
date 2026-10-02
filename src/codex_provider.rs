@@ -72,9 +72,11 @@ impl CodexProvider {
                     "failed to start {}: {error}",
                     self.executable.to_string_lossy()
                 )),
-                ProcessError::Io(_) | ProcessError::NonZeroExit(_) => ProviderError::Unavailable(
-                    "Codex CLI availability check failed; process output is withheld".into(),
-                ),
+                ProcessError::Io(_) | ProcessError::Stdin(_) | ProcessError::NonZeroExit(_) => {
+                    ProviderError::Unavailable(
+                        "Codex CLI availability check failed; process output is withheld".into(),
+                    )
+                }
                 ProcessError::TimedOut(_)
                 | ProcessError::Cancelled(_)
                 | ProcessError::CancelledBeforeStart
@@ -195,7 +197,7 @@ impl CodexProvider {
             ProcessError::Spawn(error) => {
                 ProviderError::Unavailable(format!("Codex CLI could not be started: {error}"))
             }
-            ProcessError::Io(error) => {
+            ProcessError::Io(error) | ProcessError::Stdin(error) => {
                 ProviderError::ExecutionFailed(format!("Codex process I/O failed: {error}"))
             }
             ProcessError::TimedOut(output) => {

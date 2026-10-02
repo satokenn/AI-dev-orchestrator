@@ -50,6 +50,9 @@ impl ArtifactRecord {
     pub fn tree_oid(&self) -> &str {
         &self.tree_oid
     }
+    pub fn repository_root(&self) -> &Path {
+        &self.repository_root
+    }
     pub fn state(&self) -> ArtifactState {
         self.state
     }
@@ -465,6 +468,7 @@ impl<'a> ArtifactManager<'a> {
                 actual: u64::try_from(revision).unwrap_or_default(),
             });
         }
+        Self::ensure_no_active_publication(&tx, task)?;
         let still_available: Option<String> = tx.query_row(
             "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
             params![task.as_str(), artifact_id],
@@ -538,6 +542,7 @@ impl<'a> ArtifactManager<'a> {
                 actual: u64::try_from(revision).unwrap_or_default(),
             });
         }
+        Self::ensure_no_active_publication(&tx, task)?;
         let still_available: Option<String> = tx.query_row(
             "SELECT tree_oid FROM service_artifacts WHERE task_id=?1 AND id=?2 AND state='available'",
             params![task.as_str(), artifact_id],
@@ -647,6 +652,23 @@ impl<'a> ArtifactManager<'a> {
             validation_id: validation_id.to_owned(),
             decision_id: decision_id.to_owned(),
         })
+    }
+
+    fn ensure_no_active_publication(
+        tx: &rusqlite::Transaction<'_>,
+        task: &TaskId,
+    ) -> Result<(), ArtifactError> {
+        let active: Option<String> = tx.query_row(
+            "SELECT id FROM service_artifact_publication_operations WHERE task_id=?1 AND status IN ('accepted','running','recovery_required') ORDER BY rowid LIMIT 1",
+            params![task.as_str()],
+            |row| row.get(0),
+        ).optional()?;
+        if active.is_some() {
+            return Err(ArtifactError::Invalid(
+                "Task has an active publication operation".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn cleanup_validation_workspace(
@@ -949,7 +971,7 @@ impl<'a> ArtifactManager<'a> {
         if !is_oid(&record.tree_oid) {
             return Err(ArtifactError::Invalid("invalid Git tree object ID".into()));
         }
-        let output = match self.runner.run(
+        let output = match self.runner.run_git(
             ProcessRequest::new(self.git_executable.clone())
                 .args(["cat-file", "-t", &record.tree_oid])
                 .cwd(&record.repository_root),
@@ -1018,7 +1040,7 @@ impl<'a> ArtifactManager<'a> {
             request = request.env(*key, value.clone());
         }
         self.runner
-            .run(request)
+            .run_git(request)
             .map_err(|e| ArtifactError::Git(process_error(e)))
     }
 }
@@ -1480,6 +1502,150 @@ mod tests {
             ),
             Err(ArtifactError::Invalid(_))
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_publication_blocks_validation_and_decision_writes() {
+        let root = std::env::temp_dir().join(format!("artifact-publication-guard-{}", new_id()));
+        let repository = root.join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        fs::write(repository.join("tracked.txt"), "content\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        let repository = fs::canonicalize(repository).unwrap();
+        let task = TaskId::new("artifact-active-publication-task");
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        ledger
+            .save_task(&Task::new(
+                task.clone(),
+                "active publication guard",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO service_artifacts(id,task_id,base_commit,tree_oid,repository_root,ref_name,state,created_at) VALUES('artifact-a',?1,?2,?3,?4,?5,'available',0)",
+                rusqlite::params![task.as_str(), base, tree, repository.to_string_lossy().as_ref(), format!("{REF_PREFIX}artifact-a")],
+            )
+            .unwrap();
+        let workspaces = WorkspaceManager::new(&repository).unwrap();
+        let manager = ArtifactManager::new(&workspaces, &ledger);
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO service_artifact_publication_operations(id,request_id,task_id,request_digest,artifact_id,tree_oid,base_commit,validation_id,decision_id,base_branch,head_branch,status,phase,accepted_revision,revision,accepted_at) VALUES('fixture-publication','fixture-request',?1,'digest','artifact-a',?2,?3,'validation-fixture','decision-fixture','main','artifact/fixture','accepted','accepted',0,0,0)",
+                rusqlite::params![task.as_str(), tree, base],
+            )
+            .unwrap();
+        drop(connection);
+
+        for status in ["accepted", "running", "recovery_required"] {
+            ledger
+                .lock_connection()
+                .unwrap()
+                .execute(
+                    "UPDATE service_artifact_publication_operations SET status=?1 WHERE id='fixture-publication'",
+                    [status],
+                )
+                .unwrap();
+            let connection = ledger.lock_connection().unwrap();
+            let revision: i64 = connection
+                .query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    [task.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let validation_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_validations WHERE task_id=?1",
+                    [task.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let decision_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_codex_decisions WHERE task_id=?1",
+                    [task.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(connection);
+
+            assert!(matches!(
+                manager.record_validation(
+                    &task,
+                    "artifact-a",
+                    u64::try_from(revision).unwrap(),
+                    ValidationResult::from_check("check", "passed", true, Some(0), "withheld"),
+                ),
+                Err(ArtifactError::Invalid(message)) if message == "Task has an active publication operation"
+            ));
+            assert!(matches!(
+                manager.record_decision(
+                    &task,
+                    "artifact-a",
+                    u64::try_from(revision).unwrap(),
+                    CodexDecisionKind::Accepted,
+                    "fixture decision",
+                    &[],
+                ),
+                Err(ArtifactError::Invalid(message)) if message == "Task has an active publication operation"
+            ));
+
+            let connection = ledger.lock_connection().unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                        [task.as_str()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                revision,
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM artifact_validations WHERE task_id=?1",
+                        [task.as_str()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                validation_count,
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM artifact_codex_decisions WHERE task_id=?1",
+                        [task.as_str()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                decision_count,
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 

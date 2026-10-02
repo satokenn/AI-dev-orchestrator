@@ -4,6 +4,7 @@
 
 mod antigravity;
 mod artifact;
+pub mod artifact_publication;
 pub mod cli;
 mod codex_provider;
 mod copilot_provider;
@@ -24,6 +25,11 @@ pub use antigravity::AntigravityProvider;
 pub use artifact::{
     ArtifactCodexDecisionRecord, ArtifactPublicationPermit, ArtifactRecord, ArtifactState,
     ArtifactValidationRecord, CodexDecisionKind,
+};
+pub use artifact_publication::{
+    ArtifactPublicationGateway, ArtifactPublicationPayload, DraftPullRequest,
+    GitHubArtifactPublicationGateway, PublicationGatewayError, SecretScanError, SecretScanResult,
+    SecretScanner,
 };
 pub use codex_provider::CodexProvider;
 pub use copilot_provider::CopilotProvider;
@@ -47,8 +53,10 @@ pub use operation_ledger::{
     SqliteExecutionLedger as SqliteOperationLedger, UsageRecord, ValidationRecord,
 };
 pub use operation_service::{
-    ArtifactInput, AttemptInput, AttemptRunRequest, BaseInput, OperationAcceptance,
-    OperationService, OperationSnapshot, ServiceError, ServiceOperationStatus,
+    ArtifactInput, ArtifactPublicationAcceptance, ArtifactPublicationPhase,
+    ArtifactPublicationRequest, ArtifactPublicationSnapshot, AttemptInput, AttemptRunRequest,
+    BaseInput, OperationAcceptance, OperationService, OperationSnapshot, ServiceError,
+    ServiceOperationStatus,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,
