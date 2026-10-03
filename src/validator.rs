@@ -3,10 +3,11 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::{
-    ProcessError, ProcessOutput, ProcessRequest, ProcessRunner, ValidationCheckResult,
-    ValidationResult,
+    CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner,
+    ValidationCheckResult, ValidationResult,
 };
 
 /// One mechanical check to run in a workspace.
@@ -16,6 +17,7 @@ pub struct ValidationCheck {
     command: OsString,
     args: Vec<OsString>,
     cwd: Option<PathBuf>,
+    timeout: Option<Duration>,
 }
 
 impl ValidationCheck {
@@ -27,6 +29,7 @@ impl ValidationCheck {
             command: command.into(),
             args: Vec::new(),
             cwd: None,
+            timeout: None,
         }
     }
 
@@ -49,6 +52,13 @@ impl ValidationCheck {
         self
     }
 
+    /// Sets a per-check timeout. Zero is rejected by `CommandValidator::validate`.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -65,11 +75,19 @@ impl ValidationCheck {
     pub fn cwd_ref(&self) -> Option<&Path> {
         self.cwd.as_deref()
     }
+    #[must_use]
+    pub const fn timeout_value(&self) -> Option<Duration> {
+        self.timeout
+    }
 
     fn request_with_cwd(&self, cwd: PathBuf) -> ProcessRequest {
-        ProcessRequest::new(self.command.clone())
+        let request = ProcessRequest::new(self.command.clone())
             .args(self.args.clone())
-            .cwd(cwd)
+            .cwd(cwd);
+        match self.timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
     }
 }
 
@@ -86,6 +104,15 @@ pub enum ValidatorError {
         reason: String,
     },
     NoChecksConfigured,
+    InvalidCheck {
+        name: String,
+        reason: String,
+    },
+    Cancelled,
+    Interrupted {
+        reason: crate::StopReason,
+        stopped: bool,
+    },
 }
 
 impl fmt::Display for ValidatorError {
@@ -107,6 +134,14 @@ impl fmt::Display for ValidatorError {
                 workspace.display()
             ),
             Self::NoChecksConfigured => formatter.write_str("no validation checks configured"),
+            Self::InvalidCheck { name, reason } => {
+                write!(formatter, "invalid validation check '{name}': {reason}")
+            }
+            Self::Cancelled => formatter.write_str("validation was cancelled"),
+            Self::Interrupted { reason, stopped } => write!(
+                formatter,
+                "validation was interrupted ({reason:?}, stopped={stopped})"
+            ),
         }
     }
 }
@@ -116,6 +151,18 @@ impl std::error::Error for ValidatorError {}
 /// Common API for deterministic validators.
 pub trait Validator {
     fn validate(&self, workspace: &Path) -> Result<ValidationResult, ValidatorError>;
+
+    /// Runs validation while observing a caller-owned cancellation signal.
+    ///
+    /// Existing validators remain source-compatible; validators that launch
+    /// cancellable work should override this method.
+    fn validate_with_cancellation(
+        &self,
+        workspace: &Path,
+        _cancellation: CancellationToken,
+    ) -> Result<ValidationResult, ValidatorError> {
+        self.validate(workspace)
+    }
 }
 
 /// Runs a sequence of configured process checks in order.
@@ -207,8 +254,41 @@ impl CommandValidator {
 
 impl Validator for CommandValidator {
     fn validate(&self, workspace: &Path) -> Result<ValidationResult, ValidatorError> {
+        self.validate_with_cancellation(workspace, CancellationToken::new())
+    }
+
+    fn validate_with_cancellation(
+        &self,
+        workspace: &Path,
+        cancellation: CancellationToken,
+    ) -> Result<ValidationResult, ValidatorError> {
+        CommandValidator::validate_with_cancellation(self, workspace, cancellation)
+    }
+}
+
+impl CommandValidator {
+    /// Runs configured checks in order, passing one cancellation signal to every process.
+    pub fn validate_with_cancellation(
+        &self,
+        workspace: &Path,
+        token: CancellationToken,
+    ) -> Result<ValidationResult, ValidatorError> {
         if self.checks.is_empty() {
             return Err(ValidatorError::NoChecksConfigured);
+        }
+        for check in &self.checks {
+            if check.name.trim().is_empty() || check.command.is_empty() {
+                return Err(ValidatorError::InvalidCheck {
+                    name: check.name.clone(),
+                    reason: "name and command must not be empty".to_owned(),
+                });
+            }
+            if check.timeout.is_some_and(|timeout| timeout.is_zero()) {
+                return Err(ValidatorError::InvalidCheck {
+                    name: check.name.clone(),
+                    reason: "timeout must be greater than zero".to_owned(),
+                });
+            }
         }
         Self::validate_workspace(workspace)?;
         let resolved_cwds: Vec<_> = self
@@ -222,12 +302,12 @@ impl Validator for CommandValidator {
             .zip(resolved_cwds)
             .map(|(check, cwd)| {
                 let request = check.request_with_cwd(cwd);
-                match self.runner.run(request) {
-                    Ok(output) => result_from_output(check, output, true),
+                match self.runner.run_with_cancellation(request, token.clone()) {
+                    Ok(output) => Ok(result_from_output(check, output, true)),
                     Err(error) => result_from_error(check, error),
                 }
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         Ok(ValidationResult::from_checks(
             "workspace validation",
             checks,
@@ -265,6 +345,15 @@ impl Validator for RustValidator {
     fn validate(&self, workspace: &Path) -> Result<ValidationResult, ValidatorError> {
         self.inner.validate(workspace)
     }
+
+    fn validate_with_cancellation(
+        &self,
+        workspace: &Path,
+        cancellation: CancellationToken,
+    ) -> Result<ValidationResult, ValidatorError> {
+        self.inner
+            .validate_with_cancellation(workspace, cancellation)
+    }
 }
 
 /// Returns the standard checks in their required execution order.
@@ -294,72 +383,41 @@ fn result_from_output(
         check.name(),
         passed,
         output.exit_code(),
-        diagnostics(&output.stdout, &output.stderr),
-    )
-}
-
-fn result_from_error(check: &ValidationCheck, error: ProcessError) -> ValidationCheckResult {
-    match error {
-        ProcessError::NonZeroExit(output) => result_from_output(check, output, false),
-        ProcessError::TimedOut(output) => {
-            result_from_output_with_prefix(check, output, "process timed out")
-        }
-        ProcessError::Cancelled(output) => {
-            result_from_output_with_prefix(check, output, "process cancelled")
-        }
-        ProcessError::CancelledBeforeStart => {
-            ValidationCheckResult::new(check.name(), false, None, "process cancelled before start")
-        }
-        ProcessError::Interrupted {
-            reason,
-            stopped,
-            stdout,
-            stderr,
-            output_truncated: _,
-            diagnostic,
-            ..
-        } => ValidationCheckResult::new(
-            check.name(),
-            false,
-            None,
-            format!(
-                "process interrupted ({reason:?}, stopped={stopped}): {diagnostic}; {}",
-                diagnostics(&stdout, &stderr)
-            ),
-        ),
-        ProcessError::Spawn(error) | ProcessError::Io(error) | ProcessError::Stdin(error) => {
-            ValidationCheckResult::new(check.name(), false, None, error.to_string())
-        }
-    }
-}
-
-fn result_from_output_with_prefix(
-    check: &ValidationCheck,
-    output: ProcessOutput,
-    prefix: &str,
-) -> ValidationCheckResult {
-    let exit_status = output.exit_code();
-    let diagnostics = diagnostics(&output.stdout, &output.stderr);
-    ValidationCheckResult::new(
-        check.name(),
-        false,
-        exit_status,
-        if diagnostics.is_empty() {
-            prefix.to_owned()
+        if passed {
+            "process exited successfully"
         } else {
-            format!("{prefix}\n{diagnostics}")
+            "process exited with a non-zero status"
         },
     )
 }
 
-fn diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
-    let stdout = String::from_utf8_lossy(stdout);
-    let stderr = String::from_utf8_lossy(stderr);
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => stdout.into_owned(),
-        (true, false) => stderr.into_owned(),
-        (false, false) => format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
+fn result_from_error(
+    check: &ValidationCheck,
+    error: ProcessError,
+) -> Result<ValidationCheckResult, ValidatorError> {
+    match error {
+        ProcessError::NonZeroExit(output) => Ok(result_from_output(check, output, false)),
+        ProcessError::TimedOut(output) => Ok(ValidationCheckResult::new(
+            check.name(),
+            false,
+            output.exit_code(),
+            "process timed out",
+        )),
+        ProcessError::Cancelled(_) | ProcessError::CancelledBeforeStart => {
+            Err(ValidatorError::Cancelled)
+        }
+        ProcessError::Interrupted {
+            reason, stopped, ..
+        } => Err(ValidatorError::Interrupted { reason, stopped }),
+        ProcessError::Spawn(error) | ProcessError::Io(error) | ProcessError::Stdin(error) => {
+            let kind = error.kind();
+            Ok(ValidationCheckResult::new(
+                check.name(),
+                false,
+                None,
+                format!("process failed ({kind:?})"),
+            ))
+        }
     }
 }
 

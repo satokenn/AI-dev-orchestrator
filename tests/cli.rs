@@ -218,6 +218,83 @@ fn status_does_not_create_a_missing_ledger_parent() {
     assert!(!root.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn invalid_repository_config_stops_production_before_planner_provider_or_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "ai-dev-orchestrator-cli-config-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let repository_config = root.join(".ai-dev-orchestrator/config.toml");
+    fs::create_dir_all(repository_config.parent().unwrap()).unwrap();
+    fs::write(
+        &repository_config,
+        "schema_version = 1\n[validation]\nchecks = [{ name = 'unsafe-cwd', command = 'sh', cwd = '../outside', timeout_ms = 1000 }]\n",
+    )
+    .unwrap();
+
+    let bin = root.join("fake-bin");
+    fs::create_dir(&bin).unwrap();
+    let process_marker = root.join("unexpected-process");
+    let marker = process_marker.to_string_lossy();
+    for command in ["codex", "copilot", "agy", "git"] {
+        let path = bin.join(command);
+        fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' '{command} $*' >> '{marker}'\nexit 0\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '%s\\n' '{\"title\":\"fixture\",\"body\":\"fixture body\"}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ledger = root.join("ledger.sqlite3");
+    let output = binary()
+        .args([
+            "run",
+            "--repo",
+            "example/project",
+            "--issue",
+            "7",
+            "--repository-root",
+            root.to_str().unwrap(),
+            "--ledger",
+            ledger.to_str().unwrap(),
+        ])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(OPERATION_ERROR));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cwd must be a relative path without parent components"),
+        "unexpected production failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !process_marker.exists(),
+        "Planner, Provider, or git process ran"
+    );
+    assert!(
+        !root.join(".ai-dev-orchestrator/worktrees").exists(),
+        "workspace manager created a worktree directory"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn publication_lookup_uses_exact_task_id_not_issue_number_suffix() {
     let ledger = SqliteExecutionLedger::open_in_memory().unwrap();

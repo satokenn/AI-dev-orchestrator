@@ -4,10 +4,10 @@ use std::{fmt, path::Path, sync::Arc, time::Duration};
 
 use crate::operation_ledger::{ExecutionLedger, OperationId, OperationRequest, OperationStatus};
 use crate::{
-    AgentProvider, Attempt, AttemptId, DomainError, ExecutionPolicy, ModelChoice, PlannerDecision,
-    PolicyError, ProviderError, ProviderRequest, ProviderResolutionError, ProviderResolver,
-    ProviderResult, RetryPolicy, Task, ValidationResult, Validator, ValidatorError, Workspace,
-    WorkspaceError, WorkspaceManager,
+    AgentProvider, Attempt, AttemptId, CancellationToken, DomainError, ExecutionPolicy,
+    ModelChoice, PlannerDecision, PolicyError, ProviderError, ProviderRequest,
+    ProviderResolutionError, ProviderResolver, ProviderResult, RetryPolicy, Task, ValidationResult,
+    Validator, ValidatorError, Workspace, WorkspaceError, WorkspaceManager,
 };
 
 /// Boundary used by the application service to prepare and validate an agent workspace.
@@ -213,12 +213,24 @@ where
         attempt_id: AttemptId,
         timeout: Duration,
     ) -> Result<OrchestrationReport, OrchestratorError> {
+        self.execute_with_cancellation(task, attempt_id, timeout, CancellationToken::new())
+    }
+
+    /// Executes one Attempt while observing caller-owned cancellation.
+    pub fn execute_with_cancellation(
+        &self,
+        task: &mut Task,
+        attempt_id: AttemptId,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<OrchestrationReport, OrchestratorError> {
         self.execute_provider(
             task,
             attempt_id,
             timeout,
             ModelChoice::ProviderDefault,
             &self.provider,
+            cancellation,
         )
     }
 
@@ -230,7 +242,32 @@ where
         model: ModelChoice,
         timeout: Duration,
     ) -> Result<OrchestrationReport, OrchestratorError> {
-        self.execute_provider(task, attempt_id, timeout, model, &self.provider)
+        self.execute_with_model_and_cancellation(
+            task,
+            attempt_id,
+            model,
+            timeout,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Executes one Attempt with an explicit model and caller-owned cancellation.
+    pub fn execute_with_model_and_cancellation(
+        &self,
+        task: &mut Task,
+        attempt_id: AttemptId,
+        model: ModelChoice,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<OrchestrationReport, OrchestratorError> {
+        self.execute_provider(
+            task,
+            attempt_id,
+            timeout,
+            model,
+            &self.provider,
+            cancellation,
+        )
     }
 
     fn execute_provider(
@@ -240,6 +277,7 @@ where
         timeout: Duration,
         model: ModelChoice,
         provider: &dyn AgentProvider,
+        cancellation: CancellationToken,
     ) -> Result<OrchestrationReport, OrchestratorError> {
         match task.state() {
             crate::TaskState::Pending => task.start().map_err(OrchestratorError::Domain)?,
@@ -326,23 +364,24 @@ where
         }
 
         let request = ProviderRequest::new(workspace.path(), task.description(), timeout, model);
-        let provider_result = match provider.execute(&request) {
-            Ok(result) => result,
-            Err(error) => {
-                fail_attempt_with_provider_error(task, &attempt_id, &error)?;
-                finish_operation(
-                    self.operation_ledger.as_deref(),
-                    operation_id.as_ref(),
-                    provider_error_status(&error),
-                    Some(&error.to_string()),
-                )?;
-                return Err(OrchestratorError::Provider {
-                    error,
-                    attempt: Box::new(attempt_snapshot(task, &attempt_id)),
-                    workspace: Box::new(workspace),
-                });
-            }
-        };
+        let provider_result =
+            match provider.execute_with_cancellation(&request, cancellation.clone()) {
+                Ok(result) => result,
+                Err(error) => {
+                    fail_attempt_with_provider_error(task, &attempt_id, &error)?;
+                    finish_operation(
+                        self.operation_ledger.as_deref(),
+                        operation_id.as_ref(),
+                        provider_error_status(&error),
+                        Some(&error.to_string()),
+                    )?;
+                    return Err(OrchestratorError::Provider {
+                        error,
+                        attempt: Box::new(attempt_snapshot(task, &attempt_id)),
+                        workspace: Box::new(workspace),
+                    });
+                }
+            };
 
         task.attempt_mut(&attempt_id)
             .expect("newly added attempt must be owned by its task")
@@ -377,19 +416,37 @@ where
             .expect("newly added attempt must be owned by its task")
             .finish()
             .map_err(OrchestratorError::Domain)?;
-        let validation_result = match self.validator.validate(workspace.path()) {
+        let validation_result = match self
+            .validator
+            .validate_with_cancellation(workspace.path(), cancellation)
+        {
             Ok(result) => result,
             Err(error) => {
-                fail_attempt_with_reason(
-                    task,
-                    &attempt_id,
-                    crate::AttemptFailureReason::Validation,
-                )?;
+                let status = match &error {
+                    ValidatorError::Cancelled => {
+                        task.attempt_mut(&attempt_id)
+                            .expect("newly added attempt must be owned by its task")
+                            .complete_provider_call_after_validation_cancel()
+                            .map_err(OrchestratorError::Domain)?;
+                        OperationStatus::Cancelled
+                    }
+                    ValidatorError::Interrupted { stopped: false, .. } => {
+                        OperationStatus::RecoveryRequired
+                    }
+                    _ => {
+                        fail_attempt_with_reason(
+                            task,
+                            &attempt_id,
+                            crate::AttemptFailureReason::Validation,
+                        )?;
+                        OperationStatus::Failed
+                    }
+                };
                 finish_operation(
                     self.operation_ledger.as_deref(),
                     operation_id.as_ref(),
-                    OperationStatus::Failed,
-                    Some(&error.to_string()),
+                    status,
+                    Some("validation did not complete safely"),
                 )?;
                 return Err(OrchestratorError::Validator {
                     error,
@@ -466,6 +523,7 @@ where
             timeout,
             ModelChoice::ProviderDefault,
             provider,
+            CancellationToken::new(),
         )
     }
 
@@ -495,6 +553,25 @@ where
         decision: &PlannerDecision,
         attempt_id: AttemptId,
         policy: &ExecutionPolicy,
+    ) -> Result<OrchestrationReport, OrchestratorError> {
+        self.execute_decision_with_policy_and_cancellation(
+            task,
+            decision,
+            attempt_id,
+            policy,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Policy-gated execution that passes the caller's cancellation signal to the
+    /// Provider and subsequent Validator.
+    pub fn execute_decision_with_policy_and_cancellation(
+        &self,
+        task: &mut Task,
+        decision: &PlannerDecision,
+        attempt_id: AttemptId,
+        policy: &ExecutionPolicy,
+        cancellation: CancellationToken,
     ) -> Result<OrchestrationReport, OrchestratorError> {
         // Keep this order: all checks happen before Task/Attempt/workspace mutation.
         if matches!(
@@ -538,6 +615,7 @@ where
             timeout,
             ModelChoice::ProviderDefault,
             provider,
+            cancellation,
         )
     }
 
@@ -551,6 +629,24 @@ where
         policy: &ExecutionPolicy,
     ) -> Result<OrchestrationReport, OrchestratorError> {
         self.execute_decision_with_policy(task, decision.decision(), attempt_id, policy)
+    }
+
+    /// Preferred validated planner entry with caller-owned cancellation.
+    pub fn execute_validated_decision_with_policy_and_cancellation(
+        &self,
+        task: &mut Task,
+        decision: &crate::ValidatedPlannerDecision,
+        attempt_id: AttemptId,
+        policy: &ExecutionPolicy,
+        cancellation: CancellationToken,
+    ) -> Result<OrchestrationReport, OrchestratorError> {
+        self.execute_decision_with_policy_and_cancellation(
+            task,
+            decision.decision(),
+            attempt_id,
+            policy,
+            cancellation,
+        )
     }
 
     /// Generated-ID variant of the hard-gated planner path.
