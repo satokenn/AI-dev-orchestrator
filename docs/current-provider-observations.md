@@ -9,7 +9,6 @@ let observation = CodexProvider::new().observe_current();
 ```
 
 Serviceからv2 ContextPageを組み立てる場合は次のread-only APIを使う。返値はMCPのenvelopeではなく、#45のtransportが後で対応するstructured contentである。
-`task.create`ではSecretScannerによるredaction後の要求textだけをsnapshotと冪等性記録に保存する。冪等性照合もredacted canonical payload同士で行う。redaction結果は再適用で変化しない固定点である必要があり、Serviceが固定点を確認できない場合を含め、Scanner未設定・失敗時は固定の`policy_denied`で拒否する。`task.get_context`はsnapshotを返す前、かつProviderのCLI probeより前に再redactして固定点を確認するため、既存の未redacted snapshotもraw textをcontextへ出さない。redaction不能なら`policy_denied`としてProvider probeも行わない。
 
 ```rust
 let context = service.get_context(
@@ -20,6 +19,8 @@ let context = service.get_context(
 )?;
 let structured_content = context.to_json_value();
 ```
+
+`task.create`ではSecretScannerによるredaction後の要求textだけをsnapshotと冪等性記録に保存する。冪等性照合もredacted canonical payload同士で行う。redaction結果は再適用で変化しない固定点である必要があり、Serviceが固定点を確認できない場合を含め、Scanner未設定・失敗時は固定の`policy_denied`で拒否する。`task.get_context`はsnapshotを返す前、かつProviderのCLI probeより前に再redactして固定点を確認するため、既存の未redacted snapshotもraw textをcontextへ出さない。redaction不能なら`policy_denied`としてProvider probeも行わない。
 
 返す`ProviderObservation`は、CLIの存在とversion確認、Provider全体の利用可否、認証状態、Provider既定Modelの
 利用可否を別々に保持する。時刻と情報源は各Evidence / AvailabilityObservationに付く。CLIが見つからない場合は
