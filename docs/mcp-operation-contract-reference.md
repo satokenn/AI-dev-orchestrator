@@ -303,11 +303,14 @@ OperationServiceは`task.create`の前にtitle、description、各constraint、I
 
 Taskと選択したsectionのsnapshotを読む。読取専用。
 
-このService sliceは`providers`、`usage`、`attempts`のContextPageを生成する。`usage`はOperation Service Ledgerに保存されたProvider報告metricだけを返し、budgetやquotaは作らない。metricの`name`、`value`、`unit`は、Task snapshotと同じSecretScannerによるredactionと固定点検査を通してから保存する。scanner未設定・失敗・固定点不成立の場合、そのoperation自体はProvider結果どおり完了するがusage metricは一件も保存せず、固定diagnostic code `usage_redaction_unavailable`を記録する。既存Ledgerのmetricはcontext返却前にも再redactし、検査に失敗した場合は`policy_denied`とし、raw metricを返さない。保存値をJSON numberとして保持できない場合は`value:null`、`basis:"unknown"`とし、元の文字列値は返さない。redactionで値が変更された場合も数値を推定せず`value:null`、`basis:"unknown"`とする。観測時刻にはOperationの完了時刻を使い、未保存ならnullとする。MCP transportは#45の対象であり、ここでは未実装。
+このRust Service sliceは`providers`、`usage`、`attempts`、`reviews`のContextPageを生成する。これはRust APIの実装状況であり、MCP tool / transportはIssue #45の対象として未実装。`reviews` itemはReviewVerdict ID、reviewer Attempt ID、Artifact ID、verdictを含む。`usage`はOperation Service Ledgerに保存されたProvider報告metricだけを返し、budgetやquotaは作らない。metricの`name`、`value`、`unit`は、Task snapshotと同じSecretScannerによるredactionと固定点検査を通してから保存する。scanner未設定・失敗・固定点不成立の場合、そのoperation自体はProvider結果どおり完了するがusage metricは一件も保存せず、固定diagnostic code `usage_redaction_unavailable`を記録する。既存Ledgerのmetricはcontext返却前にも再redactし、検査に失敗した場合は`policy_denied`とし、raw metricを返さない。保存値をJSON numberとして保持できない場合は`value:null`、`basis:"unknown"`とし、元の文字列値は返さない。redactionで値が変更された場合も数値を推定せず`value:null`、`basis:"unknown"`とする。観測時刻にはOperationの完了時刻を使い、未保存ならnullとする。
+`reviews` sectionを要求した場合、保存済みsummaryもProvider観測より前に同じsafe redactionと固定点検査を通す。検査に失敗した場合は固定error `review redaction is unavailable` でContext取得を拒否し、raw summaryを返さない。Reviewsを要求しない取得ではsummaryを読み出さない。
 内部の`ExecutionLedger::get_task` / `SqliteExecutionLedger::get_task`は保存内容を復元するだけで、redactionしないためMCP response sourceには使わない。`task.get_context`を含む外部応答はServiceのSecretScanner境界を通したデータだけから組み立てる。scanner未設定・失敗・redaction固定点不成立ならraw Task、Attempt、Usageを返さず、固定の業務errorでfail closedする。将来別のTask / Attempt直列化経路を追加する場合もscanner境界を通す。
 保存済みTask snapshotの要求textはcontext返却前にもSecretScannerでredactし、固定点であることを確認する。これにより既存の未redacted snapshotもraw textを返さない。SecretScannerが未設定、redactionが失敗、または固定点を作れない場合はProvider probeより前に`policy_denied`とし、raw snapshotを含む応答を返さない。
 `providers` sectionではprovider observationsの件数がpage_size以内なら同一snapshot内で全件を返し、page_sizeを超える場合はrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化する。`occurred_at: null`は全non-null時刻より後に置き、null同士はID降順とする。cursorはこの順序キー（時刻の有無・時刻値・ID）で並んだ同じTask snapshot内の次位置から再開し、Task、section、page size、Task revisionに束縛する。
 Provider観測sourceがProvider一覧を列挙できない場合は、空配列として成功したように見せずcontext取得を失敗させる。
+
+このRust Service sliceには、監督側が明示実行する任意の`OperationService::submit_artifact_review`もある。reviewはread-only reviewer Attemptとして実行し、成功時にReviewVerdictをArtifact ID/treeへ結び付ける。`ArtifactInput`は現在、`submit_artifact_review`が対象Artifactをread-only reviewer Attemptへ渡すために使う。通常のimplementerによるArtifactInput実行は成功reviewer Attemptの`changes_requested`証拠がないため拒否される。旧Ledgerのaccepted non-reviewer ArtifactInput operationもclaim後に`failed` / `review_evidence_required`で終端し、Providerを起動しない。ReviewVerdictはTaskを完了させず、修正を自動決定しない。これらはRust Service APIであり、MCP transportは未実装。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
@@ -383,6 +386,16 @@ Provider観測sourceがProvider一覧を列挙できない場合は、空配列�
 入力Artifactは同じTaskに属する必要がある。branch/pathだけのbase指定は認めない。
 
 成功outputは`OperationAcceptance`。`attempt_id`を必須とする。受付時の`operation.state`は`accepted`。
+
+#### 任意の意味レビューを依頼するRust API
+
+Rust Serviceは監督側が明示的に呼び出す`OperationService::submit_artifact_review`を提供する。これは仕様上のreviewer Attemptを実行するAPIで、MCP toolやtransportではない。`ArtifactReviewRequest::new(request_id, task_id, expected_revision, provider_id, model_id, artifact_id, validation_ids, criteria)`で依頼を構成する。Validation IDとcriteriaは各1件以上、重複不可で、criteriaに空文字を含めない。
+
+依頼時はTask revision、同一Taskで最新かつavailableなArtifact、そのArtifactを作成した成功implementer Attempt、同じArtifact ID/treeを参照する各Validationを確認する。Task要求、Artifact差分、Validation結果、criteriaはProviderへ渡す前にSecretScannerでredactし固定点を確認する。Scannerが未設定または検査不能なら受付を拒否する。Reviewer Providerはread-only workspaceを強制できる必要があり、実行後もworkspace treeが対象Artifactと一致することを確認する。成功Provider出力は`{"verdict":"approved|changes_requested|inconclusive","summary":"..."}`形式のJSONでなければならない。redacted summaryを保存し、ReviewVerdictをreviewer Attempt・Artifact ID/treeへ結び付ける。
+
+Task要求、Validation事実、criteria、全diffを含む完成済みinstructionは16 KiB以下でなければならず、上限を超える依頼は受付前に拒否する。
+
+`ArtifactInput`はこのAPIでは対象Artifactをreviewer Attemptへ渡す入力であり、review後の実装修正を開始しない。旧Ledgerに残るaccepted non-reviewer ArtifactInputはclaim後に`failed` / `review_evidence_required`として終端し、Providerを起動しない。ReviewVerdictはreviewerの結論であり、Task完了や再作業を自動決定せず、監督側の採否判断を代替しない。
 
 ### `operation.get`
 

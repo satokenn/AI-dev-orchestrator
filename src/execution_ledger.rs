@@ -136,17 +136,15 @@ type PublicationTaskRow = (
     Option<String>,
 );
 
-// Version 10 was independently used by the parent Attempt-history migration and
-// the Artifact migration. Version 11 reconciles both layouts and is idempotent.
-const LATEST_SCHEMA_VERSION: u32 = 16;
+const LATEST_SCHEMA_VERSION: u32 = 19;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
     fn save_task(&self, task: &Task) -> Result<(), LedgerError>;
-    /// Restores the persisted Task and Attempt data without applying a
+    /// Restores persisted Task and Attempt data as stored, without applying a
     /// SecretScanner. This is an internal persistence API, not a response
-    /// boundary; externally returned Task or Attempt content must pass through
-    /// the configured Service redaction checks or fail closed.
+    /// boundary; outward Task and Attempt content must pass through configured
+    /// Service redaction checks or fail closed.
     fn get_task(&self, task_id: &TaskId) -> Result<Option<Task>, LedgerError>;
     fn save_attempt(
         &self,
@@ -294,12 +292,14 @@ impl SqliteExecutionLedger {
             )?;
             create_service_schema(&transaction)?;
             migrate_schema(&transaction, version)?;
+            backfill_legacy_attempt_history(&transaction)?;
         }
         create_service_schema(&transaction)?;
         create_artifact_service_schema(&transaction)?;
         create_artifact_evidence_schema(&transaction)?;
         create_artifact_publication_schema(&transaction)?;
         create_task_creation_schema(&transaction)?;
+        create_review_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -418,9 +418,8 @@ impl SqliteExecutionLedger {
 
     /// Retrieves a task and all of its attempts, ordered by insertion id.
     ///
-    /// This restores internal persistence data as stored and does not apply
-    /// secret redaction. Do not expose this value directly to a caller; any
-    /// outward Task or Attempt serialization must pass through a Service
+    /// Values are restored as stored and are not secret-redacted. Do not expose
+    /// this directly; outward serialization must pass through a Service
     /// boundary with a configured SecretScanner, or fail closed.
     pub fn get_task(&self, task_id: &TaskId) -> Result<Option<Task>, LedgerError> {
         let connection = self.lock_connection()?;
@@ -501,6 +500,39 @@ impl SqliteExecutionLedger {
                 record.attempt().semantics().as_str(),
             ],
         )?;
+        let history_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM service_attempt_history WHERE task_id=?1 AND attempt_id=?2)",
+            params![record.task_id().as_str(), record.attempt().id().as_str()],
+            |row| row.get(0),
+        )?;
+        if !history_exists {
+            let sequence: i64 = transaction.query_row(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM service_attempt_history WHERE task_id=?1",
+                params![record.task_id().as_str()],
+                |row| row.get(0),
+            )?;
+            let task_role: Option<String> = transaction
+                .query_row(
+                    "SELECT role FROM tasks WHERE id=?1",
+                    params![record.task_id().as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            transaction.execute(
+                "INSERT INTO service_attempt_history(task_id,attempt_id,sequence,role,relation_kind,related_attempt_id) VALUES(?1,?2,?3,?4,?5,NULL)",
+                params![
+                    record.task_id().as_str(),
+                    record.attempt().id().as_str(),
+                    sequence,
+                    task_role.clone().filter(|role| role != "unspecified"),
+                    if sequence == 1 && task_role.as_deref() == Some("implementer") {
+                        "initial"
+                    } else {
+                        "legacy_unspecified"
+                    }
+                ],
+            )?;
+        }
         transaction.execute(
             "DELETE FROM agent_results WHERE task_id = ?1 AND attempt_id = ?2",
             params![record.task_id().as_str(), record.attempt().id().as_str()],
@@ -962,14 +994,12 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
             }
             11 => {
                 // Existing v10 databases may have been produced by either stacked
-                // branch, so ensure both schemas exist before the next migration.
+                // branch, so ensure both schemas and the legacy history backfill.
                 create_artifact_service_schema(connection)?;
                 create_service_schema(connection)?;
-            }
-            12 => {
                 backfill_legacy_attempt_history(connection)?;
-                create_artifact_evidence_schema(connection)?;
             }
+            12 => create_artifact_evidence_schema(connection)?,
             13 => create_artifact_publication_schema(connection)?,
             14 => create_task_creation_schema(connection)?,
             15 => {
@@ -985,6 +1015,19 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
                     "TEXT",
                 )?;
             }
+            17 => create_review_schema(connection)?,
+            18 => add_column_if_missing(
+                connection,
+                "service_review_requests",
+                "criteria_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )?,
+            19 => add_column_if_missing(
+                connection,
+                "service_review_requests",
+                "started_revision",
+                "INTEGER",
+            )?,
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
@@ -1038,6 +1081,57 @@ fn backfill_legacy_attempt_history(connection: &Connection) -> Result<(), rusqli
                 NULL
          FROM ordered;",
     )
+}
+
+fn create_review_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_attempt_history (
+             task_id TEXT NOT NULL,
+             attempt_id TEXT NOT NULL,
+             sequence INTEGER NOT NULL CHECK(sequence > 0),
+             role TEXT,
+             relation_kind TEXT NOT NULL CHECK(relation_kind IN
+                 ('initial','retry_of','escalation_of','review_of','rework_from','legacy_unspecified')),
+             related_attempt_id TEXT,
+             PRIMARY KEY(task_id,attempt_id),
+             UNIQUE(task_id,sequence),
+             FOREIGN KEY(task_id,attempt_id) REFERENCES attempts(task_id,id) ON DELETE CASCADE,
+             FOREIGN KEY(task_id,related_attempt_id) REFERENCES attempts(task_id,id)
+         );
+         CREATE TABLE IF NOT EXISTS artifact_review_verdicts (
+             id TEXT PRIMARY KEY NOT NULL,
+             task_id TEXT NOT NULL,
+             reviewer_attempt_id TEXT NOT NULL,
+             artifact_id TEXT NOT NULL,
+             tree_oid TEXT NOT NULL,
+             verdict TEXT NOT NULL CHECK(verdict IN ('approved','changes_requested','inconclusive')),
+             summary TEXT NOT NULL,
+             diagnostic_code TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             UNIQUE(task_id,reviewer_attempt_id),
+             FOREIGN KEY(task_id,reviewer_attempt_id)
+                 REFERENCES attempts(task_id,id) ON DELETE CASCADE,
+             FOREIGN KEY(task_id,artifact_id)
+                 REFERENCES service_artifacts(task_id,id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS service_review_requests (
+             task_id TEXT NOT NULL,
+             reviewer_attempt_id TEXT NOT NULL,
+             artifact_id TEXT NOT NULL,
+             tree_oid TEXT NOT NULL,
+             source_attempt_id TEXT NOT NULL,
+             validation_ids_json TEXT NOT NULL,
+             criteria_json TEXT NOT NULL DEFAULT '[]',
+             started_revision INTEGER,
+             PRIMARY KEY(task_id,reviewer_attempt_id),
+             FOREIGN KEY(task_id,reviewer_attempt_id) REFERENCES attempts(task_id,id) ON DELETE CASCADE,
+             FOREIGN KEY(task_id,artifact_id) REFERENCES service_artifacts(task_id,id),
+             FOREIGN KEY(task_id,source_attempt_id) REFERENCES attempts(task_id,id)
+         );
+         CREATE INDEX IF NOT EXISTS artifact_reviews_by_artifact
+             ON artifact_review_verdicts(task_id,artifact_id,created_at,id);",
+    )?;
+    backfill_legacy_attempt_history(connection)
 }
 
 fn create_artifact_evidence_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -1590,16 +1684,20 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE tasks (id TEXT PRIMARY KEY NOT NULL, description TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL);
                  CREATE TABLE attempts (task_id TEXT NOT NULL, id TEXT NOT NULL, provider TEXT NOT NULL, state TEXT NOT NULL,
-                     started_at INTEGER, finished_at INTEGER, failure_reason TEXT, PRIMARY KEY (task_id, id));
+                     started_at INTEGER, finished_at INTEGER, failure_reason TEXT,
+                     semantics_version TEXT NOT NULL DEFAULT 'legacy_validation_coupled', PRIMARY KEY (task_id, id));
                  CREATE TABLE publications (idempotency_key TEXT PRIMARY KEY NOT NULL, repository TEXT NOT NULL,
                      branch TEXT NOT NULL, commit_sha TEXT, pull_request TEXT, phase TEXT NOT NULL);
                  INSERT INTO tasks VALUES ('task-1', 'legacy', 'developer', 'failed');
                  INSERT INTO tasks VALUES ('task-2', 'known role', 'implementer', 'active');
                  INSERT INTO tasks VALUES ('task-3', 'unknown role', 'unspecified', 'active');
-                 INSERT INTO attempts VALUES ('task-1', 'attempt-1', 'codex', 'failed', 10, 20, 'timeout');
-                 INSERT INTO attempts VALUES ('task-2', 'attempt-2', 'codex', 'failed', 10, 20, 'timeout');
-                 INSERT INTO attempts VALUES ('task-2', 'attempt-3', 'codex', 'failed', 30, 40, 'timeout');
-                 INSERT INTO attempts VALUES ('task-3', 'attempt-4', 'codex', 'failed', 50, 60, 'timeout');
+                 INSERT INTO tasks VALUES ('task-4', 'legacy role', 'developer', 'active');
+                 INSERT INTO attempts VALUES ('task-1', 'attempt-1', 'codex', 'failed', 10, 20, 'timeout', 'provider_call_v2');
+                 INSERT INTO attempts VALUES ('task-1', 'attempt-2', 'codex', 'succeeded', 30, 40, NULL, 'provider_call_v2');
+                 INSERT INTO attempts VALUES ('task-2', 'attempt-2', 'codex', 'failed', 10, 20, 'timeout', 'legacy_validation_coupled');
+                 INSERT INTO attempts VALUES ('task-2', 'attempt-3', 'codex', 'failed', 30, 40, 'timeout', 'legacy_validation_coupled');
+                 INSERT INTO attempts VALUES ('task-3', 'attempt-4', 'codex', 'failed', 50, 60, 'timeout', 'legacy_validation_coupled');
+                 INSERT INTO attempts(task_id,id,provider,state,started_at,finished_at,failure_reason) VALUES ('task-4', 'attempt-5', 'codex', 'failed', 70, 80, 'timeout');
                  INSERT INTO publications VALUES ('key-1', 'owner/repo', 'main', 'abc', '42', 'published');
                  PRAGMA user_version = 1;",
             )
@@ -1617,6 +1715,36 @@ mod tests {
         assert_eq!(attempt.attempt().requested_model(), None);
         assert_eq!(attempt.attempt().observed_provider(), None);
         assert_eq!(attempt.attempt().observed_model(), None);
+        {
+            let connection = ledger.lock_connection().unwrap();
+            let history: Vec<(i64, Option<String>, String, Option<String>)> = {
+                let mut statement = connection.prepare("SELECT sequence,role,relation_kind,related_attempt_id FROM service_attempt_history WHERE task_id='task-1' ORDER BY sequence").unwrap();
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap()
+            };
+            assert_eq!(
+                history,
+                vec![
+                    (1, None, "legacy_unspecified".into(), None),
+                    (2, None, "legacy_unspecified".into(), None)
+                ]
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT state FROM attempts WHERE task_id='task-1' AND id='attempt-2'",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                "succeeded"
+            );
+        }
         let publication = ledger.load_publication("key-1").unwrap().unwrap();
         assert_eq!(publication.repository(), "owner/repo");
         assert_eq!(publication.branch(), "main");
@@ -1681,7 +1809,7 @@ mod tests {
         );
         let unknown_role: (Option<String>, String) = connection
             .query_row(
-                "SELECT role, relation_kind FROM service_attempt_history WHERE task_id='task-1'",
+                "SELECT role, relation_kind FROM service_attempt_history WHERE task_id='task-4'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -1810,11 +1938,7 @@ mod tests {
         let version: u32 = migrated
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 16);
-        assert!(column_exists(&migrated, "validation_results", "config_id").unwrap());
-        assert!(column_exists(&migrated, "validation_results", "config_version").unwrap());
-        assert!(column_exists(&migrated, "artifact_validations", "config_id").unwrap());
-        assert!(column_exists(&migrated, "artifact_validations", "config_version").unwrap());
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         let has_publication_table: bool = migrated
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_artifact_publication_operations')",
@@ -1890,342 +2014,197 @@ mod tests {
     }
 
     #[test]
-    fn future_schema_version_is_rejected() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch("PRAGMA user_version = 17;")
+    fn legacy_history_backfill_prefers_operation_role_and_keeps_unknown_role_null() {
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task = Task::new(
+            TaskId::new("role-task"),
+            "legacy",
+            TaskRole::new("implementer"),
+        );
+        ledger.save_task(&task).unwrap();
+        let legacy_attempt = attempt("legacy-role-attempt", "codex");
+        ledger
+            .save_attempt(task.id(), &legacy_attempt, Some(1), Some(2))
             .unwrap();
-        assert!(matches!(
-            SqliteExecutionLedger::from_connection(connection),
-            Err(LedgerError::UnsupportedSchemaVersion(17))
-        ));
+        let connection = ledger.lock_connection().unwrap();
+        connection.execute("INSERT INTO service_operations(id,request_id,task_id,attempt_id,expected_revision,provider,model_kind,model_name,instruction,role,repository,base_commit,timeout_ms,status,accepted_at) VALUES('legacy-operation','legacy-request','role-task','legacy-role-attempt',0,'codex','provider_default',NULL,'old','reviewer','/repo','base',1000,'completed',1)",[]).unwrap();
+        connection
+            .execute(
+                "DELETE FROM service_attempt_history WHERE task_id='role-task'",
+                [],
+            )
+            .unwrap();
+        create_review_schema(&connection).unwrap();
+        let (role, relation): (Option<String>, String) = connection.query_row(
+            "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='role-task' AND attempt_id='legacy-role-attempt'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(role.as_deref(), Some("reviewer"));
+        assert_eq!(relation, "legacy_unspecified");
+
+        drop(connection);
+        let unknown = Task::new(
+            TaskId::new("unknown-role-task"),
+            "legacy",
+            TaskRole::new("unspecified"),
+        );
+        ledger.save_task(&unknown).unwrap();
+        let unknown_attempt = attempt("unknown-role-attempt", "codex");
+        ledger
+            .save_attempt(unknown.id(), &unknown_attempt, Some(3), Some(4))
+            .unwrap();
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "DELETE FROM service_attempt_history WHERE task_id='unknown-role-task'",
+                [],
+            )
+            .unwrap();
+        create_review_schema(&connection).unwrap();
+        let (unknown_role, unknown_relation): (Option<String>, String) = connection
+            .query_row(
+                "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='unknown-role-task' AND attempt_id='unknown-role-attempt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unknown_role, None);
+        assert_eq!(unknown_relation, "legacy_unspecified");
     }
 
     #[test]
-    fn divergent_version_ten_schemas_are_reconciled() {
-        for artifact_only_v10 in [false, true] {
-            let connection = Connection::open_in_memory().unwrap();
-            create_latest_schema(&connection).unwrap();
-            create_service_schema(&connection).unwrap();
-            create_artifact_service_schema(&connection).unwrap();
-            connection
-                .execute(
-                    "INSERT INTO tasks VALUES('legacy-task','legacy','unspecified','active')",
-                    [],
-                )
-                .unwrap();
-            connection.execute("INSERT INTO attempts(task_id,id,provider,state,semantics_version) VALUES('legacy-task','legacy-attempt','codex','failed','provider_call_v2')", []).unwrap();
-            let expected_history = if !artifact_only_v10 {
-                connection
-                    .execute_batch(
-                        "DROP TABLE service_attempt_artifacts; DROP TABLE service_artifacts;",
-                    )
-                    .unwrap();
-                connection.execute(
-                    "INSERT INTO service_attempt_history(task_id,attempt_id,sequence,role,relation_kind,related_attempt_id) VALUES('legacy-task','legacy-attempt',1,NULL,'legacy_unspecified',NULL)",
-                    [],
-                ).unwrap();
-                ("legacy_unspecified".to_owned(), 1, None)
-            } else {
-                connection
-                    .execute_batch("DROP TABLE service_attempt_history;")
-                    .unwrap();
-                connection.execute(
-                    "INSERT INTO service_operations(id,request_id,task_id,attempt_id,expected_revision,provider,model_kind,instruction,role,repository,base_commit,timeout_ms,status,accepted_at) VALUES('op','req','legacy-task','legacy-attempt',0,'codex','provider_default','instruction','implementer','/repo','commit',1000,'completed',1)",
-                    [],
-                ).unwrap();
-                ("initial".to_owned(), 1, Some("implementer".to_owned()))
-            };
-            set_schema_version(&connection, 10).unwrap();
-
-            let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
-            let connection = ledger.lock_connection().unwrap();
-            let version: u32 = connection
-                .query_row("PRAGMA user_version", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(version, 16);
-            let history: (String, i64, Option<String>) = connection.query_row(
-                "SELECT relation_kind, sequence, role FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
-                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            ).unwrap();
-            assert_eq!(history, expected_history);
-            let artifact_tables: i64 = connection.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('service_artifacts','service_attempt_artifacts')",
-                [], |row| row.get(0),
-            ).unwrap();
-            assert_eq!(artifact_tables, 2);
-        }
-    }
-
-    #[test]
-    fn evidence_v11_schema_backfills_missing_attempt_history() {
+    fn schema_v13_backfill_preserves_provider_role_without_inheriting_task_role() {
         let connection = Connection::open_in_memory().unwrap();
         create_latest_schema(&connection).unwrap();
         create_service_schema(&connection).unwrap();
         create_artifact_service_schema(&connection).unwrap();
         create_artifact_evidence_schema(&connection).unwrap();
+        create_artifact_publication_schema(&connection).unwrap();
+        create_task_creation_schema(&connection).unwrap();
         connection
             .execute(
-                "INSERT INTO tasks VALUES('legacy-task','legacy request','implementer','active')",
+                "INSERT INTO tasks(id,description,role,state) VALUES ('task-v13','legacy','implementer','active')",
                 [],
             )
             .unwrap();
         connection
             .execute(
                 "INSERT INTO attempts(task_id,id,provider,state,semantics_version)
-             VALUES('legacy-task','legacy-attempt','codex','succeeded','provider_call_v2')",
+                 VALUES ('task-v13','provider-attempt','codex','succeeded','provider_call_v2'),
+                        ('task-v13','orphan-provider-attempt','codex','succeeded','provider_call_v2')",
                 [],
             )
             .unwrap();
-        connection.execute(
-            "INSERT INTO service_operations(id,request_id,task_id,attempt_id,expected_revision,provider,model_kind,instruction,role,repository,base_commit,timeout_ms,status,accepted_at)
-             VALUES('legacy-operation','legacy-request','legacy-task','legacy-attempt',0,'codex','provider_default','implement','implementer','/repo','base',1000,'completed',1)",
-            [],
-        ).unwrap();
-        connection.execute(
-            "INSERT INTO service_artifacts(id,task_id,source_attempt_id,base_commit,tree_oid,repository_root,ref_name,state,created_at)
-             VALUES('legacy-artifact','legacy-task','legacy-attempt','base','tree','/repo','refs/ai-dev-orchestrator/artifacts/legacy','available',1)",
-            [],
-        ).unwrap();
-        connection.execute(
-            "INSERT INTO artifact_validations(id,task_id,artifact_id,tree_oid,summary,passed,created_at)
-             VALUES('legacy-validation','legacy-task','legacy-artifact','tree','passed',1,2)",
-            [],
-        ).unwrap();
-        set_schema_version(&connection, 11).unwrap();
+        connection
+            .execute(
+                "INSERT INTO service_operations(id,request_id,task_id,attempt_id,expected_revision,
+                     provider,model_kind,instruction,role,repository,base_commit,timeout_ms,status,accepted_at)
+                 VALUES ('operation-v13','request-v13','task-v13','provider-attempt',0,
+                     'codex','provider_default','implement','explorer','/repo','base',1000,'completed',1)",
+                [],
+            )
+            .unwrap();
+        set_schema_version(&connection, 13).unwrap();
 
-        let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
-        let connection = ledger.lock_connection().unwrap();
+        let migrated = SqliteExecutionLedger::from_connection(connection).unwrap();
+        let connection = migrated.lock_connection().unwrap();
+        let history: Vec<(i64, String, Option<String>, String)> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT sequence,attempt_id,role,relation_kind
+                     FROM service_attempt_history WHERE task_id='task-v13' ORDER BY sequence",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            history,
+            vec![
+                (
+                    1,
+                    "provider-attempt".into(),
+                    Some("explorer".into()),
+                    "legacy_unspecified".into(),
+                ),
+                (
+                    2,
+                    "orphan-provider-attempt".into(),
+                    None,
+                    "legacy_unspecified".into(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn future_schema_version_is_rejected() {
+        let connection = Connection::open_in_memory().unwrap();
+        let unsupported_version = LATEST_SCHEMA_VERSION + 1;
+        connection
+            .execute_batch(&format!("PRAGMA user_version = {unsupported_version};"))
+            .unwrap();
+        assert!(matches!(
+            SqliteExecutionLedger::from_connection(connection),
+            Err(LedgerError::UnsupportedSchemaVersion(version)) if version == unsupported_version
+        ));
+    }
+
+    #[test]
+    fn schema_v16_migration_adds_review_criteria_without_rewriting_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_latest_schema(&connection).unwrap();
+        create_service_schema(&connection).unwrap();
+        create_artifact_service_schema(&connection).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE service_review_requests (
+                 task_id TEXT NOT NULL,
+                 reviewer_attempt_id TEXT NOT NULL,
+                 artifact_id TEXT NOT NULL,
+                 tree_oid TEXT NOT NULL,
+                 source_attempt_id TEXT NOT NULL,
+                 validation_ids_json TEXT NOT NULL,
+                 PRIMARY KEY(task_id,reviewer_attempt_id)
+             );
+             INSERT INTO service_review_requests
+                 (task_id,reviewer_attempt_id,artifact_id,tree_oid,source_attempt_id,validation_ids_json)
+             VALUES ('task-1','attempt-1','artifact-1','tree-1','attempt-0','[\"validation-1\"]');
+             PRAGMA user_version=16;",
+        ).unwrap();
+
+        migrate_schema(&connection, 16).unwrap();
+
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 16);
-        let history: (Option<String>, String) = connection
+        assert_eq!(version, 19);
+        let row: (String, String, String) = connection
             .query_row(
-                "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='legacy-attempt'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(history, (Some("implementer".into()), "initial".into()));
-        let summary: String = connection
-            .query_row(
-                "SELECT summary FROM artifact_validations WHERE id='legacy-validation'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(summary, "passed");
-    }
-
-    #[test]
-    fn version_thirteen_open_does_not_backfill_new_cli_attempts() {
-        let root = std::env::temp_dir().join(format!(
-            "ai-dev-orchestrator-v13-attempt-history-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("execution.sqlite3");
-        let connection = Connection::open(&path).unwrap();
-        create_latest_schema(&connection).unwrap();
-        create_service_schema(&connection).unwrap();
-        create_artifact_service_schema(&connection).unwrap();
-        connection
-            .execute(
-                "INSERT INTO tasks VALUES('legacy-task','legacy request','implementer','active')",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO attempts(task_id,id,provider,state,semantics_version)
-             VALUES('legacy-task','before-v12','codex','failed','legacy_validation_coupled')",
-                [],
-            )
-            .unwrap();
-        set_schema_version(&connection, 11).unwrap();
-        drop(connection);
-
-        let ledger = SqliteExecutionLedger::open(&path).unwrap();
-        {
-            let connection = ledger.lock_connection().unwrap();
-            let version: u32 = connection
-                .query_row("PRAGMA user_version", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(version, LATEST_SCHEMA_VERSION);
-            let migrated: (Option<String>, String) = connection
-                .query_row(
-                    "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='before-v12'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(migrated, (Some("implementer".into()), "initial".into()));
-        }
-        drop(ledger);
-
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute(
-                "INSERT INTO attempts(task_id,id,provider,state,semantics_version)
-             VALUES('legacy-task','after-v13','codex','failed','legacy_validation_coupled')",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-
-        let reopened = SqliteExecutionLedger::open(&path).unwrap();
-        let connection = reopened.lock_connection().unwrap();
-        let migrated_history_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='before-v12'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let post_migration_history_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM service_attempt_history WHERE task_id='legacy-task' AND attempt_id='after-v13'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(migrated_history_count, 1);
-        assert_eq!(post_migration_history_count, 0);
-        drop(connection);
-        drop(reopened);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn artifact_only_v10_without_operation_keeps_attempt_role_unknown() {
-        let connection = Connection::open_in_memory().unwrap();
-        create_latest_schema(&connection).unwrap();
-        create_service_schema(&connection).unwrap();
-        create_artifact_service_schema(&connection).unwrap();
-        connection
-            .execute(
-                "INSERT INTO tasks VALUES('task','legacy','implementer','active')",
-                [],
-            )
-            .unwrap();
-        connection.execute(
-            "INSERT INTO attempts(task_id,id,provider,state,semantics_version) VALUES('task','attempt','codex','failed','provider_call_v2')",
-            [],
-        ).unwrap();
-        connection
-            .execute_batch("DROP TABLE service_attempt_history;")
-            .unwrap();
-        set_schema_version(&connection, 10).unwrap();
-
-        let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
-        let connection = ledger.lock_connection().unwrap();
-        let history: (Option<String>, String) = connection
-            .query_row(
-                "SELECT role,relation_kind FROM service_attempt_history WHERE task_id='task' AND attempt_id='attempt'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(history, (None, "legacy_unspecified".into()));
-    }
-
-    #[test]
-    fn artifact_only_v10_bridge_preserves_artifact_row_ref_and_tree_contents() {
-        let root = std::env::temp_dir().join(format!(
-            "ai-dev-orchestrator-v10-artifact-bridge-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let repository = root.join("repository");
-        std::fs::create_dir_all(&repository).unwrap();
-        let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repository)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout).unwrap().trim().to_owned()
-        };
-        git(&["init", "-q"]);
-        git(&["config", "user.email", "ledger-test@example.invalid"]);
-        git(&["config", "user.name", "Ledger Test"]);
-        std::fs::write(repository.join("artifact.txt"), "preserved artifact data\n").unwrap();
-        git(&["add", "artifact.txt"]);
-        git(&["commit", "-m", "artifact before migration"]);
-        let base = git(&["rev-parse", "HEAD"]);
-        let tree = git(&["rev-parse", "HEAD^{tree}"]);
-        let ref_name = "refs/ai-dev-orchestrator/artifacts/v10-artifact";
-        git(&["update-ref", ref_name, &tree]);
-        let canonical_repository = std::fs::canonicalize(&repository).unwrap();
-
-        let connection = Connection::open_in_memory().unwrap();
-        create_latest_schema(&connection).unwrap();
-        create_service_schema(&connection).unwrap();
-        create_artifact_service_schema(&connection).unwrap();
-        connection
-            .execute(
-                "INSERT INTO tasks VALUES('task','legacy artifact','unspecified','active')",
-                [],
-            )
-            .unwrap();
-        connection.execute(
-            "INSERT INTO attempts(task_id,id,provider,state,semantics_version) VALUES('task','attempt','codex','succeeded','provider_call_v2')",
-            [],
-        ).unwrap();
-        connection.execute(
-            "INSERT INTO service_artifacts(id,task_id,source_attempt_id,base_commit,tree_oid,repository_root,ref_name,state,created_at)
-             VALUES('v10-artifact','task','attempt',?1,?2,?3,?4,'available',123)",
-            rusqlite::params![
-                base,
-                tree,
-                canonical_repository.to_string_lossy().as_ref(),
-                ref_name
-            ],
-        ).unwrap();
-        connection
-            .execute_batch("DROP TABLE service_attempt_history; PRAGMA user_version=10;")
-            .unwrap();
-
-        let ledger = SqliteExecutionLedger::from_connection(connection).unwrap();
-        let connection = ledger.lock_connection().unwrap();
-        let artifact: (Option<String>, String, String, String, String, i64) = connection
-            .query_row(
-                "SELECT source_attempt_id,base_commit,tree_oid,repository_root,ref_name,created_at
-                 FROM service_artifacts WHERE task_id='task' AND id='v10-artifact' AND state='available'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                "SELECT artifact_id,validation_ids_json,criteria_json FROM service_review_requests WHERE task_id='task-1' AND reviewer_attempt_id='attempt-1'",
+                [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
             )
             .unwrap();
         assert_eq!(
-            artifact,
+            row,
             (
-                Some("attempt".into()),
-                base.clone(),
-                tree.clone(),
-                canonical_repository.to_string_lossy().into_owned(),
-                ref_name.into(),
-                123,
+                "artifact-1".into(),
+                "[\"validation-1\"]".into(),
+                "[]".into()
             )
         );
-        drop(connection);
-        assert_eq!(git(&["rev-parse", ref_name]), tree);
-        assert_eq!(
-            git(&["show", &format!("{ref_name}:artifact.txt")]),
-            "preserved artifact data"
-        );
-        let _ = std::fs::remove_dir_all(root);
+        let started_revision: Option<i64> = connection
+            .query_row(
+                "SELECT started_revision FROM service_review_requests WHERE task_id='task-1' AND reviewer_attempt_id='attempt-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(started_revision, None);
     }
 }
