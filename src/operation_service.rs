@@ -3413,7 +3413,15 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                                     usage.clone(),
                                     Some("stale_artifact"),
                                 )?,
-                                Err(error) => return Err(error),
+                                Err(_) => self.finish_attempt(
+                                    operation_id,
+                                    ServiceOperationStatus::Failed,
+                                    Some(AttemptFailureReason::Provider),
+                                    result.observed_provider().cloned(),
+                                    result.observed_model().cloned(),
+                                    usage.clone(),
+                                    Some("review_completion_failed"),
+                                )?,
                             }
                         }
                     } else {
@@ -4962,8 +4970,10 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         if attempt.semantics() != AttemptSemantics::ProviderCallV2 {
             return Err(ServiceError::InvalidStoredState);
         }
-        let request: (String,String,String,String,Option<i64>) = tx.query_row("SELECT artifact_id,tree_oid,source_attempt_id,validation_ids_json,started_revision FROM service_review_requests WHERE task_id=?1 AND reviewer_attempt_id=?2", params![task_id.as_str(),attempt_id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-        let (latest,current_tree): (Option<String>,Option<String>) = tx.query_row("SELECT id,tree_oid FROM service_artifacts WHERE task_id=?1 AND state='available' ORDER BY created_at DESC,rowid DESC LIMIT 1", params![task_id.as_str()], |r| Ok((r.get(0)?,r.get(1)?)))?;
+        let request: Option<(String,String,String,String,Option<i64>)> = tx.query_row("SELECT artifact_id,tree_oid,source_attempt_id,validation_ids_json,started_revision FROM service_review_requests WHERE task_id=?1 AND reviewer_attempt_id=?2", params![task_id.as_str(),attempt_id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let request = request.ok_or(ServiceError::InvalidStoredState)?;
+        let latest: Option<(Option<String>,Option<String>)> = tx.query_row("SELECT id,tree_oid FROM service_artifacts WHERE task_id=?1 AND state='available' ORDER BY created_at DESC,rowid DESC LIMIT 1", params![task_id.as_str()], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let (latest, current_tree) = latest.unwrap_or((None, None));
         if latest.as_deref() != Some(request.0.as_str()) {
             return Err(ServiceError::PolicyDenied(
                 "Artifact became stale during review",
@@ -6425,12 +6435,43 @@ mod tests {
     #[test]
     fn semantic_review_verdicts_are_separate_from_operation_success() {
         type StaleReviewTarget = Arc<Mutex<Option<(TaskId, String, String, String, String)>>>;
+        type CompletionFailureTarget = Arc<Mutex<Option<(TaskId, String, &'static str)>>>;
+        type ArtifactUnavailableTarget =
+            Arc<Mutex<Option<(Arc<SqliteExecutionLedger>, TaskId, String)>>>;
+        struct ArtifactUnavailableScanner {
+            target: ArtifactUnavailableTarget,
+        }
+        impl SecretScanner for ArtifactUnavailableScanner {
+            fn redact_text(&self, text: &str) -> Result<String, SecretScanError> {
+                if let Some((ledger, task_id, artifact_id)) = self.target.lock().unwrap().take() {
+                    ledger.lock_connection().unwrap().execute(
+                        "UPDATE service_artifacts SET state='recovery_required' WHERE task_id=?1 AND id=?2",
+                        params![task_id.as_str(), artifact_id],
+                    ).unwrap();
+                }
+                Ok(text.to_owned())
+            }
+            fn scan_artifact_tree(
+                &self,
+                _: &Path,
+                _: &str,
+            ) -> Result<SecretScanResult, SecretScanError> {
+                Ok(SecretScanResult::Clean)
+            }
+            fn scan_publication_payload(
+                &self,
+                _: &ArtifactPublicationPayload,
+            ) -> Result<SecretScanResult, SecretScanError> {
+                Ok(SecretScanResult::Clean)
+            }
+        }
         struct ReviewProvider {
             reference: ProviderRef,
             output: Result<String, ()>,
             calls: Arc<AtomicUsize>,
             ledger: Arc<SqliteExecutionLedger>,
             stale_target: StaleReviewTarget,
+            completion_failure_target: CompletionFailureTarget,
             observations: Arc<AtomicUsize>,
             write_attempt: bool,
             report_usage: bool,
@@ -6458,6 +6499,23 @@ mod tests {
                 {
                     let connection = self.ledger.lock_connection().unwrap();
                     connection.execute("INSERT INTO service_artifacts(id,task_id,source_attempt_id,input_artifact_id,base_commit,tree_oid,repository_root,ref_name,state,created_at) VALUES('stale-artifact-B',?1,?2,NULL,?3,?4,?5,'refs/ai-dev-orchestrator/artifacts/stale-artifact-B','available',9223372036854775807)",params![task.as_str(),source_attempt,base,tree,root]).unwrap();
+                }
+                if let Some((task, attempt, failure)) =
+                    self.completion_failure_target.lock().unwrap().take()
+                {
+                    let connection = self.ledger.lock_connection().unwrap();
+                    match failure {
+                        "request_missing" => {
+                            connection.execute("DELETE FROM service_review_requests WHERE task_id=?1 AND reviewer_attempt_id=?2", params![task.as_str(), attempt]).unwrap();
+                        }
+                        "revision_missing" => {
+                            connection.execute("UPDATE service_review_requests SET started_revision=NULL WHERE task_id=?1 AND reviewer_attempt_id=?2", params![task.as_str(), attempt]).unwrap();
+                        }
+                        "validation_json_malformed" => {
+                            connection.execute("UPDATE service_review_requests SET validation_ids_json='{' WHERE task_id=?1 AND reviewer_attempt_id=?2", params![task.as_str(), attempt]).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
                 }
                 let summary = self
                     .output
@@ -6543,6 +6601,22 @@ mod tests {
                 Ok(r#"{"verdict":"approved","summary":"looks good"}"#.to_owned()),
             ),
             ("provider_failure", Err(())),
+            (
+                "artifact_unavailable_during_review",
+                Ok(r#"{"verdict":"approved","summary":"looks good"}"#.to_owned()),
+            ),
+            (
+                "request_missing_during_review",
+                Ok(r#"{"verdict":"approved","summary":"looks good"}"#.to_owned()),
+            ),
+            (
+                "revision_missing_during_review",
+                Ok(r#"{"verdict":"approved","summary":"looks good"}"#.to_owned()),
+            ),
+            (
+                "validation_json_malformed_during_review",
+                Ok(r#"{"verdict":"approved","summary":"looks good"}"#.to_owned()),
+            ),
         ] {
             use crate::{CommandValidator, ValidationCheck};
             let repo = Repo::new();
@@ -6551,6 +6625,8 @@ mod tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let observations = Arc::new(AtomicUsize::new(0));
             let stale_target = Arc::new(Mutex::new(None));
+            let completion_failure_target = Arc::new(Mutex::new(None));
+            let artifact_unavailable_target = Arc::new(Mutex::new(None));
             let mut providers = ProviderRegistry::new();
             providers.register(FakeProvider {
                 calls: Arc::new(AtomicUsize::new(0)),
@@ -6574,17 +6650,27 @@ mod tests {
                 calls: calls.clone(),
                 ledger: ledger.clone(),
                 stale_target: stale_target.clone(),
+                completion_failure_target: completion_failure_target.clone(),
                 observations: observations.clone(),
                 write_attempt: case == "provider_write_attempt",
                 report_usage: matches!(
                     case,
-                    "stale_artifact" | "review_usage_redaction" | "review_usage_redaction_failure"
+                    "stale_artifact"
+                        | "review_usage_redaction"
+                        | "review_usage_redaction_failure"
+                        | "artifact_unavailable_during_review"
+                        | "request_missing_during_review"
+                        | "revision_missing_during_review"
+                        | "validation_json_malformed_during_review"
                 ),
                 report_secret_usage: matches!(
                     case,
                     "review_usage_redaction" | "review_usage_redaction_failure"
                 ),
             });
+            let artifact_unavailable_scanner = ArtifactUnavailableScanner {
+                target: artifact_unavailable_target.clone(),
+            };
             let service =
                 OperationService::new(&ledger, &workspace, &providers, 5, Duration::from_secs(30))
                     .unwrap()
@@ -6597,6 +6683,7 @@ mod tests {
                         "review_usage_redaction_failure" => {
                             &REVIEW_USAGE_REDACTION_UNAVAILABLE_SCANNER
                         }
+                        "artifact_unavailable_during_review" => &artifact_unavailable_scanner,
                         _ => &TEST_SECRET_SCANNER,
                     });
             let task = service
@@ -6708,6 +6795,28 @@ mod tests {
                     root,
                 ));
             }
+            if matches!(
+                case,
+                "artifact_unavailable_during_review"
+                    | "request_missing_during_review"
+                    | "revision_missing_during_review"
+                    | "validation_json_malformed_during_review"
+            ) {
+                if case == "artifact_unavailable_during_review" {
+                    *artifact_unavailable_target.lock().unwrap() =
+                        Some((ledger.clone(), task.task_id().clone(), artifact_id.clone()));
+                } else {
+                    *completion_failure_target.lock().unwrap() = Some((
+                        task.task_id().clone(),
+                        review.attempt_id().as_str().to_owned(),
+                        match case {
+                            "request_missing_during_review" => "request_missing",
+                            "revision_missing_during_review" => "revision_missing",
+                            _ => "validation_json_malformed",
+                        },
+                    ));
+                }
+            }
             let result = service
                 .run(review.operation_id(), CancellationToken::new())
                 .unwrap();
@@ -6806,7 +6915,13 @@ mod tests {
             }
             if matches!(
                 case,
-                "stale_artifact" | "summary_redaction_failure" | "provider_write_attempt"
+                "stale_artifact"
+                    | "summary_redaction_failure"
+                    | "provider_write_attempt"
+                    | "artifact_unavailable_during_review"
+                    | "request_missing_during_review"
+                    | "revision_missing_during_review"
+                    | "validation_json_malformed_during_review"
             ) {
                 assert_eq!(result.status(), ServiceOperationStatus::Failed);
                 assert_eq!(
@@ -6849,7 +6964,10 @@ mod tests {
                 assert_eq!(output_artifacts, 0);
                 assert_eq!(leaked_summaries, 0);
                 let expected_diagnostic = match case {
-                    "stale_artifact" => "stale_artifact",
+                    "stale_artifact" | "artifact_unavailable_during_review" => "stale_artifact",
+                    "request_missing_during_review"
+                    | "revision_missing_during_review"
+                    | "validation_json_malformed_during_review" => "review_completion_failed",
                     "summary_redaction_failure" => "review_redaction_failed",
                     _ => "review_workspace_changed",
                 };
@@ -6872,6 +6990,20 @@ mod tests {
                     assert_eq!(operation_usage, 1);
                     assert_eq!(attempt_usage, 1);
                     assert_eq!(verdicts, 0);
+                }
+                if case.ends_with("_during_review") {
+                    let usage_count: i64 = connection.query_row(
+                        "SELECT COUNT(*) FROM service_operation_usage WHERE operation_id=?1 AND name='input_tokens' AND value='11' AND unit='token'",
+                        params![review.operation_id().as_str()], |r| r.get(0)
+                    ).unwrap();
+                    assert_eq!(usage_count, 1);
+                    assert_eq!(result.status(), ServiceOperationStatus::Failed);
+                    drop(connection);
+                    let failed_task = ledger.get_task(task.task_id()).unwrap().unwrap();
+                    assert_eq!(
+                        failed_task.attempt(review.attempt_id()).unwrap().state(),
+                        AttemptState::Failed
+                    );
                 }
                 assert!(!format!("{result:?}").contains("REVIEW_SUMMARY_SECRET"));
             } else if let Ok(output) = provider_output {

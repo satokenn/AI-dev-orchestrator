@@ -393,6 +393,8 @@ Rust Serviceは監督側が明示的に呼び出す`OperationService::submit_art
 
 依頼時はTask revision、同一Taskで最新かつavailableなArtifact、そのArtifactを作成した成功implementer Attempt、同じArtifact ID/treeを参照する各Validationを確認する。Task要求、Artifact差分、Validation結果、criteriaはProviderへ渡す前にSecretScannerでredactし固定点を確認する。Scannerが未設定または検査不能なら受付を拒否する。Reviewer Providerはread-only workspaceを強制できる必要があり、実行後もworkspace treeが対象Artifactと一致することを確認する。成功Provider出力は`{"verdict":"approved|changes_requested|inconclusive","summary":"..."}`形式のJSONでなければならない。redacted summaryを保存し、ReviewVerdictをreviewer Attempt・Artifact ID/treeへ結び付ける。
 
+Task要求、Validation事実、criteria、全diffを含む完成済みinstructionは16 KiB以下でなければならず、上限を超える依頼は受付前に拒否する。
+
 `ArtifactInput`はこのAPIでは対象Artifactをreviewer Attemptへ渡す入力であり、review後の実装修正を開始しない。旧Ledgerに残るaccepted non-reviewer ArtifactInputはclaim後に`failed` / `review_evidence_required`として終端し、Providerを起動しない。ReviewVerdictはreviewerの結論であり、Task完了や再作業を自動決定せず、監督側の採否判断を代替しない。
 
 ### `operation.get`
