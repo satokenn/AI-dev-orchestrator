@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::{BTreeMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -1431,17 +1431,25 @@ fn availability_state(status: &crate::AvailabilityStatus) -> &'static str {
     }
 }
 fn availability_json(observation: &crate::AvailabilityObservation) -> serde_json::Value {
-    let mut value = serde_json::json!({
-        "status": availability_state(&observation.status),
-        "observed_at_ms": observation.observed_at_ms,
-        "source": evidence_source_json(&observation.source),
-    });
-    if let crate::AvailabilityStatus::Unavailable { reason }
-    | crate::AvailabilityStatus::Unknown { reason } = &observation.status
-    {
-        value["reason"] = serde_json::json!(reason);
+    match &observation.status {
+        crate::AvailabilityStatus::Available => serde_json::json!({
+            "status": "available",
+            "observed_at_ms": observation.observed_at_ms,
+            "source": evidence_source_json(&observation.source),
+        }),
+        crate::AvailabilityStatus::Unavailable { reason } => serde_json::json!({
+            "status": "unavailable",
+            "reason": reason,
+            "observed_at_ms": observation.observed_at_ms,
+            "source": evidence_source_json(&observation.source),
+        }),
+        crate::AvailabilityStatus::Unknown { reason } => serde_json::json!({
+            "status": "unknown",
+            "reason": reason,
+            "observed_at_ms": observation.observed_at_ms,
+            "source": evidence_source_json(&observation.source),
+        }),
     }
-    value
 }
 fn evidence_json<T: ContextEvidenceValue>(evidence: &Evidence<T>) -> serde_json::Value {
     match evidence {
@@ -1598,27 +1606,80 @@ fn task_request_json(request: &TaskCreateRequest) -> String {
     .to_string()
 }
 
+const TASK_CREATE_UNSAFE_TEXT: &str = "task.create text cannot be stored safely";
+
+fn ensure_task_create_text_safe(
+    scanner: Option<&dyn SecretScanner>,
+    request_json: &str,
+) -> Result<(), ServiceError> {
+    let scanner = scanner.ok_or(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
+    let value: serde_json::Value =
+        serde_json::from_str(request_json).map_err(|_| ServiceError::InvalidStoredState)?;
+    let mut text_fields = Vec::new();
+    collect_json_text_fields(&value, &mut text_fields);
+    for text in text_fields {
+        ensure_task_create_field_safe(Some(scanner), text)?;
+    }
+    Ok(())
+}
+
+fn collect_json_text_fields<'a>(value: &'a serde_json::Value, text_fields: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(text) => text_fields.push(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_text_fields(value, text_fields);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                text_fields.push(key);
+                collect_json_text_fields(value, text_fields);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn ensure_task_create_field_safe(
+    scanner: Option<&dyn SecretScanner>,
+    text: &str,
+) -> Result<(), ServiceError> {
+    let scanner = scanner.ok_or(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
+    let payload = ArtifactPublicationPayload::new("", "", "task.create request text", text);
+    match scanner.scan_publication_payload(&payload) {
+        Ok(SecretScanResult::Clean) => Ok(()),
+        Ok(SecretScanResult::Findings) | Err(_) => {
+            Err(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))
+        }
+    }
+}
+
 fn redact_task_create_request(
     request: &TaskCreateRequest,
     scanner: Option<&dyn SecretScanner>,
 ) -> Result<TaskCreateRequest, ServiceError> {
-    let scanner = scanner.ok_or(ServiceError::PolicyDenied(
-        "task text redaction is unavailable",
-    ))?;
+    let scanner = scanner.ok_or(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
     let redact = |text: &str| {
+        let original_scan = scan_task_create_field(scanner, text)?;
         let redacted = scanner
             .redact_text(text)
-            .map_err(|_| ServiceError::PolicyDenied("task text redaction is unavailable"))?;
+            .map_err(|_| ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
         let verified = scanner
             .redact_text(&redacted)
-            .map_err(|_| ServiceError::PolicyDenied("task text redaction is unavailable"))?;
+            .map_err(|_| ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))?;
         if verified != redacted {
-            return Err(ServiceError::PolicyDenied(
-                "task text redaction is unavailable",
-            ));
+            return Err(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT));
+        }
+        let redacted_scan = scan_task_create_field(scanner, &redacted)?;
+        if redacted_scan == SecretScanResult::Findings
+            || (original_scan == SecretScanResult::Findings && redacted == text)
+        {
+            return Err(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT));
         }
         Ok(redacted)
     };
+    ensure_task_create_field_safe(Some(scanner), &request.request_id)?;
     let issue = request
         .issue
         .as_ref()
@@ -1643,6 +1704,69 @@ fn redact_task_create_request(
             .collect::<Result<Vec<_>, _>>()?,
         issue,
     })
+}
+
+fn scan_task_create_field(
+    scanner: &dyn SecretScanner,
+    text: &str,
+) -> Result<SecretScanResult, ServiceError> {
+    let payload = ArtifactPublicationPayload::new("", "", "task.create request text", text);
+    scanner
+        .scan_publication_payload(&payload)
+        .map_err(|_| ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))
+}
+
+fn redact_fixed_point(
+    scanner: Option<&dyn SecretScanner>,
+    text: &str,
+) -> Result<String, ServiceError> {
+    let scanner = scanner.ok_or(ServiceError::PolicyDenied(
+        "usage text redaction is unavailable",
+    ))?;
+    let redacted = scanner
+        .redact_text(text)
+        .map_err(|_| ServiceError::PolicyDenied("usage text redaction is unavailable"))?;
+    let verified = scanner
+        .redact_text(&redacted)
+        .map_err(|_| ServiceError::PolicyDenied("usage text redaction is unavailable"))?;
+    if verified != redacted {
+        return Err(ServiceError::PolicyDenied(
+            "usage text redaction is unavailable",
+        ));
+    }
+    Ok(redacted)
+}
+
+fn redact_usage_metric(
+    metric: &UsageMetric,
+    scanner: Option<&dyn SecretScanner>,
+) -> Result<UsageMetric, ServiceError> {
+    let name = redact_fixed_point(scanner, metric.name())?;
+    let redacted_value = redact_fixed_point(scanner, metric.value())?;
+    let value = if redacted_value == metric.value() {
+        redacted_value
+    } else {
+        let marker = redact_fixed_point(scanner, "[REDACTED]")?;
+        if parse_usage_number(&marker).is_some() {
+            return Err(ServiceError::PolicyDenied(
+                "usage text redaction is unavailable",
+            ));
+        }
+        marker
+    };
+    let unit = redact_fixed_point(scanner, metric.unit())?;
+    Ok(UsageMetric::new(name, value, unit))
+}
+
+fn redact_usage_cost(
+    cost: &UsageCost,
+    scanner: Option<&dyn SecretScanner>,
+) -> Result<UsageCost, ServiceError> {
+    cost.metrics()
+        .iter()
+        .map(|metric| redact_usage_metric(metric, scanner))
+        .collect::<Result<Vec<_>, _>>()
+        .map(UsageCost::new)
 }
 
 fn redact_task_creation_result(
@@ -1759,6 +1883,90 @@ fn load_task_creation_result(
             issue,
         },
     })
+}
+
+fn stored_task_request_payload(
+    request_id: &str,
+    stored_json: &str,
+    scanner: Option<&dyn SecretScanner>,
+) -> Result<String, ServiceError> {
+    let value: serde_json::Value =
+        serde_json::from_str(stored_json).map_err(|_| ServiceError::InvalidStoredState)?;
+    let object = value.as_object().ok_or(ServiceError::InvalidStoredState)?;
+    if object.len() != 5
+        || ["source", "title", "description", "constraints", "issue"]
+            .iter()
+            .any(|key| !object.contains_key(*key))
+    {
+        return Err(ServiceError::InvalidStoredState);
+    }
+    let source = match value["source"].as_str() {
+        Some("issue") => TaskSource::Issue,
+        Some("manual") => TaskSource::Manual,
+        _ => return Err(ServiceError::InvalidStoredState),
+    };
+    let issue = if value["issue"].is_null() {
+        None
+    } else {
+        let issue_value = value["issue"]
+            .as_object()
+            .ok_or(ServiceError::InvalidStoredState)?;
+        if issue_value.len() != 4
+            || ["url", "number", "title", "body"]
+                .iter()
+                .any(|key| !issue_value.contains_key(*key))
+        {
+            return Err(ServiceError::InvalidStoredState);
+        }
+        Some(TaskIssueSnapshot {
+            url: value["issue"]["url"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            number: value["issue"]["number"]
+                .as_u64()
+                .ok_or(ServiceError::InvalidStoredState)?,
+            title: value["issue"]["title"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+            body: value["issue"]["body"]
+                .as_str()
+                .ok_or(ServiceError::InvalidStoredState)?
+                .to_owned(),
+        })
+    };
+    let request = TaskCreateRequest {
+        request_id: request_id.to_owned(),
+        source,
+        title: value["title"]
+            .as_str()
+            .ok_or(ServiceError::InvalidStoredState)?
+            .to_owned(),
+        description: value["description"]
+            .as_str()
+            .ok_or(ServiceError::InvalidStoredState)?
+            .to_owned(),
+        constraints: value["constraints"]
+            .as_array()
+            .ok_or(ServiceError::InvalidStoredState)?
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or(ServiceError::InvalidStoredState)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        issue,
+    };
+    validate_task_create(&request).map_err(|_| ServiceError::InvalidStoredState)?;
+    let sanitized = redact_task_create_request(&request, scanner)?;
+    let canonical = task_request_json(&sanitized);
+    ensure_task_create_text_safe(scanner, &canonical)?;
+    if canonical != stored_json {
+        return Err(ServiceError::InvalidStoredState);
+    }
+    Ok(canonical)
 }
 
 impl From<LedgerError> for ServiceError {
@@ -1927,55 +2135,6 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         Ok(service)
     }
 
-    /// Enables named models using an explicit, source-attributed capability catalog.
-    #[must_use]
-    pub fn with_model_catalog(mut self, catalog: &'a dyn ModelCatalog, max_age: Duration) -> Self {
-        self.model_catalog = Some(catalog);
-        self.model_catalog_max_age = max_age;
-        self
-    }
-
-    fn validate_named_model(
-        &self,
-        provider: &ProviderRef,
-        choice: &ModelChoice,
-    ) -> Result<(), ServiceError> {
-        let ModelChoice::Named(model) = choice else {
-            return Ok(());
-        };
-        let Some(catalog) = self.model_catalog else {
-            return Err(ServiceError::NamedModelRequiresCatalog);
-        };
-        let entry = catalog
-            .lookup(provider, model)
-            .map_err(|_| ServiceError::NamedModelRequiresCatalog)?
-            .ok_or(ServiceError::NamedModelRequiresCatalog)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ServiceError::NamedModelRequiresCatalog)?;
-        if !model_catalog_entry_is_fresh_at(&entry, now, self.model_catalog_max_age) {
-            return Err(ServiceError::NamedModelRequiresCatalog);
-        }
-        Ok(())
-    }
-
-    /// Injects the caller's secret scanning policy. Publication is denied when absent.
-    #[must_use]
-    pub fn with_secret_scanner(mut self, scanner: &'a dyn SecretScanner) -> Self {
-        self.secret_scanner = Some(scanner);
-        self
-    }
-
-    /// Injects the Git/GitHub publication adapter used after both scans pass.
-    #[must_use]
-    pub fn with_artifact_publication_gateway(
-        mut self,
-        gateway: &'a dyn ArtifactPublicationGateway,
-    ) -> Self {
-        self.publication_gateway = Some(gateway);
-        self
-    }
-
     /// Reads the Task snapshot and the v2 `providers` / `usage` / `attempts` ContextPage
     /// sections without changing the Task, running an Attempt, or persisting a
     /// probe result. Only explicitly registered Provider adapters are sampled.
@@ -2012,7 +2171,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ));
         }
 
-        let (mut task_snapshot, revision, attempts, usage) = {
+        let (mut task_snapshot, revision, attempts, usage, reviews) = {
             let connection = self.ledger.lock_connection()?;
             let transaction = connection.unchecked_transaction()?;
             if !transaction.query_row(
@@ -2044,30 +2203,80 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             task_snapshot.revision = revision as u64;
             task_snapshot.state = task.state();
             let attempts = self.ledger.load_attempts(&transaction, task_id)?;
-            let mut usage_statement = transaction.prepare(
-                "SELECT operation.id,operation.attempt_id,operation.finished_at,
-                        metric.sequence,metric.name,metric.value,metric.unit
-                 FROM service_operations operation
-                 JOIN service_operation_usage metric ON metric.operation_id=operation.id
-                 WHERE operation.task_id=?1
-                 ORDER BY operation.finished_at DESC,operation.id DESC,metric.sequence DESC",
-            )?;
-            let usage = usage_statement
-                .query_map(params![task_id.as_str()], |row| {
-                    let operation_id: String = row.get(0)?;
-                    let attempt_id: String = row.get(1)?;
-                    let sequence: i64 = row.get(3)?;
-                    Ok(ContextUsageMetric {
-                        id: format!("usage:{operation_id}:{sequence}"),
-                        attempt_id,
-                        finished_at_ms: row.get(2)?,
-                        name: row.get(4)?,
-                        value: row.get(5)?,
-                        unit: row.get(6)?,
+            let usage = if sections.contains(&TaskContextSection::Usage) {
+                let mut usage_statement = transaction.prepare(
+                    "SELECT operation.id,operation.attempt_id,operation.finished_at,
+                            metric.sequence,metric.name,metric.value,metric.unit
+                     FROM service_operations operation
+                     JOIN service_operation_usage metric ON metric.operation_id=operation.id
+                     WHERE operation.task_id=?1
+                     ORDER BY operation.finished_at DESC,operation.id DESC,metric.sequence DESC",
+                )?;
+                let usage = usage_statement
+                    .query_map(params![task_id.as_str()], |row| {
+                        let operation_id: String = row.get(0)?;
+                        let attempt_id: String = row.get(1)?;
+                        let sequence: i64 = row.get(3)?;
+                        Ok(ContextUsageMetric {
+                            id: format!("usage:{operation_id}:{sequence}"),
+                            attempt_id,
+                            finished_at_ms: row.get(2)?,
+                            name: row.get(4)?,
+                            value: row.get(5)?,
+                            unit: row.get(6)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(usage_statement);
+                usage
+                    .into_iter()
+                    .map(|metric| {
+                        let redacted = redact_usage_metric(
+                            &UsageMetric::new(&metric.name, &metric.value, &metric.unit),
+                            self.secret_scanner,
+                        )?;
+                        Ok(ContextUsageMetric {
+                            name: redacted.name().to_owned(),
+                            value: redacted.value().to_owned(),
+                            unit: redacted.unit().to_owned(),
+                            ..metric
+                        })
                     })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(usage_statement);
+                    .collect::<Result<Vec<_>, ServiceError>>()?
+            } else {
+                Vec::new()
+            };
+            let reviews = if sections.contains(&TaskContextSection::Reviews) {
+                let mut statement = transaction.prepare(
+                    "SELECT id,reviewer_attempt_id,artifact_id,verdict,summary,created_at
+                     FROM artifact_review_verdicts WHERE task_id=?1
+                     ORDER BY created_at DESC,id DESC",
+                )?;
+                let rows = statement
+                    .query_map(params![task_id.as_str()], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(statement);
+                rows.into_iter()
+                    .map(|(id, attempt, artifact, verdict, summary, created)| {
+                        let summary = safely_redact_review_summary(&summary, self.secret_scanner)
+                            .ok_or(ServiceError::PolicyDenied(
+                                "review redaction is unavailable",
+                            ))?;
+                        Ok(serde_json::json!({"id":id,"kind":"review_verdict","state":verdict,"occurred_at":epoch_ms_to_rfc3339(created),"summary":summary,"references":[{"kind":"attempt","id":attempt},{"kind":"artifact","id":artifact}],"details":{"review_verdict_id":id,"reviewer_attempt_id":attempt,"artifact_id":artifact,"verdict":verdict}}))
+                    })
+                    .collect::<Result<Vec<_>, ServiceError>>()?
+            } else {
+                Vec::new()
+            };
             let operation_details = attempts.iter().map(|record| {
                 let detail = transaction.query_row(
                     "SELECT COALESCE(history.role,operation.role),operation.accepted_at,operation.finished_at,
@@ -2098,6 +2307,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 revision as u64,
                 (attempts, operation_details),
                 usage,
+                reviews,
             )
         };
         redact_task_creation_result(&mut task_snapshot, self.secret_scanner)?;
@@ -2116,6 +2326,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 ));
             }
             if *section == TaskContextSection::Usage && offset > usage.len() {
+                return Err(ServiceError::InvalidRequest(
+                    "cursor offset exceeds section length",
+                ));
+            }
+            if *section == TaskContextSection::Reviews && offset > reviews.len() {
                 return Err(ServiceError::InvalidRequest(
                     "cursor offset exceeds section length",
                 ));
@@ -2162,24 +2377,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                         attempt_context_item(record, details, observed_at_ms)
                     })
                     .collect::<Vec<_>>(),
-                TaskContextSection::Reviews => {
-                    let connection = self.ledger.lock_connection()?;
-                    let mut statement = connection.prepare("SELECT id,reviewer_attempt_id,artifact_id,verdict,summary,created_at FROM artifact_review_verdicts WHERE task_id=?1 ORDER BY created_at DESC,id DESC")?;
-                    let rows = statement.query_map(params![task_id.as_str()], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, i64>(5)?,
-                        ))
-                    })?;
-                    rows.map(|row| {
-                        let (id,attempt,artifact,verdict,summary,created)=row?;
-                        Ok(serde_json::json!({"id":id,"kind":"review_verdict","state":verdict,"occurred_at":epoch_ms_to_rfc3339(created),"summary":summary,"references":[{"kind":"attempt","id":attempt},{"kind":"artifact","id":artifact}],"details":{"review_verdict_id":id,"reviewer_attempt_id":attempt,"artifact_id":artifact,"verdict":verdict}}))
-                    }).collect::<Result<Vec<_>,rusqlite::Error>>()?
-                }
+                TaskContextSection::Reviews => reviews.clone(),
             };
             items.sort_by(|left, right| {
                 right["occurred_at"]
@@ -2223,9 +2421,12 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ));
         }
         validate_task_create(request)?;
+        ensure_task_create_field_safe(self.secret_scanner, caller)?;
+        ensure_task_create_field_safe(self.secret_scanner, &request.request_id)?;
         let sanitized_request = redact_task_create_request(request, self.secret_scanner)?;
         validate_task_create(&sanitized_request)?;
         let payload = task_request_json(&sanitized_request);
+        ensure_task_create_text_safe(self.secret_scanner, &payload)?;
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx
@@ -2237,11 +2438,24 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             )
             .optional()?;
         if let Some((stored, task_id)) = existing {
+            let stored =
+                stored_task_request_payload(&request.request_id, &stored, self.secret_scanner)?;
+            let mut result = load_task_creation_result(&tx, &request.request_id, &task_id)?;
+            redact_task_creation_result(&mut result, self.secret_scanner)?;
+            let sanitized_snapshot = TaskCreateRequest {
+                request_id: result.request_id.clone(),
+                source: result.request.source,
+                title: result.request.title.clone(),
+                description: result.request.description.clone(),
+                constraints: result.request.constraints.clone(),
+                issue: result.request.issue.clone(),
+            };
             if stored != payload {
                 return Err(ServiceError::IdempotencyConflict);
             }
-            let mut result = load_task_creation_result(&tx, &request.request_id, &task_id)?;
-            redact_task_creation_result(&mut result, self.secret_scanner)?;
+            if task_request_json(&sanitized_snapshot) != stored {
+                return Err(ServiceError::InvalidStoredState);
+            }
             tx.commit()?;
             return Ok(result);
         }
@@ -2291,6 +2505,67 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         Ok(result)
     }
 
+    /// Enables named models using an explicit, source-attributed capability catalog.
+    #[must_use]
+    pub fn with_model_catalog(mut self, catalog: &'a dyn ModelCatalog, max_age: Duration) -> Self {
+        self.model_catalog = Some(catalog);
+        self.model_catalog_max_age = max_age;
+        self
+    }
+
+    fn validate_model_choice_shape(choice: &ModelChoice) -> Result<(), ServiceError> {
+        if matches!(choice, ModelChoice::Named(model) if model.as_str().is_empty()) {
+            return Err(ServiceError::InvalidRequest(
+                "named model must not be empty",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_named_model(
+        &self,
+        provider: &ProviderRef,
+        choice: &ModelChoice,
+    ) -> Result<(), ServiceError> {
+        Self::validate_model_choice_shape(choice)?;
+        let ModelChoice::Named(model) = choice else {
+            return Ok(());
+        };
+        let Some(catalog) = self.model_catalog else {
+            return Err(ServiceError::NamedModelRequiresCatalog);
+        };
+        let entry = catalog
+            .lookup(provider, model)
+            .map_err(|_| ServiceError::NamedModelRequiresCatalog)?
+            .ok_or(ServiceError::NamedModelRequiresCatalog)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ServiceError::NamedModelRequiresCatalog)?;
+        if !model_catalog_entry_is_fresh_at(&entry, now, self.model_catalog_max_age) {
+            return Err(ServiceError::NamedModelRequiresCatalog);
+        }
+        Ok(())
+    }
+
+    /// Injects the caller's secret scanning policy. Publication is denied when absent.
+    #[must_use]
+    pub fn with_secret_scanner(mut self, scanner: &'a dyn SecretScanner) -> Self {
+        self.secret_scanner = Some(scanner);
+        self
+    }
+
+    /// Injects the Git/GitHub publication adapter used after both scans pass.
+    #[must_use]
+    pub fn with_artifact_publication_gateway(
+        mut self,
+        gateway: &'a dyn ArtifactPublicationGateway,
+    ) -> Self {
+        self.publication_gateway = Some(gateway);
+        self
+    }
+
+    /// Creates a pending Task and its revision zero snapshot atomically. The
+    /// caller scopes the task.create request ID; replay returns the first result.
     fn idempotent_acceptance(
         &self,
         request: &AttemptRunRequest,
@@ -2419,6 +2694,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 "ArtifactInput requires a successful changes_requested ReviewVerdict",
             ));
         }
+        Self::validate_model_choice_shape(&request.model_id)?;
         if let Some(accepted) = self.idempotent_acceptance(request)? {
             return Ok(accepted);
         }
@@ -3286,6 +3562,10 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        let usage = usage
+            .iter()
+            .map(|metric| redact_usage_metric(metric, self.secret_scanner))
+            .collect::<Result<Vec<_>, _>>()?;
         let (input_artifact_id, output_artifact_id): (Option<String>, Option<String>) = connection.query_row(
             "SELECT relation.input_artifact_id,relation.output_artifact_id FROM service_attempt_artifacts relation WHERE relation.task_id=?1 AND relation.attempt_id=?2",
             params![task, attempt], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -3527,6 +3807,11 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         let artifact = artifacts
             .verify_input(&request.task_id, &request.artifact_id)
             .map_err(ServiceError::from)?;
+        if repository_has_replace_refs(artifact.repository_root(), self.default_timeout) {
+            return Err(ServiceError::PolicyDenied(
+                "Git replace refs make Artifact scanning ambiguous",
+            ));
+        }
         if artifact.tree_oid() != permit.tree_oid()
             || artifact.base_commit() != permit.base_commit()
         {
@@ -3660,6 +3945,18 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
                 return Err(ServiceError::from(error));
             }
         };
+        if repository_has_replace_refs(artifact.repository_root(), self.default_timeout) {
+            self.finish_publication(
+                &acceptance.operation_id,
+                ServiceOperationStatus::Failed,
+                "publication_replace_refs_present",
+                None,
+                None,
+            )?;
+            return Err(ServiceError::PolicyDenied(
+                "Git replace refs make Artifact scanning ambiguous",
+            ));
+        }
         let artifact_scan =
             match scanner.scan_artifact_tree(artifact.repository_root(), artifact.tree_oid()) {
                 Ok(result) => result,
@@ -4007,23 +4304,33 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             ArtifactPublicationPhase::Pushing,
             Some(&commit_sha),
         )?;
-        if gateway
-            .push_commit(
-                artifact.repository_root(),
-                &commit_sha,
-                payload.head_branch(),
-                self.default_timeout,
-            )
-            .is_err()
-        {
-            self.finish_publication(
-                operation_id,
-                ServiceOperationStatus::RecoveryRequired,
-                "publication_push_ambiguous",
-                Some(&commit_sha),
-                None,
-            )?;
-            return Err(ServiceError::PublicationRecoveryRequired);
+        match gateway.push_commit(
+            artifact.repository_root(),
+            &commit_sha,
+            payload.head_branch(),
+            self.default_timeout,
+        ) {
+            Ok(()) => {}
+            Err(crate::artifact_publication::PublicationGatewayError::RejectedBeforeEffect) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_push_rejected_before_effect",
+                    Some(&commit_sha),
+                    None,
+                )?;
+                return Err(ServiceError::PublicationFailed);
+            }
+            Err(_) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::RecoveryRequired,
+                    "publication_push_ambiguous",
+                    Some(&commit_sha),
+                    None,
+                )?;
+                return Err(ServiceError::PublicationRecoveryRequired);
+            }
         }
         self.save_publication_phase(
             operation_id,
@@ -4043,6 +4350,28 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             self.default_timeout,
         ) {
             Ok(pull_request) => pull_request,
+            Err(crate::artifact_publication::PublicationGatewayError::RejectedBeforeEffect) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::Failed,
+                    "publication_pr_rejected_before_effect",
+                    Some(&commit_sha),
+                    None,
+                )?;
+                return Err(ServiceError::PublicationFailed);
+            }
+            Err(
+                crate::artifact_publication::PublicationGatewayError::ObservationUnavailableBeforeEffect,
+            ) => {
+                self.finish_publication(
+                    operation_id,
+                    ServiceOperationStatus::RecoveryRequired,
+                    "publication_pr_observation_unavailable",
+                    Some(&commit_sha),
+                    None,
+                )?;
+                return Err(ServiceError::PublicationRecoveryRequired);
+            }
             Err(_) => {
                 self.finish_publication(
                     operation_id,
@@ -4517,6 +4846,17 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         usage: Option<UsageCost>,
         diagnostic: Option<&str>,
     ) -> Result<(), ServiceError> {
+        // Usage is optional evidence. Never let an unavailable or ambiguous
+        // redactor strand a provider operation or cause raw strings to persist.
+        let (usage, usage_redaction_failed) = match usage {
+            Some(cost) => match redact_usage_cost(&cost, self.secret_scanner) {
+                Ok(redacted) => (Some(redacted), false),
+                Err(_) => (None, true),
+            },
+            None => (None, false),
+        };
+        let diagnostic =
+            diagnostic.or(usage_redaction_failed.then_some("usage_redaction_unavailable"));
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (task_text, attempt_text, current): (String, String, String) = tx.query_row(
@@ -4590,6 +4930,16 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         observed_model: Option<ModelRef>,
         usage: Option<UsageCost>,
     ) -> Result<(), ServiceError> {
+        // Review usage is optional evidence, just like usage on an ordinary
+        // provider attempt. Keep a successful verdict even if it cannot be
+        // safely redacted, and never persist the raw metrics.
+        let (usage, usage_redaction_failed) = match usage {
+            Some(cost) => match redact_usage_cost(&cost, self.secret_scanner) {
+                Ok(redacted) => (Some(redacted), false),
+                Err(_) => (None, true),
+            },
+            None => (None, false),
+        };
         let mut connection = self.ledger.lock_connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (task_text, attempt_text, status): (String, String, String) = tx.query_row(
@@ -4647,8 +4997,8 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             });
         }
         attempt.record_observed_target(observed_provider, observed_model);
-        if let Some(cost) = usage.clone() {
-            attempt.set_usage_cost(cost);
+        if let Some(cost) = usage.as_ref() {
+            attempt.set_usage_cost(cost.clone());
         }
         attempt.complete_provider_call()?;
         let finished = now_ms();
@@ -4661,7 +5011,7 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         }
         let review_id = format!("review-{}", attempt_id.as_str());
         tx.execute("INSERT INTO artifact_review_verdicts(id,task_id,reviewer_attempt_id,artifact_id,tree_oid,verdict,summary,diagnostic_code,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'provider_review',?8)",params![review_id,task_id.as_str(),attempt_id.as_str(),request.0,request.1,verdict.as_str(),summary,finished])?;
-        tx.execute("UPDATE service_operations SET status='completed',finished_at=?2,observed_provider=?3,observed_model=?4,diagnostic_code=NULL WHERE id=?1",params![operation_id.as_str(),finished,attempt.observed_provider().map(ProviderRef::as_str),attempt.observed_model().map(ModelRef::as_str)])?;
+        tx.execute("UPDATE service_operations SET status='completed',finished_at=?2,observed_provider=?3,observed_model=?4,diagnostic_code=?5 WHERE id=?1",params![operation_id.as_str(),finished,attempt.observed_provider().map(ProviderRef::as_str),attempt.observed_model().map(ModelRef::as_str),usage_redaction_failed.then_some("usage_redaction_unavailable")])?;
         bump_revision(&tx, &task_id)?;
         tx.commit()?;
         Ok(())
@@ -4754,6 +5104,31 @@ fn valid_git_branch(branch: &str) -> bool {
             .any(|byte| byte <= b' ' || byte == 0x7f || b"~^:?*[\\".contains(&byte))
 }
 
+fn repository_has_replace_refs(repository: &Path, timeout: Duration) -> bool {
+    let output = crate::process_runner::ProcessRunner.run_with_env_removed(
+        crate::process_runner::ProcessRequest::new("git")
+            .arg("-C")
+            .arg(repository.as_os_str().to_owned())
+            .args(["for-each-ref", "--format=%(refname)", "refs/replace"])
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .timeout(timeout),
+        &[
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+        ],
+    );
+    match output {
+        Ok(output) if !output.output_truncated && output.status.success() => {
+            !output.stdout.is_empty()
+        }
+        _ => true,
+    }
+}
+
 fn valid_git_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -4805,6 +5180,56 @@ mod tests {
     const CHILD_OPERATION_ID: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_OPERATION";
     const CHILD_MARKER_PATH: &str = "AI_DEV_ORCHESTRATOR_SERVICE_LOCK_MARKER";
 
+    const TASK_SECRET_SENTINEL: &str = "TASK_CREATE_SECRET_SENTINEL";
+    const TASK_MULTILINE_SECRET_SENTINEL: &str = "TASK_CREATE_MULTILINE_SECRET\nSENTINEL";
+
+    struct TaskCreateScanner {
+        unavailable: bool,
+    }
+
+    impl SecretScanner for TaskCreateScanner {
+        fn redact_text(&self, text: &str) -> Result<String, SecretScanError> {
+            if self.unavailable
+                || text.contains(TASK_SECRET_SENTINEL)
+                || text.contains(TASK_MULTILINE_SECRET_SENTINEL)
+            {
+                Err(SecretScanError::Unavailable)
+            } else {
+                Ok(text.to_owned())
+            }
+        }
+
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+
+        fn scan_publication_payload(
+            &self,
+            payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            if self.unavailable {
+                return Err(SecretScanError::Unavailable);
+            }
+            if payload.title().contains(TASK_SECRET_SENTINEL)
+                || payload.body().contains(TASK_SECRET_SENTINEL)
+                || payload.title().contains(TASK_MULTILINE_SECRET_SENTINEL)
+                || payload.body().contains(TASK_MULTILINE_SECRET_SENTINEL)
+            {
+                Ok(SecretScanResult::Findings)
+            } else {
+                Ok(SecretScanResult::Clean)
+            }
+        }
+    }
+
+    fn clean_task_scanner() -> TaskCreateScanner {
+        TaskCreateScanner { unavailable: false }
+    }
+
     fn sqlite_open_is_busy(error: &crate::LedgerError) -> bool {
         matches!(
             error,
@@ -4837,6 +5262,60 @@ mod tests {
             } else {
                 Ok(text.to_owned())
             }
+        }
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+        fn scan_publication_payload(
+            &self,
+            _payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+    }
+
+    struct UsageRedactionUnavailableScanner;
+    static REVIEW_USAGE_REDACTION_UNAVAILABLE_SCANNER: UsageRedactionUnavailableScanner =
+        UsageRedactionUnavailableScanner;
+
+    struct UsageNonFixedScanner;
+
+    impl SecretScanner for UsageRedactionUnavailableScanner {
+        fn redact_text(&self, text: &str) -> Result<String, SecretScanError> {
+            if text.contains("sentinel-secret") {
+                Err(SecretScanError::Unavailable)
+            } else {
+                Ok(text.to_owned())
+            }
+        }
+        fn scan_artifact_tree(
+            &self,
+            _repository: &Path,
+            _tree_oid: &str,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+        fn scan_publication_payload(
+            &self,
+            _payload: &ArtifactPublicationPayload,
+        ) -> Result<SecretScanResult, SecretScanError> {
+            Ok(SecretScanResult::Clean)
+        }
+    }
+
+    impl SecretScanner for UsageNonFixedScanner {
+        fn redact_text(&self, text: &str) -> Result<String, SecretScanError> {
+            Ok(if text.contains("sentinel-secret") {
+                "[REDACTED]-one".to_owned()
+            } else if text == "[REDACTED]-one" {
+                "[REDACTED]-two".to_owned()
+            } else {
+                text.to_owned()
+            })
         }
         fn scan_artifact_tree(
             &self,
@@ -4924,6 +5403,19 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn publication_preflight_rejects_git_replace_refs() {
+        let repo = Repo::new();
+        let tree = git(&repo.0, &["rev-parse", "HEAD^{tree}"]);
+        let replacement = git(&repo.0, &["mktree"]);
+        git(
+            &repo.0,
+            &["update-ref", &format!("refs/replace/{tree}"), &replacement],
+        );
+
+        assert!(repository_has_replace_refs(&repo.0, Duration::from_secs(1)));
     }
 
     fn cleanup_fixture_worktree(
@@ -5036,10 +5528,16 @@ mod tests {
         let provider = &json["sections"]["providers"]["items"][0]["details"];
         assert_eq!(provider["cli_present"]["status"], "known");
         assert_eq!(provider["cli_present"]["value"], true);
-        assert_eq!(provider["authentication"]["status"], "unknown");
+        assert_eq!(
+            provider["authentication"]["status"].as_str(),
+            Some("unknown")
+        );
         assert!(provider["authentication"]["reason"].as_str().is_some());
         assert_eq!(provider["availability"], "unknown");
-        assert_eq!(provider["availability_evidence"]["status"], "unknown");
+        assert_eq!(
+            provider["availability_evidence"]["status"].as_str(),
+            Some("unknown")
+        );
         assert!(
             provider["availability_evidence"]["reason"]
                 .as_str()
@@ -5082,6 +5580,131 @@ mod tests {
     }
 
     #[test]
+    fn task_context_attempt_history_orders_null_timestamps_last_and_pages_by_that_order() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(crate::CodexProvider::with_executable("true"));
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
+        let task = service
+            .create_task(
+                "caller",
+                &TaskCreateRequest::new(
+                    "create-null-time-pages",
+                    TaskSource::Manual,
+                    "Context task",
+                    "Check history ordering",
+                    vec![],
+                    None,
+                ),
+            )
+            .unwrap();
+
+        for (id, started_at) in [
+            ("attempt-timestamped", Some(100)),
+            ("attempt-null-a", None),
+            ("attempt-null-z", None),
+        ] {
+            let attempt = Attempt::new_provider_call_v2(
+                AttemptId::new(id),
+                ProviderRef::new("codex"),
+                ModelChoice::ProviderDefault,
+            );
+            ledger
+                .save_attempt(task.task_id(), &attempt, started_at, None)
+                .unwrap();
+        }
+
+        let sections = [TaskContextSection::Attempts];
+        let first = service
+            .get_context(task.task_id(), &sections, 1, &BTreeMap::new())
+            .unwrap();
+        assert_eq!(
+            first.sections()["attempts"].items()[0]["id"],
+            "attempt-timestamped"
+        );
+        let cursor = first.sections()["attempts"]
+            .next_cursor()
+            .unwrap()
+            .to_owned();
+        let second = service
+            .get_context(
+                task.task_id(),
+                &sections,
+                1,
+                &BTreeMap::from([("attempts".to_owned(), cursor)]),
+            )
+            .unwrap();
+        assert_eq!(
+            second.sections()["attempts"].items()[0]["id"],
+            "attempt-null-z"
+        );
+        assert_eq!(
+            second.sections()["attempts"].items()[0]["occurred_at"],
+            serde_json::Value::Null
+        );
+        let cursor = second.sections()["attempts"]
+            .next_cursor()
+            .unwrap()
+            .to_owned();
+        let third = service
+            .get_context(
+                task.task_id(),
+                &sections,
+                1,
+                &BTreeMap::from([("attempts".to_owned(), cursor)]),
+            )
+            .unwrap();
+        assert_eq!(
+            third.sections()["attempts"].items()[0]["id"],
+            "attempt-null-a"
+        );
+        assert!(third.sections()["attempts"].next_cursor().is_none());
+    }
+
+    #[test]
+    fn availability_wire_shape_flattens_status_and_reason() {
+        let source = crate::EvidenceSource {
+            kind: crate::EvidenceSourceKind::ProviderCli,
+            reference: "fake".into(),
+        };
+        let observations = [
+            (crate::AvailabilityStatus::Available, "available", None),
+            (
+                crate::AvailabilityStatus::Unavailable {
+                    reason: "probe failed".into(),
+                },
+                "unavailable",
+                Some("probe failed"),
+            ),
+            (
+                crate::AvailabilityStatus::Unknown {
+                    reason: "not measured".into(),
+                },
+                "unknown",
+                Some("not measured"),
+            ),
+        ];
+        for (status, expected_status, expected_reason) in observations {
+            let value = availability_json(&crate::AvailabilityObservation {
+                status,
+                observed_at_ms: 17,
+                source: source.clone(),
+            });
+            assert_eq!(value["status"].as_str(), Some(expected_status));
+            assert_eq!(
+                value.get("reason").and_then(serde_json::Value::as_str),
+                expected_reason
+            );
+            assert!(value["status"].get("status").is_none());
+        }
+    }
+
+    #[test]
     fn task_get_context_returns_persisted_usage_with_safe_numeric_values_and_paging() {
         let repo = Repo::new();
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
@@ -5111,6 +5734,7 @@ mod tests {
             write_ignored: None,
             write_gitignore: None,
             require_file: None,
+            usage: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
@@ -5218,6 +5842,366 @@ mod tests {
     }
 
     #[test]
+    fn usage_metrics_are_redacted_before_persistence_and_all_context_views() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let usage = UsageCost::new([UsageMetric::new(
+            "sentinel-secret-name",
+            "sentinel-secret-value",
+            "sentinel-secret-unit",
+        )]);
+        let mut providers = ProviderRegistry::new();
+        providers.register(FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            provider_failure: None,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("usage-secret-provider"),
+            requested_models: None,
+            observed_target: None,
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
+            usage: Some(usage),
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
+        let task = service
+            .create_task(
+                "usage-secret-caller",
+                &TaskCreateRequest::new(
+                    "usage-secret-create",
+                    TaskSource::Manual,
+                    "Safe title",
+                    "Safe description",
+                    vec![],
+                    None,
+                ),
+            )
+            .unwrap();
+        let accepted = service
+            .submit_attempt(&AttemptRunRequest::new(
+                "usage-secret-run",
+                task.task_id().clone(),
+                task.revision(),
+                ProviderRef::new("usage-secret-provider"),
+                ModelChoice::ProviderDefault,
+                "inspect usage",
+                TaskRole::new("implementer"),
+                BaseInput::new(&repo.0, repo.commit()),
+            ))
+            .unwrap();
+        let operation = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(operation.usage()[0].name(), "[REDACTED]-name");
+        assert_eq!(operation.usage()[0].value(), "[REDACTED]");
+        assert_eq!(operation.usage()[0].unit(), "[REDACTED]-unit");
+        let restored_attempt = ledger
+            .get_task(task.task_id())
+            .unwrap()
+            .unwrap()
+            .attempt(operation.attempt_id())
+            .unwrap()
+            .usage_cost()
+            .unwrap()
+            .metrics()[0]
+            .clone();
+        assert_eq!(restored_attempt.name(), "[REDACTED]-name");
+        assert_eq!(restored_attempt.value(), "[REDACTED]");
+        assert_eq!(restored_attempt.unit(), "[REDACTED]-unit");
+        {
+            let connection = ledger.lock_connection().unwrap();
+            let persisted = ["usage_metrics", "service_operation_usage"]
+                .into_iter()
+                .map(|table| {
+                    connection
+                        .query_row(
+                            &format!("SELECT group_concat(name || value || unit) FROM {table}"),
+                            [],
+                            |row| row.get::<_, Option<String>>(0),
+                        )
+                        .unwrap()
+                        .unwrap_or_default()
+                })
+                .collect::<String>();
+            assert!(!persisted.contains("sentinel-secret"));
+        }
+        let sections = [TaskContextSection::Usage];
+        let context = service
+            .get_context(task.task_id(), &sections, 10, &BTreeMap::new())
+            .unwrap();
+        let context_json = context.to_json_value().to_string();
+        assert!(!context_json.contains("sentinel-secret"));
+        let metric = &context.sections()["usage"].items()[0];
+        assert_eq!(metric["details"]["name"], "[REDACTED]-name");
+        assert_eq!(metric["details"]["unit"], "[REDACTED]-unit");
+        assert_eq!(metric["details"]["value"], serde_json::Value::Null);
+        assert_eq!(metric["details"]["basis"], "unknown");
+        let attempts_context = service
+            .get_context(
+                task.task_id(),
+                &[TaskContextSection::Attempts],
+                10,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert!(
+            !attempts_context
+                .to_json_value()
+                .to_string()
+                .contains("sentinel-secret")
+        );
+    }
+
+    #[test]
+    fn usage_redaction_failure_omits_metrics_and_records_safe_diagnostic() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            provider_failure: None,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("usage-failure-provider"),
+            requested_models: None,
+            observed_target: None,
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
+            usage: Some(UsageCost::new([UsageMetric::new(
+                "sentinel-secret-name",
+                "sentinel-secret-value",
+                "sentinel-secret-unit",
+            )])),
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&UsageRedactionUnavailableScanner);
+        let task = service
+            .create_task(
+                "usage-failure-caller",
+                &TaskCreateRequest::new(
+                    "usage-failure-create",
+                    TaskSource::Manual,
+                    "Safe title",
+                    "Safe description",
+                    vec![],
+                    None,
+                ),
+            )
+            .unwrap();
+        let accepted = service
+            .submit_attempt(&AttemptRunRequest::new(
+                "usage-failure-run",
+                task.task_id().clone(),
+                task.revision(),
+                ProviderRef::new("usage-failure-provider"),
+                ModelChoice::ProviderDefault,
+                "inspect usage",
+                TaskRole::new("implementer"),
+                BaseInput::new(&repo.0, repo.commit()),
+            ))
+            .unwrap();
+        let operation = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(operation.status(), ServiceOperationStatus::Completed);
+        assert!(operation.usage().is_empty());
+        assert_eq!(
+            operation.diagnostic_code(),
+            Some("usage_redaction_unavailable")
+        );
+        let connection = ledger.lock_connection().unwrap();
+        for table in ["usage_metrics", "service_operation_usage"] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+        connection
+            .execute(
+                "INSERT INTO service_operation_usage(operation_id,sequence,name,value,unit)
+                 VALUES(?1,0,'sentinel-secret-name','sentinel-secret-value','sentinel-secret-unit')",
+                params![accepted.operation_id().as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        let attempts_context = service
+            .get_context(
+                task.task_id(),
+                &[TaskContextSection::Attempts],
+                10,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert!(
+            !attempts_context
+                .to_json_value()
+                .to_string()
+                .contains("sentinel-secret")
+        );
+        assert!(matches!(
+            service.get_context(
+                task.task_id(),
+                &[TaskContextSection::Usage],
+                10,
+                &BTreeMap::new(),
+            ),
+            Err(ServiceError::PolicyDenied(
+                "usage text redaction is unavailable"
+            ))
+        ));
+    }
+
+    #[test]
+    fn legacy_usage_rows_are_redacted_or_denied_on_every_read_path() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(FakeProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            availability_checks: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            unknown_interrupt: false,
+            provider_failure: None,
+            execute_delay: Duration::ZERO,
+            reference: ProviderRef::new("legacy-usage-provider"),
+            requested_models: None,
+            observed_target: None,
+            write_output: None,
+            write_ignored: None,
+            write_gitignore: None,
+            require_file: None,
+            usage: None,
+        });
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
+        let task = service
+            .create_task(
+                "legacy-usage-caller",
+                &TaskCreateRequest::new(
+                    "legacy-usage-create",
+                    TaskSource::Manual,
+                    "Safe title",
+                    "Safe description",
+                    vec![],
+                    None,
+                ),
+            )
+            .unwrap();
+        let accepted = service
+            .submit_attempt(&AttemptRunRequest::new(
+                "legacy-usage-run",
+                task.task_id().clone(),
+                task.revision(),
+                ProviderRef::new("legacy-usage-provider"),
+                ModelChoice::ProviderDefault,
+                "inspect usage",
+                TaskRole::new("implementer"),
+                BaseInput::new(&repo.0, repo.commit()),
+            ))
+            .unwrap();
+        service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        {
+            let connection = ledger.lock_connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE usage_metrics SET name='sentinel-secret-name', value='sentinel-secret-value', unit='sentinel-secret-unit' WHERE task_id=?1 AND attempt_id=?2",
+                    params![task.task_id().as_str(), accepted.attempt_id().as_str()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE service_operation_usage SET name='sentinel-secret-name', value='sentinel-secret-value', unit='sentinel-secret-unit' WHERE operation_id=?1",
+                    params![accepted.operation_id().as_str()],
+                )
+                .unwrap();
+        }
+
+        let operation = service.get_operation(accepted.operation_id()).unwrap();
+        assert_eq!(operation.usage()[0].name(), "[REDACTED]-name");
+        assert_eq!(operation.usage()[0].value(), "[REDACTED]");
+        assert_eq!(operation.usage()[0].unit(), "[REDACTED]-unit");
+        let context = service
+            .get_context(
+                task.task_id(),
+                &[TaskContextSection::Usage, TaskContextSection::Attempts],
+                10,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert!(
+            !context
+                .to_json_value()
+                .to_string()
+                .contains("sentinel-secret")
+        );
+        assert_eq!(
+            context.sections()["usage"].items()[0]["details"]["value"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            context.sections()["usage"].items()[0]["details"]["basis"],
+            "unknown"
+        );
+
+        let no_scanner =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        assert!(matches!(
+            no_scanner.get_operation(accepted.operation_id()),
+            Err(ServiceError::PolicyDenied(_))
+        ));
+        assert!(matches!(
+            no_scanner.get_context(
+                task.task_id(),
+                &[TaskContextSection::Usage],
+                10,
+                &BTreeMap::new()
+            ),
+            Err(ServiceError::PolicyDenied(_))
+        ));
+
+        let non_fixed_scanner =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&UsageNonFixedScanner);
+        assert!(matches!(
+            non_fixed_scanner.get_operation(accepted.operation_id()),
+            Err(ServiceError::PolicyDenied(_))
+        ));
+        assert!(matches!(
+            non_fixed_scanner.get_context(
+                task.task_id(),
+                &[TaskContextSection::Usage],
+                10,
+                &BTreeMap::new()
+            ),
+            Err(ServiceError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
     fn usage_number_parsing_preserves_integer_precision_and_rejects_out_of_range_values() {
         assert_eq!(
             parse_usage_number("9007199254740993").unwrap().to_string(),
@@ -5308,7 +6292,7 @@ mod tests {
     }
 
     #[test]
-    fn task_get_context_validates_attempt_cursor_before_provider_probe() {
+    fn task_get_context_validates_section_cursors_before_provider_probe() {
         struct CountingResolver(std::sync::atomic::AtomicUsize);
         impl ProviderResolver for CountingResolver {
             fn resolve(
@@ -5364,6 +6348,17 @@ mod tests {
             ));
             assert_eq!(providers.0.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
+
+        let review_sections = [TaskContextSection::Reviews, TaskContextSection::Providers];
+        let review_cursor = encode_context_cursor(task.task_id(), "reviews", 1, task.revision(), 1);
+        let review_cursors = BTreeMap::from([("reviews".to_owned(), review_cursor)]);
+        assert!(matches!(
+            service.get_context(task.task_id(), &review_sections, 1, &review_cursors),
+            Err(ServiceError::InvalidRequest(
+                "cursor offset exceeds section length"
+            ))
+        ));
+        assert_eq!(providers.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -5436,8 +6431,10 @@ mod tests {
             calls: Arc<AtomicUsize>,
             ledger: Arc<SqliteExecutionLedger>,
             stale_target: StaleReviewTarget,
+            observations: Arc<AtomicUsize>,
             write_attempt: bool,
             report_usage: bool,
+            report_secret_usage: bool,
         }
         impl AgentProvider for ReviewProvider {
             fn provider_ref(&self) -> &ProviderRef {
@@ -5473,16 +6470,31 @@ mod tests {
                     Some(0),
                     Some(AgentResult::new(summary, true)),
                     self.report_usage.then(|| {
-                        crate::UsageCost::new([crate::UsageMetric::new(
-                            "input_tokens",
-                            "11",
-                            "token",
-                        )])
+                        if self.report_secret_usage {
+                            crate::UsageCost::new([crate::UsageMetric::new(
+                                "sentinel-secret-name",
+                                "sentinel-secret-value",
+                                "sentinel-secret-unit",
+                            )])
+                        } else {
+                            crate::UsageCost::new([crate::UsageMetric::new(
+                                "input_tokens",
+                                "11",
+                                "token",
+                            )])
+                        }
                     }),
                 ))
             }
             fn check_availability(&self) -> Result<(), ProviderError> {
                 Ok(())
+            }
+            fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+                self.observations.fetch_add(1, Ordering::SeqCst);
+                crate::ProviderObservation::unsupported_adapter(
+                    self.reference.clone(),
+                    observed_at_ms,
+                )
             }
         }
         for (case, provider_output) in [
@@ -5507,11 +6519,23 @@ mod tests {
                 Ok(r#"{"verdict":"approved","summary":"REVIEW_SUMMARY_SECRET"}"#.to_owned()),
             ),
             (
+                "review_context_redaction_failure",
+                Ok(r#"{"verdict":"approved","summary":"looks good"}"#.to_owned()),
+            ),
+            (
                 "validation_check_redaction_failure",
                 Ok(r#"{"verdict":"approved","summary":"looks good"}"#.to_owned()),
             ),
             (
                 "provider_write_attempt",
+                Ok(r#"{"verdict":"approved","summary":"looks good"}"#.to_owned()),
+            ),
+            (
+                "review_usage_redaction",
+                Ok(r#"{"verdict":"approved","summary":"looks good"}"#.to_owned()),
+            ),
+            (
+                "review_usage_redaction_failure",
                 Ok(r#"{"verdict":"approved","summary":"looks good"}"#.to_owned()),
             ),
             (
@@ -5525,6 +6549,7 @@ mod tests {
             let ledger = Arc::new(SqliteExecutionLedger::open_in_memory().unwrap());
             let workspace = WorkspaceManager::new(&repo.0).unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
+            let observations = Arc::new(AtomicUsize::new(0));
             let stale_target = Arc::new(Mutex::new(None));
             let mut providers = ProviderRegistry::new();
             providers.register(FakeProvider {
@@ -5541,6 +6566,7 @@ mod tests {
                 write_ignored: None,
                 write_gitignore: None,
                 require_file: None,
+                usage: None,
             });
             providers.register(ReviewProvider {
                 reference: ProviderRef::new("reviewer"),
@@ -5548,16 +6574,28 @@ mod tests {
                 calls: calls.clone(),
                 ledger: ledger.clone(),
                 stale_target: stale_target.clone(),
+                observations: observations.clone(),
                 write_attempt: case == "provider_write_attempt",
-                report_usage: case == "stale_artifact",
+                report_usage: matches!(
+                    case,
+                    "stale_artifact" | "review_usage_redaction" | "review_usage_redaction_failure"
+                ),
+                report_secret_usage: matches!(
+                    case,
+                    "review_usage_redaction" | "review_usage_redaction_failure"
+                ),
             });
             let service =
                 OperationService::new(&ledger, &workspace, &providers, 5, Duration::from_secs(30))
                     .unwrap()
                     .with_secret_scanner(match case {
                         "summary_redaction_failure" => &REVIEW_SUMMARY_FAILING_SCANNER,
+                        "review_context_redaction_failure" => &REVIEW_SUMMARY_FAILING_SCANNER,
                         "validation_check_redaction_failure" => {
                             &REVIEW_VALIDATION_NAME_FAILING_SCANNER
+                        }
+                        "review_usage_redaction_failure" => {
+                            &REVIEW_USAGE_REDACTION_UNAVAILABLE_SCANNER
                         }
                         _ => &TEST_SECRET_SCANNER,
                     });
@@ -5709,15 +6747,63 @@ mod tests {
                 assert!(matches!(conflict, Err(ServiceError::IdempotencyConflict)));
             }
             assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let requested_context_sections = if case == "review_context_redaction_failure" {
+                &[TaskContextSection::Providers, TaskContextSection::Reviews][..]
+            } else {
+                &[TaskContextSection::Reviews][..]
+            };
             let context = service
                 .get_context(
                     task.task_id(),
-                    &[TaskContextSection::Reviews],
+                    requested_context_sections,
                     10,
                     &BTreeMap::new(),
                 )
                 .unwrap()
                 .to_json_value();
+            if case == "review_context_redaction_failure" {
+                assert_eq!(observations.load(Ordering::SeqCst), 1);
+                let connection = ledger.lock_connection().unwrap();
+                connection.execute(
+                    "UPDATE artifact_review_verdicts SET summary='REVIEW_SUMMARY_SECRET' WHERE task_id=?1",
+                    params![task.task_id().as_str()],
+                ).unwrap();
+                drop(connection);
+                let rejected = service.get_context(
+                    task.task_id(),
+                    &[TaskContextSection::Providers, TaskContextSection::Reviews],
+                    10,
+                    &BTreeMap::new(),
+                );
+                assert!(matches!(
+                    rejected,
+                    Err(ServiceError::PolicyDenied(
+                        "review redaction is unavailable"
+                    ))
+                ));
+                assert!(!format!("{rejected:?}").contains("REVIEW_SUMMARY_SECRET"));
+                assert_eq!(observations.load(Ordering::SeqCst), 1);
+                let connection = ledger.lock_connection().unwrap();
+                let persisted: String = connection
+                    .query_row(
+                        "SELECT summary FROM artifact_review_verdicts WHERE task_id=?1",
+                        params![task.task_id().as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(persisted, "REVIEW_SUMMARY_SECRET");
+                drop(connection);
+                let attempts_only = service
+                    .get_context(
+                        task.task_id(),
+                        &[TaskContextSection::Attempts],
+                        10,
+                        &BTreeMap::new(),
+                    )
+                    .unwrap()
+                    .to_json_value();
+                assert!(!attempts_only.to_string().contains("REVIEW_SUMMARY_SECRET"));
+            }
             if matches!(
                 case,
                 "stale_artifact" | "summary_redaction_failure" | "provider_write_attempt"
@@ -5790,6 +6876,96 @@ mod tests {
                 assert!(!format!("{result:?}").contains("REVIEW_SUMMARY_SECRET"));
             } else if let Ok(output) = provider_output {
                 assert_eq!(result.status(), ServiceOperationStatus::Completed);
+                if matches!(
+                    case,
+                    "review_usage_redaction" | "review_usage_redaction_failure"
+                ) {
+                    let unavailable = case == "review_usage_redaction_failure";
+                    assert_eq!(
+                        result.diagnostic_code(),
+                        unavailable.then_some("usage_redaction_unavailable")
+                    );
+                    if unavailable {
+                        assert!(result.usage().is_empty());
+                        assert!(
+                            ledger
+                                .get_task(task.task_id())
+                                .unwrap()
+                                .unwrap()
+                                .attempt(result.attempt_id())
+                                .unwrap()
+                                .usage_cost()
+                                .is_none()
+                        );
+                    } else {
+                        assert_eq!(
+                            result.usage(),
+                            [UsageMetric::new(
+                                "[REDACTED]-name",
+                                "[REDACTED]",
+                                "[REDACTED]-unit"
+                            )]
+                        );
+                        let stored_attempt = ledger.get_task(task.task_id()).unwrap().unwrap();
+                        let stored_usage = stored_attempt
+                            .attempt(result.attempt_id())
+                            .unwrap()
+                            .usage_cost()
+                            .unwrap();
+                        assert_eq!(stored_usage.metrics(), result.usage());
+                    }
+                    let connection = ledger.lock_connection().unwrap();
+                    let usage_rows: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM service_operation_usage WHERE operation_id=?1",
+                            params![review.operation_id().as_str()],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let attempt_rows: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM usage_metrics WHERE task_id=?1 AND attempt_id=?2",
+                            params![task.task_id().as_str(), review.attempt_id().as_str()],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(usage_rows, if unavailable { 0 } else { 1 });
+                    assert_eq!(attempt_rows, if unavailable { 0 } else { 1 });
+                    let raw_occurrences: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM service_operation_usage WHERE operation_id=?1 AND (name LIKE '%sentinel-secret%' OR value LIKE '%sentinel-secret%' OR unit LIKE '%sentinel-secret%')",
+                            params![review.operation_id().as_str()],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let raw_attempt_occurrences: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM usage_metrics WHERE task_id=?1 AND attempt_id=?2 AND (name LIKE '%sentinel-secret%' OR value LIKE '%sentinel-secret%' OR unit LIKE '%sentinel-secret%')",
+                            params![task.task_id().as_str(), review.attempt_id().as_str()],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(raw_occurrences + raw_attempt_occurrences, 0);
+                    drop(connection);
+                    assert!(!format!("{result:?}").contains("sentinel-secret"));
+                    let usage_context = service
+                        .get_context(
+                            task.task_id(),
+                            &[TaskContextSection::Usage],
+                            10,
+                            &BTreeMap::new(),
+                        )
+                        .unwrap()
+                        .to_json_value();
+                    assert!(!usage_context.to_string().contains("sentinel-secret"));
+                    assert_eq!(
+                        usage_context["sections"]["usage"]["items"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        if unavailable { 1 } else { 2 }
+                    );
+                }
                 let expected = ReviewVerdict::parse(
                     serde_json::from_str::<serde_json::Value>(&output).unwrap()["verdict"]
                         .as_str()
@@ -5887,6 +7063,7 @@ mod tests {
             write_ignored: None,
             write_gitignore: None,
             require_file: None,
+            usage: None,
         });
         providers.register(BlockingReviewProvider {
             reference: ProviderRef::new("reviewer"),
@@ -6099,6 +7276,242 @@ mod tests {
     }
 
     #[test]
+    fn task_create_scans_raw_multiline_text_before_persisting() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "multiline-secret",
+            TaskSource::Manual,
+            "safe title",
+            TASK_MULTILINE_SECRET_SENTINEL,
+            vec![],
+            None,
+        );
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains("TASK_CREATE_MULTILINE_SECRET"));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let idempotency_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_create_idempotency", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_count, 0);
+        assert_eq!(idempotency_count, 0);
+    }
+
+    #[test]
+    fn task_create_fails_closed_when_scanner_is_missing_or_unavailable() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let request = TaskCreateRequest::new(
+            "scanner-unavailable",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![TASK_SECRET_SENTINEL.into()],
+            None,
+        );
+        let missing_scanner =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let error = missing_scanner.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+
+        let unavailable = TaskCreateScanner { unavailable: true };
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&unavailable);
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_count, 0);
+    }
+
+    #[test]
+    fn task_create_replay_scans_persisted_snapshot_before_returning_it() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "safe-replay",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![],
+            None,
+        );
+        let created = service.create_task("caller", &request).unwrap();
+        let malicious_snapshot = serde_json::json!({
+            "source": "manual",
+            "title": "safe title",
+            "description": TASK_MULTILINE_SECRET_SENTINEL,
+            "constraints": [],
+            "issue": null
+        })
+        .to_string();
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE task_request_snapshots SET request_json=?1 WHERE task_id=?2",
+                params![malicious_snapshot, created.task_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE task_create_idempotency SET request_json=?1 WHERE caller='caller' AND request_id='safe-replay'",
+                params![malicious_snapshot],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT)
+        ));
+        assert!(!error.to_string().contains("TASK_CREATE_MULTILINE_SECRET"));
+    }
+
+    #[test]
+    fn task_create_replay_reports_corrupt_stored_json_without_raw_diagnostics() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "corrupt-replay",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![],
+            None,
+        );
+        let created = service.create_task("caller", &request).unwrap();
+        let corrupted = format!("{{\"description\":\"{TASK_SECRET_SENTINEL}");
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE task_request_snapshots SET request_json=?1 WHERE task_id=?2",
+                params![corrupted, created.task_id().as_str()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(error, ServiceError::InvalidStoredState));
+        assert!(!error.to_string().contains(TASK_SECRET_SENTINEL));
+        let connection = ledger.lock_connection().unwrap();
+        let task_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let revision: i64 = connection
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                [created.task_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let snapshot_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_request_snapshots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let idempotency_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_create_idempotency", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_count, 1);
+        assert_eq!(revision, 0);
+        assert_eq!(snapshot_count, 1);
+        assert_eq!(idempotency_count, 1);
+    }
+
+    #[test]
+    fn task_create_replay_rejects_malformed_idempotency_json_before_payload_comparison() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let scanner = clean_task_scanner();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&scanner);
+        let request = TaskCreateRequest::new(
+            "corrupt-idempotency-json",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![],
+            None,
+        );
+        let created = service.create_task("caller", &request).unwrap();
+        ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "UPDATE task_create_idempotency SET request_json=?1 WHERE caller='caller' AND request_id='corrupt-idempotency-json'",
+                ["{malformed"],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            service.create_task("caller", &request),
+            Err(ServiceError::InvalidStoredState)
+        ));
+        let connection = ledger.lock_connection().unwrap();
+        let snapshot: String = connection
+            .query_row(
+                "SELECT request_json FROM task_request_snapshots WHERE task_id=?1",
+                [created.task_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(snapshot, task_request_json(&request));
+    }
+
+    #[test]
     fn task_create_validates_issue_shape_before_persisting() {
         let repo = Repo::new();
         let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
@@ -6265,6 +7678,7 @@ mod tests {
         write_ignored: Option<(String, String)>,
         write_gitignore: Option<String>,
         require_file: Option<(String, String)>,
+        usage: Option<UsageCost>,
     }
 
     #[derive(Clone, Copy)]
@@ -6341,11 +7755,13 @@ mod tests {
                 "RAW_STDERR_SECRET",
                 Some(0),
                 Some(AgentResult::new("AGENT_RESULT_SECRET", true)),
-                Some(UsageCost::new([UsageMetric::new(
-                    "input_tokens",
-                    "7",
-                    "token",
-                )])),
+                self.usage.clone().or_else(|| {
+                    Some(UsageCost::new([UsageMetric::new(
+                        "input_tokens",
+                        "7",
+                        "token",
+                    )]))
+                }),
             )
             .with_observed_target(observed_target.0, observed_target.1))
         }
@@ -6553,6 +7969,113 @@ mod tests {
     }
 
     #[test]
+    fn task_create_redacts_raw_multiline_text_before_persisting_and_replay() {
+        struct MultilineRedactionScanner;
+
+        impl SecretScanner for MultilineRedactionScanner {
+            fn redact_text(&self, text: &str) -> Result<String, SecretScanError> {
+                Ok(text.replace(TASK_MULTILINE_SECRET_SENTINEL, "[REDACTED]"))
+            }
+
+            fn scan_artifact_tree(
+                &self,
+                _repository: &Path,
+                _tree_oid: &str,
+            ) -> Result<SecretScanResult, SecretScanError> {
+                Ok(SecretScanResult::Clean)
+            }
+
+            fn scan_publication_payload(
+                &self,
+                payload: &ArtifactPublicationPayload,
+            ) -> Result<SecretScanResult, SecretScanError> {
+                if payload.title().contains(TASK_MULTILINE_SECRET_SENTINEL)
+                    || payload.body().contains(TASK_MULTILINE_SECRET_SENTINEL)
+                {
+                    Ok(SecretScanResult::Findings)
+                } else {
+                    Ok(SecretScanResult::Clean)
+                }
+            }
+        }
+
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&MultilineRedactionScanner);
+        let request = TaskCreateRequest::new(
+            "multiline-redaction",
+            TaskSource::Manual,
+            "safe title",
+            format!("safe prefix\n{TASK_MULTILINE_SECRET_SENTINEL}\nsafe suffix"),
+            vec![],
+            None,
+        );
+
+        let created = service.create_task("safe-caller", &request).unwrap();
+        assert_eq!(
+            created.description(),
+            "safe prefix\n[REDACTED]\nsafe suffix"
+        );
+        let replay = service.create_task("safe-caller", &request).unwrap();
+        assert_eq!(replay, created);
+
+        let serialized = serde_json::to_string(&task_creation_json(&created)).unwrap();
+        assert!(!serialized.contains(TASK_MULTILINE_SECRET_SENTINEL));
+        assert!(serialized.contains("[REDACTED]"));
+        let connection = ledger.lock_connection().unwrap();
+        for query in [
+            "SELECT request_json FROM task_request_snapshots",
+            "SELECT request_json FROM task_create_idempotency",
+            "SELECT description FROM tasks",
+        ] {
+            let stored: String = connection.query_row(query, [], |row| row.get(0)).unwrap();
+            assert!(!stored.contains(TASK_MULTILINE_SECRET_SENTINEL), "{query}");
+            assert!(stored.contains("[REDACTED]"), "{query}");
+        }
+    }
+
+    #[test]
+    fn task_create_replay_rejects_a_corrupted_snapshot_without_leaking_text() {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let providers = ProviderRegistry::new();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
+        let request = TaskCreateRequest::new(
+            "corrupt-replay",
+            TaskSource::Manual,
+            "safe title",
+            "safe description",
+            vec![],
+            None,
+        );
+        let created = service.create_task("caller", &request).unwrap();
+        ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "UPDATE task_request_snapshots SET request_json=?2 WHERE task_id=?1",
+                params![
+                    created.task_id().as_str(),
+                    r#"{"source":"manual","title":"stored sentinel-secret","description":"", "constraints":[],"issue":null}"#
+                ],
+            )
+            .unwrap();
+
+        let error = service.create_task("caller", &request).unwrap_err();
+        assert!(matches!(error, ServiceError::InvalidStoredState));
+        assert!(!error.to_string().contains("sentinel-secret"));
+    }
+
+    #[test]
     fn task_create_and_context_fail_closed_when_redaction_is_unavailable() {
         struct CountingResolver(AtomicUsize);
         impl ProviderResolver for CountingResolver {
@@ -6590,9 +8113,7 @@ mod tests {
         );
         assert!(matches!(
             no_scanner.create_task("caller", &request),
-            Err(ServiceError::PolicyDenied(
-                "task text redaction is unavailable"
-            ))
+            Err(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))
         ));
         assert_eq!(
             ledger
@@ -6609,9 +8130,7 @@ mod tests {
                 .with_secret_scanner(&FailingRedactionScanner);
         assert!(matches!(
             failing.create_task("caller", &request),
-            Err(ServiceError::PolicyDenied(
-                "task text redaction is unavailable"
-            ))
+            Err(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))
         ));
         let non_idempotent_scanner = NonIdempotentRedactionScanner;
         let non_idempotent =
@@ -6620,9 +8139,7 @@ mod tests {
                 .with_secret_scanner(&non_idempotent_scanner);
         assert!(matches!(
             non_idempotent.create_task("caller", &request),
-            Err(ServiceError::PolicyDenied(
-                "task text redaction is unavailable"
-            ))
+            Err(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))
         ));
         assert_eq!(
             ledger
@@ -6676,9 +8193,7 @@ mod tests {
                 10,
                 &BTreeMap::new(),
             ),
-            Err(ServiceError::PolicyDenied(
-                "task text redaction is unavailable"
-            ))
+            Err(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))
         ));
         assert_eq!(providers.0.load(Ordering::SeqCst), 0);
         assert!(matches!(
@@ -6688,9 +8203,7 @@ mod tests {
                 10,
                 &BTreeMap::new(),
             ),
-            Err(ServiceError::PolicyDenied(
-                "task text redaction is unavailable"
-            ))
+            Err(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))
         ));
         assert_eq!(providers.0.load(Ordering::SeqCst), 0);
         assert!(matches!(
@@ -6700,9 +8213,7 @@ mod tests {
                 10,
                 &BTreeMap::new(),
             ),
-            Err(ServiceError::PolicyDenied(
-                "task text redaction is unavailable"
-            ))
+            Err(ServiceError::PolicyDenied(TASK_CREATE_UNSAFE_TEXT))
         ));
         assert_eq!(providers.0.load(Ordering::SeqCst), 0);
     }
@@ -6712,6 +8223,9 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         fail_push: bool,
         fail_pull_request: bool,
+        reject_push_before_effect: bool,
+        reject_pull_request_before_effect: bool,
+        fail_pull_request_observation: bool,
     }
 
     impl ArtifactPublicationGateway for FakeArtifactPublicationGateway {
@@ -6764,6 +8278,11 @@ mod tests {
             _timeout: Duration,
         ) -> Result<(), PublicationGatewayError> {
             self.events.lock().unwrap().push("push");
+            if self.reject_push_before_effect {
+                return Err(
+                    crate::artifact_publication::PublicationGatewayError::RejectedBeforeEffect,
+                );
+            }
             if self.fail_push {
                 Err(PublicationGatewayError::CommandFailed)
             } else {
@@ -6779,6 +8298,14 @@ mod tests {
             _timeout: Duration,
         ) -> Result<DraftPullRequest, PublicationGatewayError> {
             self.events.lock().unwrap().push("draft_pr");
+            if self.fail_pull_request_observation {
+                return Err(crate::artifact_publication::PublicationGatewayError::ObservationUnavailableBeforeEffect);
+            }
+            if self.reject_pull_request_before_effect {
+                return Err(
+                    crate::artifact_publication::PublicationGatewayError::RejectedBeforeEffect,
+                );
+            }
             if self.fail_pull_request {
                 return Err(PublicationGatewayError::CommandFailed);
             }
@@ -6889,6 +8416,7 @@ mod tests {
             write_ignored: None,
             write_gitignore: None,
             require_file: None,
+            usage: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
@@ -6974,6 +8502,11 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct MutatingFailingValidator {
+        workspace: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    #[derive(Default)]
     struct TrackingValidator {
         workspace: std::sync::Mutex<Option<PathBuf>>,
     }
@@ -7029,6 +8562,21 @@ mod tests {
         ) -> Result<ValidationResult, crate::ValidatorError> {
             *self.workspace.lock().unwrap() = Some(workspace.to_owned());
             Err(crate::ValidatorError::NoChecksConfigured)
+        }
+    }
+
+    impl crate::Validator for MutatingFailingValidator {
+        fn validate(
+            &self,
+            workspace: &std::path::Path,
+        ) -> Result<ValidationResult, crate::ValidatorError> {
+            *self.workspace.lock().unwrap() = Some(workspace.to_owned());
+            fs::write(workspace.join("README.md"), "validator mutation\n")
+                .expect("modify validation worktree");
+            Err(crate::ValidatorError::InvalidWorkspace {
+                workspace: workspace.to_owned(),
+                reason: "SECRET_SENTINEL_VALIDATOR_RAW_DIAGNOSTIC".into(),
+            })
         }
     }
 
@@ -7205,6 +8753,7 @@ mod tests {
             write_ignored: None,
             write_gitignore: None,
             require_file: None,
+            usage: None,
         });
         (repo, ledger, workspace, providers, calls, checks, task_id)
     }
@@ -7231,6 +8780,7 @@ mod tests {
             write_ignored: None,
             write_gitignore: None,
             require_file: None,
+            usage: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
@@ -7269,6 +8819,7 @@ mod tests {
                 write_ignored: None,
                 write_gitignore: None,
                 require_file: None,
+                usage: None,
             });
             match OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
             {
@@ -7348,7 +8899,9 @@ mod tests {
             let marker_deadline = Instant::now() + Duration::from_secs(30);
             let mut marker_value = None;
             while Instant::now() < marker_deadline {
-                if let Ok(value) = fs::read_to_string(&marker) {
+                if let Ok(value) = fs::read_to_string(&marker)
+                    && !value.is_empty()
+                {
                     marker_value = Some(value);
                     break;
                 }
@@ -7397,6 +8950,7 @@ mod tests {
             write_ignored: None,
             write_gitignore: None,
             require_file: None,
+            usage: None,
         });
         assert!(matches!(
             OperationService::new_with_run_lock(
@@ -7439,6 +8993,7 @@ mod tests {
             write_ignored: None,
             write_gitignore: None,
             require_file: None,
+            usage: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &resolver, 3, Duration::from_secs(30))
@@ -7500,6 +9055,109 @@ mod tests {
                 .attempts()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn empty_named_model_is_rejected_before_catalog_or_ledger_side_effects() {
+        let (repo, ledger, workspace, providers, calls, checks, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let catalog = CatalogSequence::new([ModelCatalogEntry {
+            source: "test-catalog".into(),
+            observed_at_unix_seconds: now,
+            status: ModelCapabilityStatus::Supported,
+        }]);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_model_catalog(&catalog, Duration::from_secs(60));
+        let mut req = request(&repo, &task_id, 0, "empty-named-model");
+        req.model_id = ModelChoice::Named(ModelRef::new(""));
+
+        assert!(matches!(
+            service.submit_attempt(&req),
+            Err(ServiceError::InvalidRequest(
+                "named model must not be empty"
+            ))
+        ));
+        assert_eq!(catalog.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+        let connection = ledger.lock_connection().unwrap();
+        let operation_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM service_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let attempt_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+            .unwrap();
+        let revision: i64 = connection
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                [task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation_count, 0);
+        assert_eq!(attempt_count, 0);
+        assert_eq!(revision, 0);
+    }
+
+    #[test]
+    fn accepted_operation_with_empty_stored_model_fails_before_catalog_or_provider() {
+        let (repo, ledger, workspace, providers, calls, checks, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let catalog = CatalogSequence::new([ModelCatalogEntry {
+            source: "test-catalog".into(),
+            observed_at_unix_seconds: now,
+            status: ModelCapabilityStatus::Supported,
+        }]);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap()
+                .with_model_catalog(&catalog, Duration::from_secs(60));
+        let mut req = request(&repo, &task_id, 0, "accepted-empty-model");
+        req.model_id = ModelChoice::Named(ModelRef::new("supported-model"));
+        let accepted = service.submit_attempt(&req).unwrap();
+        assert_eq!(catalog.lookups.load(Ordering::SeqCst), 1);
+
+        // Recreate a persisted Accepted request from an older writer that allowed
+        // an empty named model, while leaving the Attempt queued and unstarted.
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE service_operations SET model_kind='named',model_name='' WHERE id=?1",
+                params![accepted.operation_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE attempts SET requested_model_kind='named',requested_model='' WHERE task_id=?1 AND id=?2",
+                params![task_id.as_str(), accepted.attempt_id().as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        catalog.lookups.store(0, Ordering::SeqCst);
+
+        let result = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(result.status(), ServiceOperationStatus::Failed);
+        assert_eq!(result.diagnostic_code(), Some("model_catalog_unavailable"));
+        assert_eq!(result.attempt_state(), AttemptState::Queued);
+        assert_eq!(result.started_at_ms(), None);
+        assert_eq!(result.workspace_path(), None);
+        assert_eq!(catalog.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
     }
 
     struct StaticCatalog(ModelCatalogEntry);
@@ -7945,7 +9603,8 @@ mod tests {
             service_parts(false, Duration::ZERO, false, None);
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
-                .unwrap();
+                .unwrap()
+                .with_secret_scanner(&TEST_SECRET_SCANNER);
         let req = request(&repo, &task_id, 0, "request-1");
         let accepted = service.submit_attempt(&req).unwrap();
         assert_eq!(accepted.status(), ServiceOperationStatus::Accepted);
@@ -8083,6 +9742,7 @@ mod tests {
             write_ignored: Some(("secret.excluded".into(), "not in artifact".into())),
             write_gitignore: None,
             require_file: None,
+            usage: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
@@ -8154,6 +9814,22 @@ mod tests {
                 "ArtifactInput requires a successful changes_requested ReviewVerdict"
             ))
         ));
+        let unscoped_reviewer_input = AttemptRunRequest::with_artifact(
+            "unscoped-reviewer-input",
+            task_id.clone(),
+            revision,
+            ProviderRef::new("fake"),
+            ModelChoice::ProviderDefault,
+            "review this Artifact",
+            TaskRole::new("reviewer"),
+            ArtifactInput::new(result.output_artifact_id().unwrap()),
+        );
+        assert!(matches!(
+            service.submit_attempt(&unscoped_reviewer_input),
+            Err(ServiceError::PolicyDenied(
+                "only implementer Attempts are currently representable"
+            ))
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let connection = ledger.lock_connection().unwrap();
         let counts: (i64, i64, i64) = connection
@@ -8178,6 +9854,88 @@ mod tests {
         );
         drop(connection);
         cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+    }
+
+    #[test]
+    fn previously_accepted_artifact_input_fails_before_provider_start() {
+        let (repo, ledger, workspace, providers, calls, checks, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 4, Duration::from_secs(30))
+                .unwrap();
+        let first = service
+            .submit_attempt(&request(&repo, &task_id, 0, "legacy-artifact-source"))
+            .unwrap();
+        let first_result = service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        let artifact_id = first_result.output_artifact_id().unwrap().to_owned();
+        // Recreate the persisted row shape accepted by earlier ArtifactInput-capable
+        // code: an Accepted operation, a Queued Attempt, and an input Artifact relation.
+        let connection = ledger.lock_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE service_operations SET status='accepted',finished_at=NULL,diagnostic_code=NULL,workspace_path=NULL,workspace_branch=NULL WHERE id=?1",
+                params![first.operation_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE attempts SET state='queued',finished_at=NULL,failure_reason=NULL WHERE task_id=?1 AND id=?2",
+                params![task_id.as_str(), first.attempt_id().as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE service_attempt_artifacts SET input_artifact_id=?1 WHERE task_id=?2 AND attempt_id=?3",
+                params![artifact_id, task_id.as_str(), first.attempt_id().as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        calls.store(0, Ordering::SeqCst);
+        checks.store(0, Ordering::SeqCst);
+
+        let result = service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(result.status(), ServiceOperationStatus::Failed);
+        assert_eq!(result.diagnostic_code(), Some("review_evidence_required"));
+        assert_eq!(result.attempt_state(), AttemptState::Queued);
+        assert_eq!(result.workspace_path(), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+
+        let replay = service
+            .run(first.operation_id(), CancellationToken::new())
+            .unwrap();
+        assert_eq!(replay.status(), ServiceOperationStatus::Failed);
+        assert_eq!(replay.diagnostic_code(), Some("review_evidence_required"));
+        assert_eq!(replay.attempt_state(), AttemptState::Queued);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+
+        let connection = ledger.lock_connection().unwrap();
+        let operation: (String, String) = connection
+            .query_row(
+                "SELECT status,diagnostic_code FROM service_operations WHERE id=?1",
+                params![first.operation_id().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            operation,
+            ("failed".to_owned(), "review_evidence_required".to_owned())
+        );
+        let attempt_state: String = connection
+            .query_row(
+                "SELECT state FROM attempts WHERE task_id=?1 AND id=?2",
+                params![task_id.as_str(), result.attempt_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_state, "queued");
+        drop(connection);
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, first_result.attempt_id());
     }
 
     #[test]
@@ -8376,6 +10134,92 @@ mod tests {
         cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn post_checkout_submodule_change_is_preserved_and_provider_is_not_started() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, ledger, workspace, providers, calls, _, task_id) =
+            service_parts(false, Duration::ZERO, false, None);
+        let child = std::env::temp_dir().join(format!(
+            "operation-service-submodule-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&child).unwrap();
+        git(&child, &["init", "-b", "main"]);
+        git(&child, &["config", "user.email", "service@example.invalid"]);
+        git(&child, &["config", "user.name", "Service Test"]);
+        fs::write(child.join("tracked.txt"), "base\n").unwrap();
+        git(&child, &["add", "tracked.txt"]);
+        git(&child, &["commit", "-m", "submodule base"]);
+        let child_text = child.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &child_text,
+                "modules/child",
+            ],
+        );
+        git(
+            &repo.0,
+            &["config", "--local", "submodule.modules/child.ignore", "all"],
+        );
+        git(&repo.0, &["commit", "-m", "add ignored submodule"]);
+        let base = repo.commit();
+
+        let hooks = repo.0.join(".git").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hooks_path = hooks.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &["config", "--local", "core.hooksPath", &hooks_path],
+        );
+        let hook = hooks.join("post-checkout");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nset -e\ngit -c protocol.file.allow=always submodule update --init -- modules/child\nprintf 'changed by checkout hook\\n' > modules/child/tracked.txt\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let mut req = request(&repo, &task_id, 0, "post-checkout-submodule");
+        req.input = AttemptInput::Base(BaseInput::new(&repo.0, base.clone()));
+        let accepted = service.submit_attempt(&req).unwrap();
+        let result = service
+            .run(accepted.operation_id(), CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(
+            result.status(),
+            ServiceOperationStatus::Failed,
+            "{result:?}; calls={}; workspace={:?}",
+            calls.load(Ordering::SeqCst),
+            result.workspace_path()
+        );
+        assert_eq!(result.attempt_state(), AttemptState::Queued);
+        assert_eq!(result.diagnostic_code(), Some("workspace_unavailable"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let workspace_path = result.workspace_path().unwrap();
+        assert_eq!(git(workspace_path, &["rev-parse", "HEAD"]), base);
+        assert_eq!(
+            fs::read_to_string(workspace_path.join("modules/child/tracked.txt")).unwrap(),
+            "changed by checkout hook\n"
+        );
+
+        cleanup_fixture_worktree(&repo, &workspace, &task_id, result.attempt_id());
+        fs::remove_dir_all(child).unwrap();
+    }
+
     #[test]
     fn failed_acceptance_rolls_back_operation_task_and_attempt_together() {
         let (repo, ledger, workspace, providers, calls, _, task_id) =
@@ -8455,6 +10299,7 @@ mod tests {
             write_ignored: None,
             write_gitignore: None,
             require_file: None,
+            usage: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
@@ -8528,6 +10373,7 @@ mod tests {
             write_ignored: None,
             write_gitignore: None,
             require_file: None,
+            usage: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
@@ -8606,6 +10452,7 @@ mod tests {
             write_ignored: None,
             write_gitignore: None,
             require_file: None,
+            usage: None,
         });
         let service =
             OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
@@ -8661,6 +10508,46 @@ mod tests {
         ));
         let failed_workspace = failing_validator.workspace.lock().unwrap().clone().unwrap();
         assert!(!failed_workspace.exists());
+        let validation_count: i64 = ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_validations WHERE task_id=?1 AND artifact_id=?2",
+                params![task_id.as_str(), artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(validation_count, 0);
+        let mutating_validator = MutatingFailingValidator::default();
+        let returned_error = service
+            .validate_artifact(&task_id, &artifact_id, revision(), &mutating_validator)
+            .unwrap_err();
+        let debug_output = format!("{returned_error:?}");
+        let display_output = format!("{returned_error}");
+        assert!(!debug_output.contains("SECRET_SENTINEL_VALIDATOR_RAW_DIAGNOSTIC"));
+        assert!(!display_output.contains("SECRET_SENTINEL_VALIDATOR_RAW_DIAGNOSTIC"));
+        let retained_path = match returned_error {
+            ServiceError::Artifact(ArtifactError::WorkspaceRetained { path, reason }) => {
+                assert!(
+                    reason.starts_with(
+                        "validation did not complete safely (validation workspace retained at '"
+                    ) && reason.contains(": workspace changed: expected "),
+                    "unexpected safe validation diagnostic: {reason}"
+                );
+                path
+            }
+            other => panic!("failed cleanup must retain the validation worktree: {other:?}"),
+        };
+        assert!(retained_path.exists());
+        assert_eq!(
+            fs::read_to_string(retained_path.join("README.md")).unwrap(),
+            "validator mutation\n"
+        );
+        let retained_path_text = retained_path.to_string_lossy().into_owned();
+        git(
+            &repo.0,
+            &["worktree", "remove", "--force", &retained_path_text],
+        );
         let validation_count: i64 = ledger
             .lock_connection()
             .unwrap()
@@ -8836,6 +10723,58 @@ mod tests {
     }
 
     #[test]
+    fn loaded_repository_config_is_used_and_persisted_by_artifact_validation() {
+        let fixture = artifact_publication_fixture();
+        let config_path = fixture.repo.0.join(crate::REPOSITORY_CONFIG_PATH);
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let source = "schema_version = 1\n[validation]\nchecks = [{ name = \"configured\", command = \"true\", cwd = \".\", timeout_ms = 30000 }]\n";
+        fs::write(&config_path, source).unwrap();
+        let config_version = Sha256::digest(source.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let validator = crate::load_repository_config(&fixture.repo.0)
+            .unwrap()
+            .validator()
+            .unwrap();
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let validation = service
+            .validate_artifact(
+                &fixture.task_id,
+                &fixture.artifact_id,
+                fixture.revision,
+                &validator,
+            )
+            .unwrap();
+
+        assert!(validation.passed());
+        assert_eq!(validation.config_id(), Some(crate::REPOSITORY_CONFIG_PATH));
+        assert_eq!(validation.config_version(), Some(config_version.as_str()));
+        let stored: (String, String) = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT config_id, config_version FROM artifact_validations WHERE id=?1",
+                params![validation.id()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (crate::REPOSITORY_CONFIG_PATH.to_owned(), config_version)
+        );
+    }
+
+    #[test]
     fn publication_rejects_unsupported_sensitive_stdin_before_recording_or_scanning() {
         let fixture = artifact_publication_fixture();
         let scanner_events = Arc::new(Mutex::new(Vec::new()));
@@ -8947,6 +10886,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let providers = ProviderRegistry::new();
         let service = OperationService::new(
@@ -8985,6 +10927,83 @@ mod tests {
     }
 
     #[test]
+    fn publication_rejects_replace_refs_before_secret_scan_or_ledger_write() {
+        let fixture = artifact_publication_fixture();
+        let artifact_tree: String = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT tree_oid FROM service_artifacts WHERE id=?1",
+                params![fixture.artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let replacement_tree = git(&fixture.repo.0, &["mktree"]);
+        git(
+            &fixture.repo.0,
+            &[
+                "update-ref",
+                &format!("refs/replace/{artifact_tree}"),
+                &replacement_tree,
+            ],
+        );
+
+        let scanner_events = Arc::new(Mutex::new(Vec::new()));
+        let scanner = FakeSecretScanner {
+            artifact_result: Ok(SecretScanResult::Clean),
+            payload_result: Ok(SecretScanResult::Clean),
+            events: scanner_events.clone(),
+        };
+        let gateway_events = Arc::new(Mutex::new(Vec::new()));
+        let gateway = FakeArtifactPublicationGateway {
+            repository: fixture.repo.0.clone(),
+            events: gateway_events.clone(),
+            fail_push: false,
+            fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
+        };
+        let service = OperationService::new(
+            &fixture.ledger,
+            &fixture.workspace,
+            &fixture.providers,
+            3,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_secret_scanner(&scanner)
+        .with_artifact_publication_gateway(&gateway);
+
+        assert!(matches!(
+            service.publish_artifact(&publication_request(&fixture, "replace-ref-blocked")),
+            Err(ServiceError::PolicyDenied(
+                "Git replace refs make Artifact scanning ambiguous"
+            ))
+        ));
+        let operation_count: i64 = fixture
+            .ledger
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_artifact_publication_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation_count, 0);
+        assert!(scanner_events.lock().unwrap().is_empty());
+        assert!(gateway_events.lock().unwrap().is_empty());
+        cleanup_fixture_worktree(
+            &fixture.repo,
+            &fixture.workspace,
+            &fixture.task_id,
+            &fixture.attempt_id,
+        );
+    }
+
+    #[test]
     fn publication_rejects_identical_base_and_head_branches_before_scanning_or_effects() {
         let fixture = artifact_publication_fixture();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -8998,6 +11017,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -9059,6 +11081,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -9186,6 +11211,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -9263,6 +11291,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -9320,6 +11351,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -9365,6 +11399,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -9421,6 +11458,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -9475,6 +11515,9 @@ mod tests {
             events: events.clone(),
             fail_push: false,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let service = OperationService::new(
             &fixture.ledger,
@@ -9516,6 +11559,9 @@ mod tests {
             events: events.clone(),
             fail_push: true,
             fail_pull_request: false,
+            reject_push_before_effect: false,
+            reject_pull_request_before_effect: false,
+            fail_pull_request_observation: false,
         };
         let recovery_service = OperationService::new(
             &fixture.ledger,
@@ -9563,6 +11609,137 @@ mod tests {
     }
 
     #[test]
+    fn publication_pre_effect_rejections_and_pr_observation_failures_are_distinct() {
+        for (
+            suffix,
+            reject_push,
+            reject_pr,
+            unavailable_pr,
+            fail_pr,
+            expected_status,
+            expect_recovery,
+        ) in [
+            (
+                "push-rejected",
+                true,
+                false,
+                false,
+                false,
+                ServiceOperationStatus::Failed,
+                false,
+            ),
+            (
+                "pr-rejected",
+                false,
+                true,
+                false,
+                false,
+                ServiceOperationStatus::Failed,
+                false,
+            ),
+            (
+                "pr-observation-unavailable",
+                false,
+                false,
+                true,
+                false,
+                ServiceOperationStatus::RecoveryRequired,
+                true,
+            ),
+            (
+                "pr-ambiguous",
+                false,
+                false,
+                false,
+                true,
+                ServiceOperationStatus::RecoveryRequired,
+                true,
+            ),
+        ] {
+            let fixture = artifact_publication_fixture();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let scanner = FakeSecretScanner {
+                artifact_result: Ok(SecretScanResult::Clean),
+                payload_result: Ok(SecretScanResult::Clean),
+                events: events.clone(),
+            };
+            let gateway = FakeArtifactPublicationGateway {
+                repository: fixture.repo.0.clone(),
+                events: events.clone(),
+                fail_push: false,
+                fail_pull_request: fail_pr,
+                reject_push_before_effect: reject_push,
+                reject_pull_request_before_effect: reject_pr,
+                fail_pull_request_observation: unavailable_pr,
+            };
+            let service = OperationService::new(
+                &fixture.ledger,
+                &fixture.workspace,
+                &fixture.providers,
+                3,
+                Duration::from_secs(30),
+            )
+            .unwrap()
+            .with_secret_scanner(&scanner)
+            .with_artifact_publication_gateway(&gateway);
+            let request = publication_request(&fixture, suffix);
+            let acceptance = service.publish_artifact(&request).unwrap();
+            let result = service.run_artifact_publication(&acceptance, &request);
+            if expect_recovery {
+                assert!(matches!(
+                    result,
+                    Err(ServiceError::PublicationRecoveryRequired)
+                ));
+            } else {
+                assert!(matches!(result, Err(ServiceError::PublicationFailed)));
+            }
+            let snapshot = service
+                .get_artifact_publication_operation(acceptance.operation_id())
+                .unwrap();
+            assert_eq!(snapshot.state(), expected_status, "case {suffix}");
+            let expected_code = match suffix {
+                "push-rejected" => "publication_push_rejected_before_effect",
+                "pr-rejected" => "publication_pr_rejected_before_effect",
+                "pr-observation-unavailable" => "publication_pr_observation_unavailable",
+                _ => "publication_pr_ambiguous",
+            };
+            assert_eq!(snapshot.error_code(), Some(expected_code), "case {suffix}");
+            if reject_push {
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    [
+                        "scan_artifact",
+                        "scan_payload",
+                        "scan_artifact",
+                        "scan_payload",
+                        "commit",
+                        "push"
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    [
+                        "scan_artifact",
+                        "scan_payload",
+                        "scan_artifact",
+                        "scan_payload",
+                        "commit",
+                        "push",
+                        "draft_pr"
+                    ]
+                );
+            }
+            cleanup_fixture_worktree(
+                &fixture.repo,
+                &fixture.workspace,
+                &fixture.task_id,
+                &fixture.attempt_id,
+            );
+        }
+    }
+
+    #[test]
     fn second_in_memory_service_does_not_recover_another_service_live_operation() {
         let (repo, ledger, workspace, providers, _, _, task_id) =
             service_parts(false, Duration::ZERO, false, None);
@@ -9573,5 +11750,15 @@ mod tests {
             .submit_attempt(&request(&repo, &task_id, 0, "memory-live-operation"))
             .unwrap();
         assert!(first.claim_operation(accepted.operation_id()).unwrap());
+        let second =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        assert_eq!(
+            second
+                .get_operation(accepted.operation_id())
+                .unwrap()
+                .status(),
+            ServiceOperationStatus::Running
+        );
     }
 }

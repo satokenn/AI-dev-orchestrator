@@ -61,6 +61,8 @@ pub enum SecretScanResult {
 }
 
 /// A scanner must inspect every file in the supplied Git tree and every field in the payload.
+/// Git subprocesses used by an implementation must set `GIT_NO_REPLACE_OBJECTS=1`, so a
+/// repository's replace refs cannot change which bytes the scanner sees for the supplied OID.
 /// Implementations should return only a typed failure; diagnostics may contain secret material.
 pub trait SecretScanner: Send + Sync {
     /// Returns `text` with every known secret replaced. Implementations must be
@@ -210,6 +212,10 @@ pub trait ArtifactPublicationGateway: Send + Sync {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationGatewayError {
+    /// The operation was rejected before its corresponding remote mutation began.
+    RejectedBeforeEffect,
+    /// A read-only observation failed, so an existing remote result cannot be ruled out.
+    ObservationUnavailableBeforeEffect,
     Spawn,
     CommandFailed,
     InvalidResponse,
@@ -219,6 +225,10 @@ pub enum PublicationGatewayError {
 impl fmt::Display for PublicationGatewayError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::RejectedBeforeEffect => "publication was rejected before remote effects",
+            Self::ObservationUnavailableBeforeEffect => {
+                "publication state could not be observed before remote effects"
+            }
             Self::Spawn => "publication command could not start",
             Self::CommandFailed => "publication command failed",
             Self::InvalidResponse => "publication command returned an invalid response",
@@ -275,6 +285,7 @@ impl GitHubArtifactPublicationGateway {
         request
             .args
             .extend(args.iter().map(std::ffi::OsString::from));
+        request = request.env("GIT_NO_REPLACE_OBJECTS", "1");
         let output = ProcessRunner.run_git(request).map_err(map_process_error)?;
         if output.output_truncated {
             return Err(PublicationGatewayError::InvalidResponse);
@@ -402,21 +413,30 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
         // `git push origin` follows pushurl entries, which can target repositories
         // different from the fetch URL used below to select the Pull Request target.
         // Resolve and validate every effective push destination before any push effect.
-        let fetch_url = self.git_output(repository, &["remote", "get-url", "origin"], timeout)?;
-        let push_urls = self.git_output(
-            repository,
-            &["remote", "get-url", "--push", "--all", "origin"],
-            timeout,
-        )?;
+        let fetch_url = self
+            .git_output(repository, &["remote", "get-url", "origin"], timeout)
+            .map_err(|_| PublicationGatewayError::RejectedBeforeEffect)?;
+        let push_urls = self
+            .git_output(
+                repository,
+                &["remote", "get-url", "--push", "--all", "origin"],
+                timeout,
+            )
+            .map_err(|_| PublicationGatewayError::RejectedBeforeEffect)?;
         let expected = github_repository_from_remote_url(&fetch_url)
-            .ok_or(PublicationGatewayError::InvalidResponse)?;
-        validate_push_destinations(&expected, &push_urls)?;
+            .ok_or(PublicationGatewayError::RejectedBeforeEffect)?;
+        validate_push_destinations(&expected, &push_urls)
+            .map_err(|_| PublicationGatewayError::RejectedBeforeEffect)?;
         let refspec = format!("{commit_sha}:refs/heads/{head_branch}");
         self.git_output(
             repository,
             &["push", "--porcelain", "origin", &refspec],
             timeout,
-        )?;
+        )
+        .map_err(|error| match error {
+            PublicationGatewayError::Spawn => PublicationGatewayError::RejectedBeforeEffect,
+            other => other,
+        })?;
         Ok(())
     }
 
@@ -427,38 +447,57 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
         commit_sha: &str,
         timeout: Duration,
     ) -> Result<DraftPullRequest, PublicationGatewayError> {
-        let remote = self.git_output(repository, &["remote", "get-url", "origin"], timeout)?;
+        let remote = self
+            .git_output(repository, &["remote", "get-url", "origin"], timeout)
+            .map_err(|_| PublicationGatewayError::ObservationUnavailableBeforeEffect)?;
         let remote = github_repository_from_remote_url(&remote)
-            .ok_or(PublicationGatewayError::InvalidResponse)?;
-        let listed = self.gh_output(
-            repository,
-            &[
-                "pr",
-                "list",
-                "--repo",
-                &remote.cli_selector,
-                "--state",
-                "all",
-                "--head",
-                payload.head_branch(),
-                "--base",
-                payload.base_branch(),
-                "--json",
-                "number,url,isDraft,headRefOid,headRefName,baseRefName,title,body",
-                "--limit",
-                "2",
-            ],
-            timeout,
-        )?;
-        let values: Vec<Value> =
-            serde_json::from_str(&listed).map_err(|_| PublicationGatewayError::InvalidResponse)?;
+            .ok_or(PublicationGatewayError::RejectedBeforeEffect)?;
+        let listed = self
+            .gh_output(
+                repository,
+                &[
+                    "pr",
+                    "list",
+                    "--repo",
+                    &remote.cli_selector,
+                    "--state",
+                    "all",
+                    "--head",
+                    payload.head_branch(),
+                    "--base",
+                    payload.base_branch(),
+                    "--json",
+                    "number,url,isDraft,headRefOid,headRefName,baseRefName,title,body,state",
+                    "--limit",
+                    "2",
+                ],
+                timeout,
+            )
+            .map_err(|_| PublicationGatewayError::ObservationUnavailableBeforeEffect)?;
+        let values: Vec<Value> = serde_json::from_str(&listed)
+            .map_err(|_| PublicationGatewayError::ObservationUnavailableBeforeEffect)?;
         if values.len() > 1 {
-            return Err(PublicationGatewayError::ExistingPullRequestMismatch);
+            return Err(PublicationGatewayError::RejectedBeforeEffect);
         }
         if let Some(value) = values.first() {
-            let existing = parse_pull_request_value(value)?;
-            verify_pull_request_content(value, payload)?;
-            return verify_pull_request(existing, payload, commit_sha);
+            match value.get("state").and_then(Value::as_str) {
+                Some("OPEN") => {}
+                Some("CLOSED" | "MERGED") => {
+                    return Err(PublicationGatewayError::RejectedBeforeEffect);
+                }
+                Some(_) => {
+                    return Err(PublicationGatewayError::ObservationUnavailableBeforeEffect);
+                }
+                None => {
+                    return Err(PublicationGatewayError::ObservationUnavailableBeforeEffect);
+                }
+            }
+            let existing = parse_pull_request_value(value)
+                .map_err(|_| PublicationGatewayError::ObservationUnavailableBeforeEffect)?;
+            verify_pull_request_content(value, payload)
+                .map_err(|_| PublicationGatewayError::RejectedBeforeEffect)?;
+            return verify_pull_request(existing, payload, commit_sha)
+                .map_err(|_| PublicationGatewayError::RejectedBeforeEffect);
         }
 
         let request_body = json!({
@@ -469,7 +508,7 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
             "draft": true,
         });
         let request_body = serde_json::to_vec(&request_body)
-            .map_err(|_| PublicationGatewayError::InvalidResponse)?;
+            .map_err(|_| PublicationGatewayError::RejectedBeforeEffect)?;
         let endpoint = format!("repos/{}/pulls", remote.api_path);
         let created = self.gh_output_with_stdin(
             repository,
@@ -486,7 +525,10 @@ impl ArtifactPublicationGateway for GitHubArtifactPublicationGateway {
             timeout,
             Some(request_body),
         );
-        let created = created?;
+        let created = created.map_err(|error| match error {
+            PublicationGatewayError::Spawn => PublicationGatewayError::RejectedBeforeEffect,
+            other => other,
+        })?;
         let created_value: Value =
             serde_json::from_str(&created).map_err(|_| PublicationGatewayError::InvalidResponse)?;
         verify_pull_request_content(&created_value, payload)?;
@@ -590,6 +632,9 @@ fn valid_repository_component(value: &str) -> bool {
 fn parse_api_pull_request(json: &str) -> Result<DraftPullRequest, PublicationGatewayError> {
     let value: Value =
         serde_json::from_str(json).map_err(|_| PublicationGatewayError::InvalidResponse)?;
+    if value.get("state").and_then(Value::as_str) != Some("open") {
+        return Err(PublicationGatewayError::InvalidResponse);
+    }
     Ok(DraftPullRequest::new(
         value
             .get("number")
@@ -792,7 +837,7 @@ mod tests {
                 "feature",
                 Duration::from_secs(2),
             ),
-            Err(PublicationGatewayError::InvalidResponse)
+            Err(PublicationGatewayError::RejectedBeforeEffect)
         );
         let calls = std::fs::read_to_string(&invocations).expect("read fake git invocations");
         assert!(calls.contains("remote:origin"));
@@ -802,6 +847,139 @@ mod tests {
             "git push must not be invoked: {calls}"
         );
         std::fs::remove_dir_all(root).expect("remove fake repository");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_request_list_failure_is_observation_unavailable_before_creation() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "artifact-pr-list-gateway-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fake gateway directory");
+        let repository = root.join("repository");
+        std::fs::create_dir(&repository).expect("create repository");
+        let calls = root.join("gh-calls");
+        let fake_git = root.join("git");
+        std::fs::write(
+            &fake_git,
+            "#!/bin/sh\ncase \"$3:$4\" in\n  remote:get-url) printf '%s\\n' 'https://github.com/example/project.git' ;;\n  *) exit 90 ;;\nesac\n",
+        )
+        .expect("write fake git executable");
+        let fake_gh = root.join("gh");
+        std::fs::write(
+            &fake_gh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n",
+                calls.display()
+            ),
+        )
+        .expect("write fake gh executable");
+        for executable in [&fake_git, &fake_gh] {
+            let mut permissions = std::fs::metadata(executable)
+                .expect("stat fake executable")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(executable, permissions)
+                .expect("make fake executable executable");
+        }
+
+        let gateway = GitHubArtifactPublicationGateway::with_executables(&fake_git, &fake_gh);
+        assert_eq!(
+            gateway.create_or_find_draft_pull_request(
+                &repository,
+                &ArtifactPublicationPayload::new("main", "feature", "title", "body"),
+                "0123456789012345678901234567890123456789",
+                Duration::from_secs(2),
+            ),
+            Err(PublicationGatewayError::ObservationUnavailableBeforeEffect)
+        );
+        let invocations = std::fs::read_to_string(&calls).expect("read fake gh calls");
+        assert!(invocations.contains("pr list"));
+        assert!(!invocations.contains("api"));
+        std::fs::remove_dir_all(root).expect("remove fake gateway directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_pull_request_is_reused_only_when_open() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        for (state, expected) in [
+            ("OPEN", Ok(())),
+            ("CLOSED", Err(PublicationGatewayError::RejectedBeforeEffect)),
+            (
+                "UNKNOWN_FUTURE_STATE",
+                Err(PublicationGatewayError::ObservationUnavailableBeforeEffect),
+            ),
+        ] {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "artifact-existing-pr-gateway-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("create fake gateway directory");
+            let repository = root.join("repository");
+            std::fs::create_dir(&repository).expect("create repository");
+            let calls = root.join("gh-calls");
+            let fake_git = root.join("git");
+            std::fs::write(
+                &fake_git,
+                "#!/bin/sh\ncase \"$3:$4\" in\n  remote:get-url) printf '%s\\n' 'https://github.com/example/project.git' ;;\n  *) exit 90 ;;\nesac\n",
+            )
+            .expect("write fake git executable");
+            let fake_gh = root.join("gh");
+            std::fs::write(
+                &fake_gh,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' '[{{\"number\":17,\"url\":\"https://github.com/example/project/pull/17\",\"isDraft\":true,\"headRefOid\":\"0123456789012345678901234567890123456789\",\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"title\":\"title\",\"body\":\"body\",\"state\":\"{state}\"}}]'\n",
+                    calls.display()
+                ),
+            )
+            .expect("write fake gh executable");
+            for executable in [&fake_git, &fake_gh] {
+                let mut permissions = std::fs::metadata(executable)
+                    .expect("stat fake executable")
+                    .permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(executable, permissions)
+                    .expect("make fake executable executable");
+            }
+
+            let gateway = GitHubArtifactPublicationGateway::with_executables(&fake_git, &fake_gh);
+            let result = gateway.create_or_find_draft_pull_request(
+                &repository,
+                &ArtifactPublicationPayload::new("main", "feature", "title", "body"),
+                "0123456789012345678901234567890123456789",
+                Duration::from_secs(2),
+            );
+            match expected {
+                Ok(()) => assert!(
+                    result.is_ok(),
+                    "open matching PR should be reused: {result:?}"
+                ),
+                Err(error) => assert_eq!(result, Err(error)),
+            }
+            let invocations = std::fs::read_to_string(&calls).expect("read fake gh calls");
+            assert!(invocations.contains("headRefName,baseRefName,title,body,state"));
+            assert!(!invocations.contains("api"));
+            std::fs::remove_dir_all(root).expect("remove fake gateway directory");
+        }
     }
 
     #[cfg(unix)]
@@ -862,6 +1040,7 @@ mod tests {
         let response = r#"{
             "number": 42,
             "html_url": "https://github.example/o/r/pull/42",
+            "state": "open",
             "draft": true,
             "head": {"sha": "0123456789012345678901234567890123456789", "ref": "feature"},
             "base": {"ref": "main"}
@@ -871,6 +1050,10 @@ mod tests {
         assert!(pull_request.is_draft());
         assert_eq!(pull_request.head_branch(), "feature");
         assert_eq!(pull_request.base_branch(), "main");
+        assert_eq!(
+            parse_api_pull_request(&response.replace("\"open\"", "\"closed\"")),
+            Err(PublicationGatewayError::InvalidResponse)
+        );
     }
 
     #[test]

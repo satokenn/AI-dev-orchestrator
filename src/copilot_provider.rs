@@ -261,7 +261,7 @@ impl CopilotProvider {
                 if let Some(error) = crate::provider::unsupported_model_error(
                     &self.reference,
                     model,
-                    &classification_text,
+                    &String::from_utf8_lossy(&output.stderr),
                 ) {
                     error.with_captured_output(captured)
                 } else if looks_like_authentication_failure(&classification_text) {
@@ -409,6 +409,11 @@ mod tests {
             error.kind(),
             ProviderError::UnsupportedModel { model, .. } if model.as_str() == "claude-haiku-test"
         ));
+
+        let provider = CopilotProvider::with_executable("sh")
+            .with_command_prefix("printf 'unsupported model'; exit 1");
+        let error = provider.execute(&request).unwrap_err();
+        assert!(matches!(error.kind(), ProviderError::ExecutionFailed(_)));
     }
 
     #[test]
