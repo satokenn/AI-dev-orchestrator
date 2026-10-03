@@ -94,6 +94,8 @@ ValidatorのcancelはValidation failureや`invalid_output`ではない。Provide
 
 reviewはreviewer roleの通常のAttemptとして実行し、正常なreviewer Attemptは対象ArtifactへのReviewVerdictを1件持てる。`approved` はreviewerの見解であり、`changes_requested` はreview処理の失敗ではない。
 
+ReviewVerdictの保存直前に、reviewer Attemptの開始時点で記録したTask revisionと現在revisionを照合する。Provider呼出し後でも、review中に別の操作がTask revisionを進めていれば、そのverdictは保存せず、診断code `stale_task_revision` でreviewer AttemptとOperationを`failed`終端にする。Artifactやworkspaceの既存整合性gateも別に維持する。
+
 監督Codexは差分、Validation、review、CI等を評価し、対象Artifactに次のCodexDecisionを残す。
 
 | 判断 | 意味 |
@@ -124,9 +126,11 @@ Codex自身が編集した場合はAttemptを作らない。管理済みArtifact
 
 `ExecutionLedger::get_task` / `SqliteExecutionLedger::get_task`は永続データからTaskとAttemptを復元する内部APIで、SecretScannerによるredactionをしない。Ledger getterの戻り値をそのまま外部へ直列化してはならない。外部のTask / Attempt / Usage応答はOperation Serviceなど、設定済みSecretScannerでredactし固定点を確認するService境界だけから返し、scanner未設定・失敗・固定点不成立時はfail closedする。将来追加する別のTask / Attempt出力経路もこの規則を満たす。
 
-named Modelは、Service構築時にtrusted composition rootが明示注入するread-only `ModelCatalog` が、対象Provider / Modelを `Supported` とし、sourceと観測時刻がありfreshness内の場合だけ受付ける。catalog未設定、lookup error、欠落、unknown / unsupported、未来時刻、古い記録、source欠落はTask / Attempt / Operation記録やProvider起動より前にfail closedする。受付後もOperation実行時にcatalogを再照会し、まずOperation claimやProvider準備処理より前に確認し、続いてworkspace準備後・Attempt開始直前にもう一度確認する。実行前の照会で失敗した要求はOperationを`failed`で終端し、Providerを開始していないことを示すためAttemptは`queued`のままにする。同じrequest IDの再送はこの終端結果を返し、再実行しない。現在この最終照会まで進めるのは`BaseInput`です。`BaseInput`の最終照会に失敗した場合、Providerを起動せず、workspaceのclean-only cleanupを試みます。cleanupに成功するとworkspace locatorを消し、失敗するとworkspaceを保持して`model_catalog_unavailable_workspace_retained`を記録します。`ArtifactInput`は現行Serviceが受付前に拒否するため、workspace準備後の照会と以下の保持動作には到達しません。将来`ArtifactInput`のService接続を実装する場合は、展開済みの保存成果物を失わないようworkspaceを保持してlocatorをLedgerに残す方針です。catalog lookupは外部CLIやnetworkを起動しない。ProviderDefaultはcatalogを使わない。ModelCatalogはpoint-in-time照会であり、照会後のcatalog変更をロックするleaseは提供しない。Provider-specific catalog adapter / data sourceは後続Issue #60 / #91の対象であり、既存の候補一覧を実行権限として扱わない。ProviderResultで実Modelを観測できない場合は、requested Modelから推定せずunknownのまま保持する。
+`get_context`でUsageを要求した場合、ServiceはProvider観測より前に保存済みmetricを再redactし、scannerが使えなければraw metricを返さず`policy_denied`にする。レビュー履歴のsummaryも、Reviews sectionが要求された場合に限り、Provider観測より前に保存値を再redactして返す。検査不能時は固定errorでContext全体を拒否し、Ledgerは変更しない。Usageを要求しないContext取得はUsageのredaction失敗に影響されない。
 
-現在の準備実装でServiceが受け付けて実行する入力は`BaseInput { repository, commit }`である。正式な入力モデルには、同じTaskに属する既存`ArtifactInput { artifact_id }`からの再実行も含まれるが、実行可能な成功reviewer Attemptと`changes_requested`のReviewVerdictを検証する接続が未実装のため、新規ArtifactInputは受け付け前に拒否する。旧Ledger等に残るaccepted ArtifactInput operationも、claim後に`Failed` / `review_evidence_required`で終了し、Providerを起動しない。成功したreview証拠を扱う後続PRで、この入力経路とworktree展開を接続する。
+named Modelは、Service構築時にtrusted composition rootが明示注入するread-only `ModelCatalog` が、対象Provider / Modelを `Supported` とし、sourceと観測時刻がありfreshness内の場合だけ受付ける。catalog未設定、lookup error、欠落、unknown / unsupported、未来時刻、古い記録、source欠落はTask / Attempt / Operation記録やProvider起動より前にfail closedする。受付後もOperation実行時にcatalogを再照会し、まずOperation claimやProvider準備処理より前に確認し、続いてworkspace準備後・Attempt開始直前にもう一度確認する。実行前の照会で失敗した要求はOperationを`failed`で終端し、Providerを開始していないことを示すためAttemptは`queued`のままにする。同じrequest IDの再送はこの終端結果を返し、再実行しない。現在この最終照会まで進めるのは、証拠を確認して受け付けた`BaseInput`と`ArtifactInput`です。`BaseInput`の最終照会に失敗した場合、Providerを起動せず、workspaceのclean-only cleanupを試みます。cleanupに成功するとworkspace locatorを消し、失敗するとworkspaceを保持して`model_catalog_unavailable_workspace_retained`を記録します。`ArtifactInput`の最終照会に失敗した場合も、展開済みの保存成果物を失わないようworkspaceを保持してlocatorをLedgerに残します。catalog lookupは外部CLIやnetworkを起動しない。ProviderDefaultはcatalogを使わない。ModelCatalogはpoint-in-time照会であり、照会後のcatalog変更をロックするleaseは提供しない。Provider-specific catalog adapter / data sourceは後続Issue #60 / #91の対象であり、既存の候補一覧を実行権限として扱わない。ProviderResultで実Modelを観測できない場合は、requested Modelから推定せずunknownのまま保持する。
+
+`OperationService`は`BaseInput { repository, commit }`に加え、監督側が明示依頼したreviewで`ArtifactInput { artifact_id }`をread-only reviewer Attemptへ渡す。レビュー対象は同一Taskの最新available Artifactで、成功したimplementer Attemptから作成され、同じArtifact ID/treeを参照する成功Validation evidenceが必要である。Providerへ渡す内容はSecretScannerでredactし、read-only workspaceとArtifact tree一致を検証する。成功reviewer AttemptのReviewVerdictは対象Artifact ID/treeに結び付けて保存する。通常のimplementerによるArtifactInput再実行はこの実装で受け付けない。旧Ledger等に残るaccepted non-reviewer ArtifactInput operationはclaim後に`Failed` / `review_evidence_required`で終了し、Providerを起動しない。ReviewVerdictはTask完了や再作業を自動決定せず、レビュー受付APIは任意のRust Service APIである。MCP transportは未接続である。
 
 Provider停止後のArtifact snapshotはtracked変更とignoredでない新規ファイルを含み、ignoredファイルは意図的に除外する。Provider実行中にignoredファイルが作られた場合、Serviceはそれを黙って落として成功Artifactを作ることはせず、Operationを`recovery_required`にし、調査用workspaceを保持する。Task、Attempt、Operation、Artifactと入出力relationは同じSQLite Ledgerに保存する。Git refの作成はDB transactionと一括で原子化できないため、Artifact rowを`pending_ref`で先に記録する。プロセス再起動時はService構築中にLedger lockを保持したままpending ArtifactのGit tree/refを照合し、treeが存在してrefが未作成ならrefを再作成して利用可能にする。tree欠落やref不一致は`recovery_required`として使用を拒否する。この接続だけではValidation、review、CodexDecision、publicationの公開ゲートまでは実装されない。
 
@@ -134,16 +138,18 @@ Provider停止後のArtifact snapshotはtracked変更とignoredでない新規�
 
 ### named Modelの実行前再確認後に残るworkspace
 
-workspace準備後・Attempt開始直前のCatalog再確認に失敗したOperationはProviderを起動せず、`failed`で終端する。現行Serviceでこの段階に到達するのは`BaseInput`であり、通常のnon-force cleanupを試みる。cleanupに成功したときはworkspace locatorを消し、失敗したときはworkspaceを保持して`model_catalog_unavailable_workspace_retained`を記録する。現行Serviceに残存workspaceを自動削除する処理やcleanup APIはない。`ArtifactInput`は現在受付前に拒否されるため、この失敗経路には到達しない。将来Serviceが`ArtifactInput`を受け付ける場合は、展開した保存済み内容を保護するためworkspaceを自動削除せず、locatorを残す方針である。
+workspace準備後・Attempt開始直前のCatalog再確認に失敗したOperationはProviderを起動せず、`failed`で終端する。`BaseInput`では通常のnon-force cleanupを試みる。cleanupに成功したときはworkspace locatorを消し、失敗したときはworkspaceを保持して`model_catalog_unavailable_workspace_retained`を記録する。現行Serviceに残存workspaceを自動削除する処理やcleanup APIはない。`ArtifactInput`では展開した保存済み内容を保護するためworkspaceを保持してlocatorをLedgerに残す。とくにreviewerのArtifactInput workspaceはreviewの成功・失敗後もGit管理worktreeとbranchを保持し、自動削除しない。運用者が確認して整理する際は[手動cleanup手順](#retained-worktree-cleanup)を使う。
 
-現在、named Modelの最終Catalog再確認に失敗してlocatorが残り得るのは、BaseInput workspaceのcleanupに失敗した場合である。運用者が手動整理するには`OperationService::get_operation`のsnapshotから`workspace_path()`と`workspace_branch()`を記録する。pathがある場合は、`git -C <workspace-path> rev-parse --path-format=absolute --git-common-dir`で共有Git directoryを確認し、その親directoryを元repository rootとして次を行う。
+現在、残存locatorはBaseInput workspaceのcleanupに失敗した場合と、ArtifactInput workspaceを保持する場合に生じる。運用者が手動整理するには`OperationService::get_operation`のsnapshotから`workspace_path()`と`workspace_branch()`を記録する。pathがある場合は、`git -C <workspace-path> rev-parse --path-format=absolute --git-common-dir`で共有Git directoryを確認し、その親directoryを元repository rootとして次を行う。
+
+<a id="retained-worktree-cleanup"></a>
 
 1. `git -C <repository-root> worktree list --porcelain`で対象pathとbranchが記録値に一致することを確認する。
 2. workspace内の変更、未追跡file、ignored fileとその内容を確認する。例えば`git -C <workspace-path> status --short --ignored=matching`を使う。状態がdirty、unknown、または内容を安全に確認できない場合は削除せず、必要な内容を退避して調査する。
 3. cleanでignored内容も存在しないと確認できた場合だけ、`git -C <repository-root> worktree remove <workspace-path>`を実行する。`--force`は使わない。削除に失敗した場合はworkspaceを保持する。
 4. Worktree削除後もbranchは自動削除されない。branch名はOperation snapshotの`workspace_branch()`で確認でき、`git -C <repository-root> branch --list <workspace-branch>`で存在を照合できる。branch自体の削除は、内容と他の参照を別途確認した後に運用者が判断する。
 
-worktree managerの`cleanup`はdirty workspaceを保持するnon-force操作である。この手動手順は、BaseInputのcleanupが失敗した場合に適用する。
+worktree managerの`cleanup`はdirty workspaceを保持するnon-force操作である。この手動手順は、BaseInputのcleanup失敗後と、保持されたreviewer ArtifactInput worktreeの確認・整理に適用する。
 
 ### 同一Artifact証拠ゲートのMVP
 

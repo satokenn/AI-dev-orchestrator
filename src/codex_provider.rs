@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::{
     AgentProvider, AgentResult, CancellationToken, CapturedOutput, ModelChoice, ProcessError,
     ProcessRequest, ProcessRunner, ProviderError, ProviderRef, ProviderRequest, ProviderResult,
-    UsageCost, UsageMetric,
+    UsageCost, UsageMetric, WorkspaceAccess,
 };
 
 const CODEX_COMMAND: &str = "codex";
@@ -126,7 +126,10 @@ impl CodexProvider {
                 OsString::from("exec"),
                 OsString::from("--json"),
                 OsString::from("--sandbox"),
-                OsString::from("workspace-write"),
+                OsString::from(match request.workspace_access() {
+                    WorkspaceAccess::ReadOnly => "read-only",
+                    WorkspaceAccess::ReadWrite => "workspace-write",
+                }),
                 OsString::from("--ephemeral"),
             ]);
         if let ModelChoice::Named(model) = request.model() {
@@ -420,6 +423,10 @@ impl AgentProvider for CodexProvider {
 
     fn check_availability(&self) -> Result<(), ProviderError> {
         CodexProvider::check_availability(self)
+    }
+
+    fn supports_read_only_workspace(&self) -> bool {
+        true
     }
 
     fn execute_with_cancellation(
