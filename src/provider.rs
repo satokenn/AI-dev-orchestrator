@@ -438,6 +438,12 @@ pub trait AgentProvider {
     /// Checks provider availability before an attempt is created.
     fn check_availability(&self) -> Result<(), ProviderError>;
 
+    /// Captures current, non-sensitive Provider facts for read-only Task context.
+    /// Implementations without an authoritative probe report unknown values.
+    fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        crate::ProviderObservation::unsupported_adapter(self.provider_ref().clone(), observed_at_ms)
+    }
+
     /// Executes a request while observing a caller-owned cancellation signal.
     ///
     /// Providers that support process cancellation should override this method.

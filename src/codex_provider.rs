@@ -59,6 +59,27 @@ impl CodexProvider {
         &self.executable
     }
 
+    /// Collects current local CLI facts without treating CLI launchability as
+    /// proof of account authentication or model access.
+    #[must_use]
+    pub fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        crate::ProviderObservation::probe_cli_at(
+            self.reference.clone(),
+            &self.executable,
+            observed_at_ms,
+            &self.runner,
+        )
+    }
+
+    #[must_use]
+    pub fn observe_current(&self) -> crate::ProviderObservation {
+        crate::ProviderObservation::probe_cli(
+            self.reference.clone(),
+            &self.executable,
+            &self.runner,
+        )
+    }
+
     /// Checks whether the Codex CLI can be started.
     ///
     /// Authentication is intentionally checked by the first headless
@@ -387,6 +408,10 @@ fn parse_codex_jsonl(stdout: &[u8], truncated: bool) -> Result<ParsedCodexJsonl,
 impl AgentProvider for CodexProvider {
     fn provider_ref(&self) -> &ProviderRef {
         &self.reference
+    }
+
+    fn observe_current_at(&self, observed_at_ms: i64) -> crate::ProviderObservation {
+        CodexProvider::observe_current_at(self, observed_at_ms)
     }
 
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResult, ProviderError> {

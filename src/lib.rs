@@ -11,6 +11,7 @@ mod copilot_provider;
 mod domain;
 mod execution_ledger;
 mod github_workflow;
+mod model_observation;
 mod operation_ledger;
 mod operation_service;
 mod orchestrator;
@@ -46,6 +47,10 @@ pub use github_workflow::{
     PushRequest, RepositoryEffects, ValidatedPublication, WorkflowError, issue_to_task,
     prepare_issue_publication,
 };
+pub use model_observation::{
+    AttemptTargetObservation, AvailabilityObservation, AvailabilityStatus, Evidence, EvidenceBasis,
+    EvidenceSource, EvidenceSourceKind, ModelAvailabilityObservation, ProviderObservation,
+};
 pub use operation_ledger::{
     EventKind, ExecutionLedger as OperationLedger, LedgerError as OperationLedgerError,
     LedgerRunLock, LogReference, OperationEvent, OperationId, OperationRecord, OperationRequest,
@@ -57,7 +62,8 @@ pub use operation_service::{
     ArtifactPublicationRequest, ArtifactPublicationSnapshot, AttemptInput, AttemptRunRequest,
     BaseInput, ModelCapabilityStatus, ModelCatalog, ModelCatalogEntry, ModelCatalogError,
     OperationAcceptance, OperationService, OperationSnapshot, ServiceError, ServiceOperationStatus,
-    TaskCreateRequest, TaskCreationResult, TaskIssueSnapshot, TaskRequestSnapshot, TaskSource,
+    TaskContextPage, TaskContextResult, TaskContextSection, TaskCreateRequest, TaskCreationResult,
+    TaskIssueSnapshot, TaskRequestSnapshot, TaskSource,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,
@@ -72,8 +78,8 @@ pub use process_runner::{
 };
 pub use provider::{AgentProvider, CapturedOutput, ProviderError, ProviderRequest, ProviderResult};
 pub use retry::{
-    ExecutionPolicy, PolicyError, ProviderRegistry, ProviderResolutionError, ProviderResolver,
-    RetryPolicy,
+    ExecutionPolicy, PolicyError, ProviderObservationUnavailable, ProviderRegistry,
+    ProviderResolutionError, ProviderResolver, RetryPolicy,
 };
 pub use validator::{
     CommandValidator, RustValidator, ValidationCheck, Validator, ValidatorError,

@@ -192,10 +192,13 @@ fn passes_named_model_and_types_invalid_model_selection() {
             Duration::from_secs(15),
         ))
         .unwrap_err();
-    assert!(matches!(
-        error.kind(),
-        ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
-    ));
+    assert!(
+        matches!(
+            error.kind(),
+            ProviderError::UnsupportedModel { model, .. } if model.as_str() == "gemini-test"
+        ),
+        "unexpected error: {error:?}"
+    );
 }
 
 #[test]
