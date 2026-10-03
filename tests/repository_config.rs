@@ -123,6 +123,29 @@ fn invalid_timeout_is_rejected_before_validator_can_run() {
 }
 
 #[test]
+fn absolute_and_parent_cwds_are_rejected_when_loading_config() {
+    let root = repository("invalid-cwd-shape");
+    init_repository(&root).expect("initialize");
+    for cwd in ["/tmp", "../outside"] {
+        fs::write(
+            root.join(REPOSITORY_CONFIG_PATH),
+            format!(
+                "schema_version = 1\n[validation]\nchecks = [{{ name = 'bad', command = 'sh', cwd = '{cwd}', timeout_ms = 1000 }}]\n"
+            ),
+        )
+        .expect("write config");
+        assert!(matches!(
+            load_repository_config(&root),
+            Err(RepositoryConfigError::InvalidCheck {
+                reason: "cwd must be a relative path without parent components",
+                ..
+            })
+        ));
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn unsupported_numeric_schema_version_precedes_unknown_field_validation() {
     let root = repository("unsupported-version");
     init_repository(&root).expect("initialize");
