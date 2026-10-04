@@ -141,6 +141,10 @@ const LATEST_SCHEMA_VERSION: u32 = 19;
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
     fn save_task(&self, task: &Task) -> Result<(), LedgerError>;
+    /// Restores persisted Task and Attempt data as stored, without applying a
+    /// SecretScanner. This is an internal persistence API, not a response
+    /// boundary; outward Task and Attempt content must pass through configured
+    /// Service redaction checks or fail closed.
     fn get_task(&self, task_id: &TaskId) -> Result<Option<Task>, LedgerError>;
     fn save_attempt(
         &self,
@@ -413,6 +417,10 @@ impl SqliteExecutionLedger {
     }
 
     /// Retrieves a task and all of its attempts, ordered by insertion id.
+    ///
+    /// Values are restored as stored and are not secret-redacted. Do not expose
+    /// this directly; outward serialization must pass through a Service
+    /// boundary with a configured SecretScanner, or fail closed.
     pub fn get_task(&self, task_id: &TaskId) -> Result<Option<Task>, LedgerError> {
         let connection = self.lock_connection()?;
         self.get_task_with_connection(&connection, task_id)

@@ -161,6 +161,21 @@ impl RepositoryConfig {
                         reason: "timeout_ms must be greater than zero",
                     });
                 }
+                if configured.cwd.as_ref().is_some_and(|cwd| {
+                    cwd.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                                | std::path::Component::ParentDir
+                        )
+                    })
+                }) {
+                    return Err(RepositoryConfigError::InvalidCheck {
+                        name: configured.name.clone(),
+                        reason: "cwd must be a relative path without parent components",
+                    });
+                }
                 let mut check = ValidationCheck::new(&configured.name, &configured.command)
                     .args(configured.args.iter().map(String::as_str))
                     .timeout(Duration::from_millis(configured.timeout_ms));

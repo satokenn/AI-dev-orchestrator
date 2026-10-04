@@ -235,7 +235,7 @@ fn invalid_repository_config_stops_production_before_planner_provider_or_workspa
     fs::create_dir_all(repository_config.parent().unwrap()).unwrap();
     fs::write(
         &repository_config,
-        "schema_version = 1\n[validation]\nchecks = []\n",
+        "schema_version = 1\n[validation]\nchecks = [{ name = 'unsafe-cwd', command = 'sh', cwd = '../outside', timeout_ms = 1000 }]\n",
     )
     .unwrap();
 
@@ -279,7 +279,8 @@ fn invalid_repository_config_stops_production_before_planner_provider_or_workspa
 
     assert_eq!(output.status.code(), Some(OPERATION_ERROR));
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("no validation checks configured"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cwd must be a relative path without parent components"),
         "unexpected production failure: {}",
         String::from_utf8_lossy(&output.stderr)
     );

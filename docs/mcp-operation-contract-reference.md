@@ -162,6 +162,8 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 
 `Evidence<T>`は`status`で判別する。knownは`value`、`basis` (`measured`, `configured`, `computed`, `estimated`)、`assessed_at_ms`、`source`を持ち、unknownは`reason`、`assessed_at_ms`、`source`を持つ。`source`は`kind` (`provider_api`, `provider_cli`, `provider_adapter`, `execution_ledger`, `repository_config`) と`reference`を含む。`provider_adapter`はProvider adapter自身が返した観測を表す。`AvailabilityEvidence`は`status` enum (`available`、`unavailable`、`unknown`)、`observed_at_ms`、`source`を同じobjectに持つ。unavailable / unknownではnon-empty `reason`も同じobjectに置き、statusを入れ子にしない。`ModelAvailabilityObservation`は`model: ModelChoice`と`availability: AvailabilityEvidence`を持つ。Attempt itemで`occurred_at`を特定できない場合はnull、`timestamp_basis: unknown`を返す。旧roleを特定できない場合は`role: null`とする。
 
+例えば未確認状態は`{"status":"unknown","reason":"authentication was not checked","observed_at_ms":1790115723000,"source":{"kind":"provider_cli","reference":"codex"}}`の形で返す。`status`自体を`{"status":"unknown"}`のようなobjectにしない。
+
 `model_ids`には権威あるModel catalogで確認できたnamed Modelだけを含める。CLI起動状態からModel一覧・認証・利用権・quota・利用量・料金を推定しない。観測できない値はevidenceの`unknown`として理由・時刻・sourceを残す。Task Attemptのrequested値とobserved値は別々に保持し、unknown observed値をrequested値で埋めない。
 
 | Section | `state` type |
@@ -197,7 +199,7 @@ section固有の`details`は次のfieldで構成する。列挙したfieldはす
 | `items` | `array<ContextItem>` | 必須 | sectionに属する履歴record。section固有の`details`型を使う |
 | `next_cursor` | `string \| null` | 必須 | 次page取得用token。nullは現在のsnapshotに続きがない |
 
-cursorは不透明であり、Task・section・page size・snapshot revisionに束縛される。次pageでは同じpage sizeと、同じsectionのcursorを使う。revision変更等で利用できないcursorは`invalid_cursor`。履歴は`occurred_at`降順、同時刻ならID降順。page境界に重複・欠落を作らない。
+cursorは不透明であり、Task・section・page size・snapshot revisionに束縛される。次pageでは同じpage sizeと、同じsectionのcursorを使う。revision変更等で利用できないcursorは`invalid_cursor`。Usage / Attempt historyは`occurred_at`降順、同時刻ならID降順で並べる。`occurred_at: null`は全てのnon-null時刻より後に並べ、null同士はID降順にする。cursorはこの完全な順序キー（時刻の有無・時刻値・ID）で並んだsnapshot内の次位置を表し、同じ順序で続きから再開する。page境界に重複・欠落を作らない。
 
 ### `OperationAcceptance`
 
@@ -301,10 +303,14 @@ OperationServiceは`task.create`の前にtitle、description、各constraint、I
 
 Taskと選択したsectionのsnapshotを読む。読取専用。
 
-このRust `OperationService` sliceは`providers`、`usage`、`attempts`、`reviews`のContextPageを生成する。ここでいうsliceはRust APIであり、MCP toolやtransportの実装ではない。MCP `task.get_context`への接続はIssue #45の対象として別途行う。
+このRust Service sliceは`providers`、`usage`、`attempts`、`reviews`のContextPageを生成する。これはRust APIの実装状況であり、MCP tool / transportはIssue #45の対象として未実装。`reviews` itemはReviewVerdict ID、reviewer Attempt ID、Artifact ID、verdictを含む。`usage`はOperation Service Ledgerに保存されたProvider報告metricだけを返し、budgetやquotaは作らない。metricの`name`、`value`、`unit`は、Task snapshotと同じSecretScannerによるredactionと固定点検査を通してから保存する。scanner未設定・失敗・固定点不成立の場合、そのoperation自体はProvider結果どおり完了するがusage metricは一件も保存せず、固定diagnostic code `usage_redaction_unavailable`を記録する。既存Ledgerのmetricはcontext返却前にも再redactし、検査に失敗した場合は`policy_denied`とし、raw metricを返さない。保存値をJSON numberとして保持できない場合は`value:null`、`basis:"unknown"`とし、元の文字列値は返さない。redactionで値が変更された場合も数値を推定せず`value:null`、`basis:"unknown"`とする。観測時刻にはOperationの完了時刻を使い、未保存ならnullとする。
+`reviews` sectionを要求した場合、保存済みsummaryもProvider観測より前に同じsafe redactionと固定点検査を通す。検査に失敗した場合は固定error `review redaction is unavailable` でContext取得を拒否し、raw summaryを返さない。Reviewsを要求しない取得ではsummaryを読み出さない。
+内部の`ExecutionLedger::get_task` / `SqliteExecutionLedger::get_task`は保存内容を復元するだけで、redactionしないためMCP response sourceには使わない。`task.get_context`を含む外部応答はServiceのSecretScanner境界を通したデータだけから組み立てる。scanner未設定・失敗・redaction固定点不成立ならraw Task、Attempt、Usageを返さず、固定の業務errorでfail closedする。将来別のTask / Attempt直列化経路を追加する場合もscanner境界を通す。
 保存済みTask snapshotの要求textはcontext返却前にもSecretScannerでredactし、固定点であることを確認する。これにより既存の未redacted snapshotもraw textを返さない。SecretScannerが未設定、redactionが失敗、または固定点を作れない場合はProvider probeより前に`policy_denied`とし、raw snapshotを含む応答を返さない。
-`providers` sectionではprovider observationsを同一snapshot内で一括返し、件数がpage_sizeを超える場合はrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化し、cursorはTask、section、page size、Task revisionに束縛する。Review verdict historyも同じ順序でpage化する。
+`providers` sectionではprovider observationsの件数がpage_size以内なら同一snapshot内で全件を返し、page_sizeを超える場合はrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化する。`occurred_at: null`は全non-null時刻より後に置き、null同士はID降順とする。cursorはこの順序キー（時刻の有無・時刻値・ID）で並んだ同じTask snapshot内の次位置から再開し、Task、section、page size、Task revisionに束縛する。
 Provider観測sourceがProvider一覧を列挙できない場合は、空配列として成功したように見せずcontext取得を失敗させる。
+
+このRust Service sliceには、監督側が明示実行する任意の`OperationService::submit_artifact_review`もある。reviewはread-only reviewer Attemptとして実行し、成功時にReviewVerdictをArtifact ID/treeへ結び付ける。`OperationService::submit_attempt`はimplementerの`ArtifactInput`を、失敗またはretry可能な取消Attemptからの`RetryOf` / `EscalationOf`、または成功Artifactに対する同一Artifact/treeの成功reviewer `changes_requested` evidenceに基づく`ReworkFrom`として受け付ける。条件に合わないlineageや証拠は受付前に拒否する。`submit_artifact_review`内の`ArtifactInput`は対象Artifactをread-only reviewer Attemptへ渡す入力であり、review後の修正を開始しない。旧Ledgerのaccepted non-reviewer ArtifactInput operationはclaim後に`failed` / `artifact_input_evidence_stale`で終端し、Providerを起動しない。ReviewVerdictはTaskを完了させず、修正を自動決定しない。これらはRust Service APIであり、MCP transportは未実装。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
@@ -322,32 +328,6 @@ Provider観測sourceがProvider一覧を列挙できない場合は、空配列�
 | `task` | `TaskSnapshot` | 必須 | ID、revision、state、要求snapshot |
 | `sections` | `object<string, ContextPage>` | 必須 | 要求されたsectionごとのpage |
 | `observed_at` | `string (format: date-time)` | 必須 | snapshot観測時刻 |
-
-#### 現在実装済みのRust section
-
-契約全体ではsection enumに将来の項目も含むが、このRust sliceが現在生成するsectionは`providers`、`usage`、`attempts`、`reviews`である。`reviews` itemの`details`は`review_verdict_id`、`reviewer_attempt_id`、`artifact_id`、`verdict`を含み、`verdict`は`approved`、`changes_requested`、`inconclusive`のいずれか。これはRust APIの実装状況を示し、MCP tool / transportは未実装である。
-
-例（`sections.reviews.items`）:
-
-~~~json
-{
-  "id": "review-17",
-  "kind": "review_verdict",
-  "state": "approved",
-  "occurred_at": "2026-09-28T04:05:06.000Z",
-  "summary": "The requested behavior is present.",
-  "references": [
-    {"kind": "attempt", "id": "service-attempt-17"},
-    {"kind": "artifact", "id": "artifact-12"}
-  ],
-  "details": {
-    "review_verdict_id": "review-17",
-    "reviewer_attempt_id": "service-attempt-17",
-    "artifact_id": "artifact-12",
-    "verdict": "approved"
-  }
-}
-~~~
 
 例（`sections.attempts.items`の一部）:
 
@@ -409,37 +389,13 @@ Provider観測sourceがProvider一覧を列挙できない場合は、空配列�
 
 #### 任意の意味レビューを依頼するRust API
 
-現在のRust serviceは、監督側が明示的に呼び出す`OperationService::submit_artifact_review`を提供する。これは仕様にあるreviewer Attemptの契約を実装するが、MCP toolやtransportではない（MCP Issue #45は別作業）。入力は`ArtifactReviewRequest::new(request_id, task_id, expected_revision, provider_id, model_id, artifact_id, validation_ids, criteria)`で組み立てる。すべてのvalidation IDは重複不可で、少なくとも1件を指定する。criteriaも空文字を含まない1件以上を指定する。
+Rust Serviceは監督側が明示的に呼び出す`OperationService::submit_artifact_review`を提供する。これは仕様上のreviewer Attemptを実行するAPIで、MCP toolやtransportではない。`ArtifactReviewRequest::new(request_id, task_id, expected_revision, provider_id, model_id, artifact_id, validation_ids, criteria)`で依頼を構成する。Validation IDとcriteriaは各1件以上、重複不可で、criteriaに空文字を含めない。
 
-Rust呼び出し例:
+依頼時はTask revision、同一Taskで最新かつavailableなArtifact、そのArtifactを作成した成功implementer Attempt、同じArtifact ID/treeを参照する各Validationを確認する。Task要求、Artifact差分、Validation結果、criteriaはProviderへ渡す前にSecretScannerでredactし固定点を確認する。Scannerが未設定または検査不能なら受付を拒否する。Reviewer Providerはread-only workspaceを強制できる必要があり、実行後もworkspace treeが対象Artifactと一致することを確認する。成功Provider出力は`{"verdict":"approved|changes_requested|inconclusive","summary":"..."}`形式のJSONでなければならない。redacted summaryを保存し、ReviewVerdictをreviewer Attempt・Artifact ID/treeへ結び付ける。
 
-~~~rust,ignore
-let accepted = service.submit_artifact_review(&ArtifactReviewRequest::new(
-    "review-request-17",
-    task_id.clone(),
-    current_revision,
-    ProviderRef::new("codex"),
-    ModelChoice::ProviderDefault,
-    artifact_id,
-    vec![validation_id],
-    vec!["Check the requested behavior".into()],
-))?;
-let operation = service.run(accepted.operation_id(), CancellationToken::new())?;
-~~~
+Task要求、Validation事実、criteria、全diffを含む完成済みinstructionは16 KiB以下でなければならず、上限を超える依頼は受付前に拒否する。
 
-依頼時にTask revisionが一致し、対象Artifactが同一Taskの現在の最新available Artifactであり、Artifactの作成元が成功した`implementer` Attemptであることを検証する。指定された各Validationは同じArtifact IDとtreeに属さなければならない。Task要求、Artifact差分、Validationの結果、criteriaはProviderへ渡す前にSecretScannerでredactし、redaction固定点を確認する。Scannerがない・失敗する場合は受付を拒否する。Provider adapterがread-only workspaceを強制できない場合は起動前に拒否し、実行後にもworkspace treeがArtifactと一致することを確認する。受付後に別Artifactが最新になった場合、workspaceが変わった場合、Providerが有効なJSON verdictを返さない場合はOperationを固定診断code付きで`failed`にし、ReviewVerdictを保存しない。Provider summaryのredactionに失敗した場合も、raw summaryを永続化せずOperationを`failed`にする。
-
-Provider終了後、verdict保存直前に、reviewer Attempt開始後に記録したTask revisionと現在revisionを照合する。review中にValidationなど別操作がrevisionを進めていた場合は、Provider呼出しが成功していてもReviewVerdictを保存せず、`stale_task_revision`を診断codeとしてreviewer AttemptとOperationを`failed`終端にする。正常なreview自身による開始時・終端時のrevision更新は、この比較でstale扱いしない。
-
-レビュー依頼はredacted後のpromptが16 KiBを超えると受付前に`policy_denied`で拒否する。これは各OSのprocess argument上限を越えてProviderを起動できなくなる事態を避けるためである。同一request IDの再送は保存済みのTask、revision、Provider/Model、Artifact、Validation、redacted criteriaが一致すれば、Artifactが後から古くなっていても元のOperationAcceptanceを返す。不一致や通常のAttemptが同じrequest IDを使用していた場合は`idempotency_conflict`とする。
-
-Providerが返す`AgentResult.summary`は次の構造化JSONでなければならない:
-
-~~~json
-{"verdict":"changes_requested","summary":"The parser still rejects escaped delimiters."}
-~~~
-
-有効なverdictでProvider実行が成功した場合、Operationは`completed`、reviewer Attemptは`succeeded`となり、`ReviewVerdict`を1件保存する。`changes_requested`もreview処理の失敗ではない。Verdictはレビュー担当の意見であり、Taskを完了・再作業へ自動遷移させたり、監督Codexの採否を決めたりしない。
+`ArtifactInput`はこのAPIでは対象Artifactをreviewer Attemptへ渡す入力であり、review後の実装修正を開始しない。旧Ledgerに残るaccepted non-reviewer ArtifactInputはclaim後に`failed` / `artifact_input_evidence_stale`として終端し、Providerを起動しない。ReviewVerdictはreviewerの結論であり、Task完了や再作業を自動決定せず、監督側の採否判断を代替しない。
 
 ### `operation.get`
 
@@ -503,7 +459,7 @@ operation状態・結果を読む。読取専用。
 |  | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約結果 |
 |  | `checks` | `array<CiCheck>` | 必須 | 個別check結果 |
 
-`UsageMetric`と`CiTarget`のfieldはすべて必須。
+`UsageMetric`と`CiTarget`のfieldはすべて必須。`attempt.run`が返すusage配列も同じredaction済み値だけを含む。usageを安全にredactできなければ配列を空にし、診断コード`usage_redaction_unavailable`を返す。`task.get_context`の`attempts` sectionはusage文字列を複製しないが、Attemptの他の履歴も含め、Serviceが`TaskSnapshot`、Usage、Attempt全体を組み立てる間にraw metricをcontextへ混入させない。
 
 要求Modelはoperationの受理時点で保存し、observed targetはProvider結果を受け取った後に別fieldへ保存する。Provider出力からModelを確定できない場合は`observed_model_id: null`とし、`model_id`をコピーしない。既知のProvider error `unknown_model`は、選択ModelをProviderが受け付けない場合にも使う。
 
@@ -660,6 +616,8 @@ commandとworkspaceは実行前にpolicy allowlistで検査する。
 
 公開前にServiceは`decision_id`で保存済みdecisionを検索し、decisionが`accepted`で、その`artifact_id`が公開対象と一致することを確認する。不在・不一致・非acceptedなら`invalid_state_transition`で拒否する。加えてServiceはArtifactとpublication payloadをconfigured secret-scan policyで検査する。secret検出または検査を安全に完了できない場合は`policy_denied`とし、commit・push・PR作成を開始しない。通常のValidation成功だけではsecret scan済みを意味しない。
 
+push開始前に確定した検証・remote URL・push destinationの拒否は`failed`として記録する。push結果またはPR作成API結果が不明な場合は`recovery_required`とし、同じoperationを再実行しない。push成功後にPR list/parseなどのread-only観測が失敗し、既存matching PRの有無を確認できない場合も`recovery_required`とする。PR作成を始める前に確定したpayload/既存PR不一致は`failed`とするが、既に成功したpushは取り消さない。既存PRを再利用するにはstateが`OPEN`であり、Draft状態、head SHA、head/base branch、title/bodyが要求に一致しなければならない。`CLOSED` / `MERGED`のPRは成功結果として返さない。新規作成API応答も`open`状態を確認する。
+
 成功outputは`OperationAcceptance`の全fieldと、次の必須fieldを返す。最終結果は`operation.get`の`publication.publish` result schemaを参照。
 
 | Field | JSON type | Required | 意味 |
@@ -746,7 +704,7 @@ Task完了を要求する。指定されたArtifact、accepted decision、policy
 
 ## Artifact・diff・diagnostic・logの秘匿
 
-secret、認証token、環境変数値、Provider認証情報をcontextやlogに返さない。既知secretは保存前と返却前にredactする。規則はArtifact本文、full diff、diagnostic本文、publication payloadにも適用する。redactできない本文は返さず、`forbidden` errorと必要な場合の権限付き参照を返す。redactionできない本文を空文字、`unknown`値、成功として偽装しない。log末尾やArtifact本文の取得量は要求範囲に限定する。
+secret、認証token、環境変数値、Provider認証情報をcontextやlogに返さない。既知secretは保存前と返却前にredactする。Usage metricのname/value/unitもこの規則の対象であり、redact済みfieldはredact結果で返す。valueがredactで変更された場合は数値へ推測変換せず`value:null`、`basis:"unknown"`とする。Usage metric全体を保存しないのはscanner未設定・失敗・固定点不成立の場合であり、その場合は安全な固定diagnostic codeを残す。規則はArtifact本文、full diff、diagnostic本文、publication payloadにも適用する。scanner未設定・失敗・redaction不能の場合は`policy_denied`で拒否し、本文を返さない。`forbidden`は権限境界で参照自体が許可されない場合に限る。redactionできない本文を空文字、`unknown`値、成功として偽装しない。log末尾やArtifact本文の取得量は要求範囲に限定する。
 
 業務errorのmessageへProviderのstdout / stderrやdiagnostic本文を埋め込まない。診断はtyped referenceで返し、本文を取得する場合は同じredaction規則と権限境界を適用する。redaction機能が利用できない実装はraw本文を返却・永続化せず、本文を含まない固定errorを返す。
 
