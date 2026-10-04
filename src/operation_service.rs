@@ -35,6 +35,8 @@ use crate::{
     },
 };
 
+const TASK_FINISH_TOOL_NAME: &str = "task.finish";
+
 /// A section selectable through the read-only v2 `task.get_context` contract.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TaskContextSection {
@@ -546,6 +548,120 @@ impl ArtifactPublicationRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvidenceKind {
+    Validation,
+    Review,
+    Decision,
+    Publication,
+    Ci,
+}
+
+impl EvidenceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Validation => "validation",
+            Self::Review => "review",
+            Self::Decision => "decision",
+            Self::Publication => "publication",
+            Self::Ci => "ci",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceRef {
+    kind: EvidenceKind,
+    id: String,
+}
+
+impl EvidenceRef {
+    #[must_use]
+    pub fn new(kind: EvidenceKind, id: impl Into<String>) -> Self {
+        Self {
+            kind,
+            id: id.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> EvidenceKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskFinishRequest {
+    request_id: String,
+    task_id: TaskId,
+    expected_revision: u64,
+    artifact_id: String,
+    decision_id: String,
+    evidence: Vec<EvidenceRef>,
+}
+
+impl TaskFinishRequest {
+    #[must_use]
+    pub fn new(
+        request_id: impl Into<String>,
+        task_id: TaskId,
+        expected_revision: u64,
+        artifact_id: impl Into<String>,
+        decision_id: impl Into<String>,
+        evidence: Vec<EvidenceRef>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            task_id,
+            expected_revision,
+            artifact_id: artifact_id.into(),
+            decision_id: decision_id.into(),
+            evidence,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskFinishResult {
+    request_id: String,
+    task_id: TaskId,
+    revision: u64,
+    artifact_id: String,
+    evidence: Vec<EvidenceRef>,
+}
+
+impl TaskFinishResult {
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    #[must_use]
+    pub const fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    #[must_use]
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+    #[must_use]
+    pub fn evidence(&self) -> &[EvidenceRef] {
+        &self.evidence
+    }
+    #[must_use]
+    pub const fn state(&self) -> TaskState {
+        TaskState::Completed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceOperationStatus {
     Accepted,
     Running,
@@ -879,6 +995,9 @@ pub enum ServiceError {
     Busy(OperationId),
     PolicyDenied(&'static str),
     IdempotencyConflict,
+    ArtifactTaskMismatch,
+    EvidenceArtifactMismatch,
+    InvalidStateTransitionReason(&'static str),
     OperationNotFound,
     InvalidStoredState,
     ValidationFailed,
@@ -924,6 +1043,13 @@ impl std::fmt::Display for ServiceError {
             Self::PolicyDenied(reason) => write!(formatter, "operation denied by policy: {reason}"),
             Self::IdempotencyConflict => {
                 formatter.write_str("request ID was already used with a different payload")
+            }
+            Self::ArtifactTaskMismatch => formatter.write_str("artifact belongs to another Task"),
+            Self::EvidenceArtifactMismatch => {
+                formatter.write_str("evidence belongs to another Task or Artifact")
+            }
+            Self::InvalidStateTransitionReason(reason) => {
+                write!(formatter, "invalid state transition: {reason}")
             }
             Self::OperationNotFound => formatter.write_str("operation was not found"),
             Self::InvalidStoredState => {
@@ -4203,6 +4329,247 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             error_code: row.13,
             accepted_at_ms: row.14,
             finished_at_ms: row.15,
+        })
+    }
+
+    /// Atomically completes a Task after checking its selected Artifact, accepted decision,
+    /// and every additional evidence reference supplied by the supervisor.
+    pub fn finish_task(
+        &self,
+        caller: &str,
+        request: &TaskFinishRequest,
+    ) -> Result<TaskFinishResult, ServiceError> {
+        if caller.trim().is_empty()
+            || request.request_id.trim().is_empty()
+            || request.artifact_id.trim().is_empty()
+            || request.decision_id.trim().is_empty()
+        {
+            return Err(ServiceError::InvalidRequest(
+                "caller, request_id, artifact_id, and decision_id must not be empty",
+            ));
+        }
+        if request
+            .evidence
+            .iter()
+            .any(|item| item.id.trim().is_empty())
+        {
+            return Err(ServiceError::InvalidRequest(
+                "evidence IDs must not be empty",
+            ));
+        }
+        let evidence_json = serde_json::to_string(
+            &request
+                .evidence
+                .iter()
+                .map(|item| (item.kind.as_str(), item.id.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|_| ServiceError::InvalidStoredState)?;
+
+        let mut connection = self.ledger.lock_connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, i64, String, String, String, i64)> = tx
+            .query_row(
+                "SELECT task_id,expected_revision,artifact_id,decision_id,evidence_json,revision
+                 FROM task_finishes WHERE caller=?1 AND tool_name=?2 AND request_id=?3",
+                params![caller, TASK_FINISH_TOOL_NAME, request.request_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((task, expected_revision, artifact, decision, stored_evidence, revision)) =
+            existing
+        {
+            if task != request.task_id.as_str()
+                || u64::try_from(expected_revision).ok() != Some(request.expected_revision)
+                || artifact != request.artifact_id
+                || decision != request.decision_id
+                || stored_evidence != evidence_json
+            {
+                return Err(ServiceError::IdempotencyConflict);
+            }
+            let revision = u64::try_from(revision).map_err(|_| ServiceError::InvalidStoredState)?;
+            tx.commit()?;
+            return Ok(TaskFinishResult {
+                request_id: request.request_id.clone(),
+                task_id: request.task_id.clone(),
+                revision,
+                artifact_id: request.artifact_id.clone(),
+                evidence: request.evidence.clone(),
+            });
+        }
+
+        let task = self
+            .ledger
+            .get_task_with_connection(&tx, &request.task_id)?
+            .ok_or(ServiceError::TaskNotFound)?;
+        let actual_revision: i64 = tx
+            .query_row(
+                "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                params![request.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ServiceError::TaskNotFound)?;
+        let actual_revision =
+            u64::try_from(actual_revision).map_err(|_| ServiceError::InvalidStoredState)?;
+        if actual_revision != request.expected_revision {
+            return Err(ServiceError::StaleRevision {
+                expected: request.expected_revision,
+                actual: actual_revision,
+            });
+        }
+        if !matches!(task.state(), TaskState::Pending | TaskState::Active) {
+            let mut closed_task = task.clone();
+            closed_task.complete()?;
+        }
+        let busy: Option<String> = tx
+            .query_row(
+                "SELECT id FROM service_operations WHERE task_id=?1
+                 AND status IN ('accepted','running','recovery_required') LIMIT 1",
+                params![request.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(operation_id) = busy {
+            return Err(ServiceError::Busy(OperationId::new(operation_id)));
+        }
+
+        let artifact_record: Option<(String, String)> = tx
+            .query_row(
+                "SELECT tree_oid,state FROM service_artifacts WHERE task_id=?1 AND id=?2",
+                params![request.task_id.as_str(), request.artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (artifact_tree, artifact_state) = match artifact_record {
+            Some(record) => record,
+            None => {
+                let artifact_exists_elsewhere: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM service_artifacts WHERE id=?1)",
+                    params![request.artifact_id],
+                    |row| row.get(0),
+                )?;
+                return if artifact_exists_elsewhere {
+                    Err(ServiceError::ArtifactTaskMismatch)
+                } else {
+                    Err(ServiceError::Artifact(ArtifactError::NotFound))
+                };
+            }
+        };
+        if artifact_state != "available" {
+            return Err(ServiceError::Artifact(ArtifactError::RecoveryRequired));
+        }
+        let decision: Option<(String, String, String, String)> = tx
+            .query_row(
+                "SELECT task_id,artifact_id,tree_oid,decision FROM artifact_codex_decisions WHERE id=?1",
+                params![request.decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let decision_is_latest_accepted = if let Some((
+            decision_task,
+            decision_artifact,
+            decision_tree,
+            kind,
+        )) = decision
+        {
+            let latest_id: Option<String> = tx.query_row(
+                "SELECT id FROM artifact_codex_decisions WHERE task_id=?1 AND artifact_id=?2 ORDER BY rowid DESC LIMIT 1",
+                params![request.task_id.as_str(), request.artifact_id],
+                |row| row.get(0),
+            ).optional()?;
+            decision_task == request.task_id.as_str()
+                && decision_artifact == request.artifact_id
+                && decision_tree == artifact_tree
+                && kind == "accepted"
+                && latest_id.as_deref() == Some(request.decision_id.as_str())
+        } else {
+            false
+        };
+        if !decision_is_latest_accepted {
+            return Err(ServiceError::InvalidStateTransitionReason(
+                "the selected decision is missing, stale, or is not accepted for this Artifact",
+            ));
+        }
+
+        for evidence in &request.evidence {
+            let identity = match evidence.kind {
+                EvidenceKind::Validation => tx
+                    .query_row(
+                        "SELECT task_id,artifact_id,tree_oid FROM artifact_validations WHERE id=?1",
+                        params![evidence.id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                    )
+                    .optional()?,
+                EvidenceKind::Decision => tx
+                    .query_row(
+                        "SELECT task_id,artifact_id,tree_oid FROM artifact_codex_decisions WHERE id=?1",
+                        params![evidence.id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                    )
+                    .optional()?,
+                EvidenceKind::Review | EvidenceKind::Publication | EvidenceKind::Ci => {
+                    return Err(ServiceError::InvalidRequest(
+                        "this task.finish API slice does not support review, publication, or CI evidence references",
+                    ));
+                }
+            };
+            let Some((evidence_task, evidence_artifact, evidence_tree)) = identity else {
+                return Err(ServiceError::InvalidRequest(
+                    "evidence record does not exist",
+                ));
+            };
+            if evidence_task != request.task_id.as_str()
+                || evidence_artifact != request.artifact_id
+                || evidence_tree != artifact_tree
+            {
+                return Err(ServiceError::EvidenceArtifactMismatch);
+            }
+        }
+
+        let mut completed_task = task;
+        if completed_task.state() == TaskState::Pending {
+            completed_task.start()?;
+        }
+        completed_task.complete()?;
+        let next_revision = request
+            .expected_revision
+            .checked_add(1)
+            .filter(|value| *value <= i64::MAX as u64)
+            .ok_or(ServiceError::InvalidStoredState)?;
+        tx.execute(
+            "UPDATE tasks SET state=?2 WHERE id=?1",
+            params![
+                request.task_id.as_str(),
+                task_state_to_str(completed_task.state())
+            ],
+        )?;
+        tx.execute(
+            "UPDATE service_task_revisions SET revision=?2 WHERE task_id=?1",
+            params![request.task_id.as_str(), next_revision as i64],
+        )?;
+        tx.execute(
+            "INSERT INTO task_finishes(caller,tool_name,request_id,task_id,expected_revision,artifact_id,decision_id,evidence_json,revision,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![caller, TASK_FINISH_TOOL_NAME, request.request_id, request.task_id.as_str(), request.expected_revision as i64,
+                request.artifact_id, request.decision_id, evidence_json, next_revision as i64, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(TaskFinishResult {
+            request_id: request.request_id.clone(),
+            task_id: request.task_id.clone(),
+            revision: next_revision,
+            artifact_id: request.artifact_id.clone(),
+            evidence: request.evidence.clone(),
         })
     }
 
@@ -12762,6 +13129,412 @@ mod tests {
                 .unwrap()
                 .status(),
             ServiceOperationStatus::Running
+        );
+    }
+    fn finish_service_fixture(
+        active: bool,
+    ) -> (
+        Repo,
+        SqliteExecutionLedger,
+        WorkspaceManager,
+        ProviderRegistry,
+        TaskId,
+    ) {
+        let repo = Repo::new();
+        let ledger = SqliteExecutionLedger::open_in_memory().unwrap();
+        let task_id = TaskId::new(if active {
+            "finish-active"
+        } else {
+            "finish-pending"
+        });
+        let mut task = Task::new(
+            task_id.clone(),
+            "finish a managed artifact",
+            TaskRole::new("implementer"),
+        );
+        if active {
+            task.start().unwrap();
+        }
+        ledger.save_task(&task).unwrap();
+        let workspace = WorkspaceManager::new(&repo.0).unwrap();
+        let providers = ProviderRegistry::new();
+        let connection = ledger.lock_connection().unwrap();
+        connection.execute(
+            "INSERT INTO service_artifacts(id,task_id,base_commit,tree_oid,repository_root,ref_name,state,created_at)
+             VALUES('artifact-1',?1,?2,'tree-1',?3,'refs/ai-dev-orchestrator/artifacts/finish-1','available',0)",
+            params![task_id.as_str(), repo.commit(), repo.0.to_string_lossy()],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO artifact_validations(id,task_id,artifact_id,tree_oid,summary,passed,created_at)
+             VALUES('validation-1',?1,'artifact-1','tree-1','withheld',1,0)",
+            params![task_id.as_str()],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO artifact_codex_decisions(id,task_id,artifact_id,tree_oid,decision,reason,evidence_json,created_at)
+             VALUES('decision-1',?1,'artifact-1','tree-1','accepted','accepted','[]',0)",
+            params![task_id.as_str()],
+        ).unwrap();
+        drop(connection);
+        (repo, ledger, workspace, providers, task_id)
+    }
+
+    #[test]
+    fn task_finish_supports_pending_direct_edit_and_is_atomic_and_idempotent() {
+        let (_repo, ledger, workspace, providers, task_id) = finish_service_fixture(false);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let missing_artifact = TaskFinishRequest::new(
+            "finish-missing-artifact",
+            task_id.clone(),
+            0,
+            "artifact-missing",
+            "decision-1",
+            Vec::new(),
+        );
+        assert!(matches!(
+            service.finish_task("test-caller", &missing_artifact),
+            Err(ServiceError::Artifact(ArtifactError::NotFound))
+        ));
+        let foreign_task = TaskId::new("finish-foreign-task");
+        ledger
+            .save_task(&Task::new(
+                foreign_task.clone(),
+                "other task",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        {
+            let connection = ledger.lock_connection().unwrap();
+            connection.execute(
+                "INSERT INTO service_artifacts(id,task_id,base_commit,tree_oid,repository_root,ref_name,state,created_at)
+                 VALUES('artifact-foreign',?1,'base','foreign-tree','/tmp/foreign','refs/ai-dev-orchestrator/artifacts/foreign','available',0)",
+                params![foreign_task.as_str()],
+            ).unwrap();
+        }
+        let foreign_artifact = TaskFinishRequest::new(
+            "finish-foreign-artifact",
+            task_id.clone(),
+            0,
+            "artifact-foreign",
+            "decision-1",
+            Vec::new(),
+        );
+        assert!(matches!(
+            service.finish_task("test-caller", &foreign_artifact),
+            Err(ServiceError::ArtifactTaskMismatch)
+        ));
+        let missing_decision = TaskFinishRequest::new(
+            "finish-missing-decision",
+            task_id.clone(),
+            0,
+            "artifact-1",
+            "decision-missing",
+            Vec::new(),
+        );
+        assert!(matches!(
+            service.finish_task("test-caller", &missing_decision),
+            Err(ServiceError::InvalidStateTransitionReason(_))
+        ));
+        assert_eq!(
+            ledger.get_task(&task_id).unwrap().unwrap().state(),
+            TaskState::Pending
+        );
+        assert_eq!(
+            ledger
+                .lock_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let request = TaskFinishRequest::new(
+            "finish-request-1",
+            task_id.clone(),
+            0,
+            "artifact-1",
+            "decision-1",
+            vec![EvidenceRef::new(
+                EvidenceKind::Validation,
+                "validation-missing",
+            )],
+        );
+        assert!(matches!(
+            service.finish_task("test-caller", &request),
+            Err(ServiceError::InvalidRequest(
+                "evidence record does not exist"
+            ))
+        ));
+        let task = ledger.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(task.state(), TaskState::Pending);
+        assert_eq!(
+            ledger
+                .lock_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        {
+            let connection = ledger.lock_connection().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO service_artifacts(id,task_id,base_commit,tree_oid,repository_root,ref_name,state,created_at)
+                     VALUES('artifact-2',?1,?2,'tree-2',?3,'refs/ai-dev-orchestrator/artifacts/finish-2','available',0)",
+                    params![task_id.as_str(), _repo.commit(), _repo.0.to_string_lossy()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO artifact_validations(id,task_id,artifact_id,tree_oid,summary,passed,created_at)
+                     VALUES('validation-other-artifact',?1,'artifact-2','tree-2','withheld',1,0)",
+                    params![task_id.as_str()],
+                )
+                .unwrap();
+        }
+        let mismatch_request = TaskFinishRequest::new(
+            "finish-mismatch-request",
+            task_id.clone(),
+            0,
+            "artifact-1",
+            "decision-1",
+            vec![EvidenceRef::new(
+                EvidenceKind::Validation,
+                "validation-other-artifact",
+            )],
+        );
+        assert!(matches!(
+            service.finish_task("test-caller", &mismatch_request),
+            Err(ServiceError::EvidenceArtifactMismatch)
+        ));
+        assert_eq!(
+            ledger.get_task(&task_id).unwrap().unwrap().state(),
+            TaskState::Pending
+        );
+        assert_eq!(
+            ledger
+                .lock_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        let valid_request = TaskFinishRequest::new(
+            "finish-request-1",
+            task_id.clone(),
+            0,
+            "artifact-1",
+            "decision-1",
+            vec![EvidenceRef::new(EvidenceKind::Validation, "validation-1")],
+        );
+        let result = service.finish_task("test-caller", &valid_request).unwrap();
+        assert_eq!(result.state(), TaskState::Completed);
+        assert_eq!(result.revision(), 1);
+        assert!(
+            ledger
+                .get_task(&task_id)
+                .unwrap()
+                .unwrap()
+                .attempts()
+                .is_empty()
+        );
+        assert_eq!(
+            ledger.get_task(&task_id).unwrap().unwrap().state(),
+            TaskState::Completed
+        );
+        assert_eq!(
+            service.finish_task("test-caller", &valid_request).unwrap(),
+            result
+        );
+
+        let conflicting_replay = TaskFinishRequest::new(
+            "finish-request-1",
+            task_id.clone(),
+            0,
+            "artifact-1",
+            "decision-1",
+            Vec::new(),
+        );
+        assert!(matches!(
+            service.finish_task("test-caller", &conflicting_replay),
+            Err(ServiceError::IdempotencyConflict)
+        ));
+        assert_eq!(
+            ledger.get_task(&task_id).unwrap().unwrap().state(),
+            TaskState::Completed
+        );
+
+        let second_task_id = TaskId::new("finish-second-caller-task");
+        ledger
+            .save_task(&Task::new(
+                second_task_id.clone(),
+                "second caller task",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        {
+            let connection = ledger.lock_connection().unwrap();
+            connection.execute(
+                "INSERT INTO service_artifacts(id,task_id,base_commit,tree_oid,repository_root,ref_name,state,created_at)
+                 VALUES('artifact-second-caller',?1,?2,'tree-second-caller',?3,'refs/ai-dev-orchestrator/artifacts/second-caller','available',0)",
+                params![second_task_id.as_str(), _repo.commit(), _repo.0.to_string_lossy()],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO artifact_codex_decisions(id,task_id,artifact_id,tree_oid,decision,reason,evidence_json,created_at)
+                 VALUES('decision-second-caller',?1,'artifact-second-caller','tree-second-caller','accepted','accepted','[]',0)",
+                params![second_task_id.as_str()],
+            ).unwrap();
+        }
+        let independent_caller_result = service
+            .finish_task(
+                "another-caller",
+                &TaskFinishRequest::new(
+                    "finish-request-1",
+                    second_task_id,
+                    0,
+                    "artifact-second-caller",
+                    "decision-second-caller",
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(independent_caller_result.revision(), 1);
+    }
+
+    #[test]
+    fn task_finish_completes_active_task_with_no_attempts() {
+        let (_repo, ledger, workspace, providers, task_id) = finish_service_fixture(true);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let result = service
+            .finish_task(
+                "test-caller",
+                &TaskFinishRequest::new(
+                    "finish-active-request",
+                    task_id.clone(),
+                    0,
+                    "artifact-1",
+                    "decision-1",
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(result.revision(), 1);
+        let task = ledger.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(task.state(), TaskState::Completed);
+        assert!(task.attempts().is_empty());
+    }
+
+    #[test]
+    fn task_finish_uses_domain_error_for_already_completed_task() {
+        let (_repo, ledger, workspace, providers, task_id) = finish_service_fixture(true);
+        let mut task = ledger.get_task(&task_id).unwrap().unwrap();
+        task.complete().unwrap();
+        ledger.save_task(&task).unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        assert!(matches!(
+            service.finish_task(
+                "test-caller",
+                &TaskFinishRequest::new(
+                    "finish-closed-task",
+                    task_id.clone(),
+                    1,
+                    "artifact-1",
+                    "decision-1",
+                    Vec::new(),
+                )
+            ),
+            Err(ServiceError::InvalidStateTransition(
+                DomainError::InvalidTaskTransition {
+                    from: TaskState::Completed,
+                    to: TaskState::Completed,
+                }
+            ))
+        ));
+        assert_eq!(
+            ledger.get_task(&task_id).unwrap().unwrap().state(),
+            TaskState::Completed
+        );
+        assert_eq!(
+            ledger
+                .lock_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn task_finish_rejects_missing_stale_and_nonaccepted_decisions_without_mutation() {
+        let (_repo, ledger, workspace, providers, task_id) = finish_service_fixture(false);
+        ledger
+            .lock_connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO artifact_codex_decisions(id,task_id,artifact_id,tree_oid,decision,reason,evidence_json,created_at)
+                 VALUES('decision-rejected',?1,'artifact-1','tree-1','rejected','rejected','[]',1)",
+                params![task_id.as_str()],
+            )
+            .unwrap();
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        for (request_id, decision_id) in [
+            ("finish-stale-decision", "decision-1"),
+            ("finish-rejected-decision", "decision-rejected"),
+        ] {
+            assert!(matches!(
+                service.finish_task(
+                    "test-caller",
+                    &TaskFinishRequest::new(
+                        request_id,
+                        task_id.clone(),
+                        0,
+                        "artifact-1",
+                        decision_id,
+                        Vec::new(),
+                    )
+                ),
+                Err(ServiceError::InvalidStateTransitionReason(_))
+            ));
+        }
+        assert_eq!(
+            ledger.get_task(&task_id).unwrap().unwrap().state(),
+            TaskState::Pending
+        );
+        assert_eq!(
+            ledger
+                .lock_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
         );
     }
 }

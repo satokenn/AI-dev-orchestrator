@@ -136,7 +136,7 @@ type PublicationTaskRow = (
     Option<String>,
 );
 
-const LATEST_SCHEMA_VERSION: u32 = 19;
+const LATEST_SCHEMA_VERSION: u32 = 20;
 
 /// Repository boundary for local task and attempt history.
 pub trait ExecutionLedger {
@@ -300,6 +300,7 @@ impl SqliteExecutionLedger {
         create_artifact_publication_schema(&transaction)?;
         create_task_creation_schema(&transaction)?;
         create_review_schema(&transaction)?;
+        create_task_finish_schema(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -1028,6 +1029,7 @@ fn migrate_schema(connection: &Connection, version: u32) -> Result<(), LedgerErr
                 "started_revision",
                 "INTEGER",
             )?,
+            20 => create_task_finish_schema(connection)?,
             _ => unreachable!(),
         }
         set_schema_version(connection, target)?;
@@ -1234,6 +1236,25 @@ fn create_service_schema(connection: &Connection) -> Result<(), rusqlite::Error>
              ON service_operations(task_id, status);
          INSERT OR IGNORE INTO service_task_revisions(task_id, revision)
              SELECT id, 0 FROM tasks;",
+    )
+}
+
+fn create_task_finish_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_finishes (
+             caller TEXT NOT NULL,
+             tool_name TEXT NOT NULL CHECK(tool_name='task.finish'),
+             request_id TEXT NOT NULL,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             expected_revision INTEGER NOT NULL,
+             artifact_id TEXT NOT NULL,
+             decision_id TEXT NOT NULL,
+             evidence_json TEXT NOT NULL,
+             revision INTEGER NOT NULL,
+             created_at INTEGER NOT NULL,
+             PRIMARY KEY(caller,tool_name,request_id)
+         );
+         CREATE INDEX IF NOT EXISTS task_finishes_by_task ON task_finishes(task_id, revision);",
     )
 }
 
@@ -2183,7 +2204,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
         let row: (String, String, String) = connection
             .query_row(
                 "SELECT artifact_id,validation_ids_json,criteria_json FROM service_review_requests WHERE task_id='task-1' AND reviewer_attempt_id='attempt-1'",
@@ -2206,5 +2227,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(started_revision, None);
+    }
+    #[test]
+    fn schema_v19_migration_adds_task_finish_records_without_changing_prior_schema() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_latest_schema(&connection).unwrap();
+        create_service_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks(id,description,role,state) VALUES ('task-v19','existing','developer','active')",
+                [],
+            )
+            .unwrap();
+        set_schema_version(&connection, 19).unwrap();
+
+        migrate_schema(&connection, 19).unwrap();
+
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 20);
+        let has_task_finish_table: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_finishes')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_task_finish_table);
+        let existing_task: String = connection
+            .query_row(
+                "SELECT description FROM tasks WHERE id='task-v19'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(existing_task, "existing");
     }
 }
