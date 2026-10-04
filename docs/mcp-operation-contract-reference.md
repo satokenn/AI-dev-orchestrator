@@ -310,7 +310,7 @@ Taskと選択したsectionのsnapshotを読む。読取専用。
 `providers` sectionではprovider observationsの件数がpage_size以内なら同一snapshot内で全件を返し、page_sizeを超える場合はrequestを拒否する。UsageとAttempt historyは`occurred_at`降順、同時刻ならID降順でpage化する。`occurred_at: null`は全non-null時刻より後に置き、null同士はID降順とする。cursorはこの順序キー（時刻の有無・時刻値・ID）で並んだ同じTask snapshot内の次位置から再開し、Task、section、page size、Task revisionに束縛する。
 Provider観測sourceがProvider一覧を列挙できない場合は、空配列として成功したように見せずcontext取得を失敗させる。
 
-このRust Service sliceには、監督側が明示実行する任意の`OperationService::submit_artifact_review`もある。reviewはread-only reviewer Attemptとして実行し、成功時にReviewVerdictをArtifact ID/treeへ結び付ける。`ArtifactInput`は現在、`submit_artifact_review`が対象Artifactをread-only reviewer Attemptへ渡すために使う。通常のimplementerによるArtifactInput実行は成功reviewer Attemptの`changes_requested`証拠がないため拒否される。旧Ledgerのaccepted non-reviewer ArtifactInput operationもclaim後に`failed` / `review_evidence_required`で終端し、Providerを起動しない。ReviewVerdictはTaskを完了させず、修正を自動決定しない。これらはRust Service APIであり、MCP transportは未実装。
+このRust Service sliceには、監督側が明示実行する任意の`OperationService::submit_artifact_review`もある。reviewはread-only reviewer Attemptとして実行し、成功時にReviewVerdictをArtifact ID/treeへ結び付ける。`OperationService::submit_attempt`はimplementerの`ArtifactInput`を、失敗またはretry可能な取消Attemptからの`RetryOf` / `EscalationOf`、または成功Artifactに対する同一Artifact/treeの成功reviewer `changes_requested` evidenceに基づく`ReworkFrom`として受け付ける。条件に合わないlineageや証拠は受付前に拒否する。`submit_artifact_review`内の`ArtifactInput`は対象Artifactをread-only reviewer Attemptへ渡す入力であり、review後の修正を開始しない。旧Ledgerのaccepted non-reviewer ArtifactInput operationはclaim後に`failed` / `artifact_input_evidence_stale`で終端し、Providerを起動しない。ReviewVerdictはTaskを完了させず、修正を自動決定しない。これらはRust Service APIであり、MCP transportは未実装。
 
 | Request field | JSON type | Required | 意味 |
 | --- | --- | --- | --- |
@@ -395,7 +395,7 @@ Rust Serviceは監督側が明示的に呼び出す`OperationService::submit_art
 
 Task要求、Validation事実、criteria、全diffを含む完成済みinstructionは16 KiB以下でなければならず、上限を超える依頼は受付前に拒否する。
 
-`ArtifactInput`はこのAPIでは対象Artifactをreviewer Attemptへ渡す入力であり、review後の実装修正を開始しない。旧Ledgerに残るaccepted non-reviewer ArtifactInputはclaim後に`failed` / `review_evidence_required`として終端し、Providerを起動しない。ReviewVerdictはreviewerの結論であり、Task完了や再作業を自動決定せず、監督側の採否判断を代替しない。
+`ArtifactInput`はこのAPIでは対象Artifactをreviewer Attemptへ渡す入力であり、review後の実装修正を開始しない。旧Ledgerに残るaccepted non-reviewer ArtifactInputはclaim後に`failed` / `artifact_input_evidence_stale`として終端し、Providerを起動しない。ReviewVerdictはreviewerの結論であり、Task完了や再作業を自動決定せず、監督側の採否判断を代替しない。
 
 ### `operation.get`
 
