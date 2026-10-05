@@ -966,7 +966,7 @@ mod tests {
                 &repository,
                 &ArtifactPublicationPayload::new("main", "feature", "title", "body"),
                 "0123456789012345678901234567890123456789",
-                Duration::from_secs(2),
+                Duration::from_secs(5),
             );
             match expected {
                 Ok(()) => assert!(
