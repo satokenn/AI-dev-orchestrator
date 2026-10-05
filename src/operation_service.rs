@@ -4339,24 +4339,6 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
         caller: &str,
         request: &TaskFinishRequest,
     ) -> Result<TaskFinishResult, ServiceError> {
-        if caller.trim().is_empty()
-            || request.request_id.trim().is_empty()
-            || request.artifact_id.trim().is_empty()
-            || request.decision_id.trim().is_empty()
-        {
-            return Err(ServiceError::InvalidRequest(
-                "caller, request_id, artifact_id, and decision_id must not be empty",
-            ));
-        }
-        if request
-            .evidence
-            .iter()
-            .any(|item| item.id.trim().is_empty())
-        {
-            return Err(ServiceError::InvalidRequest(
-                "evidence IDs must not be empty",
-            ));
-        }
         let evidence_json = serde_json::to_string(
             &request
                 .evidence
@@ -4440,6 +4422,17 @@ impl<'a, P: ProviderResolver> OperationService<'a, P> {
             )
             .optional()?;
         if let Some(operation_id) = busy {
+            return Err(ServiceError::Busy(OperationId::new(operation_id)));
+        }
+        let publication_operation: Option<String> = tx
+            .query_row(
+                "SELECT id FROM service_artifact_publication_operations WHERE task_id=?1
+                 AND status IN ('accepted','running','recovery_required') LIMIT 1",
+                params![request.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(operation_id) = publication_operation {
             return Err(ServiceError::Busy(OperationId::new(operation_id)));
         }
 
@@ -13535,6 +13528,297 @@ mod tests {
                 )
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn task_finish_preserves_opaque_identifiers_and_checks_empty_evidence_normally() {
+        let (_repo, ledger, workspace, providers, task_id) = finish_service_fixture(false);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let request = TaskFinishRequest::new(
+            "",
+            task_id.clone(),
+            0,
+            "artifact-1",
+            "decision-1",
+            Vec::new(),
+        );
+        let result = service.finish_task("", &request).unwrap();
+        assert_eq!(result.request_id(), "");
+        assert_eq!(service.finish_task("", &request).unwrap(), result);
+
+        let conflicting_evidence = TaskFinishRequest::new(
+            "",
+            task_id.clone(),
+            0,
+            "artifact-1",
+            "decision-1",
+            vec![EvidenceRef::new(EvidenceKind::Validation, "")],
+        );
+        assert!(matches!(
+            service.finish_task("", &conflicting_evidence),
+            Err(ServiceError::IdempotencyConflict)
+        ));
+
+        let (_repo, ledger, workspace, providers, second_task_id) = finish_service_fixture(false);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let whitespace_request = TaskFinishRequest::new(
+            "  ",
+            second_task_id.clone(),
+            0,
+            "artifact-1",
+            "decision-1",
+            Vec::new(),
+        );
+        let result = service.finish_task("  ", &whitespace_request).unwrap();
+        assert_eq!(result.request_id(), "  ");
+        assert_eq!(
+            service.finish_task("  ", &whitespace_request).unwrap(),
+            result
+        );
+        let (_repo, ledger, workspace, providers, independent_task_id) =
+            finish_service_fixture(false);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let independent_caller = service
+            .finish_task(
+                "different caller",
+                &TaskFinishRequest::new(
+                    "  ",
+                    independent_task_id,
+                    0,
+                    "artifact-1",
+                    "decision-1",
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(independent_caller.request_id(), "  ");
+        assert_eq!(independent_caller.revision(), 1);
+
+        let (_repo, ledger, workspace, providers, third_task_id) = finish_service_fixture(false);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let empty_evidence = TaskFinishRequest::new(
+            "empty-evidence",
+            third_task_id.clone(),
+            0,
+            "artifact-1",
+            "decision-1",
+            vec![EvidenceRef::new(EvidenceKind::Validation, "")],
+        );
+        assert!(matches!(
+            service.finish_task("caller", &empty_evidence),
+            Err(ServiceError::InvalidRequest(
+                "evidence record does not exist"
+            ))
+        ));
+        assert_eq!(
+            ledger.get_task(&third_task_id).unwrap().unwrap().state(),
+            TaskState::Pending
+        );
+        assert_eq!(
+            ledger
+                .lock_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM task_finishes WHERE task_id=?1",
+                    params![third_task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn task_finish_empty_artifact_and_decision_use_domain_errors_without_mutation() {
+        let (_repo, ledger, workspace, providers, task_id) = finish_service_fixture(false);
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        let empty_artifact = TaskFinishRequest::new(
+            "empty-artifact",
+            task_id.clone(),
+            0,
+            "",
+            "decision-1",
+            Vec::new(),
+        );
+        assert!(matches!(
+            service.finish_task("caller", &empty_artifact),
+            Err(ServiceError::Artifact(ArtifactError::NotFound))
+        ));
+        let empty_decision = TaskFinishRequest::new(
+            "empty-decision",
+            task_id.clone(),
+            0,
+            "artifact-1",
+            "",
+            Vec::new(),
+        );
+        assert!(matches!(
+            service.finish_task("caller", &empty_decision),
+            Err(ServiceError::InvalidStateTransitionReason(_))
+        ));
+        assert_eq!(
+            ledger.get_task(&task_id).unwrap().unwrap().state(),
+            TaskState::Pending
+        );
+        let connection = ledger.lock_connection().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM task_finishes WHERE task_id=?1",
+                    params![task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn task_finish_blocks_only_on_active_publication_for_the_same_task() {
+        fn insert_publication(
+            ledger: &SqliteExecutionLedger,
+            id: &str,
+            task_id: &TaskId,
+            status: &str,
+        ) {
+            ledger
+                .lock_connection()
+                .unwrap()
+                .execute(
+                    "INSERT INTO service_artifact_publication_operations
+                     (id,request_id,task_id,request_digest,artifact_id,tree_oid,base_commit,
+                      validation_id,decision_id,base_branch,head_branch,status,phase,
+                      accepted_revision,revision,accepted_at)
+                     VALUES(?1,?1,?2,'digest','artifact-1','tree-1','base','validation-1',
+                            'decision-1','main','publish',?3,'prepared',0,0,0)",
+                    params![id, task_id.as_str(), status],
+                )
+                .unwrap();
+        }
+
+        for status in ["accepted", "running", "recovery_required"] {
+            let (_repo, ledger, workspace, providers, task_id) = finish_service_fixture(false);
+            let operation_id = format!("publication-{status}");
+            insert_publication(&ledger, &operation_id, &task_id, status);
+            let service =
+                OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                    .unwrap();
+            assert!(matches!(
+                service.finish_task(
+                    "caller",
+                    &TaskFinishRequest::new(
+                        format!("finish-{status}"),
+                        task_id.clone(),
+                        0,
+                        "artifact-1",
+                        "decision-1",
+                        Vec::new(),
+                    )
+                ),
+                Err(ServiceError::Busy(id)) if id.as_str() == operation_id
+            ));
+            assert_eq!(
+                ledger.get_task(&task_id).unwrap().unwrap().state(),
+                TaskState::Pending
+            );
+            let connection = ledger.lock_connection().unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT revision FROM service_task_revisions WHERE task_id=?1",
+                        params![task_id.as_str()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM task_finishes WHERE task_id=?1",
+                        params![task_id.as_str()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+
+        for status in ["completed", "failed"] {
+            let (_repo, ledger, workspace, providers, task_id) = finish_service_fixture(false);
+            insert_publication(&ledger, &format!("terminal-{status}"), &task_id, status);
+            let service =
+                OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                    .unwrap();
+            assert_eq!(
+                service
+                    .finish_task(
+                        "caller",
+                        &TaskFinishRequest::new(
+                            format!("finish-terminal-{status}"),
+                            task_id,
+                            0,
+                            "artifact-1",
+                            "decision-1",
+                            Vec::new(),
+                        ),
+                    )
+                    .unwrap()
+                    .revision(),
+                1
+            );
+        }
+
+        let (_repo, ledger, workspace, providers, task_id) = finish_service_fixture(false);
+        let foreign_task = TaskId::new("foreign-publication-task");
+        ledger
+            .save_task(&Task::new(
+                foreign_task.clone(),
+                "foreign publication task",
+                TaskRole::new("implementer"),
+            ))
+            .unwrap();
+        insert_publication(&ledger, "foreign-publication", &foreign_task, "running");
+        let service =
+            OperationService::new(&ledger, &workspace, &providers, 3, Duration::from_secs(30))
+                .unwrap();
+        assert_eq!(
+            service
+                .finish_task(
+                    "caller",
+                    &TaskFinishRequest::new(
+                        "finish-with-foreign-publication",
+                        task_id,
+                        0,
+                        "artifact-1",
+                        "decision-1",
+                        Vec::new(),
+                    ),
+                )
+                .unwrap()
+                .revision(),
+            1
         );
     }
 }

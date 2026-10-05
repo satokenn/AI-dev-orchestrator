@@ -188,7 +188,7 @@ retry は別の Attempt ID として追加されます。
 
 ## GitHub Workflow
 
-以下も現行GitHubWorkflowの挙動であり、MCP Operation Serviceの公開条件ではありません。MCP契約の`publication.publish`と`task.finish`は、対象Artifact、accepted CodexDecision、policy必須の証拠を別途照合します。
+以下も現行GitHubWorkflowの挙動であり、MCP Operation Serviceの公開条件ではありません。MCP契約の`publication.publish`と`task.finish`は、対象Artifact、accepted CodexDecision、policy必須の証拠を別途照合します。`task.finish`は同じTaskで処理中または復旧が必要なArtifact公開も待機対象として拒否します。
 
 `GitHubWorkflow` publishes only an `OrchestrationReport` whose aggregate
 `ValidationResult` passed. Commit, push, and pull-request effects are injected
