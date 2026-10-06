@@ -835,7 +835,7 @@ mod tests {
                 &repository,
                 "0123456789012345678901234567890123456789",
                 "feature",
-                Duration::from_secs(2),
+                Duration::from_secs(5),
             ),
             Err(PublicationGatewayError::RejectedBeforeEffect)
         );
@@ -966,7 +966,7 @@ mod tests {
                 &repository,
                 &ArtifactPublicationPayload::new("main", "feature", "title", "body"),
                 "0123456789012345678901234567890123456789",
-                Duration::from_secs(5),
+                Duration::from_secs(2),
             );
             match expected {
                 Ok(()) => assert!(
