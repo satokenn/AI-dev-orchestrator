@@ -61,11 +61,11 @@ pub use operation_ledger::{
 pub use operation_service::{
     ArtifactInput, ArtifactPublicationAcceptance, ArtifactPublicationPhase,
     ArtifactPublicationRequest, ArtifactPublicationSnapshot, ArtifactReviewRequest, AttemptInput,
-    AttemptRunRequest, BaseInput, ModelCapabilityStatus, ModelCatalog, ModelCatalogEntry,
-    ModelCatalogError, OperationAcceptance, OperationService, OperationSnapshot, ReviewVerdict,
-    ReviewVerdictRecord, ServiceError, ServiceOperationStatus, TaskContextPage, TaskContextResult,
-    TaskContextSection, TaskCreateRequest, TaskCreationResult, TaskIssueSnapshot,
-    TaskRequestSnapshot, TaskSource,
+    AttemptRunRequest, BaseInput, EvidenceKind, EvidenceRef, ModelCapabilityStatus, ModelCatalog,
+    ModelCatalogEntry, ModelCatalogError, OperationAcceptance, OperationService, OperationSnapshot,
+    ReviewVerdict, ReviewVerdictRecord, ServiceError, ServiceOperationStatus, TaskContextPage,
+    TaskContextResult, TaskContextSection, TaskCreateRequest, TaskCreationResult,
+    TaskFinishRequest, TaskFinishResult, TaskIssueSnapshot, TaskRequestSnapshot, TaskSource,
 };
 pub use orchestrator::{
     OrchestrationReport, Orchestrator, OrchestratorError, OrchestratorService, WorkspaceManagerPort,
