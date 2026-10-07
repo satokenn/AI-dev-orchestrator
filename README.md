@@ -71,6 +71,8 @@ Provider APIでは成功・失敗結果にUTF-8変換前のstdout/stderr byte列
 
 Provider起動前にworkspaceのHEADが指定commitと一致し、tracked・untracked・ignored fileが空であることも確認します。hook等が内容を作った場合はProviderを起動せず、workspaceと内容を保持します。実行中のOperationはworkspace pathとbranchを参照として記録し、結果確認・Artifact連携までは自動削除しません。永続LedgerのService構築時は、取得したロックの下で残存するrunning Operationを `recovery_required` として閉じてから依頼受付を始めます。中断結果を推測せず、同じOperationを再実行しません。これはRust Service APIの中核実装であり、MCP transport、ArtifactInput、redacted log保存、named Model catalog、CLIへの配線は別作業です。仕様の正本は[ドメインモデル](docs/domain-model.md)と[MCP 操作契約](docs/mcp-operation-contract.md)です。
 
+任意の hard budget は `OperationService::with_execution_count_budget(Some(...))` で有効化します。現在の予算metricはTask scopeの実行claim数（`execution` 単位）のみです。受付時にSQLiteの即時transaction内で上限を確認し、上限到達時は `BudgetExhausted` で拒否します。Policy未設定（`None`）なら予算だけを理由に拒否しません。受理済みOperationは、その後Serviceのbudget設定が変わっても取消・拒否されません。実行claimはProvider availabilityやworkspace準備より前に1回を消費し、同じOperationの再送や復旧で重複計上しません。これはServiceが保証する操作実行枠であり、Provider側の外部利用量・料金上限を保証しません。
+
 Service利用側は明示したbase commitで受付し、返されたIDで同期実行または後から状態取得を行います。
 
 ```rust,ignore
