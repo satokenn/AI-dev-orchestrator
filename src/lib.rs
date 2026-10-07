@@ -27,7 +27,10 @@ pub use domain::{
     DomainError, ModelChoice, ModelRef, ProviderRef, Task, TaskId, TaskRole, TaskState, UsageCost,
     UsageMetric, ValidationCheckResult, ValidationResult,
 };
-pub use execution_ledger::{AttemptRecord, ExecutionLedger, LedgerError, SqliteExecutionLedger};
+pub use execution_ledger::{
+    AttemptRecord, ExecutionLedger, HistoricalPerformance, HistoricalPerformanceQuery, LedgerError,
+    PerformanceRequestedModel, PerformanceTarget, PerformanceWindow, SqliteExecutionLedger,
+};
 pub use github_workflow::{
     CommitRequest, GhIssueSource, GhPullRequestGateway, GhRepositoryEffects, GitHubWorkflow,
     IssueExecutor, IssueRef, IssueSnapshot, IssueSource, PreparedPublication, PublicationLedger,
