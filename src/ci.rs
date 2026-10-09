@@ -884,7 +884,9 @@ impl CiProvider for GhCiProvider {
         timeout: Duration,
     ) -> Result<CiProviderSnapshot, CiProviderError> {
         let now = unix_ms();
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            CiProviderError::Unavailable("CI observation timeout is out of range".into())
+        })?;
         let (repository, pr_number, sha, base_branch) = match query {
             CiQueryTarget::Commit { repository, sha } => {
                 (repository.clone(), None, sha.clone(), None)
@@ -1522,6 +1524,51 @@ if [ "$mode" = 'unavailable' ] && [ "$endpoint" = 'repos/owner/repo/pulls/42' ];
             runtime.observe(None, &target),
             Err(CiError::Provider(CiProviderError::Unavailable(_)))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_adapter_rejects_unrepresentable_timeout_before_starting_cli() {
+        use std::os::unix::fs::PermissionsExt;
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "ci-timeout-overflow-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let executable = directory.join("gh");
+        let marker = directory.join("started");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let provider = GhCiProvider::with_executable(&executable);
+        let result = provider.observe(
+            &CiQueryTarget::Commit {
+                repository: "owner/repo".into(),
+                sha: "a".repeat(40),
+            },
+            Duration::MAX,
+        );
+
+        assert_eq!(
+            result,
+            Err(CiProviderError::Unavailable(
+                "CI observation timeout is out of range".into()
+            ))
+        );
+        assert!(
+            !marker.exists(),
+            "gh must not start for an invalid deadline"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
