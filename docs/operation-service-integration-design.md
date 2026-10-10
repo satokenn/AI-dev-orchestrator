@@ -1,6 +1,6 @@
 # Operation ServiceとMCPの統合設計
 
-更新日: 2026-10-11。**本変更は設計・仕様の改訂であり、製品コード・DB migration・runtime挙動は変更しない。**
+更新日: 2026-10-11（日本時間、Asia/Tokyo）。**本変更は設計・仕様の改訂であり、製品コード・DB migration・runtime挙動は変更しない。**
 
 ## 目的と要約
 
