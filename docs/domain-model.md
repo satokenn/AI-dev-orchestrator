@@ -70,24 +70,26 @@ stateDiagram-v2
 
 `Succeeded` は**モデル呼び出しの正常終了だけ**を表す。検証成功、review承認、監督Codexの受入、Task完了は含まない。Attemptに `Validating` 状態は置かず、Validationの結果でAttemptの終端状態を変更しない。
 
-## 実装・検証・reviewの例
+## 実装・検証・任意reviewの例
 
 | 順番 | 行ったこと | 記録する事実 |
 | --- | --- | --- |
 | 1 | 実装モデルを呼び出した | implementer Attempt=`Succeeded`、Artifact A |
 | 2 | Artifact Aを検証した | Validation A=`failed`。Attempt 1は変更しない |
-| 3 | 修正モデルを呼び出した | implementer Attempt=`Succeeded`、input=A、output=Artifact B |
+| 3 | Validation失敗後、reviewを挟まず修正モデルを呼び出した | implementer Attempt=`Succeeded`、relation=`SpecifiedInput`（参照先はArtifact Aの作成Attempt）、input=A、output=Artifact B |
 | 4 | Artifact Bを検証した | Validation B=`passed` |
 | 5 | Artifact Bをreviewした | reviewer Attempt=`Succeeded`、ReviewVerdict B=`changes_requested` または `approved` |
 | 6 | Artifact Bを採否判断した | 監督Codexが証拠を評価してCodexDecisionを記録 |
 
-reviewerが修正を求めても、reviewの呼び出し自体が正常ならreviewer Attemptは `Succeeded` である。review出力が欠ける・形式不正なら、そのAttemptは無効な出力として扱う。
+reviewは任意であり、Validation後や修正前の必須段階ではない。reviewを行って修正を求めても、reviewの呼び出し自体が正常ならreviewer Attemptは `Succeeded` である。review出力が欠ける・形式不正なら、そのAttemptは無効な出力として扱う。
 
 ## 成果物に結び付ける事実
 
 `ValidationResult`はAttemptの状態ではない。対象Artifact、check定義、各checkの終了結果、診断、実行時刻を持つ。passは監督Codexの受入やTask完了を自動発生させず、failはAttemptを失敗へ書き換えない。成果物が変われば、古いValidationを新しい成果物のpublish gateに使えない。
 
-reviewはreviewer roleの通常のAttemptとして実行し、正常なreviewer Attemptは対象ArtifactへのReviewVerdictを1件持てる。`approved` はreviewerの見解であり、`changes_requested` はreview処理の失敗ではない。
+reviewはreviewer roleの通常のAttemptとして実行し、任意である。正常なreviewer Attemptは対象ArtifactへのReviewVerdictを1件持てる。reviewerを実行しても、対象Artifactや作成元Attemptを確認できない場合に履歴の参照先を推定しない。`approved` はreviewerの見解であり、`changes_requested` はreview処理の失敗ではない。
+
+Attempt履歴の分類は[実装・レビュー・修正を記録する設計](implementation-review-model.md)に従う。新規Taskのsequence 1でBaseInputから始めるimplementerだけを`Initial`とし、explorer、`Initial`に該当しないBaseInput（後続実行・explorer/reviewer）、reviewを経ない修正、作成元Attemptが特定できないArtifactへのreviewなどは`SpecifiedInput`を使う。作成元が成功済みimplementer Attemptと確認できる現在Artifactへのreviewは`ReviewOf`を維持する。それ以外の一般reviewは`SpecifiedInput`で生成元参照を保持する。`SpecifiedInput`では明示された入力を既存のAttempt input欄に一度だけ保存し、ArtifactInputに記録された同じTask内の作成元Attemptがある場合はそのrelation参照先を必ず保持する。分類理由が不明でも既知の作成元参照をnullにしない。BaseInputは参照先を持たない。reviewer + BaseInputはread-only Attemptとして実行し、Artifactを対象とするReviewVerdictは作らない。一般のAttempt要求からretryやreworkの理由を推測しない。既存履歴の移行では保存済みrelationと参照先をそのまま保持し、新規規則で再分類しない。`LegacyUnspecified`は既存relationを復元できない履歴の移行時だけの分類である。
 
 監督Codexは差分、Validation、review、CI等を評価し、対象Artifactに次のCodexDecisionを残す。
 

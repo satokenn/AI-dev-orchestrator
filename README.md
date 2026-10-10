@@ -98,6 +98,8 @@ Antigravity CLI (`agy`) の headless Provider と手動 Live Provider Test の�
 
 Provider / Model 選定へ渡す Task、利用状況、過去実績、Attempt 履歴と、role ごとの選定結果の構造は、[モデル選定の入力・出力仕様](docs/model-selection-spec.md)を参照してください。
 
+Service、Ledger、MCPの接続方針は[Operation Service統合設計](docs/operation-service-integration-design.md)を参照してください。
+
 同じ開発作業で実装、レビュー、修正を行うときの記録方法と、完了にする判断は、
 [実装・レビュー・修正を記録する設計](docs/implementation-review-model.md)を参照してください。
 

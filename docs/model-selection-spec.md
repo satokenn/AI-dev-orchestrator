@@ -340,6 +340,7 @@ enum AttemptRelationSummary {
     EscalationOf { attempt_id: AttemptId },
     ReviewOf { attempt_id: AttemptId },
     ReworkFrom { review_attempt_id: AttemptId },
+    SpecifiedInput { attempt_id: Option<AttemptId> },
     LegacyUnspecified,
 }
 
@@ -386,7 +387,9 @@ struct RoleAssignment {
 
 `SelectionRole` と `CapabilityRef` は v1 では拡張可能な non-empty string newtype とする。
 Issue #58では、実行時のroleをAttemptへ保持し、`ReviewSummary`をreviewer Attemptの専用結果として
-永続化する方針を採用した。`AttemptRelationSummary`はretry／escalation／review／reworkを区別する。
+永続化する方針を採用した。reviewは任意である。`AttemptRelationSummary`はretry／escalation／review／reworkを区別する。
+sequence 1のBaseInputによるimplementerだけが`Initial`となり、explorer、`Initial`に該当しないBaseInput（後続実行・explorer/reviewer）、reviewなしの修正、作成元Attempt不明のArtifact reviewなど、既存の理由分類に当てはまらない実行は`SpecifiedInput`で表す。作成元が成功済みimplementer Attemptと確認できる現在Artifactへのreviewは`ReviewOf`を維持する。それ以外の一般reviewは`SpecifiedInput`で生成元参照を保持する。`attempt_id`はArtifactInputに記録された同じTask内の作成元Attemptを確認できる場合に設定し、分類理由が不明でも既知の作成元Attempt参照を省略しない。BaseInputおよび作成元不明のArtifactInputではnullにする。入力値はAttempt入力として一度だけ保存し、このsummary variantへ複製しない。移行時は既存のrelationと参照先をそのまま保持し、新規分類規則で再分類しない。
+一般の実行要求にはretry/rework理由がないため、Provider/Model差や直前の結果から既存関係を推定しない。明示理由を受ける既存APIはその意味を維持する。`LegacyUnspecified`は移行時だけ使う。
 既存Ledgerから確定できない`role`と`review`は省略し、履歴を推測で補わない。移行済みLedgerで
 relationを復元できないAttemptは、`relation: { "kind": "legacy_unspecified" }`として保持する。
 Domain上の不変条件とLedger migrationは
@@ -626,6 +629,8 @@ Provider / Model の利用可否や価格を示さない。説明のため一部
   }
 }
 ```
+
+selection outputに`reviewer` roleが含まれる場合もreviewが必須になるわけではない。監督Codexは必要なroleだけを要求し、実行と履歴relationはOperation Serviceが入力と確定済み証拠から記録する。selectionの`reason`はProvider/Model選定理由であり、Attemptのretry/rework理由として使わない。
 
 </details>
 
