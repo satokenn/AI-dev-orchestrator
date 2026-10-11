@@ -106,8 +106,10 @@ cargo test --workspace --all-features
 作業時は、対象に応じて次の資料も参照する。新しい共通ルールや開発基盤ドキュメントを追加した場合は、ここに導線を追加する。
 
 - [`README.md`](README.md): プロジェクト概要と開発者向けの入口
-- [初期アーキテクチャ](docs/architecture.md): 主要コンポーネントの高レベル構造、責務境界、未決定事項
+- [OpenSpecの使い方](openspec/README.md): 提案中の統合設計の読む順番、要件・設計・残作業の分担、既存仕様の移行状況
+- [開発支援システムの全体像](docs/architecture.md): 最初に読む入口。目的、登場人物、作業の流れ、設定の出どころ、詳細仕様を読む順番
 - [モデル選定の入力・出力仕様](docs/model-selection-spec.md): Provider / Model選定の入力、出力、観測事実とCodex判断の責務境界
+- [Operation Service統合設計](docs/operation-service-integration-design.md): Service、Ledger、MCPの接続方針、依存所有、未実装範囲
 - [実装・レビュー・修正を記録する設計](docs/implementation-review-model.md): 実装・レビュー・修正の履歴、レビュー結果、状態、Ledger保存単位
 - [作業・モデル実行・成果物のドメインモデル](docs/domain-model.md): Attempt、Validation、review verdict、監督Codex受入、成果物、旧データ互換の契約
 - [Rustコード品質・テスト方針](docs/rust-quality.md): 必須検証、テスト種別、warningとunsafeの扱い
