@@ -1,0 +1,34 @@
+schema: spec-driven
+
+context: |
+  Language: Japanese
+  All artifacts must be written in Japanese.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+  このプロジェクトは、利用者の開発要求を監督Codexが読み、担当モデルへの依頼、
+  検証結果の確認、修正、PR公開を進めるためのRust製の開発支援システムである。
+  監督Codexが担当モデルや次の操作を判断し、Rust側が依頼を検査・実行・記録する。
+  AGENTS.mdの変更範囲、読みやすさ、検証、PRの完了条件に従う。
+  既存仕様はdocs/にあり、OpenSpecへの移行はまだ行っていない。
+  移行済み仕様がないことを、既存要件がないこととして扱わない。
+  docs/architecture.mdを入口とし、操作はdocs/mcp-operation-contract.mdと
+  docs/mcp-operation-contract-reference.md、状態はdocs/domain-model.md、履歴は
+  docs/implementation-review-model.md、モデル選定はdocs/model-selection-spec.mdを確認する。
+  承認済みの要件を保ち、未マージPRや未コミット変更を承認済み仕様と混同しない。
+  仕様や記録形式が存在することを、製品の統合実装が完成したこととして扱わない。
+  自動モデル選択、自動修正、自動レビュー、自動マージなどを先回りして追加しない。
+
+rules:
+  proposal:
+    - 最初に、誰が何に困っていて、この変更で何ができるようになるかを日本語で説明する。
+    - 対応範囲、対象外、既存仕様の参照先を示す。内部名だけで変更を説明しない。
+  specs:
+    - 読者が実装を知らなくても、誰が何を入力し、何が返るか分かる要件と利用例を書く。
+    - 通常時と代表的な失敗時を示す。必要な英語の識別名には日本語の意味を添える。
+    - 既存要件の移行と新しい変更を区別し、既存文書の該当節を示す。
+  design:
+    - 細則より先に、目的、対象範囲、登場人物、全体の流れを説明する。
+    - 設定を誰がどこから用意するかを明示し、未決定・未実装の部分を隠さない。
+    - データや責務の関係が複雑なら、表または図と具体例で説明する。
+  tasks:
+    - 各項目を既存仕様または提案した要件と対応させ、完了を確認する方法を示す。
+    - 実装、文書改訂、レビュー、検証を区別し、実施していない項目を完了にしない。

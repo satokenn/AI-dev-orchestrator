@@ -2,6 +2,14 @@
 
 AI エージェントを活用した開発オーケストレーションのためのプロジェクトです。
 
+## 初めて読む方へ
+
+**今回の統合設計をレビューする方は、[変更の目的](openspec/changes/service-integration-design/proposal.md)から読んでください。** 目的・要件と利用例・設計・残りの作業をOpenSpecで分けて説明しています。読む順番と利用方法は[OpenSpecの使い方](openspec/README.md)を参照してください。
+
+**何を作るプロジェクトか、設計が目的に合っているかを確認する方は、[開発支援システムの全体像](docs/architecture.md)から読んでください。** 登場人物、作業の流れ、設定を用意する側、詳細仕様への案内をまとめています。
+
+このREADMEのインストール手順と内部APIの説明は、現行CLIについてのものです。監督CodexがMCP経由で作業・検証・公開を依頼する構成は、[統合設計](docs/operation-service-integration-design.md)が説明する目標です。設計文書があることは、その構成がすべて実装され、今使えることを意味しません。
+
 ## インストールと使い方
 
 Rust toolchain を用意した環境では、リポジトリ直下で次を実行してインストールできます。
@@ -94,7 +102,7 @@ Antigravity CLI (`agy`) の headless Provider と手動 Live Provider Test の�
 
 ## アーキテクチャ
 
-主要コンポーネントの構造と、Codex、Rust Orchestrator、Provider、Validator の責務境界は、[初期アーキテクチャ](docs/architecture.md)を参照してください。
+仕様を初めて読む方は、まず[開発支援システムの全体像](docs/architecture.md)を参照してください。目的、登場人物、一つの作業の流れ、設定の出どころ、詳細仕様を読む順番をまとめています。
 
 Provider / Model 選定へ渡す Task、利用状況、過去実績、Attempt 履歴と、role ごとの選定結果の構造は、[モデル選定の入力・出力仕様](docs/model-selection-spec.md)を参照してください。
 
