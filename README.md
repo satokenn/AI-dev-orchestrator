@@ -2,6 +2,14 @@
 
 AI エージェントを活用した開発オーケストレーションのためのプロジェクトです。
 
+## 初めて読む方へ
+
+**今回の統合設計をレビューする方は、[変更の目的](openspec/changes/service-integration-design/proposal.md)から読んでください。** 目的・要件と利用例・設計・残りの作業をOpenSpecで分けて説明しています。読む順番と利用方法は[OpenSpecの使い方](openspec/README.md)を参照してください。
+
+**何を作るプロジェクトか、設計が目的に合っているかを確認する方は、[開発支援システムの全体像](docs/architecture.md)から読んでください。** 登場人物、作業の流れ、設定を用意する側、詳細仕様への案内をまとめています。
+
+このREADMEのインストール手順と内部APIの説明は、現行CLIについてのものです。監督CodexがMCP経由で作業・検証・公開を依頼する構成は、[統合設計](docs/operation-service-integration-design.md)が説明する目標です。設計文書があることは、その構成がすべて実装され、今使えることを意味しません。
+
 ## インストールと使い方
 
 Rust toolchain を用意した環境では、リポジトリ直下で次を実行してインストールできます。
@@ -33,7 +41,7 @@ timeout / cancel時のprocess group停止、停止確認結果、部分ログと
 
 ## AgentProvider 契約
 
-Agent 実行先の違いは `AgentProvider` に閉じ込めます。実装は `ProviderRequest` の workspace、prompt、timeout を受け取り、`ProviderResult` の stdout、stderr、終了状態、任意の `AgentResult` と `UsageCost` を返します。実行に失敗した場合は `ProviderError`（不正な要求、実行失敗、タイムアウト、利用不能）を返します。
+Agent 実行先ごとの違いは `AgentProvider` の実装で扱います。実装は `ProviderRequest` の workspace、prompt、timeout を受け取り、`ProviderResult` の stdout、stderr、終了状態、任意の `AgentResult` と `UsageCost` を返します。実行に失敗した場合は `ProviderError`（不正な要求、実行失敗、タイムアウト、利用不能）を返します。
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
@@ -57,17 +65,19 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 ## Validator
 
-`RustValidator` は明示された workspace を cwd として、`cargo fmt`、`cargo clippy`、`cargo test` の機械的なチェックを順番に実行します。全チェックを内包した aggregate の `ValidationResult` を1件返し、各コマンドの終了状態と stdout / stderr の診断は `ValidationResult::checks()` から参照できます。1つでも失敗した場合は aggregate を成功として扱いません。`CommandValidator` と `ValidationCheck` を使えば、同じ `Validator` API で決定的なチェック列も構成できます。
+`RustValidator` は指定された作業ディレクトリで、`cargo fmt`、`cargo clippy`、`cargo test` を順番に実行します。全コマンドの結果をまとめた `ValidationResult` を1件返し、各コマンドの終了状態と stdout / stderr の診断は `ValidationResult::checks()` から参照できます。1つでも失敗した場合は全体を成功として扱いません。`CommandValidator` と `ValidationCheck` を使えば、同じ `Validator` API で実行するコマンドの一覧を指定できます。
+
+これは現行CLIの検証処理です。提案中のMCP構成では、[入力条件の確認・成果物のテスト・秘密情報の検出・CI結果の取得](docs/architecture.md#何を確認し何を実行するのか)を区別します。現行CLIの結果形式を、そのままMCPの結果形式として扱うものではありません。
 
 ## Orchestrator Service
 
-以下は現在のCLI Orchestrator実装の説明です。現行LedgerではAttemptのSucceeded/FailedがValidation結果と結合した旧意味論です（`legacy_validation_coupled`）。新しいMCP Operation Serviceの契約ではAttempt stateはProvider呼出し結果のみを表します。両者を同一のruntime semanticsとして扱わないでください。
+以下は現在のCLI Orchestrator実装の説明です。現行LedgerではAttemptのSucceeded/FailedにValidation結果を含める旧来の定義を使います（`legacy_validation_coupled`）。新しいMCP Operation Serviceの契約ではAttempt stateはProvider呼出し結果のみを表します。両者を実行時に同じ意味を持つものとして扱わないでください。
 
 `Orchestrator`（`OrchestratorService` の別名）は、Pending の Task を Active にし、Task が所有する1つの Attempt を Queued から Running、Provider 実行、Validating へ進め、`Validator` の aggregate 結果を一度だけ適用します。検証成功時は Attempt が Succeeded、検証失敗時は Failed になります。Provider の失敗や Validator 自体の実行エラーも、失敗した Attempt と Workspace、診断を含む型付き `OrchestratorError` として返します。
 
 Retry / escalation は `RetryPolicy` と `ProviderResolver` を介して Orchestrator が制御します。`execute_decision` は PlannerDecision の意図だけを受け取り、Attempt ID、状態遷移、Provider 解決、Attempt ごとの Workspace 作成は Rust 側で行います。`max_attempts` は新しい Attempt を追加する前に検査され、終端 Task への追加は拒否されます。timeout / cancellation の retry は policy で明示的に許可した場合だけ可能です。`ProviderRegistry` は複数 Provider の本番配線と fake 差し替えに利用できます。
 
-Planner 経路では `ExecutionPolicy` と `execute_decision_with_policy` を使用してください。この hard gate は `max_attempts`、ProviderRegistry 解決、Provider 別 timeout、Provider availability を、Task / Attempt / workspace の変更より前に検査します。timeout は caller から受け取らず、policy に設定された値だけが ProviderRequest に渡されます。availability check は全 AgentProvider の必須境界で、未実装 Provider は fail-closed になります。
+Planner 経路では `ExecutionPolicy` と `execute_decision_with_policy` を使用してください。この実行前の必須検査では `max_attempts`、ProviderRegistry による解決、Provider 別 timeout、Provider availability を、Task / Attempt / workspace を変更する前に検査します。timeout は caller から受け取らず、policy に設定された値だけが ProviderRequest に渡されます。availability check は全 AgentProvider で必須の検査です。未実装 Provider は実行を拒否します。
 
 Issue #30 の1 Attemptフローは、検証成功時も Task を Active のまま返します。Task全体の完了判断は後続の実行ポリシーで確定します。作成した worktree は Orchestrator が自動削除しないため、結果や未コミット変更を確認した後に `WorkspaceManager::cleanup`（または明示的な `cleanup_force`）を呼び出します。
 
@@ -94,15 +104,17 @@ Antigravity CLI (`agy`) の headless Provider と手動 Live Provider Test の�
 
 ## アーキテクチャ
 
-主要コンポーネントの構造と、Codex、Rust Orchestrator、Provider、Validator の責務境界は、[初期アーキテクチャ](docs/architecture.md)を参照してください。
+仕様を初めて読む方は、まず[開発支援システムの全体像](docs/architecture.md)を参照してください。目的、登場人物、一つの作業の流れ、設定の出どころ、詳細仕様を読む順番をまとめています。
 
-Provider / Model 選定へ渡す Task、利用状況、過去実績、Attempt 履歴と、role ごとの選定結果の構造は、[モデル選定の入力・出力仕様](docs/model-selection-spec.md)を参照してください。
+モデルを選ぶ目的・判断の流れ・担当の分担は[モデル選定の概要](docs/model-selection-spec.md)、選定用JSONの項目・型・省略条件・入出力例は[モデル選定の詳細仕様](docs/model-selection-spec-reference.md)を参照してください。
+
+Service、Ledger、MCPの接続方針は[Operation Service統合設計](docs/operation-service-integration-design.md)を参照してください。
 
 同じ開発作業で実装、レビュー、修正を行うときの記録方法と、完了にする判断は、
 [実装・レビュー・修正を記録する設計](docs/implementation-review-model.md)を参照してください。
 
 `Attempt` をモデル呼び出し1回の記録として扱い、機械検証、AI review verdict、監督Codexの受入、
-公開/CI、Task完了を成果物へ束縛する別の事実として扱うDomain契約は、
+公開/CI、Task完了をそれぞれ成果物に結び付いた別の事実として扱うDomain契約は、
 [作業・モデル実行・成果物のドメインモデル](docs/domain-model.md)を参照してください。
 
 監督Codexが依頼できる操作と返る事実は、[MCP 操作契約の概要](docs/mcp-operation-contract.md)を参照してください。
