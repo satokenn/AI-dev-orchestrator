@@ -272,7 +272,7 @@
 | 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `attempt_id` | `string` | 必須 | 過去のモデル実行のID |
-| `sequence` | `integer`（0以上） | 必須 | Task内での実行順。履歴番号の条件は履歴設計に従う |
+| `sequence` | `integer`（1以上） | 必須 | Task内での実行順。履歴番号の条件は履歴設計に従う |
 | `role` | `string`（空文字列不可） | 条件付き | 担当を復元できない旧履歴では省略する |
 | `relation` | `object` | 未確定 | 関係の種類と、必要な参照先。値なしの場合のJSON表現は未確定 |
 | `target` | `object` | 必須 | `provider`は文字列、`model`はモデル指定と取得根拠を含むオブジェクト。実際に使ったモデルが不明なら`status: "unknown"`にする |
@@ -776,6 +776,7 @@ struct MetricValue {
     unit: String,
 }
 
+#[serde(tag = "status", rename_all = "snake_case")]
 enum Evidence<T> {
     Known {
         value: T,
