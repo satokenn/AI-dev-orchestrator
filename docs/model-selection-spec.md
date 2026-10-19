@@ -135,6 +135,8 @@ current_attempts[]        現在のTaskで行った実行履歴
 
 `task`には、目的、利用者の制約、現在の状態、今回選ぶ担当を含めます。GitHub Issueを起点にする場合は、選定時点のタイトル・本文・ラベル・コメントを順序を保って含める。コメントに要求変更や設計判断が含まれる場合があるためです。
 
+Issueを使わず依頼内容を直接登録した作業でも、目的と制約を渡します。MCPの作業登録では、この出所を`source: "manual"`と呼びます。人間が実装するという意味ではありません。[作業登録時の出所と保存内容](mcp-operation-contract-reference.md#taskrequest--tasksnapshot)を参照してください。
+
 Rust側は、入力を固定する前に秘密情報と認証情報を取り除き、伏せ字化していない実行先のログを除外します。
 
 `requested_roles`は「今回どの担当を選ぶか」を示します。出力では、各担当に一つずつ割り当てます。実装担当とレビュー担当を同時に要求できるが、必ず異なるモデルを選ぶという規則ではない。必要な能力と実行許可の規則をRust側が提示し、監督Codexがその範囲で判断する。
@@ -405,7 +407,7 @@ Provider / Model の利用可否や価格を示さない。説明のため一部
 <details>
 <summary>Rust型定義の詳細を表示する</summary>
 
-以下は、v1の項目と必須性を示す型案です。実装では`serde`を使い、分類を識別する値付きの列挙型（tagged enum）にする。JSONの項目名は`snake_case`とする。時刻は既存DBと同じUnix時刻のミリ秒、量は丸めや浮動小数点誤差を避けるため十進数の文字列で表す。
+以下は、v1の必須項目と省略可能な項目を示す型案です。実装では`serde`を使い、分類を識別する値付きの列挙型（tagged enum）にする。JSONの項目名は`snake_case`とする。時刻は既存DBと同じUnix時刻のミリ秒、量は丸めや浮動小数点誤差を避けるため十進数の文字列で表す。
 
 JSONでは、`ModelChoice`を`kind`、`Evidence`を`status`で識別するオブジェクトとして表す。
 `Evidence::Known` は `status: "known"` と `basis`、`Evidence::Unknown` は

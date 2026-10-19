@@ -26,7 +26,9 @@
 
 操作の入力はMCP `tools/call`の`params.arguments`、成功時の構造化された出力は操作結果の`structuredContent`に対応する。MCPの付随情報や、JSON-RPCと操作結果の外側の包み方は、本書では再定義しない。
 
-入力・出力の形式はJSON Schema 2020-12に対応する。各表の「必須性」は項目の省略可否を示し、値に`null`を使えるかとは別である。たとえば`string | null`は必須項目に文字列か`null`を入れることを意味し、「任意」は項目自体を省略できることを意味する。説明文の日本語は送受信する値ではない。
+入力・出力の形式はJSON Schema 2020-12に対応する。各表の「省略できるか」には、入力する側・応答する側がその項目を含める必要があるかを記す。「必須」は省略できない項目、「任意」は省略できる項目、「条件付き」は指定された条件に応じて必要になる項目を表す。
+
+項目の省略と、値として`null`を渡すことは異なる。たとえば、必須項目の型が`string | null`なら、その項目を含めた上で、文字列または`null`を入れる。説明文の日本語は送受信する値ではない。
 
 MCPの`inputSchema`が入力形式、任意の`outputSchema`が構造化された出力形式を定める。[MCP Tools仕様（2026-07-28）](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)と[JSON Schemaの必須項目](https://json-schema.org/understanding-json-schema/reference/object#required-properties)に従い、#45の実装は本書の型・必須項目・列挙した値に合わせて入力を検査する。
 
@@ -38,7 +40,7 @@ MCPの`inputSchema`が入力形式、任意の`outputSchema`が構造化され�
 | `integer` | 整数値。更新番号、取得件数、連番等に使う |
 | `number` | 数値。使用量等に使う |
 | `boolean` | `true`または`false` |
-| `object` | JSONオブジェクト。項目の型・必須性は対応する表で定義 |
+| `object` | JSONオブジェクト。項目の型と省略できる条件は対応する表で定義 |
 | `array<T>` | T型の要素を持つJSON 配列 |
 | `T \| null` | T型またはJSON `null`。項目自体は省略できない |
 | `enum(a, b)` | 記載した文字列値のみ許可 |
@@ -47,7 +49,19 @@ MCPの`inputSchema`が入力形式、任意の`outputSchema`が構造化され�
 
 DBの更新や外部処理の実行を伴う入力は`request_id: string`を必須とする。既存Taskを変更する場合はさらに`task_id: string`と`expected_revision: integer`を必須とする。読取入力は`request_id`と`expected_revision`を持たない。
 
-同じ依頼の再送を識別するキー（冪等性キー）の範囲は`caller + tool name + request_id`。`task.create`を含むDB更新や外部処理を伴うすべての入力に適用する。同じキーで、形式を揃えた入力内容も一致する場合は保存済みの応答を返し、DB更新や外部処理を繰り返さない。同じキーで入力内容が異なる場合は`idempotency_conflict`で拒否する。
+通信が切れて依頼への応答を受け取れなかった場合、呼出側は同じ依頼を送り直せる。Serviceは再送で作業を二重に作ったり、モデルを二重に起動したりしないよう、次の3項目の組合せで受付済みの依頼を探す。この組合せを「冪等性キー」と呼ぶ。`+`は文字列の連結ではなく、3項目を組み合わせて識別するという意味である。
+
+| 項目 | 誰が用意し、何を表すか |
+| --- | --- |
+| `caller` | MCP接続側が確定してServiceへ渡す呼出元の識別子。操作の入力JSONで自己申告する項目ではない |
+| `tool name` | `task.create`や`attempt.run`など、依頼した操作の名前 |
+| `request_id` | 呼出側が依頼に付ける識別子。同じ依頼を再送するときは同じ値を使う |
+
+3項目がすべて同じで、比較用に形式を揃えた入力内容も一致する場合は、保存済みの応答を返す。DB更新や外部処理は繰り返さない。同じ3項目で入力内容が異なる場合は、同じ依頼のIDを別の内容へ使い回したものとして`idempotency_conflict`で拒否する。呼出元や操作名が異なれば、`request_id`だけが同じでも別の依頼として扱う。
+
+たとえば、`task.create`の応答が届かず、同じ呼出元が同じ操作名・`request_id`・入力内容で再送した場合、最初に作成したTaskの受付結果を返す。別のTaskは作らない。この重複防止は、`task.create`を含め、DBを書き換える操作や外部処理を行う操作すべてに適用する。読取専用の操作には適用しない。
+
+入力内容を比較するときに形式を揃えることを、統合設計では「正規化」と呼ぶ。ただし、省略と`null`を同一とするかなど、何を同じ内容とみなすかの細則は未確定である。[統合設計の残る仕様確認](operation-service-integration-design.md#説明の補足と仕様の確定を分ける)を参照する。
 
 IDはすべて文字列として扱い、呼出側はIDの形式・連番・内部構造を解釈しない。日時はRFC 3339形式の文字列（例: `2026-10-10T15:00:00Z`）として送受信し、UTCを示す`Z`を使う。項目が任意なら省略し、nullを使うのは型に`| null`と明記された場合だけ。
 
@@ -69,11 +83,39 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 
 ## 共通型
 
+### この文書で区別する確認処理
+
+従来「検査」とまとめていた処理には、次の違いがある。入力の形式や権限を確認することと、成果物に対してテストを実行することは、別の処理である。
+
+| 処理 | 対象と動作 | 結果の扱い |
+| --- | --- | --- |
+| 入力・実行条件の確認 | MCP接続処理とServiceが、項目の型、更新番号、対象の所属、権限、予算、許可されたコマンドや作業場所を確認する | 条件違反なら、該当するDB更新や外部処理を始める前に拒否する |
+| 成果物の検証（Validation） | Validatorが、指定した保存済み成果物を対象に、ビルド・テスト・静的解析などのコマンドを実行する | コマンドごとの結果と、検証全体の結果を記録する。成果物の採用判断とは別 |
+| 秘密情報の検出・伏せ字化 | SecretScannerが、保存・返却・公開する内容に既知の秘密情報が含まれるか確認し、必要な箇所を伏せ字にする | 秘密情報を含む公開や、安全に確認できない公開は拒否する。コマンドそのものが伏せ字化で変わる場合も実行しない |
+| CI結果の取得 | GitHub・CI接続処理が、指定したPRやコミットについて外部で実行されたCIの状態を取得する | `CiCheck`として記録する。`ci.get`や`ci.wait`がテストを新たに実行するわけではない |
+
+Validationでいう一つの「検査」（check）は、名前・実行コマンド・引数・制限時間を指定した一回のコマンド実行を指す。入力は`ValidationCheck`、その結果は`ValidationCheckResult`で表す。「検査セット」（profile）は、こうしたコマンドの組合せに、起動側が名前を付けて登録したものである。
+
+たとえば、起動側が`rust-checks`という名前にfmt・clippy・testを登録した場合、監督Codexはその名前を指定して実行を依頼できる。結果には、各コマンドの名前、`passed`（成功）・`failed`（失敗）・`unknown`（結果不明）のいずれか、診断への参照が入る。`rust-checks`は説明用の名前であり、組込みの予約名ではない。
+
+`diagnostic_ref`は、エラーなどを調べる診断記録を指す値であり、診断本文そのものではない。呼出側は値の内部構造を解釈しない。長時間処理の出力ログを読む操作は`operation.list_logs`である。同操作の`diagnostic`出力と、この参照値を使う取得方法との対応は、[残る仕様確認](operation-service-integration-design.md#説明の補足と仕様の確定を分ける)に記す。
+
+コマンドや作業場所を許可する設定は[統合設計のValidator設定](operation-service-integration-design.md#validatorの許可設定)、秘密情報を含む入力の扱いは[秘密情報の確認手順](operation-service-integration-design.md#validation要求に含まれる値の秘密情報検査)に従う。
+
 ### `TaskRequest` / `TaskSnapshot`
 
-| 型名 | 項目 | JSON型 | 必須性 | 意味 |
+`TaskRequest`は、作業作成時に受け取った依頼内容の記録である。`source`、タイトル、本文、制約と、Issueを元にした場合のIssue情報を保存する。`TaskSnapshot`は、この依頼内容に作業ID・現在の更新番号・現在の状態を添えて返す形式である。
+
+`source`は依頼内容の出所を表し、次の二つを区別する。実装を人間とモデルのどちらが行うかを指定する値ではない。
+
+| `source`の値 | どのように作業を登録するか |
+| --- | --- |
+| `issue` | 呼出側が取得したGitHub Issueの情報を、依頼内容とともに渡す |
+| `manual` | Issueを出所とせず、タイトル・依頼本文・制約を直接渡す。監督Codexから渡す場合も含む |
+
+| 型名 | 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- | --- |
-| `TaskRequest` | `source` | `enum(issue, manual)` | 必須 | 要求の出所 |
+| `TaskRequest` | `source` | `enum(issue, manual)` | 必須 | 依頼内容の出所。Issue情報を伴う`issue`か、依頼を直接渡す`manual` |
 |  | `title` | `string` | 必須 | 作業のタイトル |
 |  | `description` | `string` | 必須 | 要求本文 |
 |  | `constraints` | `array<string>` | 必須 | 要求制約。制約なしは空配列 |
@@ -81,11 +123,15 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 | `TaskSnapshot` | `task_id` | `string` | 必須 | Task ID |
 |  | `revision` | `integer` | 必須 | Task更新番号 |
 |  | `state` | `enum(pending, active, completed, failed, cancelled)` | 必須 | Task状態 |
-|  | `request` | `TaskRequest` | 必須 | 作成時点で固定した要求 |
+|  | `request` | `TaskRequest` | 必須 | 作業作成時に保存した依頼内容。出所、タイトル、本文、制約、Issue情報を含む |
+
+ここで依頼内容を「固定する」とは、作業作成時に受け取った値を、その時点の依頼として保存することである。後から取得したIssueの内容で、この作成時の記録を置き換えない。現在のTaskの状態や更新番号とは分けて保持する。
+
+`task.create`の入力では、`manual`なら`issue`項目を省略する。一方、保存結果として返す`TaskRequest`には`issue`項目が必ずあり、`manual`なら値は`null`となる。`issue`の場合は、入力にも保存結果にも`IssueSnapshot`を含める。
 
 `IssueSnapshot`は次のJSONオブジェクトとする。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `url` | `string (format: uri)` | 必須 | Issue URL |
 | `number` | `integer (minimum: 1)` | 必須 | Issue番号 |
@@ -94,7 +140,7 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 
 ### `EvidenceRef`
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `kind` | `enum(validation, review, decision, publication, ci)` | 必須 | 参照する記録の種別 |
 | `id` | `string` | 必須 | Serviceが発行した記録ID |
@@ -103,21 +149,23 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 
 ### `ContextItem`
 
-`task.get_context`は情報の分類ごとに次の共通項目を返す。`details`の型は情報の分類ごとの表で定義する。
+`task.get_context`では、モデル実行の履歴を`attempts`、成果物の検証履歴を`validations`などの分類に分けて取得する。各分類の一覧には、1件ずつの記録を`ContextItem`として返す。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+各記録に共通するID・状態・要約などを次の表に示す。共通項目だけでは表せない内容は`details`に入る。たとえば、モデル実行の記録には実行先やモデル名、検証の記録には対象成果物や各コマンドの結果を入れる。
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `id` | `string` | 必須 | 履歴記録ID |
-| `kind` | `string` | 必須 | 記録種別 |
+| `kind` | `string` | 必須 | この1件の記録の種類。例: `attempt`はモデル実行、`validation`は成果物の検証 |
 | `state` | `string \| null` | 必須 | 記録種別に定義された状態。状態を持たない記録はnull |
 | `occurred_at` | `string (format: date-time)` | 必須 | 記録時刻（RFC 3339 UTC） |
 | `summary` | `string` | 必須 | 人が読める短い要約 |
 | `references` | `array<Reference>` | 必須 | 関連記録 |
-| `details` | `object` | 必須 | 情報の分類固有の追加情報 |
+| `details` | `object` | 必須 | この種類の記録に必要な具体的な項目。モデル実行なら実行先、検証なら対象成果物と各コマンドの結果など |
 
-情報の分類固有の`details`は次の項目で構成する。列挙した項目はすべて必須であり、null可能な項目はその型に明記する。
+次の表は、どの分類にどの種類の記録が入り、`details`に何を含めるかを示す。たとえば分類`validations`には`kind: "validation"`の記録が入り、その`details`に`validation_id`、`artifact_id`、`check_profile_id`、`checks`を含める。列挙した項目はすべて必須であり、`null`を許す項目はその型に明記する。
 
-| 情報の分類 | 種類 | 項目 | JSON型 | 必須性 | 意味 |
+| 情報の分類 | 種類 | 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- | --- | --- |
 | `providers` | `provider` | `provider_id` | `string` | 必須 | Provider ID |
 |  |  | `model_ids` | `array<string>` | 必須 | 利用可能なModel ID |
@@ -143,8 +191,8 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 |  |  | `diff_ref` | `string \| null` | 必須 | 差分参照。なければnull |
 | `validations` | `validation` | `validation_id` | `string` | 必須 | Validation ID |
 |  |  | `artifact_id` | `string` | 必須 | 検証対象Artifact |
-|  |  | `check_profile_id` | `string \| null` | 必須 | 適用検査セット。明示checksならnull |
-|  |  | `checks` | `array<ValidationCheckResult>` | 必須 | 個別検査結果 |
+|  |  | `check_profile_id` | `string \| null` | 必須 | 実行したコマンドの組合せを起動側が登録した名前。`checks`でコマンドを直接指定した場合はnull |
+|  |  | `checks` | `array<ValidationCheckResult>` | 必須 | 実行対象の各コマンドについて、名前・成功か失敗か不明か・診断への参照を返す一覧 |
 | `reviews` | `review_verdict` | `review_verdict_id` | `string` | 必須 | ReviewVerdict ID |
 |  |  | `reviewer_attempt_id` | `string` | 必須 | Reviewer Attempt ID |
 |  |  | `artifact_id` | `string` | 必須 | review対象Artifact |
@@ -165,7 +213,7 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 |  |  | `pull_request_number` | `integer \| null` | 必須 | PR番号。コミット指定ならnull |
 |  |  | `head_sha` | `string` | 必須 | 観測対象コミット |
 |  |  | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約状態 |
-|  |  | `checks` | `array<CiCheck>` | 必須 | 個別検査結果 |
+|  |  | `checks` | `array<CiCheck>` | 必須 | GitHubから取得したCIチェックごとの名前・状態・URL・完了時刻の一覧 |
 
 `ContextItem.state`の値は次のとおり。情報の分類ごとに別のenumであり、一覧にない状態を使わない。
 
@@ -183,24 +231,24 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 
 次のJSONオブジェクト型を使用する。記載した項目はすべて必須。
 
-| 型名 | 項目 | JSON型 | 必須性 | 意味 |
+| 型名 | 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- | --- |
 | `Reference` | `kind` | `string` | 必須 | 参照先記録の種別 |
 |  | `id` | `string` | 必須 | 参照先記録ID |
-| `ValidationCheckResult` | `name` | `string` | 必須 | 検査名 |
-|  | `state` | `enum(passed, failed, unknown)` | 必須 | 検査結果 |
+| `ValidationCheckResult` | `name` | `string` | 必須 | このコマンド実行に付けた名前。例: `test` |
+|  | `state` | `enum(passed, failed, unknown)` | 必須 | このコマンド実行の結果。成功・失敗・結果不明を区別する |
 |  | `diagnostic_ref` | `string \| null` | 必須 | 診断参照。なければnull |
-| `CiCheck` | `name` | `string` | 必須 | CIの検査名 |
+| `CiCheck` | `name` | `string` | 必須 | GitHub側で実行されたCIチェックの名前 |
 |  | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 観測した状態 |
 |  | `url` | `string \| null` | 必須 | 検査 URL。なければnull |
 |  | `completed_at` | `string \| null` | 必須 | 完了時刻。非nullならRFC 3339 UTC |
 
 ### `ContextPage`
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
-| `items` | `array<ContextItem>` | 必須 | 情報の分類に属する履歴記録。情報の分類固有の`details`型を使う |
-| `next_cursor` | `string \| null` | 必須 | 次ページ取得用トークン。nullは現在の時点固定記録に続きがない |
+| `items` | `array<ContextItem>` | 必須 | 指定した分類の記録一覧。各記録の`details`は、前述の分類別の表に従う |
+| `next_cursor` | `string \| null` | 必須 | 続きの取得時に渡す値。nullなら、この一覧の続きをすべて返し終えている |
 
 続きの取得位置は中身を解釈せずに使い、Task・情報の分類・取得件数・一覧を固定した時点の更新番号に結び付ける。次ページでは同じ取得件数と、同じ情報の分類の続きの取得位置を使う。更新番号の変更等で続きの取得位置を利用できない場合は`invalid_cursor`。履歴は`occurred_at`降順、同時刻ならID降順。ページ境界に重複・欠落を作らない。
 
@@ -208,7 +256,7 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 
 長時間処理を受け付けたときの共通出力。処理は応答後にも進むため、受付時点では最終結果を返さない。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 対応する要求ID |
@@ -221,7 +269,7 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 
 `OperationRef`の項目はすべて必須。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `operation_id` | `string` | 必須 | 処理ID |
 | `kind` | `enum(attempt.run, task.cancel, operation.cancel, validation.run, publication.publish, ci.wait)` | 必須 | 受付対象の操作 |
@@ -232,7 +280,7 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 
 ### `ErrorPayload`
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string \| null` | 必須 | 読み取れるなら対象要求ID。取得不能ならnull |
@@ -240,7 +288,7 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 
 `Error`の次の項目はすべて必須。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `code` | `ErrorCode` | 必須 | 下記の業務エラーコード |
 | `message` | `string` | 必須 | 人が読める説明 |
@@ -257,13 +305,13 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 
 ## 操作ごとの入力・出力
 
-各入力 / 出力表はJSON Schemaの`properties`に相当する項目を列挙する。表の「必須性」は「必須」「任意」「条件付き」のいずれか。条件付き項目の条件は表の直後に記す。未知入力項目は拒否し、未知出力項目は無視する。全成功出力には`schema_version: const "v1"`を含む。
+各入力 / 出力表はJSON Schemaの`properties`に相当する項目を列挙する。表の「省略できるか」は「必須」「任意」「条件付き」のいずれか。条件付き項目の条件は表の直後に記す。未知入力項目は拒否し、未知出力項目は無視する。全成功出力には`schema_version: const "v1"`を含む。
 
 ### `task.create`
 
 Taskを作成する。`request_id`は再送を識別するキーに含まれる。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 重複作成を防ぐ要求ID |
@@ -273,18 +321,18 @@ Taskを作成する。`request_id`は再送を識別するキーに含まれる�
 | `constraints` | `array<string>` | 必須 | 要求制約。なしなら空配列 |
 | `issue` | `IssueSnapshot` | 条件付き | 要求の出所が`issue`なら必須、`manual`なら省略 |
 
-`issue`は前述の`IssueSnapshot`型を使う。タイトルと本文は作成時点で固定した記録。
+`source`の`issue`と`manual`は、[依頼内容の記録](#taskrequest--tasksnapshot)で定義した出所を表す。`issue`項目には、呼出側が取得した時点のIssueのURL・番号・タイトル・本文を渡す。Serviceはこれを作成時の依頼として保存する。
 
 成功出力
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 入力で受け取った要求IDをそのまま返す |
 | `task_id` | `string` | 必須 | 新規Task ID |
 | `revision` | `integer` | 必須 | 初期更新番号 |
 | `state` | `const "pending"` | 必須 | 初期作業の状態 |
-| `request` | `TaskRequest` | 必須 | 保存したsource・要求・制約・Issue 時点固定記録 |
+| `request` | `TaskRequest` | 必須 | 作業作成時に受け取って保存した出所・タイトル・依頼本文・制約・Issue情報 |
 
 例（操作 `arguments`）
 
@@ -299,13 +347,15 @@ Taskを作成する。`request_id`は再送を識別するキーに含まれる�
 }
 ~~~
 
-同じ`request_id`・同じ入力は同じ作成結果を返す。入力内容を変えて再利用すると`idempotency_conflict`となる。
+上の例は、Issueを使わず「区切り文字のエスケープに対応する」と直接依頼する入力である。`issue`項目は省略している。返る`request`には、出所・タイトル・依頼本文・制約と`issue: null`を含む。通信上の`schema_version`と`request_id`は、`request`内の項目ではない。
+
+同じ呼出元が`task.create`を同じ`request_id`・同じ入力で再送した場合は、同じ作成結果を返す。入力内容を変えて再利用すると`idempotency_conflict`となる。
 
 ### `task.get_context`
 
 Taskと、選択した分類の情報を、記録した時点の内容で読む。読取専用。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `task_id` | `string` | 必須 | 読むTask |
@@ -315,12 +365,12 @@ Taskと、選択した分類の情報を、記録した時点の内容で読む�
 
 成功出力
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
-| `task` | `TaskSnapshot` | 必須 | ID、更新番号、状態、要求時点固定記録 |
+| `task` | `TaskSnapshot` | 必須 | 作業ID、現在の更新番号と状態、作業作成時に保存した依頼内容 |
 | `sections` | `object<string, ContextPage>` | 必須 | 要求された情報の分類ごとのページ |
-| `observed_at` | `string (format: date-time)` | 必須 | 時点固定記録観測時刻 |
+| `observed_at` | `string (format: date-time)` | 必須 | この応答で返す作業情報と履歴を取得した時刻 |
 
 例（`sections.attempts.items`の一部）
 
@@ -340,10 +390,10 @@ Taskと、選択した分類の情報を、記録した時点の内容で読む�
 
 指定Provider / Modelを一回実行する。長時間処理。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
-| `request_id` | `string` | 必須 | 再送を識別するキー |
+| `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
 | `task_id` | `string` | 必須 | 対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に確認した更新番号 |
 | `provider_id` | `string` | 必須 | 呼び出すProvider |
@@ -355,7 +405,7 @@ Taskと、選択した分類の情報を、記録した時点の内容で読む�
 
 `ArtifactInput`と`BaseInput`の各項目はすべて必須。
 
-| 型名 | 項目 | JSON型 | 必須性 | 意味 |
+| 型名 | 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- | --- |
 | `ArtifactInput` | `artifact_id` | `string` | 必須 | 入力Artifact ID |
 | `BaseInput` | `repository` | `string` | 必須 | 開始時コミットのリポジトリ |
@@ -369,21 +419,21 @@ Taskと、選択した分類の情報を、記録した時点の内容で読む�
 
 operation状態・結果を読む。読取専用。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `operation_id` | `string` | 必須 | 取得対象 |
 
 成功出力
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `operation` | `Operation` | 必須 | operation記録 |
 
 `Operation`の項目はすべて必須。nullを許す項目も省略せず、該当しない場合はnullを返す。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `operation_id` | `string` | 必須 | 処理ID |
 | `task_id` | `string` | 必須 | 対象Task ID |
@@ -397,7 +447,7 @@ operation状態・結果を読む。読取専用。
 
 `result`と`error`は同時に非nullにならない。`OperationResult`は`kind`に対応する次のJSONオブジェクトのいずれか。
 
-| 操作の種類 | 結果項目 | JSON型 | 必須性 | 意味 |
+| 操作の種類 | 結果項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- | --- |
 | `attempt.run` | `attempt_id` | `string` | 必須 | 作成したAttempt ID |
 |  | `attempt_state` | `enum(succeeded, failed, cancelled)` | 必須 | Provider実行の終端状態 |
@@ -411,7 +461,7 @@ operation状態・結果を読む。読取専用。
 | `validation.run` | `validation_id` | `string` | 必須 | Validation ID |
 |  | `artifact_id` | `string` | 必須 | 検証対象Artifact |
 |  | `state` | `enum(passed, failed, unknown)` | 必須 | 集約結果 |
-|  | `checks` | `array<ValidationCheckResult>` | 必須 | 個別検査結果 |
+|  | `checks` | `array<ValidationCheckResult>` | 必須 | コマンドごとの名前・状態・診断への参照の一覧 |
 | `publication.publish` | `publication_id` | `string` | 必須 | Publication ID |
 |  | `repository` | `string` | 必須 | リポジトリ |
 |  | `head_sha` | `string` | 必須 | 公開コミット |
@@ -421,11 +471,11 @@ operation状態・結果を読む。読取専用。
 |  | `target` | `CiTarget` | 必須 | 観測対象 |
 |  | `observed_at` | `string (format: date-time)` | 必須 | 観測時刻 |
 |  | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約結果 |
-|  | `checks` | `array<CiCheck>` | 必須 | 個別検査結果 |
+|  | `checks` | `array<CiCheck>` | 必須 | GitHubから取得したCIチェックごとの名前・状態・URL・完了時刻の一覧 |
 
 `UsageMetric`と`CiTarget`の項目はすべて必須。
 
-| 型名 | 項目 | JSON型 | 必須性 | 意味 |
+| 型名 | 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- | --- |
 | `UsageMetric` | `name` | `string` | 必須 | 指標名 |
 |  | `value` | `number \| null` | 必須 | 値。不明ならnull |
@@ -439,7 +489,7 @@ operation状態・結果を読む。読取専用。
 
 指定operationのログ範囲を読む。ログ本文は伏せ字化済み。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `operation_id` | `string` | 必須 | 対象operation |
@@ -449,13 +499,13 @@ operation状態・結果を読む。読取専用。
 
 成功出力は次の項目をすべて含む。`LogChunk`の項目もすべて必須。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `chunks` | `array<LogChunk>` | 必須 | 取得したログの一片 |
 | `next_cursor` | `string \| null` | 必須 | 次ページ用の続きの取得位置。続きがなければnull |
 
-| ログ一片の項目 | JSON型 | 必須性 | 意味 |
+| ログ一片の項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `sequence` | `integer` | 必須 | operation内のログの一片順 |
 | `occurred_at` | `string (format: date-time)` | 必須 | ログ記録時刻 |
@@ -468,10 +518,10 @@ operation状態・結果を読む。読取専用。
 
 ひとつのoperationへの取消を要求する。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
-| `request_id` | `string` | 必須 | 再送を識別するキー |
+| `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
 | `task_id` | `string` | 必須 | 対象operationのTask |
 | `expected_revision` | `integer` | 必須 | 最後に確認した更新番号 |
 | `operation_id` | `string` | 必須 | 取消対象 |
@@ -482,10 +532,10 @@ operation状態・結果を読む。読取専用。
 
 Taskと未終了operationの取消を要求する。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
-| `request_id` | `string` | 必須 | 再送を識別するキー |
+| `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
 | `task_id` | `string` | 必須 | 取消対象 |
 | `expected_revision` | `integer` | 必須 | 最後に確認した更新番号 |
 | `reason` | `string` | 任意 | 取消理由 |
@@ -494,32 +544,34 @@ Taskと未終了operationの取消を要求する。
 
 ### `validation.run`
 
-保存済み成果物に機械検証を実行する。登録済みの検査セットを識別名で指定するか、検査コマンドを直接指定する。
+保存済み成果物を対象に、ビルド・テスト・静的解析などのコマンドを実行する。起動側がコマンドの組合せに付けた名前（`check_profile_id`）を指定するか、実行するコマンドを`checks`に直接渡す。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
-| `request_id` | `string` | 必須 | 再送を識別するキー |
+| `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
 | `task_id` | `string` | 必須 | 対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に確認した更新番号 |
 | `artifact_id` | `string` | 必須 | 検証対象 |
-| `check_profile_id` | `string` | 検査セット利用時に必須 | 登録済み検査セット |
-| `checks` | `array<ValidationCheck>` | 明示検査利用時に必須 | 実行する検査 |
+| `check_profile_id` | `string` | 登録名で指定する場合は必須 | 起動側が登録したコマンドの組合せの名前。例: `rust-checks` |
+| `checks` | `array<ValidationCheck>` | コマンドを直接指定する場合は必須 | 実行するコマンドの一覧。各要素に名前・コマンド・引数・制限時間を入れる |
 
 `check_profile_id`か`checks`のちょうど一方を指定する。`ValidationCheck`の項目はすべて必須。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `name` | `string` | 必須 | 検査名 |
 | `command` | `string` | 必須 | 許可一覧と照合する実行コマンド |
 | `args` | `array<string>` | 必須 | コマンドの引数。なしなら空配列 |
 | `timeout_ms` | `integer (minimum: 1)` | 必須 | 検査の制限時間 |
 
-実行コマンドと作業場所は、起動側が設定した許可一覧を使って実行前に検査する。
+Serviceは、コマンドと作業場所が起動側の許可一覧に含まれるか確認してからValidatorへ渡す。登録名を使う場合も、実際に実行するコマンドをその登録内容から取得し、受付時の設定内容を保存する。これにより、後で設定が変わっても、何を実行する依頼だったかを確認できる。
+
+受付応答は実行完了を意味しない。終了後に`operation.get`を呼ぶと、対象成果物、検証全体の状態、コマンドごとの結果を取得できる。`checks`の空配列を成功とは扱わず、結果不明として記録する。複数コマンドの結果から全体の状態を決める細則は、[残る仕様確認](operation-service-integration-design.md#説明の補足と仕様の確定を分ける)を参照する。
 
 成功出力は`OperationAcceptance`の全項目と、次の必須項目を返す。最終結果の各項目は`operation.get`の`validation.run` 結果のデータ形式を参照。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `artifact_id` | `string` | 必須 | 検証対象Artifact |
 
@@ -527,10 +579,10 @@ Taskと未終了operationの取消を要求する。
 
 監督Codexの判断をArtifactに記録する。同期処理。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
-| `request_id` | `string` | 必須 | 再送を識別するキー |
+| `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
 | `task_id` | `string` | 必須 | 対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に確認した更新番号 |
 | `artifact_id` | `string` | 必須 | 判断対象 |
@@ -540,7 +592,7 @@ Taskと未終了operationの取消を要求する。
 
 成功出力の項目はすべて必須。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 入力で受け取った要求IDをそのまま返す |
@@ -550,7 +602,7 @@ Taskと未終了operationの取消を要求する。
 
 `CodexDecision`の項目はすべて必須。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `decision_id` | `string` | 必須 | 判断記録ID |
 | `artifact_id` | `string` | 必須 | 判断対象Artifact |
@@ -562,10 +614,10 @@ Taskと未終了operationの取消を要求する。
 
 指定した成果物をPRとして公開する。起動側が設定した許可条件に必要な根拠記録がなければ、公開を始める前に拒否する。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
-| `request_id` | `string` | 必須 | 再送を識別するキー |
+| `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
 | `task_id` | `string` | 必須 | 対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に確認した更新番号 |
 | `artifact_id` | `string` | 必須 | 公開するArtifact |
@@ -580,7 +632,7 @@ Taskと未終了operationの取消を要求する。
 
 成功出力は`OperationAcceptance`の全項目と、次の必須項目を返す。最終結果は`operation.get`の`publication.publish` 結果のデータ形式を参照。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `artifact_id` | `string` | 必須 | 公開対象Artifact |
 
@@ -588,7 +640,7 @@ Taskと未終了operationの取消を要求する。
 
 PR / コミットの検査状態を一度観測する。読取専用。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `publication_id` | `string` | `target`未指定時に必須 | Publicationの指定 |
@@ -596,7 +648,7 @@ PR / コミットの検査状態を一度観測する。読取専用。
 
 `PullRequestTarget`と`CommitTarget`の項目はすべて必須。`publication_id`と`target`は同時に指定しない。
 
-| 型名 | 項目 | JSON型 | 必須性 | 意味 |
+| 型名 | 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- | --- |
 | `PullRequestTarget` | `repository` | `string` | 必須 | リポジトリ |
 |  | `number` | `integer (minimum: 1)` | 必須 | PR番号 |
@@ -605,23 +657,23 @@ PR / コミットの検査状態を一度観測する。読取専用。
 
 成功出力は次の項目をすべて含む。`passed`は観測対象SHAに限る。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `observation_id` | `string` | 必須 | 観測記録ID |
 | `target` | `CiTarget` | 必須 | 観測対象 |
 | `observed_at` | `string (format: date-time)` | 必須 | 観測時刻 |
-| `checks` | `array<CiCheck>` | 必須 | 個別検査結果 |
+| `checks` | `array<CiCheck>` | 必須 | GitHubから取得したCIチェックごとの名前・状態・URL・完了時刻の一覧 |
 | `state` | `enum(pending, passed, failed, unknown)` | 必須 | 集約結果 |
 
 ### `ci.wait`
 
 CI状態を待機期限まで待つ。長時間処理。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
-| `request_id` | `string` | 必須 | 再送を識別するキー |
+| `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
 | `task_id` | `string` | 必須 | 対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に確認した更新番号 |
 | `publication_id` | `string` | `target`未指定時に必須 | Publicationの指定 |
@@ -634,10 +686,10 @@ CI状態を待機期限まで待つ。長時間処理。
 
 Task完了を要求する。指定されたArtifact、採用とした判断、起動側の許可規則で必須とする根拠記録を照合し、満たさなければ状態を変えない。
 
-| 入力項目 | JSON型 | 必須性 | 意味 |
+| 入力項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
-| `request_id` | `string` | 必須 | 再送を識別するキー |
+| `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
 | `task_id` | `string` | 必須 | 完了対象Task |
 | `expected_revision` | `integer` | 必須 | 最後に確認した更新番号 |
 | `artifact_id` | `string` | 必須 | 完了対象Artifact |
@@ -646,7 +698,7 @@ Task完了を要求する。指定されたArtifact、採用とした判断、�
 
 成功出力の項目はすべて必須。
 
-| 項目 | JSON型 | 必須性 | 意味 |
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 入力で受け取った要求IDをそのまま返す |

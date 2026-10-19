@@ -65,7 +65,9 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 ## Validator
 
-`RustValidator` は明示された workspace を cwd として、`cargo fmt`、`cargo clippy`、`cargo test` の機械的なチェックを順番に実行します。全チェックを内包した aggregate の `ValidationResult` を1件返し、各コマンドの終了状態と stdout / stderr の診断は `ValidationResult::checks()` から参照できます。1つでも失敗した場合は aggregate を成功として扱いません。`CommandValidator` と `ValidationCheck` を使えば、同じ `Validator` API で決定的なチェック列も構成できます。
+`RustValidator` は指定された作業ディレクトリで、`cargo fmt`、`cargo clippy`、`cargo test` を順番に実行します。全コマンドの結果をまとめた `ValidationResult` を1件返し、各コマンドの終了状態と stdout / stderr の診断は `ValidationResult::checks()` から参照できます。1つでも失敗した場合は全体を成功として扱いません。`CommandValidator` と `ValidationCheck` を使えば、同じ `Validator` API で実行するコマンドの一覧を指定できます。
+
+これは現行CLIの検証処理です。提案中のMCP構成では、[入力条件の確認・成果物のテスト・秘密情報の検出・CI結果の取得](docs/architecture.md#何を確認し何を実行するのか)を区別します。現行CLIの結果形式を、そのままMCPの結果形式として扱うものではありません。
 
 ## Orchestrator Service
 
