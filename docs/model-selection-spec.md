@@ -19,7 +19,7 @@
 
 たとえば「実装担当を選ぶ」という要求に、Rust側が候補A・Bと既知の利用状況を渡し、監督Codexが「Aを選ぶ、理由は実装に必要な能力があるから」と返す。Rust側はAがまだ利用可能かを再確認して実行へ渡す。**候補情報を取れない場合に、Codexがモデル一覧や利用量を想像して補うことはない。**
 
-この文書は取得する情報の形式を定めます。モデル一覧や料金の具体的な取得方法、最も安いモデルを探す機能は定めません。
+Rustから監督Codexへ渡す選定用JSONの構造と各項目の意味は、この文書の対象です。実行先のCLIやAPIからその情報をどう取得するか、どのMCP操作や通信処理で選定用JSONを受け渡すかは、この文書では定めません。最も安いモデルを探す機能の実装も対象外です。
 
 | 読む目的 | 該当箇所 |
 | --- | --- |
@@ -47,6 +47,8 @@ Rustが事実を収集 → JSON入力 → Codexが候補を選定 → JSON出力
 
 ### JSON入力の全体像
 
+これはRustが作成して監督Codexへ渡すデータです。監督Codexが自分で候補一覧や利用量を書いてRustへ送る入力ではありません。具体的な形は[入力のJSON例](#rustから監督codexへ渡すjson)で確認できます。
+
 | 項目 | 内容 |
 | --- | --- |
 | `schema_version` | 入力形式のバージョン |
@@ -55,6 +57,8 @@ Rustが事実を収集 → JSON入力 → Codexが候補を選定 → JSON出力
 | `task` | 目的、制約、Issue、選定する担当 |
 | `providers` | 選択可能なProvider / Modelと、利用状況・実績 |
 | `current_attempts` | 同じTaskですでに行った実行と、その結果 |
+
+この6項目が、Rustから監督Codexへ渡すJSONオブジェクトの最上位の項目である。すべて必要であり、外側に`input`という項目は付けない。型と入れ子の項目は[送信するJSONの構造](#rustから渡すjsonの項目と入れ子構造)で定義する。以下の図は、そのうち候補と履歴の関係を示す概略図である。
 
 ```text
 task
@@ -78,7 +82,9 @@ current_attempts[]        現在のTaskで行った実行履歴
 
 ### JSON出力の全体像
 
-監督Codexは、入力で要求された各担当について、次の項目だけを返す。
+これは監督Codexが選定後にRustへ返すデータです。入力に対応する[出力のJSON例](#監督codexからrustへ返すjson)も分けて掲載します。
+
+出力の最上位には、整数`1`の`schema_version`、入力と同じ文字列の`request_id`、担当ごとの選定結果を並べた`assignments`配列を必ず含める。各選定結果には`role`、`target`、`reason`を含める。次表の`target.provider`と`target.model`は、`target`オブジェクト内の項目を表す。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -179,173 +185,320 @@ Rust側は、入力を固定する前に秘密情報と認証情報を取り除�
 
 伏せ字化していない標準出力・標準エラー出力や機密情報は渡さない。選定に必要な分類と短い要約だけを渡す。過去の実行記録を新しい選定結果で上書きしない。
 
+## Rustから渡すJSONの項目と入れ子構造
+
+ここでは、JSON例やRustの型定義を読まずに、Rustが何をどこに入れて渡すか確認できるよう、各オブジェクトの項目を列挙する。項目名と構造は既存の本文・型案に対応する。以下で「必須」と記した項目は値を含める必要がある。配列の各要素は、対応する表の構造を持つ。
+
+一方、元の型案で`Option`となっている項目は、値がないことを表せても、それをJSONで省略するか`null`にするかが一律には決まっていない。そのような箇所は表で未確定と示す。[未確定の送信形式](#送信形式でまだ確定していないこと)が残るため、この文書を実装可能な完成仕様とは扱わない。
+
+### 最上位の6項目
+
+| 項目 | JSONでの形 | 含める条件と意味 |
+| --- | --- | --- |
+| `schema_version` | 整数`1` | 必須。選定用の入出力形式のバージョン |
+| `request_id` | 文字列 | 必須。Rustが今回の選定依頼に付けるID。監督Codexは出力にも同じ値を入れる |
+| `captured_at_ms` | 整数 | 必須。Rustがこの入力を作成したUnix時刻。単位はミリ秒 |
+| `task` | 作業オブジェクト | 必須。下記「作業と選定する担当」の構造 |
+| `providers` | 実行先オブジェクトの配列 | 必須。下記「実行先とモデル候補」の構造。各要素にその実行先の`models`を含める |
+| `current_attempts` | 実行履歴オブジェクトの配列 | 必須。同じTaskの実行を`sequence`順に並べる。各要素は下記「現在の実行履歴」の構造 |
+
+### 作業と選定する担当
+
+`task`に入れる項目は次のとおり。
+
+| 項目 | JSONでの形 | 含める条件と意味 |
+| --- | --- | --- |
+| `task_id` | 文字列 | 必須。どの作業のモデルを選ぶか |
+| `objective` | 文字列 | 必須。作業の目的 |
+| `constraints` | 文字列の配列 | 必須。利用者が指定した制約 |
+| `state` | 状態を表す値 | 必須。Taskの状態。例は`"active"`。全状態のJSON表記は未確定 |
+| `issue` | Issue情報オブジェクト | Issue起点の場合の情報。Issueを使わない場合の省略・`null`の区別は未確定 |
+| `requested_roles` | 担当指定オブジェクトの配列 | 必須。今回、どの担当のモデルを選ぶか |
+
+`task.requested_roles`の各要素に入れる項目:
+
+| 項目 | JSONでの形 | 意味 |
+| --- | --- | --- |
+| `role` | 空でない文字列 | 選定する担当。例は`implementer`、`reviewer` |
+| `instruction` | 文字列 | その担当へ依頼する仕事 |
+| `required_capabilities` | 文字列の配列（各要素は空文字列不可） | その担当に必要な能力の識別名。例は`workspace_write`、`code_review` |
+
+この3項目は必須。`task.issue`がある場合の項目は、`repository`（リポジトリ名）、`number`（非負整数のIssue番号）、`url`、`title`、`body`、`labels`（文字列の配列）、`comments`（コメントの配列）であり、すべて含める。`number`以外の単独の値は文字列である。各コメントには`url`、`author`、`created_at_ms`、`body`を含める。`created_at_ms`はUnix時刻のミリ秒を表す整数で、他の3項目は文字列である。
+
+### 実行先とモデル候補
+
+`providers`の各要素に入れる項目:
+
+| 項目 | JSONでの形 | 含める条件と意味 |
+| --- | --- | --- |
+| `provider` | 文字列 | 必須。実行先の識別名 |
+| `availability` | 利用可否オブジェクト | 必須。この実行先を使えるか。構造は下記「利用可否と値の取得根拠」 |
+| `limits` | 利用制限オブジェクトの配列 | 必須。この実行先全体に適用される制限 |
+| `api_usage` | API使用量オブジェクト | API使用量が対象外の場合だけ値なしを許す。例では`null`だが、省略も許すかは未確定 |
+| `performance` | 過去実績オブジェクトの配列 | 必須。この実行先全体の過去実績 |
+| `models` | モデル候補オブジェクトの配列 | 必須。この実行先で選べる候補 |
+
+各`providers[].models[]`に入れる項目:
+
+| 項目 | JSONでの形 | 含める条件と意味 |
+| --- | --- | --- |
+| `model` | モデル指定オブジェクト | 必須。下記の2形式のどちらか |
+| `availability` | 利用可否オブジェクト | 必須。このモデルを使えるか |
+| `limits` | 利用制限オブジェクトの配列 | 必須。このモデルだけに適用される制限 |
+| `api_usage` | API使用量オブジェクト | 実行先と同じく、対象外の場合だけ値なしを許す。JSONでの省略可否は未確定 |
+| `capabilities` | 文字列の配列（各要素は空文字列不可） | 必須。この候補が対応する能力の識別名 |
+| `performance` | 過去実績オブジェクトの配列 | 必須。このモデルの過去実績 |
+| `estimated_execution` | 計測項目オブジェクトの配列 | 必須。次の一回の実行についての推定値 |
+
+モデル指定オブジェクトは、名前指定なら`{"kind":"named","model":"モデル名"}`、実行先の既定モデルなら`{"kind":"provider_default"}`とする。候補を選ぶ際の指定に`unknown`は使わない。過去に実際に使ったモデルが不明な場合は、下記の実行履歴で区別する。
+
+### 利用可否と値の取得根拠
+
+`availability`には、`status`、`observed_at_ms`、`source`を必ず含める。`status`は`available`・`unavailable`・`unknown`の文字列であり、後者二つでは空でない文字列の`reason`も同じオブジェクトに含める。`observed_at_ms`は確認時刻を表す整数で、単位はUnix時刻のミリ秒である。`status`を別のオブジェクトへ入れ子にしない。
+
+使用量・金額・残量・件数などには、値の取得根拠を含む次のオブジェクトを使う。末尾のRust型案では、これを`Evidence<T>`と呼んでいる。`T`はその場所で入る値の型を表す。
+
+| 場合 | 必ず含める項目 | 意味 |
+| --- | --- | --- |
+| 値が分かる | `status: "known"`、`value`、`basis`、`assessed_at_ms`、`source` | 値そのものに、実測・設定・計算・推定のどれかを添える |
+| 値が分からない | `status: "unknown"`、`reason`、`assessed_at_ms`、`source` | 数値を作らず、取得できない理由を文字列で残す |
+
+`basis`は`measured`・`configured`・`computed`・`estimated`の文字列である。`assessed_at_ms`は取得または評価したUnix時刻のミリ秒を表す整数である。`source`は取得元を表し、次の2項目を必ず持つ。
+
+| 項目 | JSONでの形 | 意味 |
+| --- | --- | --- |
+| `kind` | `provider_api`・`provider_cli`・`execution_ledger`・`repository_config`の文字列 | API、CLI、記録DB、リポジトリ設定のどれから得たか |
+| `reference` | 文字列 | その情報の取得元や計算元を追うための情報 |
+
+金額・トークン数などの`value`は、`amount`（十進数を文字列にした量）と`unit`（単位の文字列）を持つオブジェクトである。件数の`value`は非負整数、時刻の`value`はUnix時刻のミリ秒を表す整数とする。これらは同じ形の数値ではなく、項目に応じた型で渡す。
+
+### 制限・API使用量・過去実績
+
+利用制限の各要素には、次の項目を含める。
+
+| 項目 | JSONでの形 | 含める条件と意味 |
+| --- | --- | --- |
+| `name` | 文字列 | 必須。要求回数など、制限する項目の名前 |
+| `scope` | 文字列 | 必須。アカウントやプロジェクトなど、制限が適用される範囲 |
+| `enforcement` | `hard`または`advisory`の文字列 | 必須。実行許可の条件か、比較の参考情報か |
+| `window` | 期間オブジェクト | 期間なしも表せるが、省略・`null`の区別は未確定 |
+| `limit`、`used`、`remaining` | 量と取得根拠を含むオブジェクト | 必須。それぞれ上限・使用量・残量。分かる場合の`value`は`amount`と`unit`を持つ |
+| `resets_at_ms` | 時刻と取得根拠を含むオブジェクト | 必須。リセット時刻。分かる場合の`value`は整数 |
+
+期間オブジェクトには、`starts_at_ms`と`ends_at_ms`を含める。どちらもUnix時刻のミリ秒を表す整数である。
+
+API使用量オブジェクトには、`scope`（適用範囲の文字列）、`window`（期間）、`actual_usage`（実使用量の配列）、`configured_budget`（設定予算の配列）、`remaining_budget`（残予算の配列）をすべて含める。
+
+- 実使用量と次回実行の推定値の各要素は、`name`と`value`を持つ。`value`は上記の取得根拠を含むオブジェクトで、分かる値には`amount`と`unit`を使う。
+- 設定予算と残予算の各要素には、さらに`enforcement`を含める。未設定の予算を架空の要素として追加しない。
+- 過去実績の各要素には、`window`、`attempts`、`succeeded`、`failed`、`cancelled`、`validation_passed`、`validation_failed`、`review_approved`、`review_changes_requested`、`review_inconclusive`、`retries`をすべて含める。`window`以外は取得根拠を含む件数であり、分かる場合の`value`は非負整数である。担当別の実績なら`role`も持つ。全担当をまとめた場合の`role`の省略・`null`の区別は未確定。
+
+過去実績の各件数が何を数えるかは[過去実績と現在の実行履歴](#過去実績と現在の実行履歴)に従う。
+
+### 現在の実行履歴
+
+`current_attempts`の各要素に入れる項目:
+
+| 項目 | JSONでの形 | 含める条件と意味 |
+| --- | --- | --- |
+| `attempt_id` | 文字列 | 必須。過去のモデル実行のID |
+| `sequence` | 非負整数 | 必須。Task内での実行順。履歴番号の条件は履歴設計に従う |
+| `role` | 空でない文字列 | 担当を復元できない旧履歴では省略する |
+| `relation` | 履歴関係オブジェクト | 関係の種類と、必要な参照先。値なしの場合のJSON表現は未確定 |
+| `target` | 実行先とモデルを持つオブジェクト | 必須。`provider`は文字列、`model`はモデル指定と取得根拠を含むオブジェクト。実際に使ったモデルが不明なら`status: "unknown"`にする |
+| `state` | 状態を表す値 | 必須。Attemptの状態。新旧の状態の意味とJSON表記の対応は未確定 |
+| `failure` | 失敗情報オブジェクト | `category`（分類の文字列）、`retryable`（真偽値）、`summary`（短い説明の文字列）。失敗情報がない場合の省略・`null`の区別は未確定 |
+| `validation` | 検証要約オブジェクトの配列 | 必須。各要素は`name`（文字列）、`passed`（真偽値）、`summary`（文字列）。結果不明をこの真偽値で表す方法は未確定 |
+| `review` | レビュー要約オブジェクト | `outcome`（レビューの結論）と`summary`（文字列）を持つ。旧履歴で復元できない場合は省略する |
+| `usage` | 利用量の一覧と取得根拠を含むオブジェクト | 必須。分かる場合の`value`は、`name`と`value`を持つ計測項目の配列 |
+| `started_at_ms`、`finished_at_ms` | 整数 | 開始・終了のUnix時刻をミリ秒で表す。時刻がない場合の省略・`null`の区別は未確定 |
+
+`review.outcome`は承認・修正要求・判断不能を区別する。Rust型案の`Approved`・`ChangesRequested`・`Inconclusive`をJSONの文字列へどう対応させるかは、まだ明記されていない。
+
+履歴関係オブジェクトは`kind`で種類を表す。`initial`と`legacy_unspecified`は種類だけ、`retry_of`・`escalation_of`・`review_of`は参照先の`attempt_id`、`rework_from`は`review_attempt_id`、`specified_input`は作成元の`attempt_id`を持つ。`specified_input`で参照先がない場合は`attempt_id: null`とする。この分類と参照条件は[履歴設計](implementation-review-model.md#守る規則)に従い、選定入力を作る際に再分類しない。
+
+### 送信形式でまだ確定していないこと
+
+| 不足している規則 | 現在の記述だけでは決められないこと |
+| --- | --- |
+| 値なし項目の表現 | `task.issue`、各`api_usage`、制限の`window`、実績の`role`、履歴の`relation`・`failure`・開始終了時刻などを、省略するか`null`にするか。`role`・`review`が復元不能な旧履歴で省略する規則と、`specified_input.attempt_id: null`は既に記載済み |
+| 状態とレビュー結論の文字列表現 | Task・Attemptの全状態とReviewOutcomeをJSONでどう表し、新旧履歴の意味の違いをどう伝えるか |
+| 結果不明の検証要約 | `ValidationSummary.passed`は真偽値しか持たないが、結果不明を失敗へ変換してはならない。新しいValidation結果との対応 |
+
+これらは例の見やすさとは別の、送信形式の仕様不足である。Rust型案や例から暗黙に補って実装せず、仕様を確定してから統合実装へ進む。
+
 ## 入力と出力の詳細なJSON例
 
-次の例は、同じ実行先でモデル名を指定する場合と既定モデルを使う場合、実測値・推定値・不明な値、複数担当への割当を示す。`example_api`、`sample-model-a`、利用量、金額はすべて架空であり、実在する
-Provider / Model の利用可否や価格を示さない。説明のため一部の空配列と履歴 field は省略している。
-実装する schema では Rust 型案にある必須 field を省略しない。
+以下は、Rustから監督Codexへ渡す入力と、監督CodexからRustへ返す出力を、実際に受け渡すJSONオブジェクトごとに分けた例です。外側に`input`や`output`という項目を付けて一つのJSONにまとめる形式ではありません。
 
-例示上は入力と出力を見比べられるよう、外側に `input` と `output` を並べている。実際の受け渡しでは
-この外側のobjectは使わず、`input` の値がCodexへの入力、`output` の値がCodexからの出力になる。
+例には、同じ実行先でモデル名を指定する候補と既定モデルを使う候補、実測値・推定値・不明な値、実装担当とレビュー担当の割当を含めます。実行先・モデル名・利用量・金額はすべて架空です。実在するモデルの利用可否や価格は示しません。
 
-<details>
-<summary>詳細なJSON例を表示する</summary>
+### Rustから監督Codexへ渡すJSON
+
+Rustは、作業の目的と制約、今回選ぶ担当、候補ごとの利用可否・使用量・制約・実績、現在の実行履歴を一つの入力にまとめます。監督Codexは、その情報から担当ごとの実行先とモデルを選びます。
+
+この例では、実装に`workspace_write`、レビューに`code_review`という能力を求めています。名前を指定する候補は両方に対応し、既定モデルの候補はレビューに対応しています。残予算の値は不明ですが、この例の予算は比較材料として扱う`advisory`です。実行を必ず制限する`hard`の残量が不明な場合は、[上限の確認規則](#強制する上限の残量が不明な場合)に従います。
 
 ```json
 {
-  "input": {
-    "schema_version": 1,
-    "request_id": "selection-01J...",
-    "captured_at_ms": 1790000000000,
-    "task": {
-      "task_id": "task-57",
-      "objective": "Issue #57 の入力・出力仕様を定義する",
-      "constraints": ["既存の状態遷移を迂回しない"],
-      "state": "active",
-      "issue": {
-        "repository": "owner/repository",
-        "number": 57,
-        "url": "https://github.com/owner/repository/issues/57",
-        "title": "モデル選定の入力・出力仕様を定義する",
-        "body": "...",
-        "labels": ["design"],
-        "comments": []
-      },
-      "requested_roles": [
-        {
-          "role": "implementer",
-          "instruction": "変更を実装して検証する",
-          "required_capabilities": ["workspace_write"]
-        },
-        {
-          "role": "reviewer",
-          "instruction": "完了条件と差分をレビューする",
-          "required_capabilities": ["code_review"]
-        }
-      ]
+  "schema_version": 1,
+  "request_id": "selection-01J...",
+  "captured_at_ms": 1790000000000,
+  "task": {
+    "task_id": "task-57",
+    "objective": "Issue #57 の入力・出力仕様を定義する",
+    "constraints": ["既存の状態遷移を迂回しない"],
+    "state": "active",
+    "issue": {
+      "repository": "owner/repository",
+      "number": 57,
+      "url": "https://github.com/owner/repository/issues/57",
+      "title": "モデル選定の入力・出力仕様を定義する",
+      "body": "...",
+      "labels": ["design"],
+      "comments": []
     },
-    "providers": [
+    "requested_roles": [
       {
-        "provider": "example_api",
-        "availability": {
-          "status": "available",
-          "observed_at_ms": 1790000000000,
-          "source": {"kind": "provider_api", "reference": "models.list"}
-        },
-        "limits": [],
-        "api_usage": {
-          "scope": "repository_budget",
-          "window": {"starts_at_ms": 1789990000000, "ends_at_ms": 1790076400000},
-          "actual_usage": [
+        "role": "implementer",
+        "instruction": "変更を実装して検証する",
+        "required_capabilities": ["workspace_write"]
+      },
+      {
+        "role": "reviewer",
+        "instruction": "完了条件と差分をレビューする",
+        "required_capabilities": ["code_review"]
+      }
+    ]
+  },
+  "providers": [
+    {
+      "provider": "example_api",
+      "availability": {
+        "status": "available",
+        "observed_at_ms": 1790000000000,
+        "source": {"kind": "provider_api", "reference": "models.list"}
+      },
+      "limits": [],
+      "api_usage": {
+        "scope": "repository_budget",
+        "window": {"starts_at_ms": 1789990000000, "ends_at_ms": 1790076400000},
+        "actual_usage": [
+          {
+            "name": "cost",
+            "value": {
+              "status": "known",
+              "value": {"amount": "1.42", "unit": "USD"},
+              "basis": "measured",
+              "assessed_at_ms": 1790000000000,
+              "source": {"kind": "provider_api", "reference": "usage"}
+            }
+          }
+        ],
+        "configured_budget": [
+          {
+            "name": "cost",
+            "enforcement": "advisory",
+            "value": {
+              "status": "known",
+              "value": {"amount": "10.00", "unit": "USD"},
+              "basis": "configured",
+              "assessed_at_ms": 1790000000000,
+              "source": {"kind": "repository_config", "reference": "daily_budget"}
+            }
+          }
+        ],
+        "remaining_budget": [
+          {
+            "name": "cost",
+            "enforcement": "advisory",
+            "value": {
+              "status": "unknown",
+              "reason": "provider did not expose a matching billing window",
+              "assessed_at_ms": 1790000000000,
+              "source": {"kind": "provider_api", "reference": "usage"}
+            }
+          }
+        ]
+      },
+      "performance": [],
+      "models": [
+        {
+          "model": {"kind": "named", "model": "sample-model-a"},
+          "availability": {
+            "status": "available",
+            "observed_at_ms": 1790000000000,
+            "source": {"kind": "provider_api", "reference": "models.list"}
+          },
+          "limits": [],
+          "api_usage": null,
+          "capabilities": ["workspace_write", "code_review"],
+          "performance": [],
+          "estimated_execution": [
             {
               "name": "cost",
               "value": {
                 "status": "known",
-                "value": {"amount": "1.42", "unit": "USD"},
-                "basis": "measured",
+                "value": {"amount": "0.08", "unit": "USD"},
+                "basis": "estimated",
                 "assessed_at_ms": 1790000000000,
-                "source": {"kind": "provider_api", "reference": "usage"}
-              }
-            }
-          ],
-          "configured_budget": [
-            {
-              "name": "cost",
-              "enforcement": "advisory",
-              "value": {
-                "status": "known",
-                "value": {"amount": "10.00", "unit": "USD"},
-                "basis": "configured",
-                "assessed_at_ms": 1790000000000,
-                "source": {"kind": "repository_config", "reference": "daily_budget"}
-              }
-            }
-          ],
-          "remaining_budget": [
-            {
-              "name": "cost",
-              "enforcement": "advisory",
-              "value": {
-                "status": "unknown",
-                "reason": "provider did not expose a matching billing window",
-                "assessed_at_ms": 1790000000000,
-                "source": {"kind": "provider_api", "reference": "usage"}
+                "source": {"kind": "execution_ledger", "reference": "recent_attempt_average"}
               }
             }
           ]
         },
-        "performance": [],
-        "models": [
-          {
-            "model": {"kind": "named", "model": "sample-model-a"},
-            "availability": {
-              "status": "available",
-              "observed_at_ms": 1790000000000,
-              "source": {"kind": "provider_api", "reference": "models.list"}
-            },
-            "limits": [],
-            "api_usage": null,
-            "capabilities": ["workspace_write", "code_review"],
-            "performance": [],
-            "estimated_execution": [
-              {
-                "name": "cost",
-                "value": {
-                  "status": "known",
-                  "value": {"amount": "0.08", "unit": "USD"},
-                  "basis": "estimated",
-                  "assessed_at_ms": 1790000000000,
-                  "source": {"kind": "execution_ledger", "reference": "recent_attempt_average"}
-                }
-              }
-            ]
+        {
+          "model": {"kind": "provider_default"},
+          "availability": {
+            "status": "available",
+            "observed_at_ms": 1790000000000,
+            "source": {"kind": "provider_cli", "reference": "capability_probe"}
           },
-          {
-            "model": {"kind": "provider_default"},
-            "availability": {
-              "status": "available",
-              "observed_at_ms": 1790000000000,
-              "source": {"kind": "provider_cli", "reference": "capability_probe"}
-            },
-            "limits": [],
-            "api_usage": null,
-            "capabilities": ["code_review"],
-            "performance": [],
-            "estimated_execution": []
-          }
-        ]
-      }
-    ],
-    "current_attempts": []
-  },
-  "output": {
-    "schema_version": 1,
-    "request_id": "selection-01J...",
-    "assignments": [
-      {
-        "role": "implementer",
-        "target": {
-          "provider": "example_api",
-          "model": {"kind": "named", "model": "sample-model-a"}
-        },
-        "reason": "利用可能で必要 capability を満たす候補だから"
-      },
-      {
-        "role": "reviewer",
-        "target": {
-          "provider": "example_api",
-          "model": {"kind": "provider_default"}
-        },
-        "reason": "レビュー capability を持つ利用可能な候補だから"
-      }
-    ]
-  }
+          "limits": [],
+          "api_usage": null,
+          "capabilities": ["code_review"],
+          "performance": [],
+          "estimated_execution": []
+        }
+      ]
+    }
+  ],
+  "current_attempts": []
 }
 ```
 
-選定結果にレビュー担当（`reviewer`）が含まれても、レビューが必須になるわけではない。監督Codexが必要な担当だけを要求する。履歴の関係はServiceが入力と確認済みの記録から保存する。選定理由（`reason`）はモデルを選んだ理由であり、再試行やレビュー指摘への修正を行った理由として使わない。
+### 監督CodexからRustへ返すJSON
 
-</details>
+監督Codexは、同じ`request_id`に対して、要求された担当ごとの実行先・モデル・選定理由を返します。上の入力にある利用量や利用可否を、選定結果の中で書き換えて返しません。
+
+この例では、実装担当には名前を指定したモデル、レビュー担当には実行先の既定モデルを選んでいます。Rustはこの結果を入力と現在の利用条件に照合してから、実行を許可するか確認します。
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "selection-01J...",
+  "assignments": [
+    {
+      "role": "implementer",
+      "target": {
+        "provider": "example_api",
+        "model": {"kind": "named", "model": "sample-model-a"}
+      },
+      "reason": "利用可能で必要 capability を満たす候補だから"
+    },
+    {
+      "role": "reviewer",
+      "target": {
+        "provider": "example_api",
+        "model": {"kind": "provider_default"}
+      },
+      "reason": "レビュー capability を持つ利用可能な候補だから"
+    }
+  ]
+}
+```
+
+選定結果にレビュー担当（`reviewer`）が含まれても、レビューが必須になるわけではありません。監督Codexが必要な担当だけを要求します。履歴の関係はServiceが入力と確認済みの記録から保存します。選定理由（`reason`）はモデルを選んだ理由であり、再試行やレビュー指摘への修正を行った理由として使いません。
 
 ## Rustが行う検証
 
