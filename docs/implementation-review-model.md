@@ -95,7 +95,7 @@ Attemptごとに、少なくとも次の情報を記録します。
 | 理由（relation kind） | `Initial`、`RetryOf`、`EscalationOf`、`ReviewOf`、`ReworkFrom`、`SpecifiedInput`のいずれか。移行時に関係を復元できない旧記録は`LegacyUnspecified`とする |
 | 参照先（related attempt） | `RetryOf`などの既存の理由に必要なAttempt、または`SpecifiedInput`のArtifactInputに記録された同じTask内の作成元Attempt。理由が不明でも作成元が分かるなら参照を保持する。BaseInputと作成元不明の場合は参照先なし |
 | 実行の状態 | 実行中、成功、失敗、取消のどれか |
-| 結果 | 実装結果、検証結果、利用量、レビュー結果など |
+| 結果 | モデル呼び出しの終了結果、AgentResult（モデルの作業報告）、利用量など。検証結果とレビューの結論は別の記録に保存する |
 
 実装担当が実装と修正を行います。修正専用のroleは設けません。実装担当の履歴をまとめて確認でき、`ReworkFrom`の場合は、どのレビュー指摘に基づく修正かも追えます。
 
