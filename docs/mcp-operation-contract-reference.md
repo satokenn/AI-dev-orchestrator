@@ -2,9 +2,9 @@
 
 ## 読者・前提・適用する版
 
-まず[全体像](architecture.md)と[操作の概要](mcp-operation-contract.md)を読む。本書は、その操作の入力項目・出力項目・エラーを実装や照合に使う参照資料である。目的や分担を確認するレビューで、本書を先頭から読む必要はない。
+まず[全体像](architecture.md)と[操作の概要](mcp-operation-contract.md)を読む。本書はその操作の入力項目・出力項目・エラーを実装や照合に使う参照資料である。目的や分担を確認するレビューで、本書を先頭から読む必要はない。
 
-**ここに記載する形式はv1である。** [統合設計の適用版](operation-service-integration-design.md#根拠と適用版)は、承認済みPR #84のモデル指定変更とPR #88のCI観測変更を適用したv2を対象にする。本PRはその変更を本書の表へ取り込んだり、v2の実装を提供したりするものではない。両者を同じ版の入力として混ぜない。モデル選定用の別仕様にある整数`schema_version: 1`とも区別する。
+**ここに記載する形式はv1である**。 [統合設計の適用版](operation-service-integration-design.md#根拠と適用版)は承認済みPR #84のモデル指定変更とPR #88のCI観測変更を適用したv2を対象にする。本PRはその変更を本書の表へ取り込んだり、v2の実装を提供したりするものではない。両者を同じ版の入力として混ぜない。モデル選定用の別仕様にある整数`schema_version: 1`とも区別する。
 
 ## この資料の使い方
 
@@ -43,11 +43,11 @@ MCPの`inputSchema`が入力形式、任意の`outputSchema`が構造化され�
 | `T \| null` | T型またはJSON `null`。項目自体は省略できない |
 | `enum(a, b)` | 記載した文字列値のみ許可 |
 
-すべての操作の入力の`params.arguments`は`schema_version: "v1"`を必須とする。未対応版は`unsupported_schema_version`。不明な入力項目は`invalid_request`とし、副作用前に拒否する。成功する操作の出力の`structuredContent`はすべて`schema_version: "v1"`を含む。業務エラーはMCPの操作実行エラー（`isError: true`）として返し、`content`に下記の種類を識別できるエラーを含める。MCP入力の付随情報や通信規約上のエラーはこのアプリケーション契約の対象外。
+すべての操作で、入力の`params.arguments`は`schema_version: "v1"`を必須とする。未対応版は`unsupported_schema_version`。不明な入力項目は`invalid_request`とし、副作用前に拒否する。成功する操作の出力の`structuredContent`はすべて`schema_version: "v1"`を含む。業務エラーはMCPの操作実行エラー（`isError: true`）として返し、`content`に下記の種類を識別できるエラーを含める。MCP入力の付随情報や通信規約上のエラーはこのアプリケーション契約の対象外。
 
 DBの更新や外部処理の実行を伴う入力は`request_id: string`を必須とする。既存Taskを変更する場合はさらに`task_id: string`と`expected_revision: integer`を必須とする。読取入力は`request_id`と`expected_revision`を持たない。
 
-同じ依頼の再送を識別するキー（冪等性キー）の範囲は`caller + tool name + request_id`。`task.create`を含むDB更新や外部処理を伴うすべての入力に適用する。同じキーで、形式を揃えた入力内容も同じ場合は保存済みの応答を返し、DB更新や外部処理を繰り返さない。同じキーで入力内容が異なる場合は`idempotency_conflict`で拒否する。
+同じ依頼の再送を識別するキー（冪等性キー）の範囲は`caller + tool name + request_id`。`task.create`を含むDB更新や外部処理を伴うすべての入力に適用する。同じキーで、形式を揃えた入力内容も一致する場合は保存済みの応答を返し、DB更新や外部処理を繰り返さない。同じキーで入力内容が異なる場合は`idempotency_conflict`で拒否する。
 
 IDはすべて文字列として扱い、呼出側はIDの形式・連番・内部構造を解釈しない。日時はRFC 3339形式の文字列（例: `2026-10-10T15:00:00Z`）として送受信し、UTCを示す`Z`を使う。項目が任意なら省略し、nullを使うのは型に`| null`と明記された場合だけ。
 
@@ -99,11 +99,11 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 | `kind` | `enum(validation, review, decision, publication, ci)` | 必須 | 参照する記録の種別 |
 | `id` | `string` | 必須 | Serviceが発行した記録ID |
 
-根拠となる記録は結果を申告する項目ではなく、保存済み記録への参照である。Serviceは存在、Task所属、対象Artifactを照合する。CI 根拠となる記録は対象Publicationのリポジトリ、PR、公開先コミットの識別子が一致しなければならない。存在しないIDは`invalid_request`、別Artifactに属する記録は`evidence_artifact_mismatch`。
+根拠として指定するのは、結果の申告ではなく、保存済み記録への参照である。Serviceは、指定した記録が存在するか、対象Taskに属するか、どのArtifactを対象にしているかを照合する。CIの根拠となる記録は対象Publicationのリポジトリ、PR、公開先コミットの識別子が一致しなければならない。存在しないIDは`invalid_request`、別Artifactに属する記録は`evidence_artifact_mismatch`。
 
 ### `ContextItem`
 
-各`task.get_context` 情報の分類は次の共通項目を返す。`details`の型は情報の分類ごとの表で定義する。
+`task.get_context`は情報の分類ごとに次の共通項目を返す。`details`の型は情報の分類ごとの表で定義する。
 
 | 項目 | JSON型 | 必須性 | 意味 |
 | --- | --- | --- | --- |
@@ -202,7 +202,7 @@ IDはすべて文字列として扱い、呼出側はIDの形式・連番・内�
 | `items` | `array<ContextItem>` | 必須 | 情報の分類に属する履歴記録。情報の分類固有の`details`型を使う |
 | `next_cursor` | `string \| null` | 必須 | 次ページ取得用トークン。nullは現在の時点固定記録に続きがない |
 
-続きの取得位置（続きの取得位置）は中身を解釈せずに使い、Task・情報の分類・取得件数・一覧を固定した時点の更新番号に結び付ける。次ページでは同じ取得件数と、同じ情報の分類の続きの取得位置を使う。更新番号変更等で利用できない続きの取得位置は`invalid_cursor`。履歴は`occurred_at`降順、同時刻ならID降順。ページ境界に重複・欠落を作らない。
+続きの取得位置は中身を解釈せずに使い、Task・情報の分類・取得件数・一覧を固定した時点の更新番号に結び付ける。次ページでは同じ取得件数と、同じ情報の分類の続きの取得位置を使う。更新番号の変更等で続きの取得位置を利用できない場合は`invalid_cursor`。履歴は`occurred_at`降順、同時刻ならID降順。ページ境界に重複・欠落を作らない。
 
 ### `OperationAcceptance`
 
@@ -275,7 +275,7 @@ Taskを作成する。`request_id`は再送を識別するキーに含まれる�
 
 `issue`は前述の`IssueSnapshot`型を使う。タイトルと本文は作成時点で固定した記録。
 
-成功出力:
+成功出力
 
 | 項目 | JSON型 | 必須性 | 意味 |
 | --- | --- | --- | --- |
@@ -286,7 +286,7 @@ Taskを作成する。`request_id`は再送を識別するキーに含まれる�
 | `state` | `const "pending"` | 必須 | 初期作業の状態 |
 | `request` | `TaskRequest` | 必須 | 保存したsource・要求・制約・Issue 時点固定記録 |
 
-例（操作 `arguments`）:
+例（操作 `arguments`）
 
 ~~~json
 {
@@ -299,11 +299,11 @@ Taskを作成する。`request_id`は再送を識別するキーに含まれる�
 }
 ~~~
 
-同じ`request_id`・同じ入力は同じ作成結果を返す。入力内容違いの再利用は`idempotency_conflict`。
+同じ`request_id`・同じ入力は同じ作成結果を返す。入力内容を変えて再利用すると`idempotency_conflict`となる。
 
 ### `task.get_context`
 
-Taskと選択した情報の分類の時点固定記録を読む。読取専用。
+Taskと、選択した分類の情報を、記録した時点の内容で読む。読取専用。
 
 | 入力項目 | JSON型 | 必須性 | 意味 |
 | --- | --- | --- | --- |
@@ -313,7 +313,7 @@ Taskと選択した情報の分類の時点固定記録を読む。読取専用�
 | `page_size` | `integer (minimum: 1, maximum: 100)` | 任意、既定20 | 各情報の分類から返す最大件数 |
 | `cursors` | `object<string, string>` | 任意 | 情報の分類名と、その分類の次ページ用の続きの取得位置の対応表 |
 
-成功出力:
+成功出力
 
 | 項目 | JSON型 | 必須性 | 意味 |
 | --- | --- | --- | --- |
@@ -322,7 +322,7 @@ Taskと選択した情報の分類の時点固定記録を読む。読取専用�
 | `sections` | `object<string, ContextPage>` | 必須 | 要求された情報の分類ごとのページ |
 | `observed_at` | `string (format: date-time)` | 必須 | 時点固定記録観測時刻 |
 
-例（`sections.attempts.items`の一部）:
+例（`sections.attempts.items`の一部）
 
 ~~~json
 {
@@ -374,7 +374,7 @@ operation状態・結果を読む。読取専用。
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `operation_id` | `string` | 必須 | 取得対象 |
 
-成功出力:
+成功出力
 
 | 項目 | JSON型 | 必須性 | 意味 |
 | --- | --- | --- | --- |
@@ -660,7 +660,7 @@ Task完了を要求する。指定されたArtifact、採用とした判断、�
 
 `stale_revision`、`policy_denied`等の業務エラーはMCPの操作実行エラーとして返し、`isError: true`にする。エラーの詳細は`ErrorPayload`に従う。データ形式/JSON-RPC構造不正などMCP通信規約上のエラーと、業務上の操作エラーを混同しない。
 
-`retryable: true`は同じ入力の再送許可を意味しない。DB更新や外部処理を伴う入力を作り直す場合は、新しい要求IDと最新更新番号を使う。時間切れや中断で実行結果を確定できない場合、Serviceは`recovery_required`を記録し、成功・失敗・未実行のいずれかを推測しない。状態確定までは同一operationの再実行をせず、`operation.get`で確認する。
+`retryable: true`は同じ入力の再送許可を意味しない。DB更新や外部処理を伴う入力を作り直す場合は、新しい要求IDと最新更新番号を使う。時間切れや中断で実行結果を確定できない場合、Serviceは`recovery_required`を記録し、成功・失敗・未実行のいずれかを推測しない。状態確定までは同一operationを再実行せず、`operation.get`で確認する。
 
 ## 秘密情報の扱い
 

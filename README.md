@@ -41,7 +41,7 @@ timeout / cancel時のprocess group停止、停止確認結果、部分ログと
 
 ## AgentProvider 契約
 
-Agent 実行先の違いは `AgentProvider` に閉じ込めます。実装は `ProviderRequest` の workspace、prompt、timeout を受け取り、`ProviderResult` の stdout、stderr、終了状態、任意の `AgentResult` と `UsageCost` を返します。実行に失敗した場合は `ProviderError`（不正な要求、実行失敗、タイムアウト、利用不能）を返します。
+Agent 実行先ごとの違いは `AgentProvider` の実装で扱います。実装は `ProviderRequest` の workspace、prompt、timeout を受け取り、`ProviderResult` の stdout、stderr、終了状態、任意の `AgentResult` と `UsageCost` を返します。実行に失敗した場合は `ProviderError`（不正な要求、実行失敗、タイムアウト、利用不能）を返します。
 
 Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数やセッション情報は共通契約に含めません。
 
@@ -69,13 +69,13 @@ Provider の識別子は `ProviderRef` で表し、Provider 固有の CLI 引数
 
 ## Orchestrator Service
 
-以下は現在のCLI Orchestrator実装の説明です。現行LedgerではAttemptのSucceeded/FailedがValidation結果と結合した旧意味論です（`legacy_validation_coupled`）。新しいMCP Operation Serviceの契約ではAttempt stateはProvider呼出し結果のみを表します。両者を同一のruntime semanticsとして扱わないでください。
+以下は現在のCLI Orchestrator実装の説明です。現行LedgerではAttemptのSucceeded/FailedにValidation結果を含める旧来の定義を使います（`legacy_validation_coupled`）。新しいMCP Operation Serviceの契約ではAttempt stateはProvider呼出し結果のみを表します。両者を実行時に同じ意味を持つものとして扱わないでください。
 
 `Orchestrator`（`OrchestratorService` の別名）は、Pending の Task を Active にし、Task が所有する1つの Attempt を Queued から Running、Provider 実行、Validating へ進め、`Validator` の aggregate 結果を一度だけ適用します。検証成功時は Attempt が Succeeded、検証失敗時は Failed になります。Provider の失敗や Validator 自体の実行エラーも、失敗した Attempt と Workspace、診断を含む型付き `OrchestratorError` として返します。
 
 Retry / escalation は `RetryPolicy` と `ProviderResolver` を介して Orchestrator が制御します。`execute_decision` は PlannerDecision の意図だけを受け取り、Attempt ID、状態遷移、Provider 解決、Attempt ごとの Workspace 作成は Rust 側で行います。`max_attempts` は新しい Attempt を追加する前に検査され、終端 Task への追加は拒否されます。timeout / cancellation の retry は policy で明示的に許可した場合だけ可能です。`ProviderRegistry` は複数 Provider の本番配線と fake 差し替えに利用できます。
 
-Planner 経路では `ExecutionPolicy` と `execute_decision_with_policy` を使用してください。この hard gate は `max_attempts`、ProviderRegistry 解決、Provider 別 timeout、Provider availability を、Task / Attempt / workspace の変更より前に検査します。timeout は caller から受け取らず、policy に設定された値だけが ProviderRequest に渡されます。availability check は全 AgentProvider の必須境界で、未実装 Provider は fail-closed になります。
+Planner 経路では `ExecutionPolicy` と `execute_decision_with_policy` を使用してください。この実行前の必須検査では `max_attempts`、ProviderRegistry による解決、Provider 別 timeout、Provider availability を、Task / Attempt / workspace を変更する前に検査します。timeout は caller から受け取らず、policy に設定された値だけが ProviderRequest に渡されます。availability check は全 AgentProvider で必須の検査です。未実装 Provider は実行を拒否します。
 
 Issue #30 の1 Attemptフローは、検証成功時も Task を Active のまま返します。Task全体の完了判断は後続の実行ポリシーで確定します。作成した worktree は Orchestrator が自動削除しないため、結果や未コミット変更を確認した後に `WorkspaceManager::cleanup`（または明示的な `cleanup_force`）を呼び出します。
 
@@ -112,7 +112,7 @@ Service、Ledger、MCPの接続方針は[Operation Service統合設計](docs/ope
 [実装・レビュー・修正を記録する設計](docs/implementation-review-model.md)を参照してください。
 
 `Attempt` をモデル呼び出し1回の記録として扱い、機械検証、AI review verdict、監督Codexの受入、
-公開/CI、Task完了を成果物へ束縛する別の事実として扱うDomain契約は、
+公開/CI、Task完了をそれぞれ成果物に結び付いた別の事実として扱うDomain契約は、
 [作業・モデル実行・成果物のドメインモデル](docs/domain-model.md)を参照してください。
 
 監督Codexが依頼できる操作と返る事実は、[MCP 操作契約の概要](docs/mcp-operation-contract.md)を参照してください。

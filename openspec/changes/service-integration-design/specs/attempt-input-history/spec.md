@@ -2,9 +2,9 @@
 
 ## Purpose
 
-作業依頼（`Task`）の中でモデルを一回呼び出した記録（`Attempt`）、保存済みの変更（`Artifact`）、作業開始時点のcommit（`BaseInput`）を扱います。この仕様は、明示された入力と、その入力が履歴上どこから来たかを記録します。既存分類と旧履歴の意味を保ち、調査やレビューなしの修正を誤った理由へ結び付けません。
+作業依頼（`Task`）の中でモデルを一回呼び出した記録（`Attempt`）、保存済みの変更（`Artifact`）、作業開始時点のcommit（`BaseInput`）を扱います。この仕様は明示された入力と、その入力が履歴上どこから来たかを記録する方法を定めます。既存分類と旧履歴の意味を保ち、調査やレビューなしの修正を誤った理由へ結び付けません。
 
-履歴分類、既存relationの優先、旧履歴移行の詳細な正本は[実装・レビュー・修正を記録する設計](../../../../../docs/implementation-review-model.md#守る規則)と[ドメインモデル](../../../../../docs/domain-model.md#実装検証任意レビューの例)です。この差分は、そこに定めた`SpecifiedInput`の条件を独立して検証可能にします。
+履歴分類、既存relationの優先、旧履歴移行の詳細な正本は[実装・レビュー・修正を記録する設計](../../../../../docs/implementation-review-model.md#守る規則)と[ドメインモデル](../../../../../docs/domain-model.md#実装検証任意レビューの例)です。この差分はそこに定めた`SpecifiedInput`の条件を独立して検証可能にします。
 
 ## ADDED Requirements
 
@@ -15,7 +15,7 @@
 #### Scenario: Validation失敗後にレビューなしで成果物を修正する
 
 - **WHEN** 成功した実装Attemptが作成したArtifactを明示入力とし、検証失敗後にレビューを経ない実装Attemptを依頼する
-- **THEN** 新しいAttemptを`SpecifiedInput`として記録し、既存の根拠のない`RetryOf`や`ReworkFrom`にはしない
+- **THEN** 新しいAttemptを`SpecifiedInput`として記録し、根拠がないまま`RetryOf`や`ReworkFrom`には分類しない
 
 #### Scenario: 現在Artifactの作成元が分かるレビュー
 
