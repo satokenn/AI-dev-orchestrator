@@ -12,7 +12,8 @@ context: |
   移行済み仕様がないことを、既存要件がないこととして扱わない。
   docs/architecture.mdを入口とし、操作はdocs/mcp-operation-contract.mdと
   docs/mcp-operation-contract-reference.md、状態はdocs/domain-model.md、履歴は
-  docs/implementation-review-model.md、モデル選定はdocs/model-selection-spec.mdを確認する。
+  docs/implementation-review-model.md、モデル選定の概要はdocs/model-selection-spec.md、
+  選定用JSONの詳細はdocs/model-selection-spec-reference.mdを確認する。
   承認済みの要件を保ち、未マージPRや未コミット変更を承認済み仕様と混同しない。
   仕様や記録形式が存在することを、製品の統合実装が完成したこととして扱わない。
   自動モデル選択、自動修正、自動レビュー、自動マージなどを先回りして追加しない。

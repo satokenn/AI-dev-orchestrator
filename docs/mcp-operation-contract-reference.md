@@ -311,7 +311,9 @@ Validationでいう一つの「検査」（check）は、名前・実行コマ�
 
 Taskを作成する。`request_id`は再送を識別するキーに含まれる。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 重複作成を防ぐ要求ID |
@@ -323,18 +325,7 @@ Taskを作成する。`request_id`は再送を識別するキーに含まれる�
 
 `source`の`issue`と`manual`は、[依頼内容の記録](#taskrequest--tasksnapshot)で定義した出所を表す。`issue`項目には、呼出側が取得した時点のIssueのURL・番号・タイトル・本文を渡す。Serviceはこれを作成時の依頼として保存する。
 
-成功出力
-
-| 項目 | JSON型 | 省略できるか | 意味 |
-| --- | --- | --- | --- |
-| `schema_version` | `const "v1"` | 必須 | 形式の版 |
-| `request_id` | `string` | 必須 | 入力で受け取った要求IDをそのまま返す |
-| `task_id` | `string` | 必須 | 新規Task ID |
-| `revision` | `integer` | 必須 | 初期更新番号 |
-| `state` | `const "pending"` | 必須 | 初期作業の状態 |
-| `request` | `TaskRequest` | 必須 | 作業作成時に受け取って保存した出所・タイトル・依頼本文・制約・Issue情報 |
-
-例（操作 `arguments`）
+##### 入力例
 
 ~~~json
 {
@@ -347,15 +338,30 @@ Taskを作成する。`request_id`は再送を識別するキーに含まれる�
 }
 ~~~
 
-上の例は、Issueを使わず「区切り文字のエスケープに対応する」と直接依頼する入力である。`issue`項目は省略している。返る`request`には、出所・タイトル・依頼本文・制約と`issue: null`を含む。通信上の`schema_version`と`request_id`は、`request`内の項目ではない。
+上の例は、Issueを使わず「区切り文字のエスケープに対応する」と直接依頼する入力である。`issue`項目は省略している。
 
 同じ呼出元が`task.create`を同じ`request_id`・同じ入力で再送した場合は、同じ作成結果を返す。入力内容を変えて再利用すると`idempotency_conflict`となる。
+
+#### 出力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
+| --- | --- | --- | --- |
+| `schema_version` | `const "v1"` | 必須 | 形式の版 |
+| `request_id` | `string` | 必須 | 入力で受け取った要求IDをそのまま返す |
+| `task_id` | `string` | 必須 | 新規Task ID |
+| `revision` | `integer` | 必須 | 初期更新番号 |
+| `state` | `const "pending"` | 必須 | 初期作業の状態 |
+| `request` | `TaskRequest` | 必須 | 作業作成時に受け取って保存した出所・タイトル・依頼本文・制約・Issue情報 |
+
+入力例の`manual`による作成では、返る`request`には、出所・タイトル・依頼本文・制約と`issue: null`を含む。通信上の`schema_version`と`request_id`は、`request`内の項目ではない。
 
 ### `task.get_context`
 
 Taskと、選択した分類の情報を、記録した時点の内容で読む。読取専用。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `task_id` | `string` | 必須 | 読むTask |
@@ -363,7 +369,7 @@ Taskと、選択した分類の情報を、記録した時点の内容で読む�
 | `page_size` | `integer (minimum: 1, maximum: 100)` | 任意、既定20 | 各情報の分類から返す最大件数 |
 | `cursors` | `object<string, string>` | 任意 | 情報の分類名と、その分類の次ページ用の続きの取得位置の対応表 |
 
-成功出力
+#### 出力
 
 | 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
@@ -390,7 +396,9 @@ Taskと、選択した分類の情報を、記録した時点の内容で読む�
 
 指定Provider / Modelを一回実行する。長時間処理。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
@@ -413,18 +421,22 @@ Taskと、選択した分類の情報を、記録した時点の内容で読む�
 
 入力Artifactは同じTaskに属する必要がある。ブランチ名やパスだけの開始時点のコード指定は認めない。
 
+#### 出力
+
 成功出力は`OperationAcceptance`。`attempt_id`を必須とする。受付時の`operation.state`は`accepted`。
 
 ### `operation.get`
 
 operation状態・結果を読む。読取専用。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `operation_id` | `string` | 必須 | 取得対象 |
 
-成功出力
+#### 出力
 
 | 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
@@ -489,13 +501,17 @@ operation状態・結果を読む。読取専用。
 
 指定operationのログ範囲を読む。ログ本文は伏せ字化済み。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `operation_id` | `string` | 必須 | 対象operation |
 | `stream` | `enum(stdout, stderr, diagnostic)` | 必須 | 読む出力の種類 |
 | `cursor` | `string` | 任意 | 次ページ用の続きの取得位置 |
 | `limit` | `integer (minimum: 1, maximum: 1000)` | 任意、既定100 | 取得するログの一片の最大件数 |
+
+#### 出力
 
 成功出力は次の項目をすべて含む。`LogChunk`の項目もすべて必須。
 
@@ -518,7 +534,9 @@ operation状態・結果を読む。読取専用。
 
 ひとつのoperationへの取消を要求する。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
@@ -526,13 +544,17 @@ operation状態・結果を読む。読取専用。
 | `expected_revision` | `integer` | 必須 | 最後に確認した更新番号 |
 | `operation_id` | `string` | 必須 | 取消対象 |
 
+#### 出力
+
 成功出力は`OperationAcceptance`。`operation`は取消要求を表す新operation。対象operationが停止するまでは取消完了ではない。
 
 ### `task.cancel`
 
 Taskと未終了operationの取消を要求する。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
@@ -540,13 +562,17 @@ Taskと未終了operationの取消を要求する。
 | `expected_revision` | `integer` | 必須 | 最後に確認した更新番号 |
 | `reason` | `string` | 任意 | 取消理由 |
 
+#### 出力
+
 成功出力は`OperationAcceptance`。operationの完了前にTaskの取消完了とは扱わない。
 
 ### `validation.run`
 
 保存済み成果物を対象に、ビルド・テスト・静的解析などのコマンドを実行する。起動側がコマンドの組合せに付けた名前（`check_profile_id`）を指定するか、実行するコマンドを`checks`に直接渡す。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
@@ -569,6 +595,8 @@ Serviceは、コマンドと作業場所が起動側の許可一覧に含まれ�
 
 受付応答は実行完了を意味しない。終了後に`operation.get`を呼ぶと、対象成果物、検証全体の状態、コマンドごとの結果を取得できる。`checks`の空配列を成功とは扱わず、結果不明として記録する。複数コマンドの結果から全体の状態を決める細則は、[残る仕様確認](operation-service-integration-design.md#説明の補足と仕様の確定を分ける)を参照する。
 
+#### 出力
+
 成功出力は`OperationAcceptance`の全項目と、次の必須項目を返す。最終結果の各項目は`operation.get`の`validation.run` 結果のデータ形式を参照。
 
 | 項目 | JSON型 | 省略できるか | 意味 |
@@ -579,7 +607,9 @@ Serviceは、コマンドと作業場所が起動側の許可一覧に含まれ�
 
 監督Codexの判断をArtifactに記録する。同期処理。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
@@ -589,6 +619,8 @@ Serviceは、コマンドと作業場所が起動側の許可一覧に含まれ�
 | `decision` | `enum(accepted, rejected, changes_requested)` | 必須 | 判断 |
 | `reason` | `string` | 必須 | 判断理由 |
 | `evidence` | `array<EvidenceRef>` | 任意 | 判断に参照した保存済み証拠 |
+
+#### 出力
 
 成功出力の項目はすべて必須。
 
@@ -614,7 +646,9 @@ Serviceは、コマンドと作業場所が起動側の許可一覧に含まれ�
 
 指定した成果物をPRとして公開する。起動側が設定した許可条件に必要な根拠記録がなければ、公開を始める前に拒否する。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
@@ -630,6 +664,8 @@ Serviceは、コマンドと作業場所が起動側の許可一覧に含まれ�
 
 公開前にServiceは`decision_id`で保存済み採用判断を検索し、採用判断が`accepted`で、その`artifact_id`が公開対象と一致することを確認する。不在・不一致・採用以外の判断なら`invalid_state_transition`で拒否する。加えてServiceはArtifactと公開時に渡す内容を起動側が設定した秘密情報検査の規則で検査する。秘密情報検出または検査を安全に完了できない場合は`policy_denied`とし、コミット・push・PR作成を開始しない。通常のValidation成功だけでは秘密情報検査済みを意味しない。
 
+#### 出力
+
 成功出力は`OperationAcceptance`の全項目と、次の必須項目を返す。最終結果は`operation.get`の`publication.publish` 結果のデータ形式を参照。
 
 | 項目 | JSON型 | 省略できるか | 意味 |
@@ -640,7 +676,9 @@ Serviceは、コマンドと作業場所が起動側の許可一覧に含まれ�
 
 PR / コミットの検査状態を一度観測する。読取専用。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `publication_id` | `string` | `target`未指定時に必須 | Publicationの指定 |
@@ -654,6 +692,8 @@ PR / コミットの検査状態を一度観測する。読取専用。
 |  | `number` | `integer (minimum: 1)` | 必須 | PR番号 |
 | `CommitTarget` | `repository` | `string` | 必須 | リポジトリ |
 |  | `sha` | `string` | 必須 | コミット SHA |
+
+#### 出力
 
 成功出力は次の項目をすべて含む。`passed`は観測対象SHAに限る。
 
@@ -670,7 +710,9 @@ PR / コミットの検査状態を一度観測する。読取専用。
 
 CI状態を待機期限まで待つ。長時間処理。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
@@ -680,13 +722,19 @@ CI状態を待機期限まで待つ。長時間処理。
 | `target` | `PullRequestTarget \| CommitTarget` | `publication_id`未指定時に必須 | PRまたはコミットの指定 |
 | `deadline` | `string (format: date-time)` | 必須 | 待機期限（RFC 3339 UTC） |
 
-`publication_id`と`target`は同時に指定しない。成功出力は`OperationAcceptance`。期限までにCIが確定しない場合、operationは`failed`、`result`はnull、`error.code`は`timeout`、`error.details_ref`は最後に永続化したCI観測記録（`CiObservation`）のIDを返す。CI結果が未確定でも観測記録自体を永続化できた場合はこの時間切れ応答であり、成功扱いではない。Serviceがoperationの終了状態または最後の観測値の永続化を確定できない中断の場合は`recovery_required`とし、結果を推測しない。
+`publication_id`と`target`は同時に指定しない。
+
+#### 出力
+
+成功出力は`OperationAcceptance`。期限までにCIが確定しない場合、operationは`failed`、`result`はnull、`error.code`は`timeout`、`error.details_ref`は最後に永続化したCI観測記録（`CiObservation`）のIDを返す。CI結果が未確定でも観測記録自体を永続化できた場合はこの時間切れ応答であり、成功扱いではない。Serviceがoperationの終了状態または最後の観測値の永続化を確定できない中断の場合は`recovery_required`とし、結果を推測しない。
 
 ### `task.finish`
 
 Task完了を要求する。指定されたArtifact、採用とした判断、起動側の許可規則で必須とする根拠記録を照合し、満たさなければ状態を変えない。
 
-| 入力項目 | JSON型 | 省略できるか | 意味 |
+#### 入力
+
+| 項目 | JSON型 | 省略できるか | 意味 |
 | --- | --- | --- | --- |
 | `schema_version` | `const "v1"` | 必須 | 形式の版 |
 | `request_id` | `string` | 必須 | 呼出側が依頼に付けるID。同じ依頼を再送するときは同じ値 |
@@ -695,6 +743,8 @@ Task完了を要求する。指定されたArtifact、採用とした判断、�
 | `artifact_id` | `string` | 必須 | 完了対象Artifact |
 | `decision_id` | `string` | 必須 | 同じArtifactへの採用判断（`accepted`のCodexDecision） |
 | `evidence` | `array<EvidenceRef>` | 任意 | 追加で照合する証拠 |
+
+#### 出力
 
 成功出力の項目はすべて必須。
 

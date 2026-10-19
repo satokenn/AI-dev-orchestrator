@@ -68,6 +68,7 @@ git diff --name-only <base>...HEAD
 - 状態、複数の結果、責務境界など関係が複雑な内容は、表・概念図・代表的な利用例を用いて説明する。通常系だけでなく、失敗や判断が分かれる代表例も示す。
 - 実装名、保存形式、移行、例外、対象外、後続Issueは、基本の流れを説明した後に置く。要約だけで重要な条件を省略したり、詳細を先頭へ詰め込んだりしない。
 - 構成上の参照例は [実装・レビュー・修正を記録する設計](docs/implementation-review-model.md) とする。ただし、内容に不要な節や図を機械的に複製せず、対象読者と複雑さに応じて最小の構成を選ぶ。
+- 文書の担当範囲は[全体像の文書案内](docs/architecture.md#詳細仕様を読む順番)に従う。同じ役割の文書で概要と詳細の分け方を揃え、入出力は同じ階層・同じ列構成で定義する。レビューでは、値やリンクの一致に加えて、文書間の担当範囲と文書内の説明の粒度を確認する。
 
 ## 検証ルール
 
@@ -108,7 +109,8 @@ cargo test --workspace --all-features
 - [`README.md`](README.md): プロジェクト概要と開発者向けの入口
 - [OpenSpecの使い方](openspec/README.md): 提案中の統合設計の読む順番、要件・設計・残作業の分担、既存仕様の移行状況
 - [開発支援システムの全体像](docs/architecture.md): 最初に読む入口。目的、登場人物、作業の流れ、設定の出どころ、詳細仕様を読む順番
-- [モデル選定の入力・出力仕様](docs/model-selection-spec.md): Provider / Model選定の入力、出力、観測事実とCodex判断の責務境界
+- [モデル選定の概要](docs/model-selection-spec.md): モデルを選ぶ目的、判断の流れ、Rustと監督Codexの分担
+- [モデル選定の詳細仕様](docs/model-selection-spec-reference.md): 選定用JSONの項目・型・省略条件、共通形式、入出力例、拒否条件と未確定事項
 - [Operation Service統合設計](docs/operation-service-integration-design.md): Service、Ledger、MCPの接続方針、依存所有、未実装範囲
 - [実装・レビュー・修正を記録する設計](docs/implementation-review-model.md): 実装・レビュー・修正の履歴、レビュー結果、状態、Ledger保存単位
 - [作業・モデル実行・成果物のドメインモデル](docs/domain-model.md): Attempt、Validation、review verdict、監督Codex受入、成果物、旧データ互換の契約

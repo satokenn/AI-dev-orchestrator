@@ -58,17 +58,22 @@ Validatorに渡す一つの検査（check）は、名前・コマンド・引数
 
 ## 詳細仕様を読む順番
 
-全体像の確認には、この文書と次の操作概要を使う。個別のデータや実装をレビューするときは、該当する詳細だけを読む。
+この文書で全体像を確認した後、モデル選定とMCP操作は概要から読む。目的や処理の流れを確認してから、正確なJSON項目が必要な場合に詳細仕様へ進む。
 
-| 確認したいこと | 読む文書 |
-| --- | --- |
-| 今回の統合設計で何を変え、何をレビューするか | [OpenSpecの変更目的](../openspec/changes/service-integration-design/proposal.md)と[設計の説明](../openspec/changes/service-integration-design/design.md) |
-| 監督Codexが何を依頼でき、何が返るか | [MCP操作の概要](mcp-operation-contract.md) |
-| 起動時の設定、処理同士の接続、終了や失敗の扱い | [Operation ServiceとMCPの統合設計](operation-service-integration-design.md) |
-| 作業・成果物・検証・採用判断の意味と状態 | [ドメインモデル](domain-model.md) |
-| 実装・レビュー・修正の履歴のつながり | [履歴の設計](implementation-review-model.md) |
-| 担当モデルの選定に渡す情報と選定結果 | [モデル選定の仕様](model-selection-spec.md) |
-| 操作の正確な入力・出力形式やエラー | [MCP操作の詳細仕様](mcp-operation-contract-reference.md) |
+文書ごとの担当範囲は次のとおり。同じ役割の文書は同じ粒度で書き、概要に完全なJSONやRust型案を混在させない。状態や履歴の規則はそれぞれの文書を参照し、通信仕様で別の意味を定義し直さない。
+
+| 確認すること | 担当する文書 | その文書で定める内容 |
+| --- | --- | --- |
+| 今回何を変え、何をレビューするか | [OpenSpecの変更目的](../openspec/changes/service-integration-design/proposal.md)と[設計の説明](../openspec/changes/service-integration-design/design.md) | 今回の目的・範囲・設計判断。既存仕様全体を複製しない |
+| システム全体が何をするか | この文書 | 登場人物、一件の作業の流れ、設定を用意する側、文書の担当範囲 |
+| 作業・成果物・結果の意味と状態 | [ドメインモデル](domain-model.md) | 作業、モデル実行、成果物、検証・レビュー・採用判断の意味。通信形式は定めない |
+| 実装・レビュー・修正のつながり | [履歴設計](implementation-review-model.md) | 実行の順番・役割・関係、レビューと修正、旧履歴の保存条件 |
+| モデルを選ぶ目的と流れ | [モデル選定の概要](model-selection-spec.md) | 誰が何を集めて選ぶか、重要な判断規則。完全なJSONやRust型案は載せない |
+| 選定用JSONの正確な形式 | [モデル選定の詳細仕様](model-selection-spec-reference.md) | 共通規則、入力・出力の項目・型・省略条件、例、拒否条件と未確定事項 |
+| 依頼できる操作と結果の読み方 | [MCP操作の概要](mcp-operation-contract.md) | 何を渡して何が返るか、通常時と失敗時の操作の流れ |
+| 操作の正確な入出力形式 | [MCP操作の詳細仕様](mcp-operation-contract-reference.md) | 共通規則、入力・出力の項目・型・省略条件、例、エラーと復旧条件 |
+| 処理をどうつなぐか | [統合設計](operation-service-integration-design.md) | 起動・設定・受付・実行・保存・終了の接続。各操作の項目は再定義しない |
+| 変更資料をどう管理するか | [OpenSpecの使い方](../openspec/README.md) | 提案・追加要件・設計・作業一覧の分担と、既存仕様との関係 |
 
 以下では、上の説明を実装上の責務に対応させる。
 

@@ -21,7 +21,7 @@ OpenSpec CLI **1.14.1**を使います。Codex用の公式スキルは各作業�
 
 既存仕様全体の移行はまだ行っていません。承認済み仕様を置く`openspec/specs/`には、提案中の変更を確定済みとして反映していません。既存の要件は`docs/`を参照します。製品コード、DB、実行時の動作はこの文書改訂で変わりません。
 
-既存仕様を移すときは、[全体の構成](../docs/architecture.md)、[操作の概要](../docs/mcp-operation-contract.md)、[操作の詳細](../docs/mcp-operation-contract-reference.md)、[状態と成果物](../docs/domain-model.md)、[実装・レビュー・修正の履歴](../docs/implementation-review-model.md)、[モデル選定](../docs/model-selection-spec.md)と照合します。未マージの提案や手元の変更を、承認済みの要件として取り込みません。
+既存仕様を移すときは、[全体の構成](../docs/architecture.md)、[操作の概要](../docs/mcp-operation-contract.md)、[操作の詳細](../docs/mcp-operation-contract-reference.md)、[状態と成果物](../docs/domain-model.md)、[実装・レビュー・修正の履歴](../docs/implementation-review-model.md)、[モデル選定の概要](../docs/model-selection-spec.md)、[モデル選定の詳細](../docs/model-selection-spec-reference.md)と照合します。未マージの提案や手元の変更を、承認済みの要件として取り込みません。
 
 ## Codexで使う
 

@@ -106,7 +106,7 @@ Antigravity CLI (`agy`) の headless Provider と手動 Live Provider Test の�
 
 仕様を初めて読む方は、まず[開発支援システムの全体像](docs/architecture.md)を参照してください。目的、登場人物、一つの作業の流れ、設定の出どころ、詳細仕様を読む順番をまとめています。
 
-Provider / Model 選定へ渡す Task、利用状況、過去実績、Attempt 履歴と、role ごとの選定結果の構造は、[モデル選定の入力・出力仕様](docs/model-selection-spec.md)を参照してください。
+モデルを選ぶ目的・判断の流れ・担当の分担は[モデル選定の概要](docs/model-selection-spec.md)、選定用JSONの項目・型・省略条件・入出力例は[モデル選定の詳細仕様](docs/model-selection-spec-reference.md)を参照してください。
 
 Service、Ledger、MCPの接続方針は[Operation Service統合設計](docs/operation-service-integration-design.md)を参照してください。
 
